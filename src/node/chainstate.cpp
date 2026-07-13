@@ -44,7 +44,13 @@ std::optional<int> FindChainstateRebuildPreflightFailureHeight(
     AssertLockHeld(::cs_main);
     const CBlockIndex* block = target;
     while (block) {
-        if (!(block->nStatus & BLOCK_HAVE_DATA)) return block->nHeight;
+        // A chainstate-only rebuild does not re-import block files. Entries
+        // accepted only through assumeUTXO therefore cannot be used to rebuild
+        // the active chainstate even when their raw block bytes are present.
+        if (!(block->nStatus & BLOCK_HAVE_DATA) ||
+            !block->IsValid(BLOCK_VALID_TRANSACTIONS)) {
+            return block->nHeight;
+        }
         if (block->nHeight == 0) {
             return block->GetBlockHash() == expected_genesis
                 ? std::nullopt
@@ -111,7 +117,7 @@ static ChainstateLoadResult PreflightChainstateRebuild(
         if (missing_height) {
             chainstate->ResetCoinsViews();
             return {ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED,
-                    strprintf(_("Cannot run -reindex-chainstate because local block data is missing at height %d. The existing chainstate was not wiped. Disable pruning and restart with full -reindex to redownload missing history; wallets are not removed."),
+                    strprintf(_("Cannot run -reindex-chainstate because locally stored, transaction-validated block history is incomplete at height %d. The existing chainstate was not wiped. Disable pruning and restart with full -reindex to redownload and validate missing history; wallets are not removed."),
                               *missing_height)};
         }
         chainstate->ResetCoinsViews();

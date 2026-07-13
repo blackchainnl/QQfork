@@ -21,8 +21,9 @@ namespace node {
 
 struct CacheSizes;
 
-/** Return the first height that cannot be replayed, or std::nullopt when target
- * has block data and contiguous ancestry through the configured genesis. */
+/** Return the first height that cannot rebuild chainstate, or std::nullopt when
+ * target has transaction-validated block data and contiguous ancestry through
+ * the configured genesis. */
 std::optional<int> FindChainstateRebuildPreflightFailureHeight(
     const CBlockIndex* target,
     const uint256& expected_genesis) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);

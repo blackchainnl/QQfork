@@ -37,9 +37,9 @@ BOOST_AUTO_TEST_CASE(chainstate_rebuild_block_data_preflight)
     tip.nHeight = 2;
     middle.pprev = &genesis;
     tip.pprev = &middle;
-    genesis.nStatus = BLOCK_HAVE_DATA;
-    middle.nStatus = BLOCK_HAVE_DATA;
-    tip.nStatus = BLOCK_HAVE_DATA;
+    genesis.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_TRANSACTIONS;
+    middle.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_TRANSACTIONS;
+    tip.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_TRANSACTIONS;
 
     BOOST_CHECK(!node::FindChainstateRebuildPreflightFailureHeight(
         nullptr, genesis_hash));
@@ -52,6 +52,13 @@ BOOST_AUTO_TEST_CASE(chainstate_rebuild_block_data_preflight)
     BOOST_REQUIRE(missing_middle);
     BOOST_CHECK_EQUAL(*missing_middle, 1);
     middle.nStatus |= BLOCK_HAVE_DATA;
+
+    middle.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_TREE | BLOCK_ASSUMED_VALID;
+    const auto assumed_middle = node::FindChainstateRebuildPreflightFailureHeight(
+        &tip, genesis_hash);
+    BOOST_REQUIRE(assumed_middle);
+    BOOST_CHECK_EQUAL(*assumed_middle, 1);
+    middle.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_TRANSACTIONS;
 
     tip.nStatus &= ~BLOCK_HAVE_DATA;
     const auto missing_tip = node::FindChainstateRebuildPreflightFailureHeight(

@@ -9,6 +9,7 @@
 #include <consensus/validation.h>
 #include <kernel/disconnected_transactions.h>
 #include <node/kernel_notifications.h>
+#include <node/chainstate.h>
 #include <node/utxo_snapshot.h>
 #include <random.h>
 #include <rpc/blockchain.h>
@@ -447,6 +448,9 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_delete_snapshot_rehomes_mempool, Snaps
     BOOST_CHECK(rebuilt.ActiveChainstate().GetMempool() == node_mempool);
     BOOST_CHECK(!rebuilt.m_blockman.m_snapshot_height);
     BOOST_CHECK_EQUAL(rebuilt.GetAll().size(), 1U);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        rebuilt.GetMutex(), return rebuilt.ActiveTip()->GetBlockHash()),
+        snapshot_tip_hash);
 
     BOOST_CHECK(!fs::exists(snapshot_dir));
 
@@ -458,6 +462,87 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_delete_snapshot_rehomes_mempool, Snaps
         rebuilt.GetMutex(), return rebuilt.ActiveHeight()), previous_height + 1);
     BOOST_CHECK(rebuilt.ActiveChainstate().GetMempool() == node_mempool);
     BOOST_CHECK(!rebuilt.m_blockman.m_snapshot_height);
+}
+
+//! A chainstate-only rebuild cannot recover an active assumeUTXO chain from raw
+//! block bytes whose index entries have not completed transaction validation.
+//! Refuse before deleting either persisted chainstate.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_reindex_chainstate_refuses_assumed_history, SnapshotTestSetup)
+{
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    Chainstate& background_chainstate = chainman.ActiveChainstate();
+    this->SetupSnapshot();
+
+    // Simulate a background validator that has reached height 90 while the
+    // snapshot chain has raw data, but only assumeUTXO validity, through its
+    // base at height 110.
+    DisconnectedBlockTransactions unused_pool{MAX_DISCONNECTED_TX_POOL_SIZE * 1000};
+    BlockValidationState unused_state;
+    {
+        LOCK2(::cs_main, background_chainstate.MempoolMutex());
+        while (background_chainstate.m_chain.Height() > 90) {
+            BOOST_REQUIRE(background_chainstate.DisconnectTip(
+                unused_state, &unused_pool));
+            unused_pool.clear();
+        }
+
+        for (int height = 91; height <= 110; ++height) {
+            CBlockIndex* const index = background_chainstate.m_chainman.m_blockman.LookupBlockIndex(
+                chainman.ActiveChain()[height]->GetBlockHash());
+            BOOST_REQUIRE(index);
+            index->nStatus = (index->nStatus &
+                              ~(BLOCK_VALID_MASK | BLOCK_FAILED_MASK)) |
+                             BLOCK_VALID_TREE | BLOCK_ASSUMED_VALID |
+                             BLOCK_HAVE_DATA | BLOCK_FAILED_VALID;
+            // Clear the temporary failure bit through the production helper so
+            // the modified index entry is queued for persistence.
+            background_chainstate.ResetBlockFailureFlags(index);
+            BOOST_CHECK(index->nStatus & BLOCK_HAVE_DATA);
+            BOOST_CHECK(index->IsAssumedValid());
+            BOOST_CHECK(!index->IsValid(BLOCK_VALID_TRANSACTIONS));
+        }
+    }
+
+    const uint256 background_tip = WITH_LOCK(
+        chainman.GetMutex(), return background_chainstate.m_chain.Tip()->GetBlockHash());
+    const uint256 snapshot_tip = WITH_LOCK(
+        chainman.GetMutex(), return chainman.ActiveTip()->GetBlockHash());
+    const fs::path base_dir = chainman.m_options.datadir / "chainstate";
+    const fs::path snapshot_dir = *node::FindSnapshotChainstateDir(
+        chainman.m_options.datadir);
+
+    ChainstateManager& restarted = this->SimulateNodeRestart();
+    node::ChainstateLoadOptions options;
+    options.mempool = Assert(m_node.mempool.get());
+    options.reindex_chainstate = true;
+    const auto [status, error] = node::LoadChainstate(
+        restarted, m_cache_sizes, options);
+
+    BOOST_CHECK(status == node::ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED);
+    BOOST_CHECK(error.original.find("transaction-validated block history is incomplete at height 110") !=
+                std::string::npos);
+    BOOST_CHECK(fs::exists(base_dir));
+    BOOST_CHECK(fs::exists(snapshot_dir));
+    BOOST_CHECK(restarted.IsSnapshotActive());
+    BOOST_CHECK_EQUAL(restarted.GetAll().size(), 2U);
+
+    // Reopen both databases without wiping and prove their saved tips survived
+    // the refused startup.
+    {
+        LOCK(::cs_main);
+        for (Chainstate* chainstate : restarted.GetAll()) {
+            chainstate->InitCoinsDB(
+                /*cache_size_bytes=*/1 << 20,
+                /*in_memory=*/false,
+                /*should_wipe=*/false);
+            const uint256 saved_tip = chainstate->CoinsDB().GetBestBlock();
+            BOOST_CHECK_EQUAL(saved_tip,
+                              chainstate->m_from_snapshot_blockhash
+                                  ? snapshot_tip
+                                  : background_tip);
+            chainstate->ResetCoinsViews();
+        }
+    }
 }
 
 //! Test LoadBlockIndex behavior when multiple chainstates are in use.
