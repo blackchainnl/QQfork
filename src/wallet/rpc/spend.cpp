@@ -6,6 +6,7 @@
 
 #include <addresstype.h>
 #include <chainparams.h>
+#include <consensus/demurrage.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <core_io.h>
@@ -47,8 +48,8 @@ static bool IsDirectQuantumMigrationScript(const CScript& script_pub_key)
 static std::optional<CCoinControl::InputFamily> InferRecipientInputFamily(const CScript& script_pub_key)
 {
     if (script_pub_key.empty() || script_pub_key.IsUnspendable()) return std::nullopt;
-    if (IsQuantumMigrationScript(script_pub_key) || IsQuantumColdStakeScript(script_pub_key) || IsEUTXOScript(script_pub_key)) {
-        return std::nullopt;
+    if (IsQuantumMigrationScript(script_pub_key) || IsQuantumColdStakeScript(script_pub_key)) {
+        return CCoinControl::InputFamily::QUANTUM;
     }
     return CCoinControl::InputFamily::LEGACY;
 }
@@ -56,7 +57,10 @@ static std::optional<CCoinControl::InputFamily> InferRecipientInputFamily(const 
 static void MergeRecipientInputFamily(std::optional<CCoinControl::InputFamily>& inferred, const std::optional<CCoinControl::InputFamily>& candidate)
 {
     if (!candidate) return;
-    inferred = candidate;
+    // Any legacy recipient makes legacy funding the safe Migration-phase
+    // choice. A quantum input may never create legacy change or recipients;
+    // a legacy input can migrate value into quantum outputs.
+    if (*candidate == CCoinControl::InputFamily::LEGACY || !inferred) inferred = candidate;
 }
 
 static void ApplyInferredInputFamily(CCoinControl& coin_control, const std::optional<CCoinControl::InputFamily>& inferred)
@@ -75,6 +79,32 @@ static void ApplyRecipientInputFamily(CCoinControl& coin_control, const std::vec
     ApplyInferredInputFamily(coin_control, inferred);
 }
 
+static bool RecipientsAreQuantumOnly(const std::vector<CRecipient>& recipients)
+{
+    bool found_spendable{false};
+    for (const CRecipient& recipient : recipients) {
+        const CScript script_pub_key = recipient.scriptPubKey
+            ? *recipient.scriptPubKey
+            : GetScriptForDestination(recipient.dest);
+        const auto family = InferRecipientInputFamily(script_pub_key);
+        if (!family) continue;
+        found_spendable = true;
+        if (*family != CCoinControl::InputFamily::QUANTUM) return false;
+    }
+    return found_spendable;
+}
+
+static bool LegacyToQuantumFallbackActive(const CWallet& wallet)
+{
+    LOCK(::cs_main);
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const CBlockIndex* tip = wallet.chain().chainman().ActiveChain().Tip();
+    const int next_height = tip ? tip->nHeight + 1 : 0;
+    const int64_t next_mtp = tip ? tip->GetMedianTimePast() : 0;
+    return IsQuantumWitnessSpendActive(consensus, next_mtp, next_height) &&
+           !consensus.IsQuantumFinalLockout(next_mtp, next_height);
+}
+
 static void ApplyOutputInputFamily(CCoinControl& coin_control, const std::vector<CTxOut>& outputs)
 {
     std::optional<CCoinControl::InputFamily> inferred;
@@ -87,12 +117,16 @@ static void ApplyOutputInputFamily(CCoinControl& coin_control, const std::vector
 static void CommitWalletTransactionOrThrow(CWallet& wallet, const CTransactionRef& tx, mapValue_t map_value, const std::string& action)
 {
     std::string broadcast_error;
-    if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error)) {
+    WalletCommitStatus status;
+    if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error, &status)) {
         const std::string reason = broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error;
-        if (!wallet.AbandonTransaction(tx->GetHash())) {
-            wallet.WalletLogPrintf("%s transaction could not be abandoned after broadcast failure: txid=%s\n", action, tx->GetHash().ToString());
-        }
-        throw JSONRPCError(RPC_WALLET_ERROR, strprintf("%s transaction was created but could not be broadcast: %s", action, reason));
+        // Preserve the established -walletrejectlongchains=0 behavior: a
+        // transaction may be retained for later relay even when immediate
+        // mempool submission fails. Only preflight failures that occur before
+        // AddToWallet are hard commit errors. Terminal lifecycle failures are
+        // persisted as abandoned audit records and must still be reported.
+        if (status == WalletCommitStatus::PERSISTED_PENDING) return;
+        throw JSONRPCError(RPC_WALLET_ERROR, strprintf("%s transaction could not be committed: %s", action, reason));
     }
 }
 
@@ -128,26 +162,28 @@ static void ParseRecipients(const UniValue& address_amounts, const UniValue& sub
 
 UniValue SendMoneyToScript(CWallet& wallet, const CScript scriptPubKey, CAmount nValue, const CCoinControl &coin_control, mapValue_t map_value)
 {
-    EnsureWalletIsUnlocked(wallet);
+    {
+        LOCK(wallet.cs_wallet);
+        EnsureWalletIsUnlocked(wallet);
 
-    // This function is only used by sendtoaddress and sendmany.
-    // This should always try to sign, if we don't have private keys, don't try to do anything here.
-    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+        // This function is only used by sendtoaddress and sendmany.
+        // This should always try to sign, if we don't have private keys, don't try to do anything here.
+        if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+        }
+
+        const auto bal = GetBalance(wallet);
+        const CAmount curBalance = bal.m_mine_trusted;
+
+        if (nValue <= 0)
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid amount");
+
+        if (nValue > curBalance)
+            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds");
+
+        if (wallet.m_wallet_unlock_staking_only)
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to create transaction");
     }
-
-    const auto bal = GetBalance(wallet);
-    CAmount curBalance = bal.m_mine_trusted;
-
-    // Check amount
-    if (nValue <= 0)
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid amount");
-
-    if (nValue > curBalance)
-        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds");
-
-    if (wallet.m_wallet_unlock_staking_only)
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to create transaction");
 
     std::vector<CRecipient> recipients;
     CTxDestination dest;
@@ -161,11 +197,23 @@ UniValue SendMoneyToScript(CWallet& wallet, const CScript scriptPubKey, CAmount 
     // Send
     constexpr int RANDOM_CHANGE_POSITION = -1;
     auto res = CreateTransaction(wallet, recipients, RANDOM_CHANGE_POSITION, coin_control, true);
+    // Prefer already-quantum inputs for quantum-only recipients, but preserve
+    // the ordinary migration path: a legacy input may fund quantum outputs
+    // during Migration. Retry as a single legacy-family transaction rather
+    // than mixing legacy and quantum inputs when quantum balance is short.
+    if (!res && coin_control.m_input_family == CCoinControl::InputFamily::QUANTUM &&
+        RecipientsAreQuantumOnly(recipients) && LegacyToQuantumFallbackActive(wallet)) {
+        CCoinControl legacy_fallback{coin_control};
+        legacy_fallback.m_input_family = CCoinControl::InputFamily::LEGACY;
+        legacy_fallback.m_exclude_generated_quantum_inputs = false;
+        legacy_fallback.m_include_generated_quantum_inputs = false;
+        res = CreateTransaction(wallet, recipients, RANDOM_CHANGE_POSITION, legacy_fallback, true);
+    }
     if (!res) {
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
     const CTransactionRef& tx = res->tx;
-    wallet.CommitTransaction(tx, std::move(map_value), {} /* orderForm */);
+    CommitWalletTransactionOrThrow(wallet, tx, std::move(map_value), "Blackcoin send");
     return tx->GetHash().GetHex();
 }
 
@@ -202,7 +250,7 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
         CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
         result.pushKV("txid", tx->GetHash().GetHex());
         if (add_to_wallet && !psbt_opt_in) {
-            pwallet->CommitTransaction(tx, {}, /*orderForm=*/{});
+            CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Blackcoin wallet transaction");
         } else {
             result.pushKV("hex", hex);
         }
@@ -236,16 +284,19 @@ static void PreventOutdatedOptions(const UniValue& options)
 
 UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vector<CRecipient> &recipients, mapValue_t map_value, bool verbose)
 {
-    EnsureWalletIsUnlocked(wallet);
+    {
+        LOCK(wallet.cs_wallet);
+        EnsureWalletIsUnlocked(wallet);
 
-    // This function is only used by sendtoaddress and sendmany.
-    // This should always try to sign, if we don't have private keys, don't try to do anything here.
-    if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+        // This function is only used by sendtoaddress and sendmany.
+        // This should always try to sign, if we don't have private keys, don't try to do anything here.
+        if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+        }
+
+        if (wallet.m_wallet_unlock_staking_only)
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to create transaction");
     }
-
-    if (wallet.m_wallet_unlock_staking_only)
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to create transaction");
 
     // Shuffle recipient list
     std::shuffle(recipients.begin(), recipients.end(), FastRandomContext());
@@ -253,11 +304,19 @@ UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vecto
     // Send
     constexpr int RANDOM_CHANGE_POSITION = -1;
     auto res = CreateTransaction(wallet, recipients, RANDOM_CHANGE_POSITION, coin_control, true);
+    if (!res && coin_control.m_input_family == CCoinControl::InputFamily::QUANTUM &&
+        RecipientsAreQuantumOnly(recipients) && LegacyToQuantumFallbackActive(wallet)) {
+        CCoinControl legacy_fallback{coin_control};
+        legacy_fallback.m_input_family = CCoinControl::InputFamily::LEGACY;
+        legacy_fallback.m_exclude_generated_quantum_inputs = false;
+        legacy_fallback.m_include_generated_quantum_inputs = false;
+        res = CreateTransaction(wallet, recipients, RANDOM_CHANGE_POSITION, legacy_fallback, true);
+    }
     if (!res) {
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
     const CTransactionRef& tx = res->tx;
-    wallet.CommitTransaction(tx, std::move(map_value), /*orderForm=*/{});
+    CommitWalletTransactionOrThrow(wallet, tx, std::move(map_value), "Blackcoin send");
     if (verbose) {
         UniValue entry(UniValue::VOBJ);
         entry.pushKV("txid", tx->GetHash().GetHex());
@@ -293,8 +352,6 @@ RPCHelpMan burn()
     // Make sure the results are valid at least up to the most recent block
     // the user could have gotten from another RPC command prior to now
     pwallet->BlockUntilSyncedToCurrentChain();
-
-    LOCK(pwallet->cs_wallet);
 
     if (request.params.size() > 1) {
         std::vector<unsigned char> data;
@@ -394,7 +451,7 @@ RPCHelpMan burnwallet()
         throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, util::ErrorString(res).original);
     }
     const CTransactionRef& tx = res->tx;
-    pwallet->CommitTransaction(tx, std::move(mapValue), {});
+    CommitWalletTransactionOrThrow(*pwallet, tx, std::move(mapValue), "Blackcoin burn");
 
     return tx->GetHash().GetHex();
 },
@@ -440,8 +497,6 @@ RPCHelpMan optimizeutxoset()
     // the user could have gotten from another RPC command prior to now
     pwallet->BlockUntilSyncedToCurrentChain();
 
-    LOCK(pwallet->cs_wallet);
-
     EnsureWalletIsUnlocked(*pwallet);
 
     mapValue_t mapValue;
@@ -472,7 +527,7 @@ RPCHelpMan optimizeutxoset()
 
     UniValue entry(UniValue::VOBJ);
     if (transmit) {
-        pwallet->CommitTransaction(tx, std::move(mapValue), {} /* orderForm */);
+        CommitWalletTransactionOrThrow(*pwallet, tx, std::move(mapValue), "Blackcoin UTXO optimization");
         entry.pushKV("txid", tx->GetHash().GetHex());
     }
     else {
@@ -535,8 +590,6 @@ RPCHelpMan sendtoaddress()
     // Make sure the results are valid at least up to the most recent block
     // the user could have gotten from another RPC command prior to now
     pwallet->BlockUntilSyncedToCurrentChain();
-
-    LOCK(pwallet->cs_wallet);
 
     // Wallet comments
     mapValue_t mapValue;
@@ -641,8 +694,6 @@ RPCHelpMan sendmany()
     // the user could have gotten from another RPC command prior to now
     pwallet->BlockUntilSyncedToCurrentChain();
 
-    LOCK(pwallet->cs_wallet);
-
     if (!request.params[0].isNull() && !request.params[0].get_str().empty()) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "Dummy value must be set to \"\"");
     }
@@ -692,7 +743,7 @@ RPCHelpMan settxfee()
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
-    LOCK(pwallet->cs_wallet);
+    LOCK2(::cs_main, pwallet->cs_wallet);
 
     CAmount nAmount = AmountFromValue(request.params[0]);
     CFeeRate tx_fee_rate(nAmount, 1000);
@@ -1162,10 +1213,6 @@ RPCHelpMan signrawtransactionwithwallet()
         throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "TX decode failed. Make sure the tx has at least one input.");
     }
 
-    // Sign the transaction
-    LOCK(pwallet->cs_wallet);
-    EnsureWalletIsUnlocked(*pwallet);
-
     // Fetch previous transactions (inputs):
     std::map<COutPoint, Coin> coins;
     for (const CTxIn& txin : mtx.vin) {
@@ -1181,7 +1228,12 @@ RPCHelpMan signrawtransactionwithwallet()
     // Script verification errors
     std::map<int, bilingual_str> input_errors;
 
-    bool complete = pwallet->SignTransaction(mtx, coins, nHashType, input_errors);
+    bool complete{false};
+    {
+        LOCK2(::cs_main, pwallet->cs_wallet);
+        EnsureWalletIsUnlocked(*pwallet);
+        complete = pwallet->SignTransaction(mtx, coins, nHashType, input_errors);
+    }
     UniValue result(UniValue::VOBJ);
     SignTransactionResultToJSON(mtx, complete, coins, input_errors, result);
     return result;
@@ -1454,7 +1506,7 @@ RPCHelpMan sendall()
             }
 
             CMutableTransaction rawTx{ConstructTransaction(options["inputs"], recipient_key_value_pairs, options["locktime"])};
-            LOCK(pwallet->cs_wallet);
+            LOCK2(::cs_main, pwallet->cs_wallet);
             if (!options.exists("inputs")) {
                 ApplyOutputInputFamily(coin_control, rawTx.vout);
             }
@@ -1854,6 +1906,10 @@ RPCHelpMan migratetoquantum()
                 "The migration deadline has passed; legacy coins are no longer spendable and cannot be migrated.");
         }
         const std::string phase = QQPhaseName(consensus.GetQuantumQuasarPhase(mtp, next_height));
+        if (!dry_run && !IsQuantumWitnessSpendActive(consensus, mtp, next_height)) {
+            throw JSONRPCError(RPC_WALLET_ERROR,
+                "Quantum funding is disabled during Gold Rush. Use dry_run with an existing wallet-backed address for planning, then migrate after Gold Rush ends.");
+        }
 
         CTxDestination dest;
         bool newly_generated = false;
@@ -1894,18 +1950,29 @@ RPCHelpMan migratetoquantum()
 
         CAmount eligible_amount = 0;
         unsigned int eligible_inputs = 0;
+        unsigned int migration_anchor_inputs = 0;
+        const CCoinsViewCache& migration_view = pwallet->chain().chainman().ActiveChainstate().CoinsTip();
         for (const COutput& out : AvailableCoins(*pwallet, &coin_control, std::nullopt, filter).All()) {
             const CScript& spk = out.txout.scriptPubKey;
             if (IsQuantumMigrationScript(spk)) continue;
             if (IsQuantumColdStakeScript(spk)) continue;
             if (IsEUTXOScript(spk)) continue;
             if (!out.spendable) continue;
+            const Coin& coin = migration_view.AccessCoin(out.outpoint);
+            if (!coin.IsSpent() && IsWalletProtectedLineageInput(
+                    *pwallet, out.outpoint, coin, consensus, mtp, next_height)) {
+                ++migration_anchor_inputs;
+            }
             coin_control.Select(out.outpoint);
             eligible_amount += out.txout.nValue;
             ++eligible_inputs;
         }
         if (eligible_inputs == 0) {
             throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable legacy coins to migrate.");
+        }
+        if (IsQuantumWitnessSpendActive(consensus, mtp, next_height) && migration_anchor_inputs == 0) {
+            throw JSONRPCError(RPC_WALLET_ERROR,
+                "This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction. Add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor. During Gold Rush, prepare that anchor before quantum spending activates.");
         }
 
         std::vector<CRecipient> recipients;
@@ -1949,8 +2016,8 @@ RPCHelpMan migratetoquantum()
 RPCHelpMan migrategoldrushrewards()
 {
     return RPCHelpMan{"migrategoldrushrewards",
-        "\nMove wallet-owned Gold Rush reward outputs to a fresh Blackcoin ML-DSA\n"
-        "migration address once quantum reward spends are active in the post-Gold-Rush migration window, and before the final lockout deadline.\n",
+        "\nOptionally consolidate matured wallet-owned Gold Rush reward outputs into another\n"
+        "wallet-backed Blackcoin ML-DSA address. A fresh move is not required for normal use.\n",
         {
             {"options", RPCArg::Type::OBJ_NAMED_PARAMS, RPCArg::Optional::OMITTED, "",
                 {
@@ -1966,7 +2033,9 @@ RPCHelpMan migrategoldrushrewards()
             {RPCResult::Type::STR, "phase", "current Blackcoin phase"},
             {RPCResult::Type::NUM_TIME, "deadline_mtp", "final migration deadline MTP"},
             {RPCResult::Type::NUM, "eligible_inputs", "count of Gold Rush reward UTXOs moved"},
-            {RPCResult::Type::STR_AMOUNT, "eligible_amount", "total Gold Rush reward value selected"},
+            {RPCResult::Type::STR_AMOUNT, "eligible_amount", "nominal Gold Rush reward value selected (compatibility field)"},
+            {RPCResult::Type::STR_AMOUNT, "effective_eligible_amount", "spendable value after scheduled demurrage"},
+            {RPCResult::Type::STR_AMOUNT, "burned_amount", "scheduled demurrage realized by this consolidation"},
             {RPCResult::Type::STR, "destination", "new quantum address funds were sent to"},
             {RPCResult::Type::BOOL, "newly_generated", "whether destination was freshly generated"},
             {RPCResult::Type::BOOL, "stored_in_wallet", "destination key confirmed persisted"},
@@ -2010,11 +2079,10 @@ RPCHelpMan migrategoldrushrewards()
             mtp = tip->GetMedianTimePast();
             next_height = tip->nHeight + 1;
         }
-        const bool goldrush_move_active = !consensus.IsQuantumFinalLockout(mtp, next_height) &&
-            IsQuantumWitnessSpendActive(consensus, mtp, next_height);
+        const bool goldrush_move_active = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
         if (!goldrush_move_active) {
             throw JSONRPCError(RPC_WALLET_ERROR,
-                "Gold Rush reward migration is only allowed once quantum reward spends are active and before the final quantum lockout deadline.");
+                "Gold Rush reward outputs remain locked until quantum witness spends activate after the Gold Rush.");
         }
         const std::string phase = QQPhaseName(consensus.GetQuantumQuasarPhase(mtp, next_height));
 
@@ -2061,22 +2129,35 @@ RPCHelpMan migrategoldrushrewards()
         ChainstateManager& chainman = pwallet->chain().chainman();
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
         CAmount eligible_amount = 0;
+        CAmount effective_eligible_amount = 0;
+        CAmount burned_amount = 0;
         unsigned int eligible_inputs = 0;
         for (const COutput& out : AvailableCoins(*pwallet, &coin_control, std::nullopt, filter).All()) {
             const CScript& spk = out.txout.scriptPubKey;
             if (!IsQuantumMigrationScript(spk) || spk == destination_script) continue;
             CScript marker_script;
             if (!IsGoldRushDirectPayoutOutput(view, out.outpoint, &marker_script) || marker_script != spk) continue;
+            const Coin& coin = view.AccessCoin(out.outpoint);
+            if (coin.IsSpent()) continue;
+            const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+                Consensus::LatestDemurrageAttestationStateForScript(view, spk);
+            const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+                coin, consensus, next_height, mtp,
+                latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+                latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
+            if (eval.locked || eval.effective_value <= 0) continue;
             coin_control.Select(out.outpoint);
             eligible_amount += out.txout.nValue;
+            effective_eligible_amount += eval.effective_value;
+            burned_amount += eval.burned_value;
             ++eligible_inputs;
         }
         if (eligible_inputs == 0) {
-            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No wallet-owned Gold Rush reward outputs need migration.");
+            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No mature wallet-owned Gold Rush reward outputs are available to consolidate.");
         }
 
         std::vector<CRecipient> recipients;
-        recipients.push_back({dest, eligible_amount, /*fSubtractFeeFromAmount=*/true});
+        recipients.push_back({dest, effective_eligible_amount, /*fSubtractFeeFromAmount=*/true});
 
         constexpr int RANDOM_CHANGE_POSITION = -1;
         auto res = CreateTransaction(*pwallet, recipients, RANDOM_CHANGE_POSITION, coin_control, /*sign=*/!dry_run);
@@ -2093,6 +2174,8 @@ RPCHelpMan migrategoldrushrewards()
         result.pushKV("deadline_mtp", consensus.nQuantumMigrationDeadlineTime);
         result.pushKV("eligible_inputs", (int)eligible_inputs);
         result.pushKV("eligible_amount", ValueFromAmount(eligible_amount));
+        result.pushKV("effective_eligible_amount", ValueFromAmount(effective_eligible_amount));
+        result.pushKV("burned_amount", ValueFromAmount(burned_amount));
         result.pushKV("destination", EncodeDestination(dest));
         result.pushKV("newly_generated", newly_generated);
         result.pushKV("stored_in_wallet", true);
@@ -3610,10 +3693,13 @@ RPCHelpMan getmigrationstatus()
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::STR, "phase", "legacy | gold_rush | migration | final_lockout"},
             {RPCResult::Type::NUM_TIME, "mediantime", "tip median-time-past driving the schedule"},
-            {RPCResult::Type::NUM_TIME, "deadline_mtp", "final migration deadline MTP (0 if unscheduled)"},
+            {RPCResult::Type::NUM_TIME, "deadline_mtp", "forecast final migration deadline time (0 if unscheduled; non-authoritative when height boundaries are enabled)"},
+            {RPCResult::Type::NUM, "deadline_height", "authoritative final Migration block height (0 for a time-only test schedule)"},
             {RPCResult::Type::BOOL, "deadline_scheduled", "whether a deadline is configured"},
-            {RPCResult::Type::NUM, "seconds_until_deadline", "max(0, deadline - mtp)"},
-            {RPCResult::Type::NUM, "blocks_until_deadline_est", "rough estimate (seconds / target spacing)"},
+            {RPCResult::Type::BOOL, "height_boundaries_authoritative", "whether exact block heights, rather than time forecasts, govern the lifecycle"},
+            {RPCResult::Type::NUM, "seconds_until_deadline", "time forecast: max(0, forecast deadline - mtp)"},
+            {RPCResult::Type::NUM, "blocks_until_deadline", "exact remaining Migration blocks when height boundaries are authoritative"},
+            {RPCResult::Type::NUM, "blocks_until_deadline_est", "non-authoritative time forecast (seconds / target spacing)"},
             {RPCResult::Type::BOOL, "deadline_passed", "whether legacy coins are already locked out"},
             {RPCResult::Type::NUM, "eligible_legacy_inputs", "spendable legacy UTXOs remaining"},
             {RPCResult::Type::STR_AMOUNT, "eligible_legacy_amount", "total value of eligible legacy coins"},
@@ -3623,9 +3709,9 @@ RPCHelpMan getmigrationstatus()
             {RPCResult::Type::STR_AMOUNT, "direct_quantum_amount", "ordinary quantum value ready for normal sends and delegation funding"},
             {RPCResult::Type::NUM, "staked_quantum_outputs", "wallet-owned bonded or staking quantum UTXOs"},
             {RPCResult::Type::STR_AMOUNT, "staked_quantum_amount", "bonded or staking quantum value"},
-            {RPCResult::Type::NUM, "goldrush_reward_outputs_needing_move", "wallet-owned Gold Rush reward UTXOs that still need migration"},
-            {RPCResult::Type::STR_AMOUNT, "goldrush_reward_amount_needing_move", "total Gold Rush reward value still needing migration"},
-            {RPCResult::Type::BOOL, "goldrush_remigration_active", "whether Gold Rush reward migration is currently allowed"},
+            {RPCResult::Type::NUM, "goldrush_reward_outputs_needing_move", "compatibility field: Gold Rush reward UTXOs still phase-locked during Gold Rush"},
+            {RPCResult::Type::STR_AMOUNT, "goldrush_reward_amount_needing_move", "compatibility field: Gold Rush reward value still phase-locked"},
+            {RPCResult::Type::BOOL, "goldrush_remigration_active", "whether optional Gold Rush reward consolidation is available"},
             {RPCResult::Type::BOOL, "quantum_spends_active", "whether ML-DSA spends are enforceable at the tip"},
             {RPCResult::Type::STR, "advice", "human-readable next step"},
         }},
@@ -3648,6 +3734,9 @@ RPCHelpMan getmigrationstatus()
         const bool passed = c.IsQuantumFinalLockout(mtp, next_height);
         const int64_t secs = (scheduled && c.nQuantumMigrationDeadlineTime > mtp)
                                  ? (c.nQuantumMigrationDeadlineTime - mtp) : 0;
+        const bool height_authoritative = c.UsesHeightLifecycle() && c.IsQuantumLifecycleScheduleOrdered();
+        const int64_t exact_blocks = height_authoritative && next_height <= c.nQuantumMigrationEndHeight
+            ? c.nQuantumMigrationEndHeight - next_height + 1 : 0;
         const bool quantum_active = IsQuantumWitnessSpendActive(c, mtp, next_height);
 
         CAmount legacy_amt = 0, quantum_amt = 0, direct_quantum_amt = 0, staked_quantum_amt = 0, goldrush_reward_amt = 0;
@@ -3660,7 +3749,8 @@ RPCHelpMan getmigrationstatus()
                 CTxDestination d;
                 const bool wallet_owned = ExtractDestination(spk, d) && pwallet->GetQuantumKeyInfo(d).has_value();
                 CScript marker_script;
-                if (IsGoldRushDirectPayoutOutput(view, out.outpoint, &marker_script) && marker_script == spk) {
+                if (IsLockedGoldRushPayoutOutput(view, out.outpoint, c,
+                        mtp, next_height, &marker_script) && marker_script == spk) {
                     goldrush_reward_amt += out.txout.nValue;
                     ++goldrush_reward_n;
                 } else if (wallet_owned) {
@@ -3686,8 +3776,11 @@ RPCHelpMan getmigrationstatus()
         r.pushKV("phase", QQPhaseName(c.GetQuantumQuasarPhase(mtp, next_height)));
         r.pushKV("mediantime", mtp);
         r.pushKV("deadline_mtp", c.nQuantumMigrationDeadlineTime);
+        r.pushKV("deadline_height", c.nQuantumMigrationEndHeight);
         r.pushKV("deadline_scheduled", scheduled);
+        r.pushKV("height_boundaries_authoritative", height_authoritative);
         r.pushKV("seconds_until_deadline", secs);
+        r.pushKV("blocks_until_deadline", exact_blocks);
         r.pushKV("blocks_until_deadline_est", (int64_t)(secs / spacing));
         r.pushKV("deadline_passed", passed);
         r.pushKV("eligible_legacy_inputs", (int)legacy_n);
@@ -3700,14 +3793,12 @@ RPCHelpMan getmigrationstatus()
         r.pushKV("staked_quantum_amount", ValueFromAmount(staked_quantum_amt));
         r.pushKV("goldrush_reward_outputs_needing_move", (int)goldrush_reward_n);
         r.pushKV("goldrush_reward_amount_needing_move", ValueFromAmount(goldrush_reward_amt));
-        const bool goldrush_move_active = !passed && quantum_active;
+        const bool goldrush_move_active = quantum_active;
         r.pushKV("goldrush_remigration_active", goldrush_move_active);
         r.pushKV("quantum_spends_active", quantum_active);
         std::string advice;
-        if (passed && goldrush_reward_n > 0) advice = "Deadline passed. Remaining Gold Rush reward outputs are permanently unspendable.";
-        else if (passed)         advice = "Deadline passed. Remaining legacy coins are permanently unspendable.";
-        else if (goldrush_reward_n > 0 && goldrush_move_active) advice = "Run migrategoldrushrewards before staking, delegation, or final lockout to move Gold Rush reward outputs to a fresh quantum address.";
-        else if (goldrush_reward_n > 0) advice = "Gold Rush reward outputs become ordinary quantum funds after they are moved to a fresh quantum address.";
+        if (passed)              advice = "Deadline passed. Remaining legacy coins are permanently unspendable.";
+        else if (goldrush_reward_n > 0) advice = "Gold Rush reward outputs remain locked until the Gold Rush ends; they then become ordinary quantum funds after normal maturity.";
         else if (legacy_n == 0)  advice = "No legacy coins remain to migrate.";
         else if (!scheduled)     advice = "No deadline scheduled yet, but you can migrate now with migratetoquantum.";
         else                     advice = "Run migratetoquantum before the deadline to move legacy coins into a quantum address.";

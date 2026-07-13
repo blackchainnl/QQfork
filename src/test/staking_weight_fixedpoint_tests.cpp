@@ -268,6 +268,8 @@ BOOST_AUTO_TEST_CASE(t8_weight_context_qcs_tiered_pool_penalty)
 BOOST_AUTO_TEST_CASE(t9_demurrage_kernel_value_gate_off_is_nominal)
 {
     Consensus::Params params;
+    params.nProtocolV4Time = 0;
+    params.nGoldRushEndTime = 50;
     params.nDemurrageActivationHeight = std::numeric_limits<int>::max();
     params.nQuantumMigrationDeadlineTime = 100;
 
@@ -290,6 +292,8 @@ BOOST_AUTO_TEST_CASE(t9_demurrage_kernel_value_gate_off_is_nominal)
 BOOST_AUTO_TEST_CASE(t10_demurrage_kernel_weight_scales_with_effective_value)
 {
     Consensus::Params params;
+    params.nProtocolV4Time = 0;
+    params.nGoldRushEndTime = 50;
     params.nDemurrageActivationHeight = 1;
     params.nQuantumMigrationDeadlineTime = 100;
 
@@ -318,6 +322,8 @@ BOOST_AUTO_TEST_CASE(t10_demurrage_kernel_weight_scales_with_effective_value)
 BOOST_AUTO_TEST_CASE(t11_demurrage_locked_kernel_weight_is_zero)
 {
     Consensus::Params params;
+    params.nProtocolV4Time = 0;
+    params.nGoldRushEndTime = 50;
     params.nDemurrageActivationHeight = 1;
     params.nQuantumMigrationDeadlineTime = 100;
 
@@ -337,9 +343,11 @@ BOOST_AUTO_TEST_CASE(t11_demurrage_locked_kernel_weight_is_zero)
     BOOST_CHECK(EffectiveStakeWeight(GetKernelStakeValue(coin, view, params, spend_height, spend_time), kFullPpm10k, kPoolOwnerPpm10k) == arith_uint256(0));
 }
 
-BOOST_AUTO_TEST_CASE(t12_demurrage_coldstake_kernel_value_stays_nominal)
+BOOST_AUTO_TEST_CASE(t12_inactive_coldstake_cannot_bypass_demurrage)
 {
     Consensus::Params params;
+    params.nProtocolV4Time = 0;
+    params.nGoldRushEndTime = 50;
     params.nDemurrageActivationHeight = 1;
     params.nQuantumMigrationDeadlineTime = 100;
 
@@ -354,9 +362,9 @@ BOOST_AUTO_TEST_CASE(t12_demurrage_coldstake_kernel_value_stays_nominal)
 
     BOOST_REQUIRE(params.IsDemurrageActive(spend_height, spend_time));
     const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin, params, spend_height, spend_time);
-    BOOST_REQUIRE(eval.exempt);
-    BOOST_CHECK_EQUAL(eval.exemption, "coldstake");
-    BOOST_CHECK_EQUAL(GetKernelStakeValue(coin, view, params, spend_height, spend_time), coin.out.nValue);
+    BOOST_REQUIRE(eval.locked);
+    BOOST_CHECK_EQUAL(eval.effective_value, 0);
+    BOOST_CHECK_EQUAL(GetKernelStakeValue(coin, view, params, spend_height, spend_time), 0);
 }
 
 #endif // BLACKCOIN_STAKING_WEIGHTS

@@ -14,6 +14,8 @@
 #include <consensus/validation.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
+#include <shadow.h>
+#include <util/time.h>
 #include <validation.h>
 #include <util/check.h>
 #include <util/moneystr.h>
@@ -177,12 +179,17 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
                          strprintf("%s: inputs missing/spent", __func__));
     }
 
-    // Blackcoin: v2+ transactions do not serialize nTime. Consensus callers must
-    // supply a deterministic spend time (for blocks, the block time) instead of
-    // using local adjusted time, or block validity can depend on verifier clock.
+    // Preserve the exact legacy v2+ timestamp behavior through Gold Rush. The
+    // legacy network substitutes local adjusted time when nTime is absent; a
+    // deterministic block-time substitution before G+1 would reject blocks the
+    // dominant implementation accepts. Once the scheduled fork is active, use
+    // the caller's deterministic block/next-block time.
     int64_t nTimeTx = tx.nTime;
-    if (!nTimeTx && tx.nVersion >= 2)
-        nTimeTx = nSpendTime;
+    if (!nTimeTx && tx.nVersion >= 2) {
+        nTimeTx = IsQuantumWitnessSpendActive(::Params().GetConsensus(), nDemurrageTime, nSpendHeight)
+            ? nSpendTime
+            : GetAdjustedTimeSeconds();
+    }
 
     CAmount nValueIn = 0;
     for (unsigned int i = 0; i < tx.vin.size(); ++i) {
@@ -191,12 +198,14 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         assert(!coin.IsSpent());
 
         // If prev is coinbase or coinstake, check that it's matured
-        if ((coin.IsCoinBase() || coin.IsCoinStake()) && nSpendHeight - coin.nHeight < (::Params().GetConsensus().IsProtocolV3_1(nTimeTx) ? ::Params().GetConsensus().nCoinbaseMaturity : Params().nCoinbaseMaturity)) {
+        if ((coin.IsCoinBase() || coin.IsCoinStake()) &&
+            nSpendHeight - coin.nHeight < (::Params().GetConsensus().IsProtocolV3_1(nTimeTx) ? ::Params().GetConsensus().nCoinbaseMaturity : Params().nCoinbaseMaturity)) {
             return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase",
                 strprintf("tried to spend coinbase at depth %d", nSpendHeight - coin.nHeight));
         }
 
-        // Check transaction timestamp
+        // Check transaction timestamp. This inherited legacy consensus rule
+        // applies to every spending transaction version.
         if (coin.nTime > nTimeTx)
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-time-earlier-than-input");
 
@@ -206,8 +215,12 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         if (!MoneyRange(coin.out.nValue)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-inputvalues-outofrange");
         }
-        const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(inputs, coin.out.scriptPubKey);
-        const Consensus::DemurrageEvaluation demurrage = Consensus::EvaluateDemurrage(coin, ::Params().GetConsensus(), nSpendHeight, nDemurrageTime, latest_attestation);
+        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+            Consensus::LatestDemurrageAttestationStateForScript(inputs, coin.out.scriptPubKey);
+        const Consensus::DemurrageEvaluation demurrage = Consensus::EvaluateDemurrage(
+            coin, ::Params().GetConsensus(), nSpendHeight, nDemurrageTime,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
         if (demurrage.locked) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-spends-locked-coin");
         }

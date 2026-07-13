@@ -23,7 +23,7 @@ std::unique_ptr<CWallet> CreateSyncedWallet(interfaces::Chain& chain, CChain& cc
 {
     auto wallet = std::make_unique<CWallet>(&chain, "", CreateMockableWalletDatabase());
     {
-        LOCK2(wallet->cs_wallet, ::cs_main);
+        LOCK2(::cs_main, wallet->cs_wallet);
         wallet->SetLastBlockProcessed(cchain.Height(), cchain.Tip()->GetBlockHash());
     }
     wallet->LoadWallet();

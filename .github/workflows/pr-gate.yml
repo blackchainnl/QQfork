@@ -1,0 +1,75 @@
+name: pull-request safety gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-gate-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  consensus-and-wallet:
+    name: consensus, wallet, and activation boundaries
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      HOST: x86_64-pc-linux-gnu
+      MAKEJOBS: 4
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            automake bison build-essential cmake gettext gperf libtool \
+            pkg-config python3 python3-zmq
+
+      - name: Reject malformed patch whitespace
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: git diff --check "origin/$BASE_REF...HEAD"
+
+      - name: Build pinned dependencies
+        run: |
+          make -j "$MAKEJOBS" -C depends \
+            HOST="$HOST" NO_QT=1 NO_UPNP=1 NO_NATPMP=1
+
+      - name: Configure
+        run: |
+          ./autogen.sh
+          ./configure \
+            --prefix="$PWD/depends/$HOST" \
+            --with-gui=no \
+            --disable-bench \
+            --disable-zmq
+
+      - name: Compile and run unit tests
+        run: make -j "$MAKEJOBS" check
+
+      - name: Run consensus and wallet functional gates
+        run: |
+          python3 test/functional/test_runner.py \
+            --ci --jobs=1 --failfast --combinedlogslen=999999 \
+            feature_quantum_activation_boundary.py \
+            feature_blackcoin_phase.py \
+            feature_goldrush_migration_rpc.py \
+            feature_goldrush_legacy_compat.py \
+            feature_goldrush_shadow_replay.py \
+            feature_goldrush_reorg.py \
+            feature_goldrush_pow_miner_e2e.py \
+            feature_goldrush_pos_unrestricted.py \
+            feature_quantum_staking_tiers.py \
+            feature_quantum_coldstaking.py \
+            feature_goldrush_coldstake_auto_migration.py \
+            wallet_basic.py \
+            wallet_resendwallettransactions.py \
+            feature_goldrush_height_schedule_multinode.py

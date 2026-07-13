@@ -77,11 +77,15 @@ BOOST_AUTO_TEST_CASE(phase_schedule_boundaries)
     BOOST_CHECK(!consensus.IsQuantumSpendEnforcementActive(consensus.nGoldRushEndTime, 0));
     BOOST_CHECK(consensus.IsQuantumSpendEnforcementActive(consensus.nGoldRushEndTime + 1, 0));
     BOOST_CHECK(consensus.IsQuantumSpendEnforcementActive(consensus.nQuantumMigrationDeadlineTime + 1, 0));
-    BOOST_CHECK(IsShadowGoldRushRewardActive(consensus, consensus.nProtocolV4Time - 1, SHADOW_REWARD_START_HEIGHT));
-    BOOST_CHECK(IsShadowGoldRushRewardActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT));
+    BOOST_CHECK(!IsShadowGoldRushRewardActive(consensus, consensus.nProtocolV4Time - 1, SHADOW_REWARD_START_HEIGHT));
+    BOOST_CHECK(IsShadowGoldRushRewardActive(consensus, consensus.nProtocolV4Time + 1, SHADOW_REWARD_START_HEIGHT));
+    BOOST_CHECK(!IsShadowGoldRushRewardActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT));
     BOOST_CHECK(!IsShadowGoldRushRewardActive(consensus, consensus.nQuantumMigrationDeadlineTime + 1, SHADOW_REWARD_START_HEIGHT));
-    BOOST_CHECK(!IsQuantumWitnessSpendActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT));
+    BOOST_CHECK(IsQuantumWitnessSpendActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT));
     BOOST_CHECK(IsQuantumWitnessSpendActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT + 1));
+    consensus.nStakeTierActivationHeight = SHADOW_REWARD_START_HEIGHT;
+    BOOST_CHECK(!IsQuantumStakeTiersActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT));
+    BOOST_CHECK(IsQuantumStakeTiersActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT + 1));
 
     consensus.nQuantumMigrationDeadlineTime = 0;
     BOOST_CHECK(consensus.GetQuantumQuasarPhase(consensus.nGoldRushEndTime + 1, 0) == Consensus::QuantumQuasarPhase::MIGRATION);
@@ -96,18 +100,65 @@ BOOST_AUTO_TEST_CASE(phase_schedule_boundaries)
 
     consensus.nQuantumMigrationDeadlineTime = consensus.nProtocolV4Time + 10;
     BOOST_CHECK(consensus.GetQuantumQuasarPhase(consensus.nProtocolV4Time + 1, 0) == Consensus::QuantumQuasarPhase::GOLD_RUSH);
-    BOOST_CHECK(consensus.GetQuantumQuasarPhase(consensus.nProtocolV4Time + 11, 0) == Consensus::QuantumQuasarPhase::FINAL_LOCKOUT);
-    BOOST_CHECK(!consensus.IsBaseNetworkStakeCompatible(consensus.nProtocolV4Time + 11, 0));
-    BOOST_CHECK(consensus.IsNewNetworkStakeOnly(consensus.nProtocolV4Time + 11, 0));
-    BOOST_CHECK(consensus.IsQuantumSpendEnforcementActive(consensus.nProtocolV4Time + 11, 0));
+    BOOST_CHECK(consensus.GetQuantumQuasarPhase(consensus.nProtocolV4Time + 11, 0) == Consensus::QuantumQuasarPhase::GOLD_RUSH);
+    BOOST_CHECK(consensus.IsBaseNetworkStakeCompatible(consensus.nProtocolV4Time + 11, 0));
+    BOOST_CHECK(!consensus.IsNewNetworkStakeOnly(consensus.nProtocolV4Time + 11, 0));
+    BOOST_CHECK(!consensus.IsQuantumSpendEnforcementActive(consensus.nProtocolV4Time + 11, 0));
 
     consensus.nGoldRushEndTime = consensus.nProtocolV4Time + 100;
     consensus.nQuantumMigrationDeadlineTime = consensus.nProtocolV4Time + 50;
-    BOOST_CHECK(consensus.GetQuantumQuasarPhase(consensus.nProtocolV4Time + 51, 0) == Consensus::QuantumQuasarPhase::FINAL_LOCKOUT);
-    BOOST_CHECK(!consensus.IsGoldRushEpoch(consensus.nProtocolV4Time + 51, 0));
-    BOOST_CHECK(!consensus.IsBaseNetworkStakeCompatible(consensus.nProtocolV4Time + 51, 0));
-    BOOST_CHECK(consensus.IsNewNetworkStakeOnly(consensus.nProtocolV4Time + 51, 0));
-    BOOST_CHECK(consensus.IsQuantumSpendEnforcementActive(consensus.nProtocolV4Time + 51, 0));
+    BOOST_CHECK(consensus.GetQuantumQuasarPhase(consensus.nProtocolV4Time + 51, 0) == Consensus::QuantumQuasarPhase::GOLD_RUSH);
+    BOOST_CHECK(consensus.IsGoldRushEpoch(consensus.nProtocolV4Time + 51, 0));
+    BOOST_CHECK(consensus.IsBaseNetworkStakeCompatible(consensus.nProtocolV4Time + 51, 0));
+    BOOST_CHECK(!consensus.IsNewNetworkStakeOnly(consensus.nProtocolV4Time + 51, 0));
+    BOOST_CHECK(!consensus.IsQuantumSpendEnforcementActive(consensus.nProtocolV4Time + 51, 0));
+    BOOST_CHECK(consensus.GetQuantumQuasarPhase(consensus.nProtocolV4Time + 101, 0) == Consensus::QuantumQuasarPhase::MIGRATION);
+    BOOST_CHECK(consensus.IsQuantumSpendEnforcementActive(consensus.nProtocolV4Time + 101, 0));
+    BOOST_CHECK(!consensus.IsQuantumFinalLockout(consensus.nProtocolV4Time + 101, 0));
+}
+
+BOOST_AUTO_TEST_CASE(mainnet_lifecycle_is_height_coherent_and_demurrage_is_automatic)
+{
+    // Constructing a test chain may mutate the process-local compressed
+    // schedule. Mainnet consensus heights must remain immutable regardless.
+    SetShadowTestSchedule(/*whitelist_height=*/1, /*reward_start_height=*/2, /*gold_rush_blocks=*/10);
+    const auto main_params = CreateChainParams(ArgsManager{}, ChainType::MAIN);
+    SetShadowTestSchedule(MAINNET_SHADOW_WHITELIST_HEIGHT,
+                          MAINNET_SHADOW_REWARD_START_HEIGHT,
+                          MAINNET_SHADOW_GOLD_RUSH_BLOCKS);
+    const Consensus::Params& consensus = main_params->GetConsensus();
+    const int gold_rush_end = MAINNET_SHADOW_REWARD_END_HEIGHT;
+    const int migration_blocks = static_cast<int>((Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS + consensus.nTargetSpacing - 1) / consensus.nTargetSpacing);
+    const int migration_end = gold_rush_end + migration_blocks;
+    const int64_t active_mtp = consensus.nQuantumMigrationDeadlineTime + 1;
+
+    BOOST_CHECK_EQUAL(consensus.nGoldRushEndHeight, gold_rush_end);
+    BOOST_CHECK_EQUAL(consensus.nQuantumMigrationEndHeight, migration_end);
+    BOOST_CHECK_EQUAL(consensus.EffectiveDemurrageActivationHeight(), migration_end + 1);
+    BOOST_CHECK_EQUAL(consensus.nStakeTierActivationHeight, gold_rush_end + 1);
+    BOOST_CHECK_EQUAL(consensus.nStakeRewardSplitActivationHeight, migration_end + 1);
+    BOOST_CHECK_EQUAL(SHADOW_HALVING_INTERVAL_BLOCKS, MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS);
+
+    BOOST_CHECK(IsShadowGoldRushRewardActive(consensus, active_mtp, gold_rush_end));
+    BOOST_CHECK(consensus.GetQuantumQuasarPhase(active_mtp, gold_rush_end) == Consensus::QuantumQuasarPhase::GOLD_RUSH);
+    BOOST_CHECK(!IsQuantumWitnessSpendActive(consensus, active_mtp, gold_rush_end));
+
+    BOOST_CHECK(!IsShadowGoldRushRewardActive(consensus, active_mtp, gold_rush_end + 1));
+    BOOST_CHECK(consensus.GetQuantumQuasarPhase(active_mtp, gold_rush_end + 1) == Consensus::QuantumQuasarPhase::MIGRATION);
+    BOOST_CHECK(IsQuantumWitnessSpendActive(consensus, active_mtp, gold_rush_end + 1));
+    BOOST_CHECK(!consensus.IsDemurrageActive(migration_end, active_mtp));
+
+    BOOST_CHECK(consensus.GetQuantumQuasarPhase(active_mtp, migration_end + 1) == Consensus::QuantumQuasarPhase::FINAL_LOCKOUT);
+    BOOST_CHECK(IsQuantumWitnessSpendActive(consensus, active_mtp, migration_end + 1));
+    BOOST_CHECK(consensus.IsDemurrageActive(migration_end + 1, active_mtp));
+
+    Coin pre_final_coin{CTxOut{10 * COIN, GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION, std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x42)})},
+        migration_end - 100, false, false, 0};
+    const Consensus::DemurrageEvaluation first_final = Consensus::EvaluateDemurrage(
+        pre_final_coin, consensus, migration_end + 1, active_mtp);
+    BOOST_CHECK(first_final.active);
+    BOOST_CHECK_EQUAL(first_final.inactive_blocks, 0);
 }
 
 BOOST_AUTO_TEST_CASE(phase_schedule_height_overrides)
@@ -152,11 +203,28 @@ BOOST_AUTO_TEST_CASE(phase_schedule_height_overrides)
     BOOST_CHECK(!consensus.IsDemurrageActive(200, t));
     BOOST_CHECK(consensus.IsDemurrageActive(201, t));
 
-    // Gold rush end height set without a migration end: migration window is open-ended.
+    // A one-sided height configuration is never treated as a hybrid schedule.
+    // Startup rejects it; direct Params consumers fall back coherently to the
+    // paired time schedule instead of mixing height and time boundaries.
     consensus.nQuantumMigrationEndHeight = 0;
+    BOOST_CHECK(consensus.HasAnyHeightLifecycleBoundary());
+    BOOST_CHECK(!consensus.UsesHeightLifecycle());
     BOOST_CHECK(!consensus.IsMigrationEndScheduled());
-    BOOST_CHECK(consensus.GetQuantumQuasarPhase(t, 5000) == Consensus::QuantumQuasarPhase::MIGRATION);
+    BOOST_CHECK(!consensus.IsGoldRushEndScheduled());
+    BOOST_CHECK(consensus.GetQuantumQuasarPhase(t, 5000) == Consensus::QuantumQuasarPhase::GOLD_RUSH);
     BOOST_CHECK(!consensus.IsQuantumFinalLockout(t, 5000));
+
+    Consensus::Params one_sided;
+    one_sided.nProtocolV4Time = 1000;
+    one_sided.nGoldRushEndTime = 2000;
+    one_sided.nQuantumMigrationDeadlineTime = 3000;
+    one_sided.nGoldRushEndHeight = 100;
+    BOOST_CHECK(one_sided.HasAnyHeightLifecycleBoundary());
+    BOOST_CHECK(!one_sided.UsesHeightLifecycle());
+    BOOST_CHECK(one_sided.GetQuantumQuasarPhase(/*nTime=*/2500, /*nHeight=*/50) ==
+                Consensus::QuantumQuasarPhase::MIGRATION);
+    BOOST_CHECK(one_sided.GetQuantumQuasarPhase(/*nTime=*/3500, /*nHeight=*/50) ==
+                Consensus::QuantumQuasarPhase::FINAL_LOCKOUT);
 }
 
 BOOST_AUTO_TEST_CASE(quantum_migration_witness_v16_address_roundtrip)
@@ -263,7 +331,8 @@ BOOST_AUTO_TEST_CASE(quantum_migration_witness_spend_enforces_mldsa)
     mtx.vout.emplace_back(9 * COIN, quantum_script);
 
     const CTransaction unsigned_tx{mtx};
-    const uint256 sighash = QuantumSignatureHash(unsigned_tx, 0, spent_output);
+    const uint256 sighash = QuantumSignatureHash(unsigned_tx, 0, spent_output,
+                                                  Params().GetConsensus().nQuantumSighashChainId);
     std::vector<uint8_t> signature;
     BOOST_REQUIRE(ML_DSA::Sign(privkey, sighash.begin(), uint256::size(), signature));
 
@@ -273,6 +342,7 @@ BOOST_AUTO_TEST_CASE(quantum_migration_witness_spend_enforces_mldsa)
 
     PrecomputedTransactionData txdata;
     txdata.Init(spend_tx, std::vector<CTxOut>{spent_output});
+    txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
     TransactionSignatureChecker checker(&spend_tx, 0, spent_output.nValue, txdata, MissingDataBehavior::FAIL);
 
     ScriptError err;
@@ -281,8 +351,18 @@ BOOST_AUTO_TEST_CASE(quantum_migration_witness_spend_enforces_mldsa)
                              checker, &err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
 
+    // Before ML-DSA activation this remains an upgradable witness program at
+    // consensus, matching the designated v26.2 Gold Rush reference node.
+    BOOST_CHECK(VerifyScript(CScript(), quantum_script, &spend_tx.vin[0].scriptWitness,
+                             SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS,
+                             checker, &err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+
+    // Node policy still keeps premature spends out of the mempool/miner
+    // template until the migration phase activates the ML-DSA rules.
     BOOST_CHECK(!VerifyScript(CScript(), quantum_script, &spend_tx.vin[0].scriptWitness,
-                              SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS,
+                              SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS |
+                                  SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
                               checker, &err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
 
@@ -291,6 +371,7 @@ BOOST_AUTO_TEST_CASE(quantum_migration_witness_spend_enforces_mldsa)
     const CTransaction tampered_tx{tampered_mtx};
     PrecomputedTransactionData tampered_txdata;
     tampered_txdata.Init(tampered_tx, std::vector<CTxOut>{spent_output});
+    tampered_txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
     TransactionSignatureChecker tampered_checker(&tampered_tx, 0, spent_output.nValue, tampered_txdata, MissingDataBehavior::FAIL);
     BOOST_CHECK(!VerifyScript(CScript(), quantum_script, &tampered_tx.vin[0].scriptWitness,
                               SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_QUANTUM_ML_DSA,
@@ -361,7 +442,8 @@ BOOST_AUTO_TEST_CASE(quantum_tiered_migration_spend_requires_stake_tier_flag)
     mtx.vout.emplace_back(9 * COIN, quantum_script);
 
     const CTransaction unsigned_tx{mtx};
-    const uint256 sighash = QuantumSignatureHash(unsigned_tx, 0, spent_output);
+    const uint256 sighash = QuantumSignatureHash(unsigned_tx, 0, spent_output,
+                                                  Params().GetConsensus().nQuantumSighashChainId);
     std::vector<uint8_t> signature;
     BOOST_REQUIRE(ML_DSA::Sign(privkey, sighash.begin(), uint256::size(), signature));
 
@@ -371,6 +453,7 @@ BOOST_AUTO_TEST_CASE(quantum_tiered_migration_spend_requires_stake_tier_flag)
 
     PrecomputedTransactionData txdata;
     txdata.Init(spend_tx, std::vector<CTxOut>{spent_output});
+    txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
     TransactionSignatureChecker checker(&spend_tx, 0, spent_output.nValue, txdata, MissingDataBehavior::FAIL);
 
     ScriptError err;
@@ -475,6 +558,8 @@ BOOST_AUTO_TEST_CASE(quantum_tiered_principal_covenant_uses_demurrage_effective_
     constexpr int64_t spend_time = migration_deadline + 1;
 
     Consensus::Params params;
+    params.nProtocolV4Time = 0;
+    params.nGoldRushEndTime = 1000;
     params.nDemurrageActivationHeight = 1;
     params.nQuantumMigrationDeadlineTime = migration_deadline;
 
@@ -574,7 +659,11 @@ BOOST_AUTO_TEST_CASE(quantum_migration_witness_sigops_are_charged)
     witness.stack.emplace_back(ML_DSA::SIGNATURE_BYTES, 0x42);
     witness.stack.emplace_back(pubkey.begin(), pubkey.end());
 
-    BOOST_CHECK_EQUAL(CountWitnessSigOps(CScript{}, quantum_script, &witness, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS), QUANTUM_ML_DSA_WITNESS_SIGOPS);
+    const unsigned int legacy_flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS;
+    BOOST_CHECK_EQUAL(CountWitnessSigOps(CScript{}, quantum_script, &witness, legacy_flags), 0U);
+    BOOST_CHECK_EQUAL(CountWitnessSigOps(CScript{}, quantum_script, &witness,
+                                        legacy_flags | SCRIPT_VERIFY_QUANTUM_ML_DSA),
+                      QUANTUM_ML_DSA_WITNESS_SIGOPS);
 }
 
 BOOST_AUTO_TEST_CASE(quantum_coldstake_witness_enforces_branch_rules)
@@ -601,7 +690,8 @@ BOOST_AUTO_TEST_CASE(quantum_coldstake_witness_enforces_branch_rules)
     owner_mtx.vin.emplace_back(COutPoint{uint256::ONE, 0});
     owner_mtx.vout.emplace_back(9 * COIN, qcs_script);
     const CTransaction owner_unsigned_tx{owner_mtx};
-    const uint256 owner_sighash = QuantumSignatureHash(owner_unsigned_tx, 0, spent_output);
+    const uint256 owner_sighash = QuantumSignatureHash(owner_unsigned_tx, 0, spent_output,
+                                                        Params().GetConsensus().nQuantumSighashChainId);
     std::vector<uint8_t> owner_signature;
     BOOST_REQUIRE(ML_DSA::Sign(owner_privkey, owner_sighash.begin(), uint256::size(), owner_signature));
     owner_mtx.vin[0].scriptWitness.stack.emplace_back(owner_signature.begin(), owner_signature.end());
@@ -611,6 +701,7 @@ BOOST_AUTO_TEST_CASE(quantum_coldstake_witness_enforces_branch_rules)
     const CTransaction owner_spend{owner_mtx};
     PrecomputedTransactionData owner_txdata;
     owner_txdata.Init(owner_spend, std::vector<CTxOut>{spent_output});
+    owner_txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
     TransactionSignatureChecker owner_checker(&owner_spend, 0, spent_output.nValue, owner_txdata, MissingDataBehavior::FAIL);
     ScriptError err;
     BOOST_CHECK(VerifyScript(CScript(), qcs_script, &owner_spend.vin[0].scriptWitness, flags, owner_checker, &err));
@@ -621,7 +712,8 @@ BOOST_AUTO_TEST_CASE(quantum_coldstake_witness_enforces_branch_rules)
     staker_mtx.vin.emplace_back(COutPoint{uint256::ONE, 0});
     staker_mtx.vout.emplace_back(9 * COIN, qcs_script);
     const CTransaction staker_unsigned_tx{staker_mtx};
-    const uint256 staker_sighash = QuantumSignatureHash(staker_unsigned_tx, 0, spent_output);
+    const uint256 staker_sighash = QuantumSignatureHash(staker_unsigned_tx, 0, spent_output,
+                                                         Params().GetConsensus().nQuantumSighashChainId);
     std::vector<uint8_t> staker_signature;
     BOOST_REQUIRE(ML_DSA::Sign(staker_privkey, staker_sighash.begin(), uint256::size(), staker_signature));
     staker_mtx.vin[0].scriptWitness.stack.emplace_back(staker_signature.begin(), staker_signature.end());
@@ -631,6 +723,7 @@ BOOST_AUTO_TEST_CASE(quantum_coldstake_witness_enforces_branch_rules)
     const CTransaction staker_non_coinstake{staker_mtx};
     PrecomputedTransactionData staker_non_coinstake_txdata;
     staker_non_coinstake_txdata.Init(staker_non_coinstake, std::vector<CTxOut>{spent_output});
+    staker_non_coinstake_txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
     TransactionSignatureChecker staker_non_coinstake_checker(&staker_non_coinstake, 0, spent_output.nValue, staker_non_coinstake_txdata, MissingDataBehavior::FAIL);
     BOOST_CHECK(!VerifyScript(CScript(), qcs_script, &staker_non_coinstake.vin[0].scriptWitness, flags, staker_non_coinstake_checker, &err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_QUANTUM_COLDSTAKE_NOT_COINSTAKE);
@@ -641,7 +734,8 @@ BOOST_AUTO_TEST_CASE(quantum_coldstake_witness_enforces_branch_rules)
     coinstake_mtx.vout.emplace_back(0, CScript{});
     coinstake_mtx.vout.emplace_back(9 * COIN, qcs_script);
     const CTransaction coinstake_unsigned_tx{coinstake_mtx};
-    const uint256 coinstake_sighash = QuantumSignatureHash(coinstake_unsigned_tx, 0, spent_output);
+    const uint256 coinstake_sighash = QuantumSignatureHash(coinstake_unsigned_tx, 0, spent_output,
+                                                            Params().GetConsensus().nQuantumSighashChainId);
     BOOST_REQUIRE(ML_DSA::Sign(staker_privkey, coinstake_sighash.begin(), uint256::size(), staker_signature));
     coinstake_mtx.vin[0].scriptWitness.stack.emplace_back(staker_signature.begin(), staker_signature.end());
     coinstake_mtx.vin[0].scriptWitness.stack.emplace_back(staker_pubkey.begin(), staker_pubkey.end());
@@ -651,6 +745,7 @@ BOOST_AUTO_TEST_CASE(quantum_coldstake_witness_enforces_branch_rules)
     BOOST_REQUIRE(coinstake_spend.IsCoinStake());
     PrecomputedTransactionData coinstake_txdata;
     coinstake_txdata.Init(coinstake_spend, std::vector<CTxOut>{spent_output});
+    coinstake_txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
     TransactionSignatureChecker coinstake_checker(&coinstake_spend, 0, spent_output.nValue, coinstake_txdata, MissingDataBehavior::FAIL);
     BOOST_CHECK(VerifyScript(CScript(), qcs_script, &coinstake_spend.vin[0].scriptWitness, flags, coinstake_checker, &err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
@@ -661,7 +756,8 @@ BOOST_AUTO_TEST_CASE(quantum_coldstake_witness_enforces_branch_rules)
     owner_coinstake_mtx.vout.emplace_back(0, CScript{});
     owner_coinstake_mtx.vout.emplace_back(9 * COIN, qcs_script);
     const CTransaction owner_coinstake_unsigned_tx{owner_coinstake_mtx};
-    const uint256 owner_coinstake_sighash = QuantumSignatureHash(owner_coinstake_unsigned_tx, 0, spent_output);
+    const uint256 owner_coinstake_sighash = QuantumSignatureHash(owner_coinstake_unsigned_tx, 0, spent_output,
+                                                                  Params().GetConsensus().nQuantumSighashChainId);
     BOOST_REQUIRE(ML_DSA::Sign(owner_privkey, owner_coinstake_sighash.begin(), uint256::size(), owner_signature));
     owner_coinstake_mtx.vin[0].scriptWitness.stack.emplace_back(owner_signature.begin(), owner_signature.end());
     owner_coinstake_mtx.vin[0].scriptWitness.stack.emplace_back(owner_pubkey.begin(), owner_pubkey.end());
@@ -671,12 +767,18 @@ BOOST_AUTO_TEST_CASE(quantum_coldstake_witness_enforces_branch_rules)
     BOOST_REQUIRE(owner_coinstake_spend.IsCoinStake());
     PrecomputedTransactionData owner_coinstake_txdata;
     owner_coinstake_txdata.Init(owner_coinstake_spend, std::vector<CTxOut>{spent_output});
+    owner_coinstake_txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
     TransactionSignatureChecker owner_coinstake_checker(&owner_coinstake_spend, 0, spent_output.nValue, owner_coinstake_txdata, MissingDataBehavior::FAIL);
     BOOST_CHECK(!VerifyScript(CScript(), qcs_script, &owner_coinstake_spend.vin[0].scriptWitness, flags, owner_coinstake_checker, &err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_QUANTUM_COLDSTAKE_OWNER_COINSTAKE);
 
+    BOOST_CHECK(VerifyScript(CScript(), qcs_script, &coinstake_spend.vin[0].scriptWitness,
+                             flags & ~SCRIPT_VERIFY_QUANTUM_COLDSTAKE, coinstake_checker, &err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
     BOOST_CHECK(!VerifyScript(CScript(), qcs_script, &coinstake_spend.vin[0].scriptWitness,
-                              flags & ~SCRIPT_VERIFY_QUANTUM_COLDSTAKE, coinstake_checker, &err));
+                              (flags & ~SCRIPT_VERIFY_QUANTUM_COLDSTAKE) |
+                                  SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
+                              coinstake_checker, &err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
 
     CMutableTransaction wrong_hash_mtx{owner_spend};
@@ -684,6 +786,7 @@ BOOST_AUTO_TEST_CASE(quantum_coldstake_witness_enforces_branch_rules)
     const CTransaction wrong_hash_spend{wrong_hash_mtx};
     PrecomputedTransactionData wrong_hash_txdata;
     wrong_hash_txdata.Init(wrong_hash_spend, std::vector<CTxOut>{spent_output});
+    wrong_hash_txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
     TransactionSignatureChecker wrong_hash_checker(&wrong_hash_spend, 0, spent_output.nValue, wrong_hash_txdata, MissingDataBehavior::FAIL);
     BOOST_CHECK(!VerifyScript(CScript(), qcs_script, &wrong_hash_spend.vin[0].scriptWitness, flags, wrong_hash_checker, &err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
@@ -708,7 +811,8 @@ BOOST_AUTO_TEST_CASE(quantum_migration_sighash_commits_all_spent_outputs)
     mtx.vout.emplace_back(29 * COIN, quantum_script);
 
     const CTransaction unsigned_tx{mtx};
-    const uint256 sighash = QuantumSignatureHash(unsigned_tx, 0, spent_outputs);
+    const uint256 sighash = QuantumSignatureHash(unsigned_tx, 0, spent_outputs,
+                                                  Params().GetConsensus().nQuantumSighashChainId);
     std::vector<uint8_t> signature;
     BOOST_REQUIRE(ML_DSA::Sign(privkey, sighash.begin(), uint256::size(), signature));
 
@@ -719,6 +823,7 @@ BOOST_AUTO_TEST_CASE(quantum_migration_sighash_commits_all_spent_outputs)
     std::vector<CTxOut> spent_outputs_copy = spent_outputs;
     PrecomputedTransactionData txdata;
     txdata.Init(spend_tx, std::move(spent_outputs_copy));
+    txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
     TransactionSignatureChecker checker(&spend_tx, 0, spent_outputs[0].nValue, txdata, MissingDataBehavior::FAIL);
 
     ScriptError err;
@@ -731,6 +836,7 @@ BOOST_AUTO_TEST_CASE(quantum_migration_sighash_commits_all_spent_outputs)
     tampered_spent_outputs[1].nValue += COIN;
     PrecomputedTransactionData tampered_txdata;
     tampered_txdata.Init(spend_tx, std::move(tampered_spent_outputs));
+    tampered_txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
     TransactionSignatureChecker tampered_checker(&spend_tx, 0, spent_outputs[0].nValue, tampered_txdata, MissingDataBehavior::FAIL);
     BOOST_CHECK(!VerifyScript(CScript(), quantum_script, &spend_tx.vin[0].scriptWitness,
                               SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_QUANTUM_ML_DSA,
@@ -783,10 +889,19 @@ BOOST_AUTO_TEST_CASE(check_input_scripts_enforces_quantum_schedule_flags)
         LOCK(cs_main);
         TxValidationState state;
         PrecomputedTransactionData txdata;
+        BOOST_CHECK(CheckInputScripts(quantum_spend, state, coins,
+                                      SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS,
+                                      true, true, txdata, nullptr));
+    }
+
+    {
+        LOCK(cs_main);
+        TxValidationState state;
+        PrecomputedTransactionData txdata;
         BOOST_CHECK(!CheckInputScripts(quantum_spend, state, coins,
-                                       SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS,
+                                       SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS |
+                                           SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
                                        true, true, txdata, nullptr));
-        BOOST_CHECK_EQUAL(state.GetRejectReason(), "blackcoin-migration-spend-premature");
     }
 
     {
@@ -838,6 +953,44 @@ BOOST_AUTO_TEST_CASE(check_input_scripts_enforces_quantum_schedule_flags)
         BOOST_CHECK(CheckInputScripts(op_return_tx, state, coins,
                                       SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_QUANTUM_ML_DSA,
                                       true, true, txdata, nullptr));
+    }
+
+    // Gold Rush preserves v26.2 future-witness consensus behavior. Once the
+    // quantum rules activate, only the exact implemented v14/v15/v16 program
+    // shapes may be spent; arbitrary future witness versions cannot become an
+    // anyone-can-spend escape hatch.
+    CCoinsView unknown_dummy;
+    CCoinsViewCache unknown_coins{&unknown_dummy};
+    const CScript unknown_quantum_script = GetScriptForDestination(
+        WitnessUnknown{2, std::vector<unsigned char>(32, 0x42)});
+    const COutPoint unknown_outpoint{uint256{3}, 0};
+    unknown_coins.AddCoin(unknown_outpoint,
+                          Coin{CTxOut{1 * COIN, unknown_quantum_script}, 1, false, false, 0},
+                          false);
+    CMutableTransaction unknown_mtx;
+    unknown_mtx.nVersion = 2;
+    unknown_mtx.vin.emplace_back(unknown_outpoint);
+    unknown_mtx.vout.emplace_back(1 * COIN, CScript() << OP_TRUE);
+    const CTransaction unknown_spend{unknown_mtx};
+
+    {
+        LOCK(cs_main);
+        TxValidationState state;
+        PrecomputedTransactionData txdata;
+        BOOST_CHECK(CheckInputScripts(unknown_spend, state, unknown_coins,
+                                      SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS,
+                                      true, true, txdata, nullptr));
+    }
+
+    {
+        LOCK(cs_main);
+        TxValidationState state;
+        PrecomputedTransactionData txdata;
+        BOOST_CHECK(!CheckInputScripts(unknown_spend, state, unknown_coins,
+                                       SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS |
+                                           SCRIPT_VERIFY_QUANTUM_ML_DSA,
+                                       true, true, txdata, nullptr));
+        BOOST_CHECK_EQUAL(state.GetRejectReason(), "unknown-quantum-witness-spend");
     }
 
     CCoinsView legacy_dummy;
@@ -937,8 +1090,14 @@ BOOST_AUTO_TEST_CASE(eutxo_commitment_witness_spend_enforces_validator_and_commi
                              checker, &err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
 
+    BOOST_CHECK(VerifyScript(CScript(), eutxo_script, &spend_tx.vin[0].scriptWitness,
+                             SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS,
+                             checker, &err));
+    BOOST_CHECK_EQUAL(err, SCRIPT_ERR_OK);
+
     BOOST_CHECK(!VerifyScript(CScript(), eutxo_script, &spend_tx.vin[0].scriptWitness,
-                              SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS,
+                              SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS |
+                                  SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM,
                               checker, &err));
     BOOST_CHECK_EQUAL(err, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
 
@@ -995,7 +1154,10 @@ BOOST_AUTO_TEST_CASE(eutxo_witness_sigops_are_charged)
     witness.stack.push_back(std::vector<unsigned char>{0x02});
     witness.stack.push_back(validator_bytes);
 
-    BOOST_CHECK_EQUAL(CountWitnessSigOps(CScript{}, eutxo_script, &witness, SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS), 1U);
+    const unsigned int legacy_flags = SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS;
+    BOOST_CHECK_EQUAL(CountWitnessSigOps(CScript{}, eutxo_script, &witness, legacy_flags), 0U);
+    BOOST_CHECK_EQUAL(CountWitnessSigOps(CScript{}, eutxo_script, &witness,
+                                        legacy_flags | SCRIPT_VERIFY_EUTXO), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(eutxo_state_transition_redeemer_roundtrip_and_successor_checks)

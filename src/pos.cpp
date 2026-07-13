@@ -61,8 +61,12 @@ CAmount GetKernelStakeValue(const Coin& coin, const CCoinsViewCache& view, const
 {
     if (!consensus.IsDemurrageActive(spend_height, spend_time)) return coin.out.nValue;
 
-    const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(view, coin.out.scriptPubKey);
-    const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin, consensus, spend_height, spend_time, latest_attestation);
+    const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+        Consensus::LatestDemurrageAttestationStateForScript(view, coin.out.scriptPubKey);
+    const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+        coin, consensus, spend_height, spend_time,
+        latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+        latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
     return eval.effective_value;
 }
 
@@ -270,8 +274,21 @@ bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, uin
         }
     }
 
-    // Now check if proof-of-stake hash meets target protocol
-    if (!KernelProductLE(bnTarget, bnWeight, hashProofOfStake))
+    // Preserve the designated legacy client's 256-bit wraparound arithmetic
+    // through Gold Rush. The corrected full-width product is a deliberate
+    // G+1 consensus rule; enabling it earlier creates different kernels once
+    // target*weight crosses 2^256.
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const bool quantum_spend_active = IsQuantumWitnessSpendActive(
+        consensus, pindexPrev->GetMedianTimePast(), pindexPrev->nHeight + 1);
+    bool kernel_meets_target{false};
+    if (quantum_spend_active) {
+        kernel_meets_target = KernelProductLE(bnTarget, bnWeight, hashProofOfStake);
+    } else {
+        bnTarget *= bnWeight;
+        kernel_meets_target = UintToArith256(hashProofOfStake) <= bnTarget;
+    }
+    if (!kernel_meets_target)
         return false;
 
     if (LogInstance().WillLogCategory(BCLog::COINSTAKE) && !fPrintProofOfStake)
@@ -292,7 +309,9 @@ bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, uin
 }
 
 // Check kernel hash target and coinstake signature
-bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned int nBits, BlockValidationState& state, CCoinsViewCache& view, unsigned int nTimeTx)
+bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned int nBits,
+                       BlockValidationState& state, CCoinsViewCache& view,
+                       unsigned int nTimeTx, const ChainstateManager& chainman)
 {
     if (!tx.IsCoinStake())
         return error("CheckProofOfStake() : called on non-coinstake %s", tx.GetHash().ToString());
@@ -306,8 +325,10 @@ bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "stake-prevout-not-exist", strprintf("CheckProofOfStake() : Stake prevout does not exist %s", txin.prevout.hash.ToString()));
     }
 
-    // Min age requirement
-    if (pindexPrev->nHeight + 1 - coinPrev.nHeight < Params().GetConsensus().nCoinbaseMaturity){
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int64_t stake_mtp = pindexPrev->GetMedianTimePast();
+    const int stake_height = pindexPrev->nHeight + 1;
+    if (pindexPrev->nHeight + 1 - coinPrev.nHeight < consensus.nCoinbaseMaturity){
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "stake-prevout-not-mature", strprintf("CheckProofOfStake() : Stake prevout is not mature, expecting %i and only matured to %i", Params().GetConsensus().nCoinbaseMaturity, pindexPrev->nHeight + 1 - coinPrev.nHeight));
     }
 
@@ -316,9 +337,6 @@ bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "stake-prevout-not-loaded", strprintf("CheckProofOfStake() : Block at height %i for prevout can not be loaded", coinPrev.nHeight));
     }
 
-    const Consensus::Params& consensus = Params().GetConsensus();
-    const int64_t stake_mtp = pindexPrev->GetMedianTimePast();
-    const int stake_height = pindexPrev->nHeight + 1;
     const bool quantum_stake = IsQuantumMigrationScript(coinPrev.out.scriptPubKey) || IsQuantumColdStakeScript(coinPrev.out.scriptPubKey);
     const bool quantum_stake_rules_active = IsQuantumWitnessSpendActive(consensus, stake_mtp, stake_height);
     std::vector<unsigned char> quantum_block_pubkey;
@@ -326,10 +344,13 @@ bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned
     if (consensus.IsNewNetworkStakeOnly(stake_mtp, stake_height) && !quantum_stake) {
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "legacy-stake-disabled", strprintf("CheckProofOfStake() : Legacy stake prevout is disabled after the Quantum Quasar migration deadline on coinstake %s", tx.GetHash().ToString()));
     }
+    if (quantum_block_signature && !quantum_stake_rules_active) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER,
+                             "bad-blk-signature",
+                             strprintf("CheckProofOfStake() : quantum block signature is premature on coinstake %s",
+                                       tx.GetHash().ToString()));
+    }
     if (quantum_block_signature) {
-        if (!quantum_stake_rules_active) {
-            return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "blackcoin-blocksig-premature", strprintf("CheckProofOfStake() : Quantum block signatures are not active on coinstake %s", tx.GetHash().ToString()));
-        }
         if (!quantum_stake || !QuantumBlockSigningPubKeyMatchesStake(quantum_block_pubkey, coinPrev.out.scriptPubKey, txin)) {
             return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "blackcoin-blocksig-stake-mismatch", strprintf("CheckProofOfStake() : Quantum block signing key does not match staked output on coinstake %s", tx.GetHash().ToString()));
         }
@@ -337,30 +358,12 @@ bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "blackcoin-blocksig-missing", strprintf("CheckProofOfStake() : Quantum stake requires ML-DSA block signing key on coinstake %s", tx.GetHash().ToString()));
     }
 
-    unsigned int script_verify_flags = SCRIPT_VERIFY_NONE;
-    if (consensus.IsProtocolV4(stake_mtp)) {
-        script_verify_flags |= SCRIPT_VERIFY_ISCOINSTAKE;
-        script_verify_flags |= SCRIPT_VERIFY_STRICTENC;
-    }
-    if (consensus.IsNewNetworkStakeOnly(stake_mtp, stake_height)) {
-        script_verify_flags |= SCRIPT_ENABLE_SIGHASH_FORKID;
-    }
-    if (IsQuantumWitnessSpendActive(consensus, stake_mtp, stake_height)) {
-        script_verify_flags |= SCRIPT_VERIFY_P2SH;
-        script_verify_flags |= SCRIPT_VERIFY_WITNESS;
-        script_verify_flags |= SCRIPT_VERIFY_V4_LARGE_SCRIPT_ELEMENT;
-        script_verify_flags |= SCRIPT_VERIFY_QUANTUM_ML_DSA;
-        script_verify_flags |= SCRIPT_VERIFY_QUANTUM_COLDSTAKE;
-    }
-    if (IsQuantumWitnessSpendActive(consensus, stake_mtp, stake_height)) {
-        script_verify_flags |= SCRIPT_VERIFY_EUTXO;
-    }
-    if (consensus.IsStakeTiersActive(stake_height)) {
-        script_verify_flags |= SCRIPT_VERIFY_QUANTUM_STAKE_TIERS;
-    }
-    if (consensus.IsQuantumFinalLockout(stake_mtp, stake_height)) {
-        script_verify_flags |= SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT;
-    }
+    // The designated legacy client verifies the kernel with SCRIPT_VERIFY_NONE.
+    // Preserve that exact behavior through G; use phase-aware quantum flags
+    // only from G+1 onward.
+    const unsigned int script_verify_flags = quantum_stake_rules_active
+        ? GetNextBlockScriptFlags(pindexPrev, chainman)
+        : SCRIPT_VERIFY_NONE;
 
     std::vector<CTxOut> spent_outputs;
     spent_outputs.reserve(tx.vin.size());
@@ -372,6 +375,16 @@ bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned
         spent_outputs.push_back(spent_coin.out);
     }
 
+    std::string contextual_reject_reason;
+    if (quantum_stake_rules_active &&
+        !CheckQuantumQuasarTransaction(tx, view, script_verify_flags, stake_height,
+                                       consensus, stake_mtp, contextual_reject_reason)) {
+        return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER,
+                             contextual_reject_reason,
+                             strprintf("CheckProofOfStake() : contextual Quantum Quasar rules failed on coinstake %s",
+                                       tx.GetHash().ToString()));
+    }
+
     // Verify signature
     if (!VerifySignature(coinPrev, txin.prevout.hash, tx, 0, script_verify_flags, consensus.nQuantumSighashChainId, &spent_outputs))
         return state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER, "stake-verify-signature-failed", strprintf("CheckProofOfStake() : VerifySignature failed on coinstake %s", tx.GetHash().ToString()));
@@ -380,7 +393,7 @@ bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned
         coinPrev.out.scriptPubKey,
         &txin,
         pindexPrev->nHeight + 1,
-        consensus.IsStakeTiersActive(pindexPrev->nHeight + 1));
+        IsQuantumStakeTiersActive(consensus, stake_mtp, pindexPrev->nHeight + 1));
     const CAmount kernel_value = GetKernelStakeValue(coinPrev, view, consensus, pindexPrev->nHeight + 1, stake_mtp);
     if (!CheckStakeKernelHash(pindexPrev, nBits, (coinPrev.nTime ? coinPrev.nTime : blockFrom->nTime), kernel_value, txin.prevout, coinPrev.out.scriptPubKey, nTimeTx, stake_weight_context, LogInstance().WillLogCategory(BCLog::COINSTAKE)))
         return state.Invalid(BlockValidationResult::BLOCK_HEADER_SYNC, "stake-check-kernel-failed", strprintf("CheckProofOfStake() : INFO: check kernel failed on coinstake %s", tx.GetHash().ToString())); // may occur during initial download or if behind on block chain sync
@@ -418,12 +431,12 @@ bool CheckKernel(CBlockIndex* pindexPrev, unsigned int nBits, uint32_t nTime, co
         }
 
         const Consensus::Params& consensus = Params().GetConsensus();
+        const int64_t stake_mtp = pindexPrev->GetMedianTimePast();
         const StakeWeightContext stake_weight_context = GetStakeWeightContext(
             coinPrev.out.scriptPubKey,
             /*stake_input=*/nullptr,
             pindexPrev->nHeight + 1,
-            consensus.IsStakeTiersActive(pindexPrev->nHeight + 1));
-        const int64_t stake_mtp = pindexPrev->GetMedianTimePast();
+            IsQuantumStakeTiersActive(consensus, stake_mtp, pindexPrev->nHeight + 1));
         const CAmount kernel_value = GetKernelStakeValue(coinPrev, view, consensus, pindexPrev->nHeight + 1, stake_mtp);
         return CheckStakeKernelHash(pindexPrev, nBits, (coinPrev.nTime ? coinPrev.nTime : blockFrom->nTime), kernel_value, prevout, coinPrev.out.scriptPubKey, nTime, stake_weight_context, /*fPrintProofOfStake=*/false);
     } else {
@@ -438,7 +451,7 @@ bool CheckKernel(CBlockIndex* pindexPrev, unsigned int nBits, uint32_t nTime, co
             stake.scriptPubKey,
             /*stake_input=*/nullptr,
             pindexPrev->nHeight + 1,
-            Params().GetConsensus().IsStakeTiersActive(pindexPrev->nHeight + 1));
+            IsQuantumStakeTiersActive(Params().GetConsensus(), stake_mtp, pindexPrev->nHeight + 1));
         if (CheckStakeKernelHash(pindexPrev, nBits, stake.blockFromTime, stake.amount, prevout, stake.scriptPubKey, nTime, stake_weight_context, /*fPrintProofOfStake=*/false)) {
             // Cache could potentially cause false positive stakes in the event of deep reorgs, so check without cache also return CheckKernel(pindexPrev, nBits, nTime, prevout, view); }
             return CheckKernel(pindexPrev, nBits, nTime, prevout, view);

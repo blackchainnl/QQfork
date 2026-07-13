@@ -76,6 +76,7 @@
 #include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
+#include <validationinterface.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
 #include <wallet/crypter.h>
@@ -91,12 +92,14 @@
 #include <wallet/walletutil.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <condition_variable>
 #include <exception>
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <variant>
@@ -132,6 +135,106 @@ static bool IsQuantumProtectedScript(const CScript& script_pubkey)
 {
     return IsQuantumMigrationScript(script_pubkey) || IsQuantumColdStakeScript(script_pubkey);
 }
+
+static constexpr const char* SYNTHETIC_GOLD_RUSH_PAYOUT_KEY{"qq_synthetic_goldrush_payout"};
+
+/**
+ * Recognize the deterministic synthetic payout envelope without consulting
+ * chainstate. This is the upgrade fallback for v30.1.0 wallets whose existing
+ * synthetic CWalletTx records predate SYNTHETIC_GOLD_RUSH_PAYOUT_KEY. Keep this
+ * strict: an ordinary coinbase must never receive next-block payout maturity.
+ */
+static bool IsSyntheticGoldRushPayoutEnvelope(const CWalletTx& wtx)
+{
+    static const std::vector<unsigned char> marker{'Q', 'Q', 'C', 'P', 'A', 'Y'};
+    const TxStateConfirmed* confirmed = wtx.state<TxStateConfirmed>();
+    if (!confirmed || confirmed->position_in_block <= 0 ||
+        !IsShadowGoldRushRewardHeight(confirmed->confirmed_block_height) ||
+        wtx.tx->nVersion != 1 || wtx.tx->nLockTime != 0 ||
+        wtx.tx->vin.size() != 1 || !wtx.tx->vin[0].prevout.IsNull() ||
+        wtx.tx->vout.size() != 1 || wtx.tx->vout[0].nValue <= 0 ||
+        !IsQuantumMigrationScript(wtx.tx->vout[0].scriptPubKey)) {
+        return false;
+    }
+
+    const CScript& script_sig = wtx.tx->vin[0].scriptSig;
+    CScript::const_iterator cursor = script_sig.begin();
+    opcodetype opcode;
+    std::vector<unsigned char> pushed_marker;
+    std::vector<unsigned char> anchor;
+    if (!script_sig.GetOp(cursor, opcode, pushed_marker) || pushed_marker != marker ||
+        !script_sig.GetOp(cursor, opcode, anchor) || anchor.size() != 40 ||
+        cursor != script_sig.end()) {
+        return false;
+    }
+
+    if (ReadLE32(anchor.data()) != static_cast<uint32_t>(confirmed->confirmed_block_height)) {
+        return false;
+    }
+    uint256 embedded_block_hash;
+    std::copy(anchor.begin() + sizeof(uint32_t),
+              anchor.begin() + sizeof(uint32_t) + uint256::size(),
+              embedded_block_hash.begin());
+    return embedded_block_hash == confirmed->confirmed_block_hash;
+}
+
+static std::optional<std::string> QuantumCommitOutputError(const CTransaction& tx, unsigned int script_verify_flags)
+{
+    const bool quantum_spend_active = script_verify_flags & SCRIPT_VERIFY_QUANTUM_ML_DSA;
+    const bool final_lockout_active = script_verify_flags & SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT;
+    for (const CTxOut& txout : tx.vout) {
+        if (IsEUTXOScript(txout.scriptPubKey)) return "eutxo-output-disabled";
+        int witness_version{0};
+        std::vector<unsigned char> witness_program;
+        const bool future_witness =
+            txout.scriptPubKey.IsWitnessProgram(witness_version, witness_program) && witness_version > 1;
+        const bool recognized_quantum =
+            IsQuantumMigrationScript(txout.scriptPubKey) ||
+            IsQuantumColdStakeScript(txout.scriptPubKey);
+        if (future_witness) {
+            if (!quantum_spend_active) return "quantum-output-premature";
+            const std::optional<QuantumStakeTierProgram> tier = GetQuantumStakeTierProgram(txout.scriptPubKey);
+            if (tier && tier->tiered && !(script_verify_flags & SCRIPT_VERIFY_QUANTUM_STAKE_TIERS)) {
+                return "quantum-tier-output-premature";
+            }
+            if (!recognized_quantum) return "unknown-quantum-witness-output";
+        }
+        const bool zero_value_data_carrier = txout.nValue == 0 &&
+            !txout.scriptPubKey.empty() && txout.scriptPubKey[0] == OP_RETURN;
+        if (final_lockout_active && !txout.IsEmpty() && !zero_value_data_carrier &&
+            !recognized_quantum) return "legacy-output-disabled";
+    }
+    return std::nullopt;
+}
+
+static bool IsPhaseDependentCommitReject(const std::string& reject_reason)
+{
+    static constexpr std::array<std::string_view, 8> PHASE_REJECTS{
+        "quantum-output-premature",
+        "quantum-tier-output-premature",
+        "unknown-quantum-witness-output",
+        "legacy-output-disabled",
+        "blackcoin-migration-spend-premature",
+        "legacy-spend-disabled",
+        "goldrush-payout-spend-premature",
+        "eutxo-output-disabled",
+    };
+    return std::any_of(PHASE_REJECTS.begin(), PHASE_REJECTS.end(), [&](const std::string_view reason) {
+        return reject_reason.compare(0, reason.size(), reason) == 0;
+    });
+}
+
+static bool IsTerminalShadowProofReject(const std::string& reject_reason)
+{
+    return reject_reason == "shadow-proof-invalid" ||
+           reject_reason == "shadow-proof-inactive" ||
+           reject_reason == "shadow-proof-height" ||
+           reject_reason == "shadow-proof-input-mismatch";
+}
+
+static constexpr const char* AUTO_SHADOW_STALE_KEY = "qq_auto_shadow_stale";
+static constexpr const char* MANUAL_SHADOW_ABANDON_KEY = "qq_manual_shadow_abandon";
+static constexpr const char* REORG_SHADOW_RESUBMIT_KEY = "qq_reorg_shadow_resubmit";
 
 static bool IsValidRGBProofAssignment(const RGBProofAssignment& assignment)
 {
@@ -180,28 +283,12 @@ static bool IsValidRGBTransitionProofRecord(const RGBTransitionProofRecord& reco
            IsBoundedRGBProofAssignments(record.outputs);
 }
 
-static bool IsRGBAnchorProvenInChainOrMempool(interfaces::Chain& chain, const uint256& txid)
-{
-    if (txid.IsNull()) return false;
-    if (chain.isInMempool(txid)) return true;
-
-    node::NodeContext* node = chain.context();
-    if (!node || !node->chainman) return false;
-
-    uint256 block_hash;
-    const CTransactionRef tx = node::GetTransaction(/*block_index=*/nullptr, /*mempool=*/nullptr, txid, block_hash, node->chainman->m_blockman);
-    if (!tx || block_hash.IsNull()) return false;
-
-    bool active{false};
-    return chain.findBlock(block_hash, FoundBlock().inActiveChain(active)) && active;
-}
-
 static bool IsQuantumProtectedSpendAllowedOutput(const CTransaction& tx, unsigned int output_index)
 {
     const CTxOut& txout = tx.vout[output_index];
     if (tx.IsCoinStake() && output_index == 0 && txout.IsEmpty()) return true;
-    if (!txout.scriptPubKey.empty() && txout.scriptPubKey[0] == OP_RETURN) return true;
-    return IsQuantumProtectedScript(txout.scriptPubKey) || IsEUTXOScript(txout.scriptPubKey);
+    if (!txout.scriptPubKey.empty() && txout.scriptPubKey[0] == OP_RETURN) return txout.nValue == 0;
+    return IsQuantumProtectedScript(txout.scriptPubKey);
 }
 
 static std::vector<ShadowSyntheticPayoutTransaction> GetWalletShadowPayoutTransactions(CWallet& wallet, const interfaces::BlockInfo& block)
@@ -241,6 +328,7 @@ static void AnnotateWalletShadowPayout(CWallet& wallet, const ShadowSyntheticPay
 
     set_value("comment", comment);
     if (!address.empty()) set_value("to", address);
+    set_value(SYNTHETIC_GOLD_RUSH_PAYOUT_KEY, "1");
 
     if (changed) {
         batch.WriteTx(wtx);
@@ -1285,7 +1373,9 @@ bool CWallet::IsSpentKey(const CScript& scriptPubKey) const
     return false;
 }
 
-CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const UpdateWalletTxFn& update_wtx, bool fFlushOnClose, bool rescanning_old_block)
+CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const UpdateWalletTxFn& update_wtx,
+                                bool fFlushOnClose, bool rescanning_old_block,
+                                std::optional<WalletBlockTime> block_time)
 {
     LOCK(cs_wallet);
 
@@ -1314,7 +1404,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
         wtx.nTimeReceived = GetTime();
         wtx.nOrderPos = IncOrderPosNext(&batch);
         wtx.m_it_wtxOrdered = wtxOrdered.insert(std::make_pair(wtx.nOrderPos, &wtx));
-        wtx.nTimeSmart = ComputeTimeSmart(wtx, rescanning_old_block);
+        wtx.nTimeSmart = ComputeTimeSmart(wtx, rescanning_old_block, block_time);
         AddToSpends(wtx, &batch);
 
         // Update birth time when tx time is older than it.
@@ -1461,7 +1551,8 @@ bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx
     return true;
 }
 
-bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxState& state, bool fUpdate, bool rescanning_old_block)
+bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxState& state, bool fUpdate,
+                                       bool rescanning_old_block, std::optional<WalletBlockTime> block_time)
 {
     const CTransaction& tx = *ptx;
     {
@@ -1515,7 +1606,8 @@ bool CWallet::AddToWalletIfInvolvingMe(const CTransactionRef& ptx, const SyncTxS
             // Block disconnection override an abandoned tx as unconfirmed
             // which means user may have to call abandontransaction again
             TxState tx_state = std::visit([](auto&& s) -> TxState { return s; }, state);
-            CWalletTx* wtx = AddToWallet(MakeTransactionRef(tx), tx_state, /*update_wtx=*/nullptr, /*fFlushOnClose=*/false, rescanning_old_block);
+            CWalletTx* wtx = AddToWallet(MakeTransactionRef(tx), tx_state, /*update_wtx=*/nullptr,
+                                         /*fFlushOnClose=*/false, rescanning_old_block, block_time);
             if (!wtx) {
                 // Can only be nullptr if there was a db write error (missing db, read-only db or a db engine internal writing error).
                 // As we only store arriving transaction in this process, and we don't want an inconsistent state, let's throw an error.
@@ -1544,16 +1636,66 @@ void CWallet::MarkInputsDirty(const CTransactionRef& tx)
     }
 }
 
-bool CWallet::AbandonTransaction(const uint256& hashTx)
+bool CWallet::AbandonTransaction(const uint256& hashTx, bool automatic_shadow_stale)
 {
+    {
     LOCK(cs_wallet);
 
     // Can't mark abandoned if confirmed or in mempool
     auto it = mapWallet.find(hashTx);
-    assert(it != mapWallet.end());
-    const CWalletTx& origtx = it->second;
+    // CommitTransaction can reject a transaction during its phase preflight,
+    // before AddToWallet. Callers use abandonment as best-effort cleanup, so a
+    // transaction that was never inserted must be a normal false result rather
+    // than a process-terminating assertion.
+    if (it == mapWallet.end()) return false;
+
+    // A broadcast snapshots the immutable transaction and releases cs_wallet
+    // before entering validation. Do not let abandonment release any member of
+    // that package until the in-flight verdict has been reconciled.
+    std::set<uint256> inflight_todo{hashTx};
+    std::set<uint256> inflight_done;
+    while (!inflight_todo.empty()) {
+        const uint256 current = *inflight_todo.begin();
+        inflight_todo.erase(inflight_todo.begin());
+        if (!inflight_done.insert(current).second) continue;
+        if (m_inflight_wallet_broadcasts.count(current)) return false;
+        const auto current_it = mapWallet.find(current);
+        if (current_it == mapWallet.end()) continue;
+        for (unsigned int output = 0; output < current_it->second.tx->vout.size(); ++output) {
+            const auto range = mapTxSpends.equal_range(COutPoint{current, output});
+            for (auto spend = range.first; spend != range.second; ++spend) {
+                if (!inflight_done.count(spend->second)) inflight_todo.insert(spend->second);
+            }
+        }
+    }
+    CWalletTx& origtx = it->second;
     if (GetTxDepthInMainChain(origtx) != 0 || origtx.InMempool()) {
         return false;
+    }
+    const auto manual_provenance = origtx.mapValue.find(MANUAL_SHADOW_ABANDON_KEY);
+    if (automatic_shadow_stale && manual_provenance != origtx.mapValue.end() && manual_provenance->second == "1") {
+        return false;
+    }
+
+    // Persist provenance so a reorg may reopen only claims abandoned by the
+    // automatic stale-proof path. A manual abandon explicitly clears it and
+    // must never be reversed behind the user's back.
+    bool provenance_changed{false};
+    if (automatic_shadow_stale && TransactionHasShadowProof(*origtx.tx)) {
+        provenance_changed = origtx.mapValue[AUTO_SHADOW_STALE_KEY] != "1";
+        origtx.mapValue[AUTO_SHADOW_STALE_KEY] = "1";
+        provenance_changed = origtx.mapValue.erase(MANUAL_SHADOW_ABANDON_KEY) != 0 || provenance_changed;
+    } else if (!automatic_shadow_stale) {
+        // Descendants need manual provenance too even though only the root
+        // carries QQSPROOF. Reorg recovery consults this before reopening an
+        // automatically abandoned package.
+        provenance_changed = origtx.mapValue[MANUAL_SHADOW_ABANDON_KEY] != "1";
+        origtx.mapValue[MANUAL_SHADOW_ABANDON_KEY] = "1";
+        provenance_changed = origtx.mapValue.erase(AUTO_SHADOW_STALE_KEY) != 0 || provenance_changed;
+    }
+    if (provenance_changed) {
+        origtx.MarkDirty();
+        WalletBatch(GetDatabase()).WriteTx(origtx);
     }
 
     auto try_updating_state = [](CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
@@ -1575,8 +1717,8 @@ bool CWallet::AbandonTransaction(const uint256& hashTx)
     // states change will remain abandoned and will require manual broadcast if the user wants them.
 
     RecursiveUpdateTxState(hashTx, try_updating_state);
+    }
 
-    ReconcileRGBAssignments(); // Re-sync the RGB ledger after abandoning a transfer.
     return true;
 }
 
@@ -1652,9 +1794,10 @@ void CWallet::RecursiveUpdateTxState(const uint256& tx_hash, const TryUpdatingSt
     }
 }
 
-void CWallet::SyncTransaction(const CTransactionRef& ptx, const SyncTxState& state, bool update_tx, bool rescanning_old_block)
+void CWallet::SyncTransaction(const CTransactionRef& ptx, const SyncTxState& state, bool update_tx,
+                              bool rescanning_old_block, std::optional<WalletBlockTime> block_time)
 {
-    if (!AddToWalletIfInvolvingMe(ptx, state, update_tx, rescanning_old_block))
+    if (!AddToWalletIfInvolvingMe(ptx, state, update_tx, rescanning_old_block, block_time))
         return; // Not one of ours
 
     // If a transaction changes 'conflicted' state, that changes the balance
@@ -1670,6 +1813,13 @@ void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
         RefreshMempoolStatus(it->second, chain());
+        const bool manual_provenance_removed = it->second.mapValue.erase(MANUAL_SHADOW_ABANDON_KEY) != 0;
+        const bool automatic_provenance_removed = it->second.mapValue.erase(AUTO_SHADOW_STALE_KEY) != 0;
+        const bool reorg_resubmit_removed = it->second.mapValue.erase(REORG_SHADOW_RESUBMIT_KEY) != 0;
+        if (manual_provenance_removed || automatic_provenance_removed || reorg_resubmit_removed) {
+            it->second.MarkDirty();
+            WalletBatch(GetDatabase()).WriteTx(it->second);
+        }
     }
 }
 
@@ -1678,6 +1828,41 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
         RefreshMempoolStatus(it->second, chain());
+
+        // Gold Rush PoW claims commit to the current parent tip. Once a claim
+        // expires on tip advancement it can never become valid again, so it
+        // must not continue reserving its wallet inputs as an inactive,
+        // unconfirmed transaction. Claims removed because they were included
+        // in a block are deliberately excluded.
+        if (reason == MemPoolRemovalReason::SHADOW_STALE && TransactionHasShadowProof(*tx)) {
+            // removeRecursive() can notify a root before its wallet descendants.
+            // Refresh the complete wallet package against the already-updated
+            // mempool before recursive abandonment so no descendant still
+            // carries a stale TxStateInMempool assertion.
+            std::set<uint256> todo{tx->GetHash()};
+            std::set<uint256> done;
+            while (!todo.empty()) {
+                const uint256 current = *todo.begin();
+                todo.erase(todo.begin());
+                if (!done.insert(current).second) continue;
+                auto current_it = mapWallet.find(current);
+                if (current_it == mapWallet.end()) continue;
+                RefreshMempoolStatus(current_it->second, chain());
+                for (unsigned int output_index = 0; output_index < current_it->second.tx->vout.size(); ++output_index) {
+                    const auto range = mapTxSpends.equal_range(COutPoint{current, output_index});
+                    for (auto spend_it = range.first; spend_it != range.second; ++spend_it) {
+                        if (!done.count(spend_it->second)) todo.insert(spend_it->second);
+                    }
+                }
+            }
+            if (AbandonTransaction(tx->GetHash(), /*automatic_shadow_stale=*/true)) {
+                WalletLogPrintf("Automatically abandoned expired Gold Rush PoW claim %s and released its inputs\n",
+                                tx->GetHash().ToString());
+            } else {
+                WalletLogPrintf("Unable to abandon expired Gold Rush PoW claim %s\n",
+                                tx->GetHash().ToString());
+            }
+        }
     }
     // Handle transactions that were removed from the mempool because they
     // conflict with transactions in a newly connected block.
@@ -1716,7 +1901,9 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
         return;
     }
     assert(block.data);
+    const WalletBlockTime block_time{block.data->GetBlockTime(), block.chain_time_max};
     const std::vector<ShadowSyntheticPayoutTransaction> shadow_payout_txs = GetWalletShadowPayoutTransactions(*this, block);
+    {
     LOCK(cs_wallet);
 
     m_last_block_processed_height = block.height;
@@ -1728,11 +1915,24 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
 
     // Scan block
     for (size_t index = 0; index < block.data->vtx.size(); index++) {
-        SyncTransaction(block.data->vtx[index], TxStateConfirmed{block.hash, block.height, static_cast<int>(index)});
+        SyncTransaction(block.data->vtx[index], TxStateConfirmed{block.hash, block.height, static_cast<int>(index)},
+                        /*update_tx=*/true, /*rescanning_old_block=*/false, block_time);
+        auto confirmed_it = mapWallet.find(block.data->vtx[index]->GetHash());
+        if (confirmed_it != mapWallet.end()) {
+            const bool manual_provenance_removed = confirmed_it->second.mapValue.erase(MANUAL_SHADOW_ABANDON_KEY) != 0;
+            const bool automatic_provenance_removed = confirmed_it->second.mapValue.erase(AUTO_SHADOW_STALE_KEY) != 0;
+            const bool reorg_resubmit_removed = confirmed_it->second.mapValue.erase(REORG_SHADOW_RESUBMIT_KEY) != 0;
+            if (manual_provenance_removed || automatic_provenance_removed || reorg_resubmit_removed) {
+                confirmed_it->second.MarkDirty();
+                WalletBatch(GetDatabase()).WriteTx(confirmed_it->second);
+            }
+        }
         transactionRemovedFromMempool(block.data->vtx[index], MemPoolRemovalReason::BLOCK);
     }
     for (size_t index = 0; index < shadow_payout_txs.size(); ++index) {
-        SyncTransaction(shadow_payout_txs[index].tx, TxStateConfirmed{block.hash, block.height, static_cast<int>(block.data->vtx.size() + index)});
+        SyncTransaction(shadow_payout_txs[index].tx,
+                        TxStateConfirmed{block.hash, block.height, static_cast<int>(block.data->vtx.size() + index)},
+                        /*update_tx=*/true, /*rescanning_old_block=*/false, block_time);
     }
     WalletBatch batch(GetDatabase());
     for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
@@ -1741,12 +1941,26 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     for (const CTransactionRef& ptx : block.data->vtx) {
         RecordQuantumRedelegationWins(*ptx, block.height, batch);
     }
+    // A non-broadcasting wallet may hold a tip-bound proof outside the
+    // mempool, so it will not receive a stale-removal callback. Mark every
+    // remaining unconfirmed proof for the scheduler's broadcast-independent
+    // validation pass after each connected block.
+    for (auto& [txid, wtx] : mapWallet) {
+        if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx)) continue;
+        if (wtx.mapValue[AUTO_SHADOW_STALE_KEY] == "1") continue;
+        wtx.mapValue[AUTO_SHADOW_STALE_KEY] = "1";
+        wtx.MarkDirty();
+        batch.WriteTx(wtx);
+    }
+    }
     ReconcileRGBAssignments(); // Re-sync the RGB ledger after a block connects.
 }
 
 void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
 {
     assert(block.data);
+    bool pending_shadow_repair{false};
+    {
     LOCK(cs_wallet);
 
     // At block disconnection, this will change an abandoned transaction to
@@ -1801,13 +2015,96 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
         SyncTransaction(tx, TxStateInactive{});
     }
 
+    // Mark every unconfirmed proof pending before evaluating replacements.
+    // Chainstate removes all tip-bound proofs on a disconnect, but its mempool
+    // removal callbacks are queued after BlockDisconnected. This marker lets
+    // the replacement scan recognize a removed newer proof even before that
+    // later callback automatically abandons it.
+    WalletBatch pending_batch(GetDatabase());
+    for (auto& [txid, wtx] : mapWallet) {
+        if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx)) continue;
+        pending_shadow_repair = true;
+        if (wtx.mapValue[AUTO_SHADOW_STALE_KEY] != "1") {
+            wtx.mapValue[AUTO_SHADOW_STALE_KEY] = "1";
+            wtx.MarkDirty();
+            pending_batch.WriteTx(wtx);
+        }
+    }
+
+    // A tip-bound QQSPROOF that became stale and was abandoned can become
+    // valid again if a reorg restores its original parent. Reopen every
+    // abandoned proof package on disconnect; normal mempool validation will
+    // decide whether it is valid for the restored tip, and a later stale-tip
+    // removal can abandon it again. This makes automatic input release
+    // reversible across reorgs.
+    std::vector<uint256> abandoned_shadow_claims;
+    for (const auto& [txid, wtx] : mapWallet) {
+        const auto provenance = wtx.mapValue.find(AUTO_SHADOW_STALE_KEY);
+        if (wtx.isAbandoned() && TransactionHasShadowProof(*wtx.tx) &&
+            provenance != wtx.mapValue.end() && provenance->second == "1") {
+            // Do not resurrect an older automatically abandoned proof after
+            // the user has replaced it. The replacement can be absent from
+            // the current mempool after restart or eviction while still being
+            // the wallet's intended spend. Reopening the old proof would let
+            // insertion-order rebroadcast consume the inputs first.
+            bool has_live_replacement{false};
+            for (const CTxIn& input : wtx.tx->vin) {
+                const auto [first, last] = mapTxSpends.equal_range(input.prevout);
+                for (auto spend = first; spend != last; ++spend) {
+                    if (spend->second == txid) continue;
+                    auto replacement = mapWallet.find(spend->second);
+                    if (replacement == mapWallet.end()) continue;
+                    RefreshMempoolStatus(replacement->second, chain());
+                    const auto automatic = replacement->second.mapValue.find(AUTO_SHADOW_STALE_KEY);
+                    const bool pending_tip_validation =
+                        TransactionHasShadowProof(*replacement->second.tx) &&
+                        automatic != replacement->second.mapValue.end() && automatic->second == "1" &&
+                        !replacement->second.InMempool();
+                    if (!replacement->second.isAbandoned() && !pending_tip_validation) {
+                        has_live_replacement = true;
+                        break;
+                    }
+                }
+                if (has_live_replacement) break;
+            }
+            if (has_live_replacement) continue;
+            abandoned_shadow_claims.push_back(txid);
+        }
+    }
+    for (const uint256& txid : abandoned_shadow_claims) {
+        RecursiveUpdateTxState(txid, [](CWalletTx& wtx) {
+            if (!wtx.isAbandoned()) return TxUpdate::UNCHANGED;
+            const auto manual = wtx.mapValue.find(MANUAL_SHADOW_ABANDON_KEY);
+            if (manual != wtx.mapValue.end() && manual->second == "1") {
+                return TxUpdate::UNCHANGED;
+            }
+            if (TransactionHasShadowProof(*wtx.tx)) {
+                wtx.mapValue[REORG_SHADOW_RESUBMIT_KEY] = "1";
+            }
+            wtx.m_state = TxStateInactive{};
+            return TxUpdate::NOTIFY_CHANGED;
+        });
+    }
+    pending_shadow_repair = pending_shadow_repair || !abandoned_shadow_claims.empty();
+    if (pending_shadow_repair) {
+        m_next_resend = NodeClock::now();
+    }
+
     // Blackcoin - Call to abandon orphaned coinstakes after handling disconnections
     AbandonOrphanedCoinstakes();
 
     WalletBatch batch(GetDatabase());
     RecomputeQuantumRedelegationWinHistory(batch);
 
+    }
     ReconcileRGBAssignments(); // Re-sync the RGB ledger after a reorg disconnects a block.
+    if (pending_shadow_repair) {
+        // The periodic wallet scheduler runs once per minute, which is too
+        // slow for a proof that becomes valid only for the restored parent.
+        // Validate and relay it immediately after releasing cs_wallet.
+        RepairStaleShadowTransactions(/*force=*/false);
+        ResubmitWalletTransactions(/*relay=*/true, /*force=*/false);
+    }
 }
 
 void CWallet::updatedBlockTip()
@@ -2190,7 +2487,8 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
         bool block_still_active = false;
         bool next_block = false;
         uint256 next_block_hash;
-        chain().findBlock(block_hash, FoundBlock().inActiveChain(block_still_active).nextBlock(FoundBlock().inActiveChain(next_block).hash(next_block_hash)));
+        int64_t block_max_time{0};
+        chain().findBlock(block_hash, FoundBlock().inActiveChain(block_still_active).maxTime(block_max_time).nextBlock(FoundBlock().inActiveChain(next_block).hash(next_block_hash)));
 
         if (fetch_block) {
             // Read block data
@@ -2203,6 +2501,11 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                     LOCK(cs_main);
                     shadow_payout_txs = GetAppliedShadowClaimPayoutTransactionRecords(chain().getCoinsTip(), block_height, block_hash, block.GetBlockTime());
                 }
+                std::optional<CBlockLocator> progress_locator;
+                if (save_progress && next_interval) {
+                    CBlockLocator locator = m_chain->getActiveChainLocator(block_hash);
+                    if (!locator.IsNull()) progress_locator = std::move(locator);
+                }
                 LOCK(cs_wallet);
                 if (!block_still_active) {
                     // Abort scan if current block is no longer active, to prevent
@@ -2212,10 +2515,15 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                     break;
                 }
                 for (size_t posInBlock = 0; posInBlock < block.vtx.size(); ++posInBlock) {
-                    SyncTransaction(block.vtx[posInBlock], TxStateConfirmed{block_hash, block_height, static_cast<int>(posInBlock)}, fUpdate, /*rescanning_old_block=*/true);
+                    SyncTransaction(block.vtx[posInBlock], TxStateConfirmed{block_hash, block_height, static_cast<int>(posInBlock)},
+                                    fUpdate, /*rescanning_old_block=*/true,
+                                    WalletBlockTime{block.GetBlockTime(), block_max_time});
                 }
                 for (size_t pos = 0; pos < shadow_payout_txs.size(); ++pos) {
-                    SyncTransaction(shadow_payout_txs[pos].tx, TxStateConfirmed{block_hash, block_height, static_cast<int>(block.vtx.size() + pos)}, fUpdate, /*rescanning_old_block=*/true);
+                    SyncTransaction(shadow_payout_txs[pos].tx,
+                                    TxStateConfirmed{block_hash, block_height, static_cast<int>(block.vtx.size() + pos)},
+                                    fUpdate, /*rescanning_old_block=*/true,
+                                    WalletBlockTime{block.GetBlockTime(), block_max_time});
                 }
                 if (!shadow_payout_txs.empty() || fUpdate) {
                     WalletBatch batch(GetDatabase());
@@ -2232,14 +2540,10 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                 result.last_scanned_block = block_hash;
                 result.last_scanned_height = block_height;
 
-                if (save_progress && next_interval) {
-                    CBlockLocator loc = m_chain->getActiveChainLocator(block_hash);
-
-                    if (!loc.IsNull()) {
-                        WalletLogPrintf("Saving scan progress %d.\n", block_height);
-                        WalletBatch batch(GetDatabase());
-                        batch.WriteBestBlock(loc);
-                    }
+                if (progress_locator) {
+                    WalletLogPrintf("Saving scan progress %d.\n", block_height);
+                    WalletBatch batch(GetDatabase());
+                    batch.WriteBestBlock(*progress_locator);
                 }
             } else {
                 // could not scan block, keep scanning but record this block as the most recent failure
@@ -2273,7 +2577,7 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
     }
     if (!max_height) {
         WalletLogPrintf("Scanning current mempool transactions.\n");
-        WITH_LOCK(cs_wallet, chain().requestMempoolTransactions(*this));
+        chain().requestMempoolTransactions(*this);
     }
     ShowProgress(strprintf("%s " + _("Rescanning…").translated, GetDisplayName()), 100); // hide progress dialog in GUI
     if (block_height && fAbortRescan) {
@@ -2286,7 +2590,6 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
         WalletLogPrintf("Rescan completed in %15dms\n", Ticks<std::chrono::milliseconds>(reserver.now() - start_time));
     }
     if (fUpdate && result.status == ScanResult::SUCCESS) {
-        LOCK(cs_wallet);
         ReconcileRGBAssignments(); // Re-sync RGB seals discovered or updated by a rescan.
     }
     return result;
@@ -2316,33 +2619,49 @@ void CWallet::AbandonOrphanedCoinstakes()
     }
 }
 
-bool CWallet::SubmitTxMemoryPoolAndRelay(CWalletTx& wtx, std::string& err_string, bool relay) const
+bool CWallet::SubmitTxMemoryPoolAndRelay(const uint256& txid, std::string& err_string, bool relay)
 {
-    AssertLockHeld(cs_wallet);
+    CTransactionRef tx;
+    {
+        LOCK(cs_wallet);
+        const auto it = mapWallet.find(txid);
+        if (it == mapWallet.end()) return false;
+        CWalletTx& wtx = it->second;
 
-    // Can't relay if wallet is not broadcasting
-    if (!GetBroadcastTransactions()) return false;
-    // Don't relay abandoned transactions
-    if (wtx.isAbandoned()) return false;
-    // Don't try to submit coinbase transactions. These would fail anyway but would
-    // cause log spam.
-    if (wtx.IsCoinBase() || wtx.IsCoinStake()) return false;
-    // Don't try to submit conflicted or confirmed transactions.
-    if (GetTxDepthInMainChain(wtx) != 0) return false;
+        // Snapshot the immutable transaction while holding the wallet lock,
+        // then release it before validation takes cs_main. Staking uses the
+        // opposite (and canonical) cs_main -> cs_wallet order.
+        if (!GetBroadcastTransactions() || wtx.isAbandoned() ||
+            wtx.IsCoinBase() || wtx.IsCoinStake() ||
+            GetTxDepthInMainChain(wtx) != 0) {
+            return false;
+        }
+        if (m_inflight_wallet_broadcasts.count(txid)) {
+            err_string = "wallet-broadcast-in-flight";
+            return false;
+        }
+        tx = wtx.tx;
+        m_inflight_wallet_broadcasts.insert(txid);
+    }
 
     // Submit transaction to mempool for relay
-    WalletLogPrintf("Submitting wtx %s to mempool for relay\n", wtx.GetHash().ToString());
-    // We must set TxStateInMempool here. Even though it will also be set later by the
-    // entered-mempool callback, if we did not there would be a race where a
-    // user could call sendmoney in a loop and hit spurious out of funds errors
-    // because we think that this newly generated transaction's change is
-    // unavailable as we're not yet aware that it is in the mempool.
-    //
-    // If broadcast fails for any reason, trying to set wtx.m_state here would be incorrect.
-    // If transaction was previously in the mempool, it should be updated when
-    // TransactionRemovedFromMempool fires.
-    bool ret = chain().broadcastTransaction(wtx.tx, m_default_max_tx_fee, relay, err_string);
-    if (ret) wtx.m_state = TxStateInMempool{};
+    WalletLogPrintf("Submitting wtx %s to mempool for relay\n", txid.ToString());
+    // Validation-interface callbacks are the sole authority for the wallet's
+    // mempool state. Writing TxStateInMempool here can race a later removal
+    // callback that already ran before broadcastTransaction returned, leaving
+    // a phantom in-mempool transaction with no subsequent correction.
+    bool ret{false};
+    try {
+        ret = chain().broadcastTransaction(tx, m_default_max_tx_fee, relay, err_string);
+    } catch (...) {
+        LOCK(cs_wallet);
+        m_inflight_wallet_broadcasts.erase(txid);
+        throw;
+    }
+    {
+        LOCK(cs_wallet);
+        m_inflight_wallet_broadcasts.erase(txid);
+    }
     return ret;
 }
 
@@ -2399,35 +2718,215 @@ NodeClock::time_point CWallet::GetDefaultNextResend() { return FastRandomContext
 // that depends on the `relay` option. Periodic rebroadcast uses the pattern
 // relay=true force=false, while loading into the mempool
 // (on start, or after import) uses relay=false force=true.
+void CWallet::RepairStaleShadowTransactions(bool force)
+{
+    // A proof is bound to one next-block tip. Never classify it while block
+    // loading, importing, reindexing, or IBD exposes an intermediate
+    // historical tip. Persist a pending marker so the scheduler retries once
+    // the chain is fully ready, even when wallet broadcasting is disabled.
+    if (!chain().isReadyToBroadcast()) {
+        LOCK(cs_wallet);
+        WalletBatch batch(GetDatabase());
+        for (auto& [txid, wtx] : mapWallet) {
+            if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx)) continue;
+            if (wtx.mapValue[AUTO_SHADOW_STALE_KEY] == "1") continue;
+            wtx.mapValue[AUTO_SHADOW_STALE_KEY] = "1";
+            wtx.MarkDirty();
+            batch.WriteTx(wtx);
+        }
+        return;
+    }
+
+    // Snapshot repair candidates without holding cs_main. Validation and the
+    // final state update acquire locks in the global cs_main -> cs_wallet
+    // order, avoiding a loadwallet/staking deadlock.
+    std::vector<std::pair<uint256, CTransactionRef>> repair_candidates;
+    {
+        LOCK(cs_wallet);
+        for (const auto& [txid, wtx] : mapWallet) {
+            const auto provenance = wtx.mapValue.find(AUTO_SHADOW_STALE_KEY);
+            const bool pending_auto_repair = provenance != wtx.mapValue.end() && provenance->second == "1";
+            if (wtx.isUnconfirmed() && TransactionHasShadowProof(*wtx.tx) &&
+                (force || pending_auto_repair)) {
+                repair_candidates.emplace_back(txid, wtx.tx);
+            }
+        }
+    }
+
+    for (const auto& candidate : repair_candidates) {
+        const uint256& txid = candidate.first;
+        const CTransactionRef& repair_tx = candidate.second;
+        for (;;) {
+            uint256 validated_tip;
+            const MempoolAcceptResult accept = [&] {
+                LOCK(cs_main);
+                const CBlockIndex* tip = chain().chainman().ActiveChain().Tip();
+                if (tip) validated_tip = tip->GetBlockHash();
+                return chain().chainman().ProcessTransaction(repair_tx, /*test_accept=*/true);
+            }();
+            if (accept.m_result_type == MempoolAcceptResult::ResultType::VALID) {
+                bool retry{false};
+                {
+                    // A valid verdict is tip-bound too. Clear its pending
+                    // marker only while the validated active tip and the
+                    // wallet-processed tip are still identical.
+                    LOCK(cs_main);
+                    const CBlockIndex* current_tip = chain().chainman().ActiveChain().Tip();
+                    if ((!current_tip && !validated_tip.IsNull()) ||
+                        (current_tip && current_tip->GetBlockHash() != validated_tip)) {
+                        retry = true;
+                    } else {
+                        TRY_LOCK(cs_wallet, wallet_lock);
+                        if (!wallet_lock || m_last_block_processed != validated_tip) {
+                            retry = true;
+                        } else {
+                            auto current_it = mapWallet.find(txid);
+                            if (current_it != mapWallet.end() && current_it->second.tx == repair_tx &&
+                                current_it->second.isUnconfirmed() &&
+                                current_it->second.mapValue.erase(AUTO_SHADOW_STALE_KEY) != 0) {
+                                current_it->second.MarkDirty();
+                                WalletBatch(GetDatabase()).WriteTx(current_it->second);
+                            }
+                        }
+                    }
+                }
+                if (!retry) break;
+                if (!force) break;
+                SyncWithValidationInterfaceQueue();
+                std::this_thread::yield();
+                continue;
+            }
+            if (!IsTerminalShadowProofReject(accept.m_state.GetRejectReason())) {
+                break;
+            }
+
+            bool retry{false};
+            {
+                // Keep the validated-tip check atomic with abandonment without
+                // ever waiting for cs_wallet while holding cs_main. Wallet
+                // submission may already hold cs_wallet while entering
+                // validation; in that case release cs_main, drain queued
+                // callbacks, and revalidate instead of dropping the repair.
+                LOCK(cs_main);
+                const CBlockIndex* current_tip = chain().chainman().ActiveChain().Tip();
+                if ((!current_tip && !validated_tip.IsNull()) ||
+                    (current_tip && current_tip->GetBlockHash() != validated_tip)) {
+                    retry = true;
+                } else {
+                    TRY_LOCK(cs_wallet, wallet_lock);
+                    if (!wallet_lock || m_last_block_processed != validated_tip) {
+                        retry = true;
+                    } else {
+                        auto current_it = mapWallet.find(txid);
+                        if (current_it == mapWallet.end() || current_it->second.tx != repair_tx ||
+                            !current_it->second.isUnconfirmed()) {
+                            break;
+                        }
+
+                        // removeRecursive() may have removed the package before
+                        // queued wallet callbacks run. Refresh the root and every
+                        // wallet descendant before AbandonTransaction() traverses
+                        // them and asserts none remain marked in-mempool.
+                        std::set<uint256> todo{txid};
+                        std::set<uint256> done;
+                        while (!todo.empty()) {
+                            const uint256 current = *todo.begin();
+                            todo.erase(todo.begin());
+                            if (!done.insert(current).second) continue;
+                            auto package_it = mapWallet.find(current);
+                            if (package_it == mapWallet.end()) continue;
+                            RefreshMempoolStatus(package_it->second, chain());
+                            for (unsigned int output_index = 0; output_index < package_it->second.tx->vout.size(); ++output_index) {
+                                const auto range = mapTxSpends.equal_range(COutPoint{current, output_index});
+                                for (auto spend_it = range.first; spend_it != range.second; ++spend_it) {
+                                    if (!done.count(spend_it->second)) todo.insert(spend_it->second);
+                                }
+                            }
+                        }
+
+                        current_it = mapWallet.find(txid);
+                        if (current_it == mapWallet.end() || current_it->second.tx != repair_tx ||
+                            !current_it->second.isUnconfirmed() || current_it->second.InMempool()) {
+                            break;
+                        }
+                        if (AbandonTransaction(txid, /*automatic_shadow_stale=*/true)) {
+                            WalletLogPrintf("Automatically abandoned stale Gold Rush PoW claim %s during wallet repair: %s\n",
+                                            txid.ToString(), accept.m_state.GetRejectReason());
+                        } else {
+                            WalletLogPrintf("Unable to abandon stale Gold Rush PoW claim %s during wallet repair: %s\n",
+                                            txid.ToString(), accept.m_state.GetRejectReason());
+                        }
+                    }
+                }
+            }
+
+            if (!retry) break;
+            // MaybeResendWalletTxs runs on the validation-interface scheduler.
+            // It cannot synchronously drain its own queue. Scheduled repair
+            // keeps the persistent pending marker and retries on the next
+            // tick; startup/import force-repair may safely drain and retry.
+            if (!force) break;
+            SyncWithValidationInterfaceQueue();
+            std::this_thread::yield();
+        }
+    }
+}
+
 void CWallet::ResubmitWalletTransactions(bool relay, bool force)
 {
-    // Don't attempt to resubmit if the wallet is configured to not broadcast,
-    // even if forcing.
-    if (!fBroadcastTransactions) return;
-
     int submitted_tx_count = 0;
 
-    { // cs_wallet scope
+    if (force) RepairStaleShadowTransactions(/*force=*/true);
+
+    std::vector<uint256> to_submit;
+    {
         LOCK(cs_wallet);
+
+        // Respect wallet broadcast policy after the non-broadcasting repair
+        // pass above.
+        if (!fBroadcastTransactions) return;
 
         // First filter for the transactions we want to rebroadcast.
         // We use a set with WalletTxOrderComparator so that rebroadcasting occurs in insertion order
-        std::set<CWalletTx*, WalletTxOrderComparator> to_submit;
+        std::set<CWalletTx*, WalletTxOrderComparator> ordered;
         for (auto& [txid, wtx] : mapWallet) {
             // Only rebroadcast unconfirmed txs
             if (!wtx.isUnconfirmed()) continue;
 
             // Attempt to rebroadcast all txes more than 5 minutes older than
             // the last block, or all txs if forcing.
-            if (!force && wtx.nTimeReceived > m_best_block_time - 5 * 60) continue;
-            to_submit.insert(&wtx);
+            const auto reorg_resubmit = wtx.mapValue.find(REORG_SHADOW_RESUBMIT_KEY);
+            const bool recovered_shadow_proof = reorg_resubmit != wtx.mapValue.end() && reorg_resubmit->second == "1";
+            if (!force && !recovered_shadow_proof && wtx.nTimeReceived > m_best_block_time - 5 * 60) continue;
+            ordered.insert(&wtx);
         }
-        // Now try submitting the transactions to the memory pool and (optionally) relay them.
-        for (auto wtx : to_submit) {
-            std::string unused_err_string;
-            if (SubmitTxMemoryPoolAndRelay(*wtx, unused_err_string, relay)) ++submitted_tx_count;
+        to_submit.reserve(ordered.size());
+        for (const CWalletTx* wtx : ordered) to_submit.push_back(wtx->GetHash());
+    }
+
+    // Submit without cs_wallet so validation may take cs_main without
+    // deadlocking the PoS thread.
+    for (const uint256& txid : to_submit) {
+        std::string err_string;
+        if (SubmitTxMemoryPoolAndRelay(txid, err_string, relay)) {
+            ++submitted_tx_count;
+            continue;
         }
-    } // cs_wallet
+
+        const bool is_shadow_proof = WITH_LOCK(cs_wallet, {
+            const auto it = mapWallet.find(txid);
+            return it != mapWallet.end() && TransactionHasShadowProof(*it->second.tx);
+        });
+        if (force && is_shadow_proof && IsTerminalShadowProofReject(err_string)) {
+            if (AbandonTransaction(txid, /*automatic_shadow_stale=*/true)) {
+                WalletLogPrintf("Automatically abandoned stale Gold Rush PoW claim %s during wallet resubmission: %s\n",
+                                txid.ToString(), err_string);
+            } else {
+                WalletLogPrintf("Unable to abandon stale Gold Rush PoW claim %s during wallet resubmission: %s\n",
+                                txid.ToString(), err_string);
+            }
+        }
+    }
 
     if (submitted_tx_count > 0) {
         WalletLogPrintf("%s: resubmit %u unconfirmed transactions\n", __func__, submitted_tx_count);
@@ -2442,6 +2941,7 @@ void MaybeResendWalletTxs(WalletContext& context)
         MaybeAutoDemurrageAttest(*pwallet);
         MaybeAutoShadowSignal(*pwallet);
         MaybeAutoRedelegateQuantumColdStake(*pwallet);
+        pwallet->RepairStaleShadowTransactions(/*force=*/false);
         if (!pwallet->ShouldResend()) continue;
         pwallet->ResubmitWalletTransactions(/*relay=*/true, /*force=*/false);
         pwallet->SetNextResend();
@@ -2503,6 +3003,8 @@ bool CWallet::SignQuantumTransaction(CMutableTransaction& tx, const std::map<COu
              IsQuantumColdStakeWitnessProgram(witness_version, witness_program))) {
             tx.vin[i].scriptSig.clear();
             quantum_inputs.insert(i);
+        } else if (IsEUTXOScript(coin_it->second.out.scriptPubKey)) {
+            input_errors[i] = _("EUTXO v15 spends are disabled in v30.1.1 because they have no quantum ownership authorization");
         } else if (verify_flags & SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT) {
             input_errors[i] = _("Legacy spends are disabled after the Quantum Quasar migration deadline");
         }
@@ -2667,6 +3169,11 @@ bool CWallet::SignQuantumTransaction(CMutableTransaction& tx, const std::map<COu
     PrecomputedTransactionData txdata;
     txdata.Init(tx_const, std::move(spent_outputs), true);
     txdata.m_quantum_sighash_chain_id = quantum_chain_id;
+    txdata.m_sighash_forkid_active = verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID;
+    if (txdata.m_sighash_forkid_active && quantum_chain_id == 0) {
+        input_errors[0] = _("Active SIGHASH_FORKID signing requires a nonzero Quantum Quasar chain id");
+        return false;
+    }
 
     for (unsigned int i = 0; i < tx.vin.size(); ++i) {
         if (input_errors.count(i)) {
@@ -2706,8 +3213,8 @@ bool CWallet::SignQuantumTransaction(CMutableTransaction& tx, const std::map<COu
     if ((verify_flags & SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT) && input_errors.empty()) {
         for (unsigned int i = 0; i < tx.vout.size(); ++i) {
             const CTxOut& txout = tx.vout[i];
-            if (txout.IsEmpty() || (!txout.scriptPubKey.empty() && txout.scriptPubKey[0] == OP_RETURN) ||
-                IsQuantumProtectedScript(txout.scriptPubKey) || IsEUTXOScript(txout.scriptPubKey)) {
+            if (txout.IsEmpty() || (txout.nValue == 0 && !txout.scriptPubKey.empty() && txout.scriptPubKey[0] == OP_RETURN) ||
+                IsQuantumProtectedScript(txout.scriptPubKey)) {
                 continue;
             }
             input_errors[0] = strprintf(_("Legacy outputs are disabled after the Quantum Quasar migration deadline (output %u)"), i);
@@ -2720,50 +3227,38 @@ bool CWallet::SignQuantumTransaction(CMutableTransaction& tx, const std::map<COu
 
 bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const
 {
-    int active_sighash = sighash;
-    unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS;
-    bool quantum_spend_active = !HaveChain();
-    bool eutxo_spend_active = !HaveChain();
-    if (HaveChain()) {
-        if (const CBlockIndex* tip = chain().getTip()) {
-            const int64_t tip_mtp = tip->GetMedianTimePast();
-            const auto& consensus = Params().GetConsensus();
-            if (consensus.IsProtocolV4(tip_mtp)) {
-                verify_flags |= SCRIPT_VERIFY_ISCOINSTAKE;
-                verify_flags |= SCRIPT_VERIFY_STRICTENC;
-            }
-            if (consensus.IsNewNetworkStakeOnly(tip_mtp, tip->nHeight + 1)) {
-                active_sighash = (active_sighash == SIGHASH_DEFAULT ? SIGHASH_ALL : active_sighash) | SIGHASH_FORKID;
-                verify_flags |= SCRIPT_ENABLE_SIGHASH_FORKID;
-            }
-            quantum_spend_active = IsQuantumWitnessSpendActive(consensus, tip_mtp, tip->nHeight + 1);
-            eutxo_spend_active = quantum_spend_active;
-            if (quantum_spend_active) {
-                verify_flags |= SCRIPT_VERIFY_V4_LARGE_SCRIPT_ELEMENT;
-                verify_flags |= SCRIPT_VERIFY_QUANTUM_ML_DSA;
-                verify_flags |= SCRIPT_VERIFY_QUANTUM_COLDSTAKE;
-            }
-            if (eutxo_spend_active) {
-                verify_flags |= SCRIPT_VERIFY_EUTXO;
-            }
-            if (consensus.IsStakeTiersActive(tip->nHeight + 1)) {
-                verify_flags |= SCRIPT_VERIFY_QUANTUM_STAKE_TIERS;
-            }
-            if (consensus.IsQuantumFinalLockout(tip_mtp, tip->nHeight + 1)) {
-                verify_flags |= SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT;
-            }
+    if (!HaveChain()) {
+        for (unsigned int i = 0; i < tx.vin.size(); ++i) {
+            input_errors[i] = _("Offline signing requires an explicit Quantum Quasar lifecycle and chain-id context; attach this wallet to a node");
         }
-    } else {
-        verify_flags |= SCRIPT_VERIFY_QUANTUM_ML_DSA;
-        verify_flags |= SCRIPT_VERIFY_QUANTUM_COLDSTAKE;
+        return false;
     }
+    int active_sighash = sighash;
+    const unsigned int verify_flags = GetActiveScriptVerifyFlags();
+    const bool quantum_spend_active = verify_flags & SCRIPT_VERIFY_QUANTUM_ML_DSA;
+    if (verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID) {
+        active_sighash = (active_sighash == SIGHASH_DEFAULT ? SIGHASH_ALL : active_sighash) | SIGHASH_FORKID;
+    }
+
+    for (unsigned int i = 0; i < tx.vin.size(); ++i) {
+        const auto coin_it = coins.find(tx.vin[i].prevout);
+        if (coin_it != coins.end() && IsEUTXOScript(coin_it->second.out.scriptPubKey)) {
+            input_errors[i] = _("EUTXO v15 spends are disabled in v30.1.1 because they have no quantum ownership authorization");
+        }
+    }
+    if (const auto output_error = QuantumCommitOutputError(CTransaction{tx}, verify_flags)) {
+        input_errors[0] = Untranslated(*output_error);
+    }
+    if (!input_errors.empty()) return false;
 
     FlatSigningProvider descriptor_keys;
     bool have_descriptor_keys{false};
     for (ScriptPubKeyMan* spk_man : GetAllScriptPubKeyMans()) {
         auto* desc_spk_man = dynamic_cast<DescriptorScriptPubKeyMan*>(spk_man);
         if (!desc_spk_man) {
-            spk_man->SignTransaction(tx, coins, active_sighash, input_errors);
+            spk_man->SignTransaction(tx, coins, active_sighash, input_errors,
+                                     Params().GetConsensus().nQuantumSighashChainId,
+                                     verify_flags);
             continue;
         }
 
@@ -2777,7 +3272,9 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
         }
     }
     if (have_descriptor_keys) {
-        ::SignTransaction(tx, &descriptor_keys, coins, active_sighash, input_errors);
+        ::SignTransaction(tx, &descriptor_keys, coins, active_sighash, input_errors,
+                          Params().GetConsensus().nQuantumSighashChainId,
+                          verify_flags);
     }
 
     LOCK(cs_wallet);
@@ -2786,47 +3283,17 @@ bool CWallet::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint,
 
 unsigned int CWallet::GetActiveScriptVerifyFlags() const
 {
-    unsigned int flags = STANDARD_SCRIPT_VERIFY_FLAGS;
-    bool quantum_spend_active = !HaveChain();
-    bool eutxo_spend_active = !HaveChain();
-    bool final_lockout_active = false;
-
-    if (HaveChain()) {
-        if (const CBlockIndex* tip = chain().getTip()) {
-            const int64_t tip_mtp = tip->GetMedianTimePast();
-            const auto& consensus = Params().GetConsensus();
-            if (consensus.IsProtocolV4(tip_mtp)) {
-                flags |= SCRIPT_VERIFY_ISCOINSTAKE;
-                flags |= SCRIPT_VERIFY_STRICTENC;
-            }
-            if (consensus.IsNewNetworkStakeOnly(tip_mtp, tip->nHeight + 1)) {
-                flags |= SCRIPT_ENABLE_SIGHASH_FORKID;
-            }
-            quantum_spend_active = IsQuantumWitnessSpendActive(consensus, tip_mtp, tip->nHeight + 1);
-            eutxo_spend_active = quantum_spend_active;
-            final_lockout_active = consensus.IsQuantumFinalLockout(tip_mtp, tip->nHeight + 1);
-            if (consensus.IsStakeTiersActive(tip->nHeight + 1)) {
-                flags |= SCRIPT_VERIFY_QUANTUM_STAKE_TIERS;
-            }
-        }
-    }
-    if (quantum_spend_active) {
-        flags |= SCRIPT_VERIFY_V4_LARGE_SCRIPT_ELEMENT;
-        flags |= SCRIPT_VERIFY_QUANTUM_ML_DSA;
-        flags |= SCRIPT_VERIFY_QUANTUM_COLDSTAKE;
-    }
-    if (eutxo_spend_active) {
-        flags |= SCRIPT_VERIFY_EUTXO;
-    }
-    if (final_lockout_active) {
-        flags |= SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT;
-    }
-    return flags;
+    if (!HaveChain()) return STANDARD_SCRIPT_VERIFY_FLAGS &
+        ~(SCRIPT_VERIFY_TAPROOT | SCRIPT_VERIFY_EUTXO);
+    LOCK(::cs_main);
+    return GetNextBlockPolicyScriptFlags(chain().getTip(), chain().chainman());
 }
 
 bool CWallet::FinalizeAndExtractPSBT(PartiallySignedTransaction& psbtx, CMutableTransaction& result) const
 {
-    return ::FinalizeAndExtractPSBT(psbtx, result, GetActiveScriptVerifyFlags());
+    if (!HaveChain()) return false;
+    return ::FinalizeAndExtractPSBT(psbtx, result, GetActiveScriptVerifyFlags(),
+                                    Params().GetConsensus().nQuantumSighashChainId);
 }
 
 TransactionError CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, int sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize) const
@@ -2834,43 +3301,15 @@ TransactionError CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& comp
     if (n_signed) {
         *n_signed = 0;
     }
-    LOCK(cs_wallet);
+    if (!HaveChain() && (sign || finalize)) return TransactionError::INVALID_PSBT;
+    const unsigned int psbt_verify_flags = GetActiveScriptVerifyFlags();
+    const bool quantum_spend_active = psbt_verify_flags & SCRIPT_VERIFY_QUANTUM_ML_DSA;
+    const bool final_lockout_active = psbt_verify_flags & SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT;
     int active_sighash = sighash_type;
-    bool quantum_spend_active = !HaveChain();
-    bool eutxo_spend_active = !HaveChain();
-    bool final_lockout_active = false;
-    unsigned int psbt_verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS;
-    if (HaveChain()) {
-        if (const CBlockIndex* tip = chain().getTip()) {
-            const int64_t tip_mtp = tip->GetMedianTimePast();
-            const auto& consensus = Params().GetConsensus();
-            if (consensus.IsProtocolV4(tip_mtp)) {
-                psbt_verify_flags |= SCRIPT_VERIFY_ISCOINSTAKE;
-                psbt_verify_flags |= SCRIPT_VERIFY_STRICTENC;
-            }
-            if (consensus.IsNewNetworkStakeOnly(tip_mtp, tip->nHeight + 1)) {
-                active_sighash = (active_sighash == SIGHASH_DEFAULT ? SIGHASH_ALL : active_sighash) | SIGHASH_FORKID;
-                psbt_verify_flags |= SCRIPT_ENABLE_SIGHASH_FORKID;
-            }
-            quantum_spend_active = IsQuantumWitnessSpendActive(consensus, tip_mtp, tip->nHeight + 1);
-            eutxo_spend_active = quantum_spend_active;
-            final_lockout_active = consensus.IsQuantumFinalLockout(tip_mtp, tip->nHeight + 1);
-            if (consensus.IsStakeTiersActive(tip->nHeight + 1)) {
-                psbt_verify_flags |= SCRIPT_VERIFY_QUANTUM_STAKE_TIERS;
-            }
-        }
+    if (psbt_verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID) {
+        active_sighash = (active_sighash == SIGHASH_DEFAULT ? SIGHASH_ALL : active_sighash) | SIGHASH_FORKID;
     }
-    if (quantum_spend_active) {
-        psbt_verify_flags |= SCRIPT_VERIFY_V4_LARGE_SCRIPT_ELEMENT;
-        psbt_verify_flags |= SCRIPT_VERIFY_QUANTUM_ML_DSA;
-        psbt_verify_flags |= SCRIPT_VERIFY_QUANTUM_COLDSTAKE;
-    }
-    if (eutxo_spend_active) {
-        psbt_verify_flags |= SCRIPT_VERIFY_EUTXO;
-    }
-    if (final_lockout_active) {
-        psbt_verify_flags |= SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT;
-    }
+    LOCK(cs_wallet);
     // Get all of the previous transactions
     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
         const CTxIn& txin = psbtx.tx->vin[i];
@@ -2891,6 +3330,17 @@ TransactionError CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& comp
 
     PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
     txdata.m_quantum_sighash_chain_id = Params().GetConsensus().nQuantumSighashChainId;
+    txdata.m_sighash_forkid_active = psbt_verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID;
+
+    for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
+        CTxOut utxo;
+        if (psbtx.GetInputUTXO(utxo, i) && IsEUTXOScript(utxo.scriptPubKey)) {
+            return TransactionError::INVALID_PSBT;
+        }
+    }
+    for (const CTxOut& txout : psbtx.tx->vout) {
+        if (IsEUTXOScript(txout.scriptPubKey)) return TransactionError::INVALID_PSBT;
+    }
 
     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
         const PSBTInput& input = psbtx.inputs.at(i);
@@ -3006,7 +3456,7 @@ TransactionError CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& comp
         const CTransaction tx_const{*psbtx.tx};
         for (const CTxOut& txout : tx_const.vout) {
             if (txout.IsEmpty() || (!txout.scriptPubKey.empty() && txout.scriptPubKey[0] == OP_RETURN) ||
-                IsQuantumProtectedScript(txout.scriptPubKey) || IsEUTXOScript(txout.scriptPubKey)) {
+                IsQuantumProtectedScript(txout.scriptPubKey)) {
                 continue;
             }
             return TransactionError::INVALID_PSBT;
@@ -3111,61 +3561,102 @@ OutputType CWallet::TransactionChangeType(const std::optional<OutputType>& chang
     return m_default_address_type;
 }
 
-bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm, std::string* broadcast_error)
+bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm,
+                                std::string* broadcast_error, WalletCommitStatus* commit_status)
 {
-    LOCK(cs_wallet);
-    WalletLogPrintf("CommitTransaction:\n%s", tx->ToString()); // NOLINT(bitcoin-unterminated-logprintf)
+    if (commit_status) *commit_status = WalletCommitStatus::REJECTED_NOT_ADDED;
 
-    // Add tx to wallet, because if it has change it's also ours,
-    // otherwise just for transaction history.
-    CWalletTx* wtx = AddToWallet(tx, TxStateInactive{}, [&](CWalletTx& wtx, bool new_tx) {
-        CHECK_NONFATAL(wtx.mapValue.empty());
-        CHECK_NONFATAL(wtx.vOrderForm.empty());
-        wtx.mapValue = std::move(mapValue);
-        wtx.vOrderForm = std::move(orderForm);
-        wtx.fTimeReceivedIsTxTime = true;
-        wtx.fFromMe = true;
-        return true;
-    });
-
-    // wtx can only be null if the db write failed.
-    if (!wtx) {
-        throw std::runtime_error(std::string(__func__) + ": Wallet db error, transaction commit failed");
+    // Reject phase-ineligible quantum outputs before AddToWallet reserves
+    // inputs or persists a transaction. Raw/PSBT construction remains
+    // available; commitment is the final wallet safety boundary.
+    if (const auto error = QuantumCommitOutputError(*tx, GetActiveScriptVerifyFlags())) {
+        if (broadcast_error) *broadcast_error = *error;
+        WalletLogPrintf("CommitTransaction(): refusing phase-ineligible output, %s\n", *error);
+        return false;
     }
 
-    // Notify that old coins are spent
-    for (const CTxIn& txin : tx->vin) {
-        CWalletTx &coin = mapWallet.at(txin.prevout.hash);
-        coin.MarkDirty();
-        NotifyTransactionChanged(coin.GetHash(), CT_UPDATED);
-    }
+    {
+        LOCK(cs_wallet);
+        WalletLogPrintf("CommitTransaction:\n%s", tx->ToString()); // NOLINT(bitcoin-unterminated-logprintf)
 
-    if (!fBroadcastTransactions) {
-        // Don't submit tx to the mempool
-        return true;
+        // Add tx to wallet, because if it has change it's also ours,
+        // otherwise just for transaction history.
+        CWalletTx* wtx = AddToWallet(tx, TxStateInactive{}, [&](CWalletTx& wtx, bool new_tx) {
+            CHECK_NONFATAL(wtx.mapValue.empty());
+            CHECK_NONFATAL(wtx.vOrderForm.empty());
+            wtx.mapValue = std::move(mapValue);
+            wtx.vOrderForm = std::move(orderForm);
+            wtx.fTimeReceivedIsTxTime = true;
+            wtx.fFromMe = true;
+            return true;
+        });
+
+        // wtx can only be null if the db write failed.
+        if (!wtx) {
+            throw std::runtime_error(std::string(__func__) + ": Wallet db error, transaction commit failed");
+        }
+
+        // Notify that old coins are spent
+        for (const CTxIn& txin : tx->vin) {
+            CWalletTx &coin = mapWallet.at(txin.prevout.hash);
+            coin.MarkDirty();
+            NotifyTransactionChanged(coin.GetHash(), CT_UPDATED);
+        }
+
+        if (!fBroadcastTransactions) {
+            // Persistence without relay is the caller-selected wallet policy.
+            if (commit_status) *commit_status = WalletCommitStatus::ACCEPTED;
+            return true;
+        }
     }
 
     std::string err_string;
-    if (!SubmitTxMemoryPoolAndRelay(*wtx, err_string, true)) {
+    bool accepted = SubmitTxMemoryPoolAndRelay(tx->GetHash(), err_string, true);
+    // A phase transition may race the pre-AddToWallet check. If the rejection
+    // was phase-dependent but the current tip now permits this exact output
+    // set, retry once against the current tip before deciding its disposition.
+    if (!accepted && IsPhaseDependentCommitReject(err_string) &&
+        !QuantumCommitOutputError(*tx, GetActiveScriptVerifyFlags())) {
+        err_string.clear();
+        accepted = SubmitTxMemoryPoolAndRelay(tx->GetHash(), err_string, true);
+    }
+    if (!accepted) {
         WalletLogPrintf("CommitTransaction(): Transaction cannot be broadcast immediately, %s\n", err_string);
         if (broadcast_error) *broadcast_error = err_string;
-        // TODO: if we expect the failure to be long term or permanent, instead delete wtx from the wallet and return failure.
+        if (IsPhaseDependentCommitReject(err_string)) {
+            // A lifecycle rejection is terminal for the active tip. Keep the
+            // audit record but release its inputs; callers must report failure
+            // instead of treating an abandoned wallet entry as a pending send.
+            if (AbandonTransaction(tx->GetHash())) {
+                if (commit_status) *commit_status = WalletCommitStatus::REJECTED_ABANDONED;
+            } else {
+                WalletLogPrintf("CommitTransaction(): unable to abandon phase-rejected transaction %s\n", tx->GetHash().ToString());
+            }
+            return false;
+        }
+        if (commit_status) *commit_status = WalletCommitStatus::PERSISTED_PENDING;
         return false;
     }
     if (broadcast_error) broadcast_error->clear();
+    if (commit_status) *commit_status = WalletCommitStatus::ACCEPTED;
     return true;
 }
 
 bool CWallet::CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm, const RGBTxCommitData& rgb_data, std::string& error)
 {
-    LOCK(cs_wallet);
-
     auto fail = [&](std::string message) {
         error = std::move(message);
         return false;
     };
 
     const uint256 hash = tx->GetHash();
+    if (const auto phase_error = QuantumCommitOutputError(*tx, GetActiveScriptVerifyFlags())) {
+        return fail("RGB anchor transaction is not valid in the active lifecycle phase: " + *phase_error);
+    }
+    bool should_broadcast{false};
+    {
+    LOCK(cs_wallet);
+
     if (mapWallet.count(hash)) return fail("RGB anchor transaction is already in the wallet");
     if (rgb_data.contract_id.IsNull() || rgb_data.transition_id.IsNull()) return fail("RGB transition id is invalid");
     if (m_rgb_contracts.count(rgb_data.contract_id) == 0) return fail("RGB contract not found");
@@ -3336,11 +3827,24 @@ bool CWallet::CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std:
         MaybeUpdateBirthTime(record.creation_time > 0 ? record.creation_time : 1);
     }
 
-    if (!fBroadcastTransactions) return true;
+    should_broadcast = fBroadcastTransactions;
+    }
+
+    if (!should_broadcast) return true;
 
     std::string err_string;
-    if (!SubmitTxMemoryPoolAndRelay(committed_wtx, err_string, true)) {
+    bool accepted = SubmitTxMemoryPoolAndRelay(hash, err_string, true);
+    if (!accepted && IsPhaseDependentCommitReject(err_string)) {
+        err_string.clear();
+        accepted = SubmitTxMemoryPoolAndRelay(hash, err_string, true);
+    }
+    if (!accepted) {
         WalletLogPrintf("CommitRGBTransaction(): Transaction cannot be broadcast immediately, %s\n", err_string);
+        if (IsPhaseDependentCommitReject(err_string)) {
+            AbandonTransaction(hash);
+            ReconcileRGBAssignments();
+            return fail("RGB anchor transaction was rejected by the active lifecycle phase: " + err_string);
+        }
     }
     error.clear();
     return true;
@@ -3348,7 +3852,10 @@ bool CWallet::CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std:
 
 DBErrors CWallet::LoadWallet()
 {
-    LOCK(cs_wallet);
+    // LoadToWallet reconciles persisted confirmed/conflicted states against
+    // chainstate. Take the canonical order so the database callback cannot
+    // acquire cs_main while holding only cs_wallet.
+    LOCK2(::cs_main, cs_wallet);
 
     DBErrors nLoadWalletRet = WalletBatch(GetDatabase()).LoadWallet(this);
     if (nLoadWalletRet == DBErrors::NEED_REWRITE)
@@ -4153,7 +4660,7 @@ std::set<COutPoint> CWallet::GetProtectedRGBSeals() const
 
 void CWallet::ReconcileRGBAssignments()
 {
-    AssertLockHeld(cs_wallet);
+    LOCK(cs_wallet);
     // Keep each owned RGB assignment's spent flag in sync with the chain. A single-use
     // seal's asset is live iff the seal outpoint is still unspent by a non-abandoned, non-conflicted
     // wallet transaction -- exactly what IsSpent() reports. Without this, a reorged-out, abandoned, or
@@ -4166,7 +4673,12 @@ void CWallet::ReconcileRGBAssignments()
         if (!record.anchor_checked || record.anchor_txid.IsNull()) continue;
         const auto wtx_it = mapWallet.find(record.anchor_txid);
         if (wtx_it != mapWallet.end() && !wtx_it->second.isAbandoned() && !wtx_it->second.isConflicted()) continue;
-        if (wtx_it == mapWallet.end() && IsRGBAnchorProvenInChainOrMempool(chain(), record.anchor_txid)) continue;
+        // Never destructively infer the absence of an external anchor. A
+        // mempool/chain lookup cannot be made atomic with this wallet update,
+        // and a false negative would permanently erase transition proofs that
+        // callbacks cannot reconstruct. Wallet-known anchors remain fully
+        // self-healing through their authoritative transaction state.
+        if (wtx_it == mapWallet.end()) continue;
         stale_transition_keys.push_back(key);
         for (const COutPoint& output : record.outputs) {
             stale_output_assignment_keys.emplace(key.first, output);
@@ -4890,8 +5402,10 @@ void CWallet::GetKeyBirthTimes(std::map<CKeyID, int64_t>& mapKeyBirth) const {
  * https://bitcointalk.org/?topic=54527, or
  * https://github.com/bitcoin/bitcoin/pull/1393.
  */
-unsigned int CWallet::ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const
+unsigned int CWallet::ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block,
+                                       std::optional<WalletBlockTime> block_time) const
 {
+    AssertLockHeld(cs_wallet);
     std::optional<uint256> block_hash;
     if (auto* conf = wtx.state<TxStateConfirmed>()) {
         block_hash = conf->confirmed_block_hash;
@@ -4901,11 +5415,9 @@ unsigned int CWallet::ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old
 
     unsigned int nTimeSmart = wtx.nTimeReceived;
     if (block_hash) {
-        int64_t blocktime;
-        int64_t block_max_time;
-        if (chain().findBlock(*block_hash, FoundBlock().time(blocktime).maxTime(block_max_time))) {
+        if (block_time) {
             if (rescanning_old_block) {
-                nTimeSmart = block_max_time;
+                nTimeSmart = block_time->block_max_time;
             } else {
                 int64_t latestNow = wtx.nTimeReceived;
                 int64_t latestEntry = 0;
@@ -4932,10 +5444,14 @@ unsigned int CWallet::ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old
                     }
                 }
 
-                nTimeSmart = std::max(latestEntry, std::min(blocktime, latestNow));
+                nTimeSmart = std::max(latestEntry, std::min(block_time->block_time, latestNow));
             }
         } else {
-            WalletLogPrintf("%s: found %s in block %s not in index\n", __func__, wtx.GetHash().ToString(), block_hash->ToString());
+            // Confirmed transaction callbacks and rescans must capture block
+            // timing before taking cs_wallet. Querying chainstate here would
+            // invert the global cs_main -> cs_wallet lock order.
+            WalletLogPrintf("%s: no pre-captured timing for %s in block %s; using receive time\n",
+                            __func__, wtx.GetHash().ToString(), block_hash->ToString());
         }
     }
     return nTimeSmart;
@@ -5438,7 +5954,7 @@ void CWallet::postInitProcess()
     ResubmitWalletTransactions(/*relay=*/false, /*force=*/true);
 
     // Update wallet transactions with current mempool transactions.
-    WITH_LOCK(cs_wallet, chain().requestMempoolTransactions(*this));
+    chain().requestMempoolTransactions(*this);
 
     // Start mining proof-of-stake blocks in the background unless the caller
     // wants explicit staking control.
@@ -5489,6 +6005,21 @@ int CWallet::GetTxBlocksToMaturity(const CWalletTx& wtx) const
     int chain_depth = GetTxDepthInMainChain(wtx);
     if (!wtx.IsCoinStake())
         assert(chain_depth >= 0); // coinbase tx should not be conflicted
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const auto synthetic = wtx.mapValue.find(SYNTHETIC_GOLD_RUSH_PAYOUT_KEY);
+    const bool synthetic_payout =
+        (synthetic != wtx.mapValue.end() && synthetic->second == "1") ||
+        IsSyntheticGoldRushPayoutEnvelope(wtx);
+    if (synthetic_payout &&
+        consensus.UsesHeightLifecycle() &&
+        GetLastBlockHeight() + 1 > consensus.nGoldRushEndHeight &&
+        chain_depth >= consensus.nCoinbaseMaturity) {
+        // Wallet balances describe what can be spent in the candidate next
+        // block. Synthetic Gold Rush payouts use ordinary coinbase maturity,
+        // so depth=M is valid at candidate height H+1 even though the generic
+        // coinbase display formula reports one block remaining.
+        return 0;
+    }
     return std::max(0, (Params().GetConsensus().nCoinbaseMaturity+1) - chain_depth);
 }
 
@@ -6597,6 +7128,7 @@ bool IsShadowPowClaimConflict(const bilingual_str& error)
 
 bool SelectShadowPowMiningTarget(CWallet& wallet, const CScript& quantum_payout_script, CScript& target, CTxDestination& dest, bilingual_str& error)
 {
+    AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
     CCoinControl coin_control;
     coin_control.m_allow_other_inputs = false;
@@ -6660,7 +7192,7 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
     }
 
     {
-        LOCK(cs_wallet);
+        LOCK2(::cs_main, cs_wallet);
         if (!HasPrivateKeys() || IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
             error = _("Gold Rush PoW mining requires a wallet with private keys.");
             return false;
@@ -6803,7 +7335,7 @@ bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& 
     CAmount fee{0};
     std::map<COutPoint, Coin> coins;
     {
-        LOCK(cs_wallet);
+        LOCK2(::cs_main, cs_wallet);
         if (IsLocked()) {
             error = _("Wallet locked before the Gold Rush PoW claim could be signed.");
             return false;
@@ -6856,7 +7388,12 @@ bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& 
     }
 
     std::map<int, bilingual_str> input_errors;
-    if (!SignTransaction(claim_tx, coins, SIGHASH_DEFAULT, input_errors)) {
+    bool signed_claim{false};
+    {
+        LOCK2(::cs_main, cs_wallet);
+        signed_claim = SignTransaction(claim_tx, coins, SIGHASH_DEFAULT, input_errors);
+    }
+    if (!signed_claim) {
         if (!input_errors.empty()) {
             error = strprintf(_("Signing Gold Rush PoW claim failed: %s"), input_errors.begin()->second.original);
         } else {
@@ -6939,7 +7476,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         CTxDestination target_dest;
         bool have_target{false};
         {
-            LOCK(cs_wallet);
+            LOCK2(::cs_main, cs_wallet);
             have_target = SelectShadowPowMiningTarget(*this, quantum_payout_script, target, target_dest, error);
         }
         if (!have_target) {

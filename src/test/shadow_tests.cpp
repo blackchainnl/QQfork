@@ -17,6 +17,7 @@
 #include <util/strencodings.h>
 
 #include <map>
+#include <array>
 #include <set>
 #include <string>
 #include <tuple>
@@ -234,7 +235,32 @@ CScript TieredQuantumMigrationScript()
         QuantumTieredProgramForCommitment(QUANTUM_TIERED_STATE_BONDED, /*unbonding_blocks=*/40500, /*unlock_height=*/0, uint256::ONE)});
 }
 
+bool ApplyShadowAndCheckpoint(CCoinsViewCache& view, const CBlock& block,
+                              const CBlockIndex* pindex,
+                              const CBlockUndo* blockundo = nullptr,
+                              bool gold_rush_active = true)
+{
+    if (!::ApplyShadowBlock(view, block, pindex, blockundo, gold_rush_active)) return false;
+    if (!pindex || pindex->nHeight < SHADOW_REWARD_START_HEIGHT ||
+        pindex->nHeight > SHADOW_REWARD_END_HEIGHT) return true;
+    return AdvanceGoldRushInventoryTip(view, pindex);
+}
+
+bool UndoShadowAndRewind(CCoinsViewCache& view, const CBlock& block,
+                         const CBlockIndex* pindex,
+                         const CBlockUndo* blockundo = nullptr,
+                         bool gold_rush_active = true)
+{
+    if (!::UndoShadowBlock(view, block, pindex, blockundo, gold_rush_active)) return false;
+    if (!pindex || pindex->nHeight < SHADOW_REWARD_START_HEIGHT ||
+        pindex->nHeight > SHADOW_REWARD_END_HEIGHT) return true;
+    return RewindGoldRushInventoryTip(view, pindex);
+}
+
 } // namespace
+
+#define ApplyShadowBlock ApplyShadowAndCheckpoint
+#define UndoShadowBlock UndoShadowAndRewind
 
 BOOST_AUTO_TEST_CASE(legacy_whitelist_uses_aggregate_script_balance)
 {
@@ -436,8 +462,8 @@ BOOST_AUTO_TEST_CASE(blackcoin_block_notice_matches_release_message)
 {
     const std::string& notice = GetQuantumQuasarBlockNotice();
     const CScript script = BuildQuantumQuasarBlockNoticeScript();
-    BOOST_CHECK_EQUAL(notice.size(), 208U);
-    BOOST_CHECK_EQUAL(script.size(), 211U);
+    BOOST_CHECK_EQUAL(notice,
+        "Quantum Quasar V30 Gold Rush is live. Upgrade now; the 18-month legacy migration begins after Gold Rush. Source: https://github.com/blackcoin-dev/blackcoin");
 
     CScript::const_iterator pc = script.begin();
     opcodetype opcode;
@@ -1170,20 +1196,31 @@ BOOST_AUTO_TEST_CASE(pow_shadow_target_relaxes_after_missed_claims_and_resets_on
     BOOST_CHECK_EQUAL(first_info.pow_target_bits, 12U);
     BOOST_CHECK_EQUAL(first_info.last_pow_height, 0U);
 
-    uint256 late_prev_hash;
-    CBlockIndex late_prev_index;
-    InitIndex(late_prev_index, SHADOW_REWARD_START_HEIGHT + 70, &first_index, late_prev_hash);
-    const ShadowGoldRushInfo late_info = GetShadowGoldRushInfo(view, &late_prev_index);
+    // Advance every authenticated inventory tip. Production code must never
+    // permit a missing middle checkpoint, even when this test only cares about
+    // the difficulty relaxation after 70 empty claim opportunities.
+    std::array<uint256, 70> empty_hashes;
+    std::array<CBlockIndex, 70> empty_indexes;
+    CBlockIndex* late_prev_index = &first_index;
+    for (size_t i = 0; i < empty_indexes.size(); ++i) {
+        InitIndex(empty_indexes[i], SHADOW_REWARD_START_HEIGHT + 1 + i,
+                  late_prev_index, empty_hashes[i]);
+        CBlock empty_block;
+        empty_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_TRUE));
+        BOOST_REQUIRE(ApplyShadowBlock(view, empty_block, &empty_indexes[i]));
+        late_prev_index = &empty_indexes[i];
+    }
+    const ShadowGoldRushInfo late_info = GetShadowGoldRushInfo(view, late_prev_index);
     BOOST_CHECK_LT(late_info.pow_target_bits, first_info.pow_target_bits);
 
     const CScript pow_target = CScript{} << OP_2;
     const CScript quantum_payout = QuantumScript(0x48);
     std::vector<unsigned char> pow_proof;
-    BOOST_REQUIRE(MineShadowProofData(pow_target, quantum_payout, &late_prev_index, view, 20'000, pow_proof));
+    BOOST_REQUIRE(MineShadowProofData(pow_target, quantum_payout, late_prev_index, view, 20'000, pow_proof));
 
     uint256 claim_hash;
     CBlockIndex claim_index;
-    InitIndex(claim_index, late_prev_index.nHeight + 1, &late_prev_index, claim_hash);
+    InitIndex(claim_index, late_prev_index->nHeight + 1, late_prev_index, claim_hash);
     CBlock claim_block;
     claim_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_3));
     claim_block.vtx.push_back(MakeCoinstakeTx(CScript{} << OP_4, {}, {CTxOut(580 * COIN, quantum_payout)}));
@@ -1304,8 +1341,10 @@ BOOST_AUTO_TEST_CASE(obsolete_goldrush_direct_payout_markers_are_exact_and_reorg
 
     const uint256 txid = coinstake->GetHash();
     CScript marker_payload;
-    BOOST_CHECK(IsGoldRushDirectPayoutOutput(view, COutPoint{txid, 2}, &marker_payload));
-    BOOST_CHECK(marker_payload == quantum_payout);
+    // Legacy raw-script QQGRPAY records are purge-only in v30.1.1. Spend
+    // authorization requires the source-bound v2 record emitted by the shadow
+    // claim path.
+    BOOST_CHECK(!IsGoldRushDirectPayoutOutput(view, COutPoint{txid, 2}, &marker_payload));
 
     // A duplicate output to the same script and an output with the wrong amount
     // are not marked, so obsolete direct-output cleanup tracks exact test-build rewards.

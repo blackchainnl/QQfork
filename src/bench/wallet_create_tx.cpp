@@ -89,7 +89,7 @@ static void WalletCreateTx(benchmark::Bench& bench, const OutputType output_type
     SetMockTime(test_setup->m_node.chainman->GetParams().GenesisBlock().nTime);
     CWallet wallet{test_setup->m_node.chain.get(), "", CreateMockableWalletDatabase()};
     {
-        LOCK(wallet.cs_wallet);
+        LOCK2(::cs_main, wallet.cs_wallet);
         wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
         wallet.SetupDescriptorScriptPubKeyMans();
         if (wallet.LoadWallet() != DBErrors::LOAD_OK) assert(false);
@@ -107,7 +107,7 @@ static void WalletCreateTx(benchmark::Bench& bench, const OutputType output_type
     }
 
     // Check available balance
-    auto bal = WITH_LOCK(wallet.cs_wallet, return wallet::AvailableCoins(wallet).GetTotalAmount()); // Cache
+    auto bal = WITH_LOCK(::cs_main, return WITH_LOCK(wallet.cs_wallet, return wallet::AvailableCoins(wallet).GetTotalAmount())); // Cache
     assert(bal == 50 * COIN * (chain_size - params.GetConsensus().nCoinbaseMaturity));
 
     wallet::CCoinControl coin_control;
@@ -118,8 +118,8 @@ static void WalletCreateTx(benchmark::Bench& bench, const OutputType output_type
         // Select inputs, each has 49 BTC
         wallet::CoinFilterParams filter_coins;
         filter_coins.max_count = preset_inputs->num_of_internal_inputs;
-        const auto& res = WITH_LOCK(wallet.cs_wallet,
-                                    return wallet::AvailableCoins(wallet, /*coinControl=*/nullptr, /*feerate=*/std::nullopt, filter_coins));
+        const auto& res = WITH_LOCK(::cs_main, return WITH_LOCK(wallet.cs_wallet,
+                                    return wallet::AvailableCoins(wallet, /*coinControl=*/nullptr, /*feerate=*/std::nullopt, filter_coins)));
         for (int i=0; i < preset_inputs->num_of_internal_inputs; i++) {
             const auto& coin{res.coins.at(output_type)[i]};
             target += coin.txout.nValue;
@@ -132,7 +132,7 @@ static void WalletCreateTx(benchmark::Bench& bench, const OutputType output_type
     std::vector<wallet::CRecipient> recipients = {{dest, target, true}};
 
     bench.epochIterations(5).run([&] {
-        LOCK(wallet.cs_wallet);
+        LOCK2(::cs_main, wallet.cs_wallet);
         const auto& tx_res = CreateTransaction(wallet, recipients, -1, coin_control);
         assert(tx_res);
     });
@@ -145,7 +145,7 @@ static void AvailableCoins(benchmark::Bench& bench, const std::vector<OutputType
     SetMockTime(test_setup->m_node.chainman->GetParams().GenesisBlock().nTime);
     CWallet wallet{test_setup->m_node.chain.get(), "", CreateMockableWalletDatabase()};
     {
-        LOCK(wallet.cs_wallet);
+        LOCK2(::cs_main, wallet.cs_wallet);
         wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
         wallet.SetupDescriptorScriptPubKeyMans();
         if (wallet.LoadWallet() != DBErrors::LOAD_OK) assert(false);
@@ -168,11 +168,11 @@ static void AvailableCoins(benchmark::Bench& bench, const std::vector<OutputType
     }
 
     // Check available balance
-    auto bal = WITH_LOCK(wallet.cs_wallet, return wallet::AvailableCoins(wallet).GetTotalAmount()); // Cache
+    auto bal = WITH_LOCK(::cs_main, return WITH_LOCK(wallet.cs_wallet, return wallet::AvailableCoins(wallet).GetTotalAmount())); // Cache
     assert(bal == 50 * COIN * (chain_size - params.GetConsensus().nCoinbaseMaturity));
 
     bench.epochIterations(2).run([&] {
-        LOCK(wallet.cs_wallet);
+        LOCK2(::cs_main, wallet.cs_wallet);
         const auto& res = wallet::AvailableCoins(wallet);
         assert(res.All().size() == (chain_size - params.GetConsensus().nCoinbaseMaturity) * 2);
     });

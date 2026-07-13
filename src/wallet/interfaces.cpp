@@ -112,12 +112,11 @@ util::Result<void> CommitWalletTransactionOrError(CWallet& wallet, const CTransa
 {
     try {
         std::string broadcast_error;
-        if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error)) {
+        WalletCommitStatus status;
+        if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error, &status)) {
             const std::string reason = broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error;
-            if (!wallet.AbandonTransaction(tx->GetHash())) {
-                wallet.WalletLogPrintf("%s transaction could not be abandoned after broadcast failure: txid=%s\n", action, tx->GetHash().ToString());
-            }
-            return util::Error{Untranslated(strprintf("Error: %s transaction was created but could not be broadcast: %s", action, reason))};
+            if (status == WalletCommitStatus::PERSISTED_PENDING) return {};
+            return util::Error{Untranslated(strprintf("Error: %s transaction could not be committed: %s", action, reason))};
         }
     } catch (const std::exception& e) {
         return util::Error{Untranslated(strprintf("Error: %s transaction could not be committed: %s", action, e.what()))};
@@ -226,7 +225,7 @@ util::Result<QuantumColdStakeDelegationInfo> DecodeWalletColdStakeDelegationAddr
 ColdStakeDelegationOutputs ScanColdStakeDelegationOutputs(
     const CWallet& wallet,
     const CScript& delegation_script,
-    bool spendable_only) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+    bool spendable_only) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
 {
     ColdStakeDelegationOutputs outputs;
 
@@ -268,6 +267,11 @@ WalletQuantumColdStakeBalanceInfo MakeWalletColdStakeBalanceInfo(const CWallet& 
 {
     WalletQuantumColdStakeBalanceInfo result;
     CTxDestination dest;
+    TRY_LOCK(::cs_main, main_lock);
+    if (!main_lock) {
+        result.available = false;
+        return result;
+    }
     TRY_LOCK(wallet.cs_wallet, wallet_lock);
     if (!wallet_lock) {
         result.available = false;
@@ -339,6 +343,9 @@ ColdStakeFundingInputs ScanColdStakeFundingInputs(
     const CCoinsViewCache& view) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
 {
     ColdStakeFundingInputs summary;
+    const CBlockIndex* tip = wallet.chain().getTip();
+    const int spend_height = tip ? tip->nHeight + 1 : 0;
+    const int64_t spend_time = tip ? tip->GetMedianTimePast() : 0;
 
     CCoinControl scan_control;
     scan_control.m_input_family = CCoinControl::InputFamily::QUANTUM_MIGRATION;
@@ -353,7 +360,8 @@ ColdStakeFundingInputs ScanColdStakeFundingInputs(
         if (out.txout.nValue <= 0 || !IsDirectQuantumMigrationScript(out.txout.scriptPubKey)) continue;
 
         CScript marker_script;
-        if (IsGoldRushDirectPayoutOutput(view, out.outpoint, &marker_script) && marker_script == out.txout.scriptPubKey) {
+        if (IsLockedGoldRushPayoutOutput(view, out.outpoint, Params().GetConsensus(),
+                spend_time, spend_height, &marker_script) && marker_script == out.txout.scriptPubKey) {
             summary.goldrush_reward_amount += out.txout.nValue;
             ++summary.goldrush_reward_inputs;
             continue;
@@ -379,6 +387,9 @@ SafeFeeInputSummary SelectSafeUnbondingFeeInputs(
     bool allow_legacy) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
 {
     SafeFeeInputSummary summary;
+    const CBlockIndex* tip = wallet.chain().getTip();
+    const int spend_height = tip ? tip->nHeight + 1 : 0;
+    const int64_t spend_time = tip ? tip->GetMedianTimePast() : 0;
 
     CoinFilterParams filter;
     filter.only_spendable = true;
@@ -399,7 +410,8 @@ SafeFeeInputSummary SelectSafeUnbondingFeeInputs(
 
         const CScript& spk = out.txout.scriptPubKey;
         CScript marker_script;
-        if (IsGoldRushDirectPayoutOutput(view, out.outpoint, &marker_script) && marker_script == spk) continue;
+        if (IsLockedGoldRushPayoutOutput(view, out.outpoint, Params().GetConsensus(),
+                spend_time, spend_height, &marker_script) && marker_script == spk) continue;
 
         const bool direct_quantum = IsDirectQuantumMigrationScript(spk);
         const bool legacy = allow_legacy && !IsQuantumMigrationScript(spk) && !IsQuantumColdStakeScript(spk) && !IsEUTXOScript(spk);
@@ -445,14 +457,12 @@ struct LocalOperatorBondCandidate
     COutPoint outpoint;
 };
 
-util::Result<WalletQuantumActionTx> CreateGoldRushColdStakeMigration(CWallet& wallet);
-
 OperatorBondOutputs ScanOperatorBondOutputs(
     const CWallet& wallet,
     const CScript& bonded_script,
     const uint256& operator_commitment,
     int spend_height,
-    bool spendable_only) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+    bool spendable_only) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
 {
     OperatorBondOutputs outputs;
 
@@ -506,6 +516,8 @@ std::vector<WalletQuantumStakeOutputInfo> ListTieredStakeOutputs(
     const auto tier = DecodeTieredStakeAddress(address, dest, require_operator_lock);
     if (!tier) return result;
 
+    TRY_LOCK(::cs_main, main_lock);
+    if (!main_lock) return result;
     TRY_LOCK(wallet.cs_wallet, wallet_lock);
     if (!wallet_lock) return result;
     const auto key_info = wallet.GetQuantumKeyInfo(dest);
@@ -578,7 +590,7 @@ std::map<uint256, std::vector<node::QuantumPoolClaim>> FindWalletQuantumPoolClai
 {
     std::map<uint256, std::vector<node::QuantumPoolClaim>> claims_by_operator;
 
-    LOCK(wallet.cs_wallet);
+    LOCK2(::cs_main, wallet.cs_wallet);
     CoinFilterParams filter;
     filter.only_spendable = false;
     filter.skip_locked = false;
@@ -701,6 +713,11 @@ WalletQuantumOperatorBondInfo MakeWalletTieredStakeBondInfo(const CWallet& walle
     const auto tier = DecodeTieredStakeAddress(address, dest, require_operator_lock);
     if (!tier) return result;
 
+    TRY_LOCK(::cs_main, main_lock);
+    if (!main_lock) {
+        result.available = false;
+        return result;
+    }
     TRY_LOCK(wallet.cs_wallet, wallet_lock);
     if (!wallet_lock) {
         result.available = false;
@@ -756,13 +773,21 @@ util::Result<WalletQuantumOperatorBondTx> FundTieredStakeAddress(
         LOCK2(::cs_main, wallet.cs_wallet);
         bilingual_str spend_error;
         if (!CanCreateSignedSpend(wallet, spend_error)) return util::Error{spend_error};
+        const CBlockIndex* tip = wallet.chain().chainman().ActiveChain().Tip();
+        if (!tip || !IsQuantumWitnessSpendActive(
+                Params().GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1)) {
+            return util::Error{_("Error: Quantum staking outputs cannot be funded until the post-Gold-Rush migration phase")};
+        }
+        if (!IsQuantumStakeTiersActive(Params().GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1)) {
+            return util::Error{_("Error: Tiered quantum staking outputs cannot be funded before tiered staking activation")};
+        }
         if (!wallet.GetQuantumKeyInfo(dest)) {
             return util::Error{_("Error: Staking address is not backed by this wallet")};
         }
 
         std::vector<CRecipient> recipients{{dest, amount, /*fSubtractFeeFromAmount=*/false}};
         CCoinControl coin_control;
-        coin_control.m_input_family = CCoinControl::InputFamily::LEGACY;
+        coin_control.m_input_family = CCoinControl::InputFamily::QUANTUM_MIGRATION;
         coin_control.m_allow_other_inputs = true;
         auto change_dest = wallet.GetNewQuantumChangeDestination();
         if (!change_dest) return util::Error{util::ErrorString(change_dest)};
@@ -940,21 +965,31 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
     CAmount amount,
     bool allow_goldrush_migration)
 {
+    (void)allow_goldrush_migration; // Retained for RPC/API compatibility; no forced first-move workflow exists.
     if (!MoneyRange(amount) || amount <= 0) {
         return util::Error{_("Error: Delegation funding amount must be positive")};
     }
 
     CTransactionRef tx;
     CAmount fee{0};
-    bool use_goldrush_migration{false};
     {
         LOCK2(::cs_main, wallet.cs_wallet);
         bilingual_str spend_error;
         if (!CanCreateSignedSpend(wallet, spend_error)) return util::Error{spend_error};
+        const CBlockIndex* tip = wallet.chain().chainman().ActiveChain().Tip();
+        if (!tip || !IsQuantumWitnessSpendActive(
+                Params().GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1)) {
+            return util::Error{_("Error: Quantum cold-stake outputs cannot be funded until the post-Gold-Rush migration phase")};
+        }
 
         CTxDestination dest;
         const auto delegation = DecodeWalletColdStakeDelegationAddress(wallet, address, dest);
         if (!delegation) return util::Error{util::ErrorString(delegation)};
+        const std::optional<QuantumStakeTierProgram> tier = GetQuantumStakeTierProgram(GetScriptForDestination(dest));
+        if (tier && tier->tiered && !IsQuantumStakeTiersActive(
+                Params().GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1)) {
+            return util::Error{_("Error: Tiered quantum cold-stake outputs cannot be funded before tiered staking activation")};
+        }
         if (!delegation->has_owner_key) {
             return util::Error{_("Error: Wallet must hold the owner key before funding a cold-stake delegation")};
         }
@@ -983,60 +1018,30 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
 
         const ColdStakeFundingInputs funding = ScanColdStakeFundingInputs(wallet, view);
         if (funding.eligible_inputs == 0) {
-            if (funding.goldrush_reward_inputs > 0) {
-                use_goldrush_migration = true;
-            } else {
-                return util::Error{_("Error: No spendable direct quantum outputs are available to fund this cold-stake delegation.")};
-            }
+            return util::Error{_("Error: No spendable direct quantum outputs are available to fund this cold-stake delegation. Gold Rush payouts become ordinary direct quantum funds after Gold Rush and normal maturity.")};
         }
-        if (!use_goldrush_migration && funding.eligible_amount <= amount) {
-            if (funding.goldrush_reward_inputs > 0) {
-                use_goldrush_migration = true;
-            } else {
-                bilingual_str error = strprintf(
-                    _("Error: Insufficient direct quantum balance to fund this delegation and its fee. Available direct quantum balance: %s."),
-                    FormatMoney(funding.eligible_amount));
-                return util::Error{error};
-            }
+        if (funding.eligible_amount <= amount) {
+            bilingual_str error = strprintf(
+                _("Error: Insufficient direct quantum balance to fund this delegation and its fee. Available direct quantum balance: %s."),
+                FormatMoney(funding.eligible_amount));
+            return util::Error{error};
         }
-        if (!use_goldrush_migration) {
-            auto change_dest = wallet.GetNewQuantumChangeDestination();
-            if (!change_dest) return util::Error{util::ErrorString(change_dest)};
 
-            std::vector<CRecipient> recipients{{dest, amount, /*fSubtractFeeFromAmount=*/false}};
-            coin_control.destChange = *change_dest;
-            int change_pos = RANDOM_CHANGE_POSITION;
-            auto res = CreateTransaction(wallet, recipients, change_pos, coin_control, /*sign=*/true);
-            if (!res) {
-                bilingual_str error = strprintf(
-                    _("Error: Unable to fund cold-stake delegation from direct quantum outputs. %s"),
-                    util::ErrorString(res).original);
-                return util::Error{error};
-            }
-            tx = res->tx;
-            fee = res->fee;
-        }
-    }
+        auto change_dest = wallet.GetNewQuantumChangeDestination();
+        if (!change_dest) return util::Error{util::ErrorString(change_dest)};
 
-    if (use_goldrush_migration) {
-        if (!allow_goldrush_migration) {
-            return util::Error{_("Error: Funding this cold-stake delegation requires first moving wallet-owned Gold Rush reward outputs to a fresh quantum address. Re-run with allow_goldrush_migration=true, or run migrategoldrushrewards first.")};
+        std::vector<CRecipient> recipients{{dest, amount, /*fSubtractFeeFromAmount=*/false}};
+        coin_control.destChange = *change_dest;
+        int change_pos = RANDOM_CHANGE_POSITION;
+        auto res = CreateTransaction(wallet, recipients, change_pos, coin_control, /*sign=*/true);
+        if (!res) {
+            bilingual_str error = strprintf(
+                _("Error: Unable to fund cold-stake delegation from direct quantum outputs. %s"),
+                util::ErrorString(res).original);
+            return util::Error{error};
         }
-        auto migration = CreateGoldRushColdStakeMigration(wallet);
-        if (!migration) return util::Error{util::ErrorString(migration)};
-
-        WalletQuantumOperatorBondTx result;
-        result.txid = migration->txid;
-        result.address = address;
-        result.amount = amount;
-        result.created_migration = true;
-        result.completed_delegation = false;
-        result.migration_txid = migration->txid;
-        result.migration_address = migration->address;
-        result.migration_amount = migration->amount;
-        result.migration_fee = migration->fee;
-        result.warning = _("Gold Rush rewards were moved to a fresh quantum address. Wait for that transaction to confirm, then fund this cold-stake delegation again.").original;
-        return result;
+        tx = res->tx;
+        fee = res->fee;
     }
 
     mapValue_t map_value;
@@ -1328,9 +1333,12 @@ WalletDemurrageInfo GetWalletDemurrageInfo(CWallet& wallet)
         Coin coin = chainstate_backed
             ? coin_it->second
             : Coin{out.txout, out.depth > 0 ? info.tip_height - out.depth + 1 : info.evaluation_height, false, false, static_cast<int>(out.time)};
-        const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(view, out.txout.scriptPubKey);
+        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+            Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
         const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
-            coin, consensus, info.evaluation_height, info.evaluation_time, latest_attestation);
+            coin, consensus, info.evaluation_height, info.evaluation_time,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
         const bool attestation_due = info.demurrage_active &&
                                      !eval.locked &&
                                      eval.inactive_blocks >= consensus.DemurrageAutoAttestBlocks();
@@ -1341,7 +1349,9 @@ WalletDemurrageInfo GetWalletDemurrageInfo(CWallet& wallet)
         output.address = EncodeDestination(dest);
         output.depth = out.depth;
         output.coin_height = coin.nHeight;
-        output.latest_attestation_height = latest_attestation;
+        output.latest_attestation_height = latest_attestation
+            ? std::optional<int>{latest_attestation->height}
+            : std::nullopt;
         output.inactive_blocks = eval.inactive_blocks;
         output.remaining_ppm = eval.remaining_ppm;
         output.nominal_amount = eval.nominal_value;
@@ -1397,6 +1407,8 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
 
     CTransactionRef tx;
     CAmount eligible_amount{0};
+    CAmount effective_eligible_amount{0};
+    CAmount burned_amount{0};
     CAmount fee{0};
     unsigned int eligible_inputs{0};
     std::string comment;
@@ -1413,13 +1425,9 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         const int64_t mtp = tip ? tip->GetMedianTimePast() : 0;
         const int next_height = tip ? tip->nHeight + 1 : 0;
         if (goldrush_rewards_only) {
-            const bool can_move_reward_outputs = consensus.IsQuantumMigrationWindow(mtp, next_height) ||
-                (allow_goldrush_epoch && !consensus.IsQuantumFinalLockout(mtp, next_height) &&
-                 IsQuantumWitnessSpendActive(consensus, mtp, next_height));
+            const bool can_move_reward_outputs = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
             if (!can_move_reward_outputs) {
-                return util::Error{allow_goldrush_epoch
-                    ? _("Gold Rush reward migration is only allowed once quantum reward spends are active and before the final quantum lockout deadline.")
-                    : _("Gold Rush reward migration is only allowed during the migration window and before the final quantum lockout deadline.")};
+                return util::Error{_("Gold Rush reward outputs remain locked until quantum witness spends activate after the Gold Rush.")};
             }
         } else if (consensus.IsQuantumFinalLockout(mtp, next_height)) {
                 return util::Error{_("The migration deadline has passed; legacy coins are no longer spendable and cannot be migrated.")};
@@ -1442,18 +1450,36 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         filter.include_generated_quantum_inputs = goldrush_rewards_only;
 
         const CCoinsViewCache& view = wallet.chain().chainman().ActiveChainstate().CoinsTip();
+        unsigned int migration_anchor_inputs{0};
         for (const COutput& out : AvailableCoins(wallet, &coin_control, std::nullopt, filter).All()) {
             const CScript& spk = out.txout.scriptPubKey;
             if (goldrush_rewards_only) {
                 if (!IsQuantumMigrationScript(spk) || spk == destination_script) continue;
                 CScript marker_script;
                 if (!IsGoldRushDirectPayoutOutput(view, out.outpoint, &marker_script) || marker_script != spk) continue;
+                const Coin& coin = view.AccessCoin(out.outpoint);
+                if (coin.IsSpent()) continue;
+                const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+                    Consensus::LatestDemurrageAttestationStateForScript(view, spk);
+                const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+                    coin, consensus, next_height, mtp,
+                    latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+                    latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
+                if (eval.locked || eval.effective_value <= 0) continue;
+                effective_eligible_amount += eval.effective_value;
+                burned_amount += eval.burned_value;
             } else {
                 if (IsQuantumMigrationScript(spk) || IsQuantumColdStakeScript(spk) || IsEUTXOScript(spk)) continue;
                 if (!out.spendable) continue;
+                const Coin& coin = view.AccessCoin(out.outpoint);
+                if (!coin.IsSpent() && IsWalletProtectedLineageInput(
+                        wallet, out.outpoint, coin, consensus, mtp, next_height)) {
+                    ++migration_anchor_inputs;
+                }
             }
             coin_control.Select(out.outpoint);
             eligible_amount += out.txout.nValue;
+            if (!goldrush_rewards_only) effective_eligible_amount += out.txout.nValue;
             ++eligible_inputs;
         }
         if (eligible_inputs == 0) {
@@ -1461,8 +1487,12 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
                 ? _("No wallet-owned Gold Rush reward outputs need migration.")
                 : _("No spendable legacy coins to migrate.")};
         }
+        if (!goldrush_rewards_only && IsQuantumWitnessSpendActive(consensus, mtp, next_height) &&
+            migration_anchor_inputs == 0) {
+            return util::Error{_("This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction. Add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor; during Gold Rush, prepare that anchor before quantum spending activates.")};
+        }
 
-        std::vector<CRecipient> recipients{{destination, eligible_amount, /*fSubtractFeeFromAmount=*/true}};
+        std::vector<CRecipient> recipients{{destination, effective_eligible_amount, /*fSubtractFeeFromAmount=*/true}};
         int change_pos = RANDOM_CHANGE_POSITION;
         auto res = CreateTransaction(wallet, recipients, change_pos, coin_control, /*sign=*/true);
         if (!res) return util::Error{util::ErrorString(res)};
@@ -1494,18 +1524,10 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     result.vsize = static_cast<int>(GetVirtualTransactionSize(*tx, 0, 0));
     result.selected_inputs = eligible_inputs;
     result.selected_amount = eligible_amount;
-    result.warning = "A new ML-DSA quantum address was created. Back up this wallet before relying on the moved funds.";
+    result.warning = burned_amount > 0
+        ? strprintf("A new ML-DSA quantum address was created. This consolidation realizes %s of scheduled demurrage. Back up this wallet.", FormatMoney(burned_amount))
+        : "A new ML-DSA quantum address was created. Back up this wallet before relying on the moved funds.";
     return result;
-}
-
-util::Result<WalletQuantumActionTx> CreateGoldRushColdStakeMigration(CWallet& wallet)
-{
-    return CreateQuantumMigrationSweep(
-        wallet,
-        /*goldrush_rewards_only=*/true,
-        /*allow_goldrush_epoch=*/true,
-        "goldrush-coldstake-migration-gui",
-        "Blackcoin Gold Rush reward migration before cold-stake delegation");
 }
 
 namespace {
@@ -1603,8 +1625,12 @@ util::Result<WalletQuantumActionTx> CreateWalletDemurrageSweep(CWallet& wallet)
     for (const COutput& out : candidates) {
         const auto coin_it = chain_coins.find(out.outpoint);
         if (coin_it == chain_coins.end() || coin_it->second.IsSpent()) continue;
-        const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(view, out.txout.scriptPubKey);
-        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin_it->second, consensus, evaluation_height, evaluation_time, latest_attestation);
+        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+            Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
+        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+            coin_it->second, consensus, evaluation_height, evaluation_time,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
         if (eval.locked) {
             ++skipped_locked_outputs;
             skipped_locked_amount += eval.nominal_value;
@@ -1916,7 +1942,6 @@ public:
         int& change_pos,
         CAmount& fee) override
     {
-        LOCK(m_wallet->cs_wallet);
         auto res = CreateTransaction(*m_wallet, recipients, change_pos,
                                      coin_control, sign);
         if (!res) return util::Error{util::ErrorString(res)};
@@ -1930,14 +1955,21 @@ public:
         WalletValueMap value_map,
         WalletOrderForm order_form) override
     {
-        LOCK(m_wallet->cs_wallet);
-        m_wallet->CommitTransaction(std::move(tx), std::move(value_map), std::move(order_form));
+        std::string broadcast_error;
+        WalletCommitStatus status;
+        if (!m_wallet->CommitTransaction(tx, std::move(value_map), std::move(order_form), &broadcast_error, &status)) {
+            if (status == WalletCommitStatus::PERSISTED_PENDING) return;
+            throw std::runtime_error(broadcast_error.empty()
+                ? "Transaction could not be committed"
+                : broadcast_error);
+        }
     }
     bool transactionCanBeAbandoned(const uint256& txid) override { return m_wallet->TransactionCanBeAbandoned(txid); }
     bool abandonTransaction(const uint256& txid) override
     {
-        LOCK(m_wallet->cs_wallet);
-        return m_wallet->AbandonTransaction(txid);
+        const bool abandoned = m_wallet->AbandonTransaction(txid);
+        if (abandoned) m_wallet->ReconcileRGBAssignments();
+        return abandoned;
     }
     CTransactionRef getTx(const uint256& txid) override
     {
@@ -1971,6 +2003,10 @@ public:
         int& num_blocks,
         int64_t& block_time) override
     {
+        TRY_LOCK(::cs_main, locked_main);
+        if (!locked_main) {
+            return false;
+        }
         TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
         if (!locked_wallet) {
             return false;
@@ -2015,9 +2051,13 @@ public:
     {
         return m_wallet->FinalizeAndExtractPSBT(psbtx, mtx);
     }
+    std::pair<unsigned int, uint32_t> getPSBTAnalysisContext() const override
+    {
+        return {m_wallet->GetActiveScriptVerifyFlags(), Params().GetConsensus().nQuantumSighashChainId};
+    }
     WalletBalances getBalances() override
     {
-        LOCK(m_wallet->cs_wallet);
+        LOCK2(::cs_main, m_wallet->cs_wallet);
         const auto bal = GetBalance(*m_wallet);
         WalletBalances result;
         result.balance = bal.m_mine_trusted;
@@ -2050,6 +2090,10 @@ public:
     }
     bool tryGetBalances(WalletBalances& balances, uint256& block_hash) override
     {
+        TRY_LOCK(::cs_main, locked_main);
+        if (!locked_main) {
+            return false;
+        }
         TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
         if (!locked_wallet) {
             return false;
@@ -2061,7 +2105,7 @@ public:
     CAmount getBalance() override { return GetBalance(*m_wallet).m_mine_trusted; }
     CAmount getAvailableBalance(const CCoinControl& coin_control) override
     {
-        LOCK(m_wallet->cs_wallet);
+        LOCK2(::cs_main, m_wallet->cs_wallet);
         CAmount total_amount = 0;
         // Fetch selected coins total amount
         if (coin_control.HasSelected()) {
@@ -2102,7 +2146,7 @@ public:
     }
     CoinsList listCoins() override
     {
-        LOCK(m_wallet->cs_wallet);
+        LOCK2(::cs_main, m_wallet->cs_wallet);
         CoinsList result;
         for (const auto& entry : ListCoins(*m_wallet)) {
             auto& group = result[entry.first];
@@ -2160,6 +2204,10 @@ public:
     }
     bool tryGetStakeWeight(uint64_t& nWeight) override
     {
+        TRY_LOCK(::cs_main, locked_main);
+        if (!locked_main) {
+            return false;
+        }
         TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
         if (!locked_wallet) {
             return false;
@@ -2170,7 +2218,7 @@ public:
     }
     uint64_t getStakeWeight() override
     {
-        LOCK(m_wallet->cs_wallet);
+        LOCK2(::cs_main, m_wallet->cs_wallet);
         return m_wallet->GetStakeWeight();
     }
     int64_t getLastCoinStakeSearchInterval() override
@@ -2215,6 +2263,12 @@ public:
         info.shadow_reward_start_height = SHADOW_REWARD_START_HEIGHT;
         info.shadow_reward_end_height = SHADOW_REWARD_END_HEIGHT;
         std::set<CScript> wallet_scripts;
+        TRY_LOCK(::cs_main, main_lock);
+        if (!main_lock) {
+            info.payout_address_available = false;
+            info.wallet_goldrush_status_available = false;
+            return info;
+        }
         {
             TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
             if (wallet_lock) {
@@ -2233,8 +2287,6 @@ public:
         }
         if (m_wallet->HaveChain()) {
             ChainstateManager& chainman = m_wallet->chain().chainman();
-            TRY_LOCK(::cs_main, main_lock);
-            if (!main_lock) return info;
             Chainstate& active = chainman.ActiveChainstate();
             const CBlockIndex* tip = active.m_chain.Tip();
             if (tip) {
@@ -2534,18 +2586,23 @@ public:
             return util::Error{Untranslated("Invalid destination address")};
         }
 
-        LOCK(m_wallet->cs_wallet);
+        CTransactionRef tx;
+        CAmount fee{0};
         auto res = CreateUTXOOptimizationTransaction(*m_wallet, dest, utxo_amount, std::nullopt);
         if (!res) {
             return util::Error{util::ErrorString(res)};
         }
-        m_wallet->CommitTransaction(res->tx, {}, {});
+        tx = res->tx;
+        fee = res->fee;
+        if (auto commit = CommitWalletTransactionOrError(*m_wallet, tx, {}, "Blackcoin UTXO optimization"); !commit) {
+            return util::Error{util::ErrorString(commit)};
+        }
 
         WalletUTXOOptimizationTx out;
-        out.txid = res->tx->GetHash().GetHex();
-        out.fee = res->fee;
+        out.txid = tx->GetHash().GetHex();
+        out.fee = fee;
         const CScript dest_script = GetScriptForDestination(dest);
-        for (const CTxOut& txout : res->tx->vout) {
+        for (const CTxOut& txout : tx->vout) {
             if (txout.scriptPubKey == dest_script && txout.nValue == utxo_amount) {
                 out.outputs++;
                 out.output_amount += txout.nValue;
@@ -2578,16 +2635,22 @@ public:
         const bool passed = consensus.IsQuantumFinalLockout(mtp, next_height);
         const int64_t secs = (scheduled && consensus.nQuantumMigrationDeadlineTime > mtp)
                                  ? consensus.nQuantumMigrationDeadlineTime - mtp : 0;
+        const bool height_authoritative = consensus.UsesHeightLifecycle() && consensus.IsQuantumLifecycleScheduleOrdered();
+        const int64_t exact_blocks = height_authoritative && next_height <= consensus.nQuantumMigrationEndHeight
+            ? consensus.nQuantumMigrationEndHeight - next_height + 1 : 0;
         const bool quantum_active = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
 
         status.phase = QuantumQuasarPhaseName(consensus.GetQuantumQuasarPhase(mtp, next_height));
         status.median_time = mtp;
         status.deadline_mtp = consensus.nQuantumMigrationDeadlineTime;
+        status.deadline_height = consensus.nQuantumMigrationEndHeight;
         status.deadline_scheduled = scheduled;
+        status.height_boundaries_authoritative = height_authoritative;
         status.seconds_until_deadline = secs;
+        status.blocks_until_deadline = exact_blocks;
         status.blocks_until_deadline_est = secs / std::max<int64_t>(1, consensus.nTargetSpacing);
         status.deadline_passed = passed;
-        status.goldrush_remigration_active = !passed && quantum_active;
+        status.goldrush_remigration_active = quantum_active;
         status.quantum_spends_active = quantum_active;
 
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
@@ -2597,7 +2660,8 @@ public:
                 CTxDestination dest;
                 const bool wallet_owned = ExtractDestination(spk, dest) && m_wallet->GetQuantumKeyInfo(dest).has_value();
                 CScript marker_script;
-                if (IsGoldRushDirectPayoutOutput(view, out.outpoint, &marker_script) && marker_script == spk) {
+                if (IsLockedGoldRushPayoutOutput(view, out.outpoint, consensus,
+                        mtp, next_height, &marker_script) && marker_script == spk) {
                     status.goldrush_reward_amount_needing_move += out.txout.nValue;
                     ++status.goldrush_reward_outputs_needing_move;
                 } else if (wallet_owned) {
@@ -2619,14 +2683,10 @@ public:
             }
         }
 
-        if (passed && status.goldrush_reward_outputs_needing_move > 0) {
-            status.advice = "Deadline passed. Remaining Gold Rush reward outputs are permanently unspendable.";
-        } else if (passed) {
+        if (passed) {
             status.advice = "Deadline passed. Remaining legacy coins are permanently unspendable.";
-        } else if (status.goldrush_reward_outputs_needing_move > 0 && status.goldrush_remigration_active) {
-            status.advice = "Move Gold Rush reward outputs to a fresh quantum address before staking, delegation, or final lockout.";
         } else if (status.goldrush_reward_outputs_needing_move > 0) {
-            status.advice = "Gold Rush reward outputs become ordinary quantum funds after they are moved to a fresh quantum address.";
+            status.advice = "Gold Rush reward outputs remain locked until the Gold Rush ends; they then become ordinary quantum funds after normal maturity.";
         } else if (status.eligible_legacy_inputs == 0) {
             status.advice = "No legacy coins remain to migrate.";
         } else if (!scheduled) {

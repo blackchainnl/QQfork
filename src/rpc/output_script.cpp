@@ -7,23 +7,30 @@
 
 #include <key_io.h>
 #include <addresstype.h>
+#include <chain.h>
+#include <chainparams.h>
 #include <crypto/mldsa.h>
 #include <crypto/sha256.h>
+#include <kernel/cs_main.h>
 #include <outputtype.h>
 #include <pubkey.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <rpc/server.h>
+#include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
+#include <shadow.h>
+#include <sync.h>
 #include <tinyformat.h>
 #include <univalue.h>
 #include <uint256.h>
 #include <util/check.h>
 #include <util/strencodings.h>
+#include <validation.h>
 
 #include <cstdint>
 #include <memory>
@@ -120,7 +127,7 @@ static RPCHelpMan createquantummigrationaddress()
                 {RPCResult::Type::STR_HEX, "witness_program", "The 32-byte migration commitment"},
                 {RPCResult::Type::BOOL, "fundable_now", "Whether ordinary wallet/RPC policy currently permits funding this address type"},
                 {RPCResult::Type::BOOL, "spendable_now", "Whether this node can currently sign/spend this address type"},
-                {RPCResult::Type::BOOL, "consensus_spend_guard_active", "Whether this node still treats migration spends as permanently disabled"},
+                {RPCResult::Type::BOOL, "consensus_spend_guard_active", "Whether the scheduled phase gate currently disables migration funding and spending"},
                 {RPCResult::Type::STR, "warning", "Migration warning"},
             }},
         RPCExamples{
@@ -140,15 +147,28 @@ static RPCHelpMan createquantummigrationaddress()
 
     const CTxDestination dest = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, commitment};
 
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    bool quantum_spend_active{false};
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip = chainman.ActiveChain().Tip();
+        if (tip) {
+            quantum_spend_active = IsQuantumWitnessSpendActive(
+                chainman.GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1);
+        }
+    }
+
     UniValue ret(UniValue::VOBJ);
     ret.pushKV("address", EncodeDestination(dest));
     ret.pushKV("isvalid_destination", IsValidDestination(dest));
     ret.pushKV("witness_version", QUANTUM_MIGRATION_WITNESS_VERSION);
     ret.pushKV("witness_program", HexStr(commitment));
-    ret.pushKV("fundable_now", true);
-    ret.pushKV("spendable_now", false);
-    ret.pushKV("consensus_spend_guard_active", false);
-    ret.pushKV("warning", "Address is fundable. It is spendable only by the ML-DSA private key whose public key hashes to this witness program once quantum witness spending is active.");
+    ret.pushKV("fundable_now", quantum_spend_active);
+    ret.pushKV("spendable_now", quantum_spend_active);
+    ret.pushKV("consensus_spend_guard_active", !quantum_spend_active);
+    ret.pushKV("warning", quantum_spend_active
+        ? "Quantum funding is active. Spending requires the ML-DSA private key whose public key hashes to this witness program."
+        : "Address construction is available for planning, but base-chain funding and spending are disabled until Gold Rush ends.");
     return ret;
 },
     };

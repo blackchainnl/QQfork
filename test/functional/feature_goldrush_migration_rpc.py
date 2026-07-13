@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Exercise the migrategoldrushrewards wallet RPC end to end."""
+"""Exercise Gold Rush payout locking, ordinary maturity, and optional consolidation."""
 
 from decimal import Decimal
 import time
@@ -122,10 +122,10 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         )
         return raw, signed
 
-    def _assert_one_reward_needs_move(self, wallet, amount, *, phase, remigration_active):
+    def _assert_one_reward_locked(self, wallet, amount, *, phase):
         status = wallet.getmigrationstatus()
         assert_equal(status["phase"], phase)
-        assert_equal(status["goldrush_remigration_active"], remigration_active)
+        # Compatibility fields count only payouts that are still phase-locked.
         assert_equal(status["goldrush_reward_outputs_needing_move"], 1)
         assert_equal(Decimal(status["goldrush_reward_amount_needing_move"]), amount)
 
@@ -162,6 +162,13 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         assert_equal(legacy_dry_run["newly_generated"], False)
         assert_equal(len(wallet.listquantumaddresses()), quantum_count_before)
         wallet.walletpassphrase("test-passphrase", 600)
+        assert_raises_rpc_error(
+            -4,
+            "Quantum funding is disabled during Gold Rush",
+            wallet.migratetoquantum,
+            {},
+        )
+        assert_equal(len(wallet.listquantumaddresses()), quantum_count_before)
 
         self.log.info("Mining a Gold Rush payout to a wallet-backed quantum address")
         payout_address = wallet.getnewquantumaddress()["address"]
@@ -174,66 +181,57 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         self._sync_mocktime_to_tip()
         payout_utxo = self._wait_for_quantum_utxo(wallet, payout_address, min_conf=COINBASE_MATURITY + 1)
         payout_amount = Decimal(str(payout_utxo["amount"]))
-        self._assert_one_reward_needs_move(wallet, payout_amount, phase="gold_rush", remigration_active=False)
+        self._assert_one_reward_locked(wallet, payout_amount, phase="gold_rush")
 
-        self.log.info("Cold-stake funding honors explicit opt-out from Gold Rush migration side effects")
+        self.log.info("Cold-stake funding is phase-gated throughout Gold Rush")
         staker_key = wallet.dumpquantumkey(wallet.getnewquantumaddress()["address"])
         coldstake_address = wallet.getnewquantumcoldstakingaddress(staker_key["public_key"], "rpc-coldstake")["address"]
         mempool_before = set(node.getrawmempool())
         assert_raises_rpc_error(
             -4,
-            "allow_goldrush_migration=true",
+            "cannot be funded until the post-Gold-Rush migration phase",
             wallet.fundquantumcoldstakeaddress,
             coldstake_address,
             Decimal("1"),
             {"allow_goldrush_migration": False},
         )
         assert_equal(set(node.getrawmempool()), mempool_before)
-        self._assert_one_reward_needs_move(wallet, payout_amount, phase="gold_rush", remigration_active=False)
+        self._assert_one_reward_locked(wallet, payout_amount, phase="gold_rush")
 
         self.log.info("migrategoldrushrewards remains disabled during Gold Rush")
         goldrush_destination = wallet.getnewquantumaddress()["address"]
         assert_raises_rpc_error(
             -4,
-            "only allowed once quantum reward spends are active",
+            "remain locked until quantum witness spends activate after the Gold Rush",
             wallet.migrategoldrushrewards,
             {"dry_run": True, "existing_address": goldrush_destination},
         )
         assert_equal(wallet.getmigrationstatus()["goldrush_reward_outputs_needing_move"], 1)
 
         self.log.info("Advancing to the migration window")
-        mining_address = wallet.getnewquantumaddress()["address"]
+        # The bridge blocks are still validated under the preceding Gold Rush
+        # MTP context, so mine them to a legacy script until G+1 is active.
+        mining_address = wallet.getnewaddress("", "legacy")
         self._mine_until_phase("migration", GOLD_RUSH_END_TIME + 16, mining_address)
         status = wallet.getmigrationstatus()
         assert_equal(status["phase"], "migration")
         assert_equal(status["goldrush_remigration_active"], True)
-        assert_equal(status["goldrush_reward_outputs_needing_move"], 1)
+        assert_equal(status["goldrush_reward_outputs_needing_move"], 0)
+        assert_equal(Decimal(status["goldrush_reward_amount_needing_move"]), Decimal("0"))
 
-        self.log.info("Ordinary sends do not auto-consume unmoved Gold Rush reward outputs")
+        self.log.info("A matured payout is an ordinary quantum input after Gold Rush")
         non_reward_locks = [
             {"txid": utxo["txid"], "vout": utxo["vout"]}
             for utxo in wallet.listunspent(1, 9999999)
             if utxo["txid"] != payout_utxo["txid"] or utxo["vout"] != payout_utxo["vout"]
         ]
         wallet.lockunspent(False, non_reward_locks)
-        try:
-            assert_raises_rpc_error(
-                -6,
-                "Insufficient funds",
-                wallet.sendtoaddress,
-                wallet.getnewquantumaddress()["address"],
-                Decimal("1"),
-            )
-        finally:
-            wallet.lockunspent(True, non_reward_locks)
-        self._assert_one_reward_needs_move(wallet, payout_amount, phase="migration", remigration_active=True)
-
-        self.log.info("Raw spends cannot bypass the Gold Rush fresh-address move rule")
+        self.log.info("A same-address raw spend is valid; no fresh-address covenant exists")
         _, same_address_signed = self._build_quantum_spend(wallet, payout_utxo, payout_address)
         assert_equal(same_address_signed["complete"], True)
         same_address_accept = node.testmempoolaccept([same_address_signed["hex"]])[0]
-        assert_equal(same_address_accept["allowed"], False)
-        assert_equal(same_address_accept["reject-reason"], "goldrush-remigration-same-address")
+        if not same_address_accept["allowed"]:
+            raise AssertionError(f"ordinary same-address payout spend rejected: {same_address_accept}")
 
         self.log.info("migrategoldrushrewards can dry-run once migration activates quantum reward spends")
         assert_raises_rpc_error(
@@ -243,15 +241,15 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
             {"dry_run": True},
         )
 
-        self.log.info("The RPC refuses to remigrate a payout back to the same quantum address")
+        self.log.info("Optional consolidation does not create a no-op same-address transaction")
         assert_raises_rpc_error(
             -6,
-            "No wallet-owned Gold Rush reward outputs need migration",
+            "No mature wallet-owned Gold Rush reward outputs",
             wallet.migrategoldrushrewards,
             {"existing_address": payout_address},
         )
 
-        self.log.info("Dry run reports fees and leaves the reward output unmoved")
+        self.log.info("Optional consolidation dry-run reports fees without changing spendability")
         migration_address = wallet.getnewquantumaddress()["address"]
         quantum_count_before = len(wallet.listquantumaddresses())
         dry_run = wallet.migrategoldrushrewards({"dry_run": True, "existing_address": migration_address})
@@ -265,25 +263,24 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         assert Decimal(dry_run["fee"]) > 0
         assert Decimal(dry_run["amount"]) == payout_amount - Decimal(dry_run["fee"])
         assert_equal(len(wallet.listquantumaddresses()), quantum_count_before)
-        assert_equal(wallet.getmigrationstatus()["goldrush_reward_outputs_needing_move"], 1)
-
-        self.log.info("Migrating the reward creates a wallet transaction and clears the need-to-move count")
-        migration = wallet.migrategoldrushrewards({"existing_address": migration_address})
-        assert_equal(migration["phase"], "migration")
-        assert_equal(migration["eligible_inputs"], 1)
-        assert_equal(migration["destination"], migration_address)
-        assert_equal(migration["newly_generated"], False)
-        assert migration["txid"] in node.getrawmempool()
-        migration_block = self.generatetoaddress(node, 1, mining_address, sync_fun=self.no_op)[0]
-        assert migration["txid"] in node.getblock(migration_block)["tx"]
-        node.syncwithvalidationinterfacequeue()
         assert_equal(wallet.getmigrationstatus()["goldrush_reward_outputs_needing_move"], 0)
+
+        self.log.info("sendtoaddress selects the payout directly and mines it without consolidation")
+        ordinary_destination = wallet.getnewquantumaddress()["address"]
+        try:
+            ordinary_txid = wallet.sendtoaddress(ordinary_destination, Decimal("1"))
+        finally:
+            wallet.lockunspent(True, non_reward_locks)
+        assert ordinary_txid in node.getrawmempool()
+        ordinary_block = self.generatetoaddress(node, 1, mining_address, sync_fun=self.no_op)[0]
+        assert ordinary_txid in node.getblock(ordinary_block)["tx"]
+        node.syncwithvalidationinterfacequeue()
         assert node.gettxout(payout_utxo["txid"], payout_utxo["vout"], False) is None
 
-        migrated_utxo = self._wait_for_quantum_utxo(wallet, migration_address, min_conf=1)
-        assert_equal(Decimal(str(migrated_utxo["amount"])), Decimal(migration["amount"]))
+        ordinary_utxo = self._wait_for_quantum_utxo(wallet, ordinary_destination, min_conf=1)
+        assert_equal(Decimal(str(ordinary_utxo["amount"])), Decimal("1"))
 
-        self.log.info("Reloading and rescanning preserves migrated reward state and quantum key usability")
+        self.log.info("Reloading and rescanning preserves ordinary payout-spend state")
         wallet.unloadwallet()
         node.loadwallet(WALLET_NAME)
         wallet = node.get_wallet_rpc(WALLET_NAME)
@@ -291,20 +288,20 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         wallet.rescanblockchain(0)
         node.syncwithvalidationinterfacequeue()
         assert_equal(wallet.getmigrationstatus()["goldrush_reward_outputs_needing_move"], 0)
-        migrated_utxo = self._wait_for_quantum_utxo(wallet, migration_address, min_conf=1)
-        assert_equal(Decimal(str(migrated_utxo["amount"])), Decimal(migration["amount"]))
+        ordinary_utxo = self._wait_for_quantum_utxo(wallet, ordinary_destination, min_conf=1)
+        assert_equal(Decimal(str(ordinary_utxo["amount"])), Decimal("1"))
 
-        self.log.info("The migrated quantum output signs and spends as a normal migration-window quantum coin")
+        self.log.info("The payout-derived quantum output remains an ordinary migration-window coin")
         final_destination = wallet.getnewquantumaddress()["address"]
-        _, spend_signed = self._build_quantum_spend(wallet, migrated_utxo, final_destination)
+        _, spend_signed = self._build_quantum_spend(wallet, ordinary_utxo, final_destination)
         assert_equal(spend_signed["complete"], True)
         accepted = node.testmempoolaccept([spend_signed["hex"]])[0]
         if not accepted["allowed"]:
-            raise AssertionError(f"migrated quantum spend rejected: {accepted}")
+            raise AssertionError(f"ordinary quantum spend rejected: {accepted}")
         spend_txid = node.sendrawtransaction(spend_signed["hex"])
         spend_block = self.generatetoaddress(node, 1, mining_address, sync_fun=self.no_op)[0]
         assert spend_txid in node.getblock(spend_block)["tx"]
-        assert node.gettxout(migrated_utxo["txid"], migrated_utxo["vout"], False) is None
+        assert node.gettxout(ordinary_utxo["txid"], ordinary_utxo["vout"], False) is None
 
 
 if __name__ == "__main__":

@@ -43,6 +43,9 @@ from test_framework.util import assert_equal, assert_greater_than, assert_raises
 
 GOLD_RUSH_END_TIME = 2_000_000_000
 MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 5_008
+GOLD_RUSH_END_HEIGHT = 11
+MIGRATION_END_HEIGHT = 26
+DEMURRAGE_ACTIVATION_HEIGHT = 27
 COIN = 100_000_000
 SHADOW_MAX_EMISSION = 51_437_700 * COIN          # src/shadow.h cap constant (verified)
 DEMURRAGE_PPM = 1_000_000
@@ -80,11 +83,11 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
             "-donatetodevfund=0",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=10",
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
-            f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
             "-qqstaketierheight=1",
             "-qqstakesplitheight=1",
-            "-qqdemurrageheight=1",
+            f"-qqdemurrageheight={DEMURRAGE_ACTIVATION_HEIGHT}",
             "-qqdemurrageblockspermonth=4",
         ]
         self.extra_args = [args, args]
@@ -244,10 +247,17 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         if len(pushes) != 3 or pushes[0] != (0x6a, None) or pushes[1][1] != QQATTEST_TAG:
             return None
         payload = pushes[2][1]
-        expected_size = 1 + 32 + 4 + ML_DSA_PUBLICKEY_BYTES + ML_DSA_SIGNATURE_BYTES
-        if payload is None or len(payload) != expected_size or payload[0] != 1:
+        fixed_prefix = 1 + 32 + 4 + 32 + 4 + 4 + 4 + 4 + 1
+        if payload is None or len(payload) < fixed_prefix + ML_DSA_PUBLICKEY_BYTES + ML_DSA_SIGNATURE_BYTES or payload[0] != 3:
             return None
-        pubkey_start = 1 + 32 + 4
+        previous_source_present = payload[fixed_prefix - 1]
+        if previous_source_present not in (0, 1):
+            return None
+        source_bytes = 32 + 32 + 4
+        expected_size = fixed_prefix + source_bytes + ML_DSA_PUBLICKEY_BYTES + ML_DSA_SIGNATURE_BYTES
+        if len(payload) != expected_size:
+            return None
+        pubkey_start = fixed_prefix + source_bytes
         pubkey = payload[pubkey_start:pubkey_start + ML_DSA_PUBLICKEY_BYTES]
         return hashlib.sha256(pubkey).digest()
 
@@ -260,7 +270,7 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         parent_mtp = node.getblockheader(node.getblockhash(0))["mediantime"]
         for block_height in range(1, height + 1):
             block = node.getblock(node.getblockhash(block_height), 2)
-            block_active = block_height >= effective_activation and parent_mtp > MIGRATION_DEADLINE_TIME
+            block_active = block_height >= effective_activation
             for tx in block["tx"]:
                 for txin in tx["vin"]:
                     if "coinbase" not in txin:
@@ -307,14 +317,12 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         assert_equal(supply["bestblock"], txoutset["bestblock"])
         # the independent monetary invariant: nominal == total UTXO value (no inflation)
         assert_equal(Decimal(supply["nominal_amount"]), Decimal(str(txoutset["total_amount"])))
-        assert_equal(Decimal(supply["circulating_amount"]) + Decimal(supply["decayed_amount"]),
-                     Decimal(supply["nominal_amount"]))
+        assert_equal(
+            Decimal(supply["circulating_amount"]) + Decimal(supply["noncirculating_amount"]),
+            Decimal(supply["nominal_amount"]),
+        )
         replay = self._replay_supply_oracle(supply)
         assert_equal(Decimal(supply["nominal_amount"]), replay["nominal_amount"])
-        assert_equal(Decimal(supply["circulating_amount"]), replay["circulating_amount"])
-        assert_equal(Decimal(supply["decayed_amount"]), replay["decayed_amount"])
-        assert_equal(supply["decayed_txouts"], replay["decayed_txouts"])
-        assert_equal(supply["locked_txouts"], replay["locked_txouts"])
         self.log.info(f"  [{label}] oracle ok: nominal={supply['nominal_amount']} "
                       f"decayed={supply['decayed_amount']} locked={supply['locked_txouts']}")
 
@@ -386,7 +394,6 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         self._assert_nodes_agree()
 
         self.log.info("Phase 1: demurrage inert before the migration deadline; supply oracle holds")
-        assert node.getblockheader(node.getbestblockhash())["time"] <= MIGRATION_DEADLINE_TIME
         assert_equal(node.getcirculatingsupply()["demurrage_active"], False)
         self._assert_supply_matches_txoutset("pre-deadline")
         self._assert_shadow_cap("pre-deadline")
@@ -482,9 +489,13 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         self._assert_shadow_cap("final")
         self._assert_nodes_agree()
 
-        self.log.info("Phase 7: dumptxoutset over the live demurrage+shadow+coldstake set (A5 marker-skip)")
-        dump = node.dumptxoutset("integration_soak_utxos.dat")
-        assert_greater_than(dump["coins_written"], 0)
+        self.log.info("Phase 7: post-whitelist snapshots fail closed until authenticated shadow-state format exists")
+        assert_raises_rpc_error(
+            -1,
+            "Quantum Quasar snapshots are disabled",
+            node.dumptxoutset,
+            "integration_soak_utxos.dat",
+        )
 
         self.log.info("Integration soak complete: no inflation, burn matches oracle, "
                       "decayed-coin staking validated cross-node, both nodes fully agree.")

@@ -512,24 +512,20 @@ static void MutateTxDelOutput(CMutableTransaction& tx, const std::string& strOut
     tx.vout.erase(tx.vout.begin() + outIdx);
 }
 
-static const unsigned int N_SIGHASH_OPTS = 13;
+// The standalone mutation tool has no active-chain lifecycle or network
+// chain-id context, so it must not offer Quantum Quasar ForkID signing.
+static const unsigned int N_SIGHASH_OPTS = 7;
 static const struct {
     const char *flagStr;
     int flags;
 } sighashOptions[N_SIGHASH_OPTS] = {
     {"DEFAULT", SIGHASH_DEFAULT},
     {"ALL", SIGHASH_ALL},
-    {"ALL|FORKID", SIGHASH_ALL|SIGHASH_FORKID},
     {"NONE", SIGHASH_NONE},
-    {"NONE|FORKID", SIGHASH_NONE|SIGHASH_FORKID},
     {"SINGLE", SIGHASH_SINGLE},
-    {"SINGLE|FORKID", SIGHASH_SINGLE|SIGHASH_FORKID},
     {"ALL|ANYONECANPAY", SIGHASH_ALL|SIGHASH_ANYONECANPAY},
-    {"ALL|FORKID|ANYONECANPAY", SIGHASH_ALL|SIGHASH_FORKID|SIGHASH_ANYONECANPAY},
     {"NONE|ANYONECANPAY", SIGHASH_NONE|SIGHASH_ANYONECANPAY},
-    {"NONE|FORKID|ANYONECANPAY", SIGHASH_NONE|SIGHASH_FORKID|SIGHASH_ANYONECANPAY},
     {"SINGLE|ANYONECANPAY", SIGHASH_SINGLE|SIGHASH_ANYONECANPAY},
-    {"SINGLE|FORKID|ANYONECANPAY", SIGHASH_SINGLE|SIGHASH_FORKID|SIGHASH_ANYONECANPAY},
 };
 
 static bool findSighashFlags(int& flags, const std::string& flagStr)
@@ -661,7 +657,7 @@ static void MutateTxSign(CMutableTransaction& tx, const std::string& flagStr)
 
     const FillableSigningProvider& keystore = tempKeystore;
 
-    bool fHashSingle = ((nHashType & ~SIGHASH_ANYONECANPAY) == SIGHASH_SINGLE);
+    bool fHashSingle = ((nHashType & ~(SIGHASH_ANYONECANPAY | SIGHASH_FORKID)) == SIGHASH_SINGLE);
 
     // Sign what we can:
     for (unsigned int i = 0; i < mergedTx.vin.size(); i++) {

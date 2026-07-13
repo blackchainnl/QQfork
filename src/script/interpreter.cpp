@@ -219,11 +219,12 @@ bool IsDERSignature(const valtype &vchSig, ScriptError* serror, bool haveHashTyp
     return true;
 }
 
-bool static IsDefinedHashtypeSignature(const valtype &vchSig) {
+bool static IsDefinedHashtypeSignature(const valtype &vchSig, bool forkid_active) {
     if (vchSig.size() == 0) {
         return false;
     }
-    unsigned char nHashType = vchSig[vchSig.size() - 1] & ~(SIGHASH_ANYONECANPAY | SIGHASH_FORKID);
+    unsigned char nHashType = vchSig[vchSig.size() - 1] & ~SIGHASH_ANYONECANPAY;
+    if (forkid_active) nHashType &= ~SIGHASH_FORKID;
     if (nHashType < SIGHASH_ALL || nHashType > SIGHASH_SINGLE)
         return false;
 
@@ -241,16 +242,19 @@ bool CheckSignatureEncoding(const std::vector<unsigned char> &vchSig, unsigned i
     } else if ((flags & SCRIPT_VERIFY_LOW_S) != 0 && !IsLowDERSignature(vchSig, serror, true)) {
         // serror is set
         return false;
-    } else if ((flags & SCRIPT_VERIFY_STRICTENC) != 0 && !IsDefinedHashtypeSignature(vchSig)) {
+    } else if ((flags & SCRIPT_VERIFY_STRICTENC) != 0 &&
+               !IsDefinedHashtypeSignature(vchSig, flags & SCRIPT_ENABLE_SIGHASH_FORKID)) {
         return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
     }
 
-    if ((vchSig.back() & SIGHASH_FORKID) != 0) {
-        if ((flags & SCRIPT_ENABLE_SIGHASH_FORKID) == 0) {
-            return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
-        }
-    } else if ((flags & SCRIPT_ENABLE_SIGHASH_FORKID) != 0) {
-            return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
+    const bool signature_has_forkid = (vchSig.back() & SIGHASH_FORKID) != 0;
+    const bool forkid_enabled = (flags & SCRIPT_ENABLE_SIGHASH_FORKID) != 0;
+    // At G+1 every legacy ECDSA signature must opt into the new chain domain.
+    // Before G, preserve the designated legacy client's raw-hashtype
+    // semantics: 0x40 is not a defined base type under STRICTENC, but blocks
+    // validated without STRICTENC may contain a correctly signed raw 0x41.
+    if (forkid_enabled && !signature_has_forkid) {
+        return set_error(serror, SCRIPT_ERR_SIG_HASHTYPE);
     }
 
     return true;
@@ -1627,7 +1631,7 @@ template <class T>
 uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn, int nHashType, const CAmount& amount, SigVersion sigversion, const PrecomputedTransactionData* cache)
 {
     assert(nIn < txTo.vin.size());
-    const bool forkid = nHashType & SIGHASH_FORKID;
+    const bool forkid = (nHashType & SIGHASH_FORKID) && cache && cache->m_sighash_forkid_active;
 
     if (sigversion == SigVersion::WITNESS_V0) {
         uint256 hashPrevouts;
@@ -1654,7 +1658,9 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
 
         HashWriter ss{};
         if (forkid) {
-            ss << std::string("Quantum Quasar SIGHASH_FORKID v1");
+            assert(cache->m_quantum_sighash_chain_id != 0);
+            ss << std::string("Quantum Quasar ECDSA SIGHASH_FORKID v2")
+               << cache->m_quantum_sighash_chain_id;
         }
         // Version
         ss << txTo.nVersion;
@@ -1685,7 +1691,25 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
     // Check for invalid use of SIGHASH_SINGLE
     if ((nHashType & 0x1f) == SIGHASH_SINGLE) {
         if (nIn >= txTo.vout.size()) {
-            //  nOut out of range
+            if (forkid) {
+                // The historical constant-one sentinel is identical on every
+                // chain and defeats a ForkID anchor. Domain-separate this
+                // invalid-SINGLE lane as well so it cannot validate on the
+                // legacy fork.
+                assert(cache->m_quantum_sighash_chain_id != 0);
+                HashWriter invalid_single{};
+                invalid_single << std::string("Quantum Quasar ECDSA invalid SIGHASH_SINGLE v2")
+                               << cache->m_quantum_sighash_chain_id
+                               << txTo.nVersion;
+                if (txTo.nVersion < 2) invalid_single << txTo.nTime;
+                invalid_single << static_cast<uint64_t>(txTo.vin.size());
+                for (const CTxIn& input : txTo.vin) {
+                    invalid_single << input.prevout << input.nSequence;
+                }
+                invalid_single << txTo.vout << txTo.nLockTime << nIn << nHashType;
+                return invalid_single.GetHash();
+            }
+            // Legacy nOut-out-of-range behavior.
             return uint256::ONE;
         }
     }
@@ -1696,7 +1720,9 @@ uint256 SignatureHash(const CScript& scriptCode, const T& txTo, unsigned int nIn
     // Serialize and hash
     HashWriter ss{};
     if (forkid) {
-        ss << std::string("Quantum Quasar SIGHASH_FORKID v1");
+        assert(cache->m_quantum_sighash_chain_id != 0);
+        ss << std::string("Quantum Quasar ECDSA SIGHASH_FORKID v2")
+           << cache->m_quantum_sighash_chain_id;
     }
     ss << txTmp << nHashType;
     return ss.GetHash();
@@ -1706,9 +1732,18 @@ template <class T>
 uint256 QuantumSignatureHashWithCache(const T& txTo, unsigned int nIn, const PrecomputedTransactionData* cache)
 {
     HashWriter ss{};
-    ss << std::string("Quantum Quasar ML-DSA spend v2");
+    ss << std::string("Quantum Quasar ML-DSA spend v3");
     ss << (cache ? cache->m_quantum_sighash_chain_id : uint32_t{0});
-    ss << TX_NO_WITNESS(txTo);
+    ss << txTo.nVersion;
+    if (txTo.nVersion < 2) ss << txTo.nTime;
+    ss << static_cast<uint64_t>(txTo.vin.size());
+    for (const CTxIn& input : txTo.vin) {
+        // scriptSig is deliberately normalized away. Legacy anchor scripts
+        // are validated independently, while excluding satisfaction bytes
+        // makes mixed-input PSBT/raw signing order-independent.
+        ss << input.prevout << input.nSequence;
+    }
+    ss << txTo.vout << txTo.nLockTime;
     ss << nIn;
     if (cache && cache->m_spent_outputs_ready && cache->m_spent_outputs.size() == txTo.vin.size()) {
         ss << cache->m_spent_outputs;
@@ -1722,9 +1757,15 @@ template <class T>
 uint256 QuantumSignatureHashForSpentOutputs(const T& txTo, unsigned int nIn, const std::vector<CTxOut>& spent_outputs, uint32_t chain_id)
 {
     HashWriter ss{};
-    ss << std::string("Quantum Quasar ML-DSA spend v2");
+    ss << std::string("Quantum Quasar ML-DSA spend v3");
     ss << chain_id;
-    ss << TX_NO_WITNESS(txTo);
+    ss << txTo.nVersion;
+    if (txTo.nVersion < 2) ss << txTo.nTime;
+    ss << static_cast<uint64_t>(txTo.vin.size());
+    for (const CTxIn& input : txTo.vin) {
+        ss << input.prevout << input.nSequence;
+    }
+    ss << txTo.vout << txTo.nLockTime;
     ss << nIn;
     ss << spent_outputs;
     return ss.GetHash();
@@ -1784,6 +1825,12 @@ bool GenericTransactionSignatureChecker<T>::CheckECDSASignature(const std::vecto
     int nHashType = vchSig.back();
     vchSig.pop_back();
 
+    if (this->txdata && this->txdata->m_sighash_forkid_active &&
+        (nHashType & SIGHASH_FORKID) &&
+        (nHashType & 0x1f) == SIGHASH_SINGLE && nIn >= txTo->vout.size()) {
+        return false;
+    }
+
     // Witness sighashes need the amount.
     if (sigversion == SigVersion::WITNESS_V0 && amount < 0) return HandleMissingData(m_mdb);
 
@@ -1801,6 +1848,9 @@ bool GenericTransactionSignatureChecker<T>::CheckMLDSASignature(Span<const unsig
     if (sig.size() != ML_DSA::SIGNATURE_BYTES) return set_error(serror, SCRIPT_ERR_ML_DSA_SIG_SIZE);
     if (pubkey.size() != ML_DSA::PUBLICKEY_BYTES) return set_error(serror, SCRIPT_ERR_ML_DSA_PUBKEY_SIZE);
     if (!txTo || !this->txdata || !this->txdata->m_spent_outputs_ready) return HandleMissingData(m_mdb);
+    if (this->txdata->m_quantum_sighash_chain_id == 0) {
+        return set_error(serror, SCRIPT_ERR_ML_DSA_SIG);
+    }
 
     const uint256 sighash = QuantumSignatureHashWithCache(*txTo, nIn, this->txdata);
     if (!VerifyMLDSASignature(sig, pubkey, sighash)) return set_error(serror, SCRIPT_ERR_ML_DSA_SIG);
@@ -2082,8 +2132,8 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             }
             return set_success(serror);
         }
-    } else if (witversion == static_cast<int>(EUTXO_WITNESS_VERSION) && program.size() == EUTXO_PROGRAM_SIZE) {
-        if (!(flags & SCRIPT_VERIFY_EUTXO)) return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
+    } else if (witversion == static_cast<int>(EUTXO_WITNESS_VERSION) && program.size() == EUTXO_PROGRAM_SIZE &&
+               (flags & SCRIPT_VERIFY_EUTXO)) {
         if (is_p2sh) return set_error(serror, SCRIPT_ERR_WITNESS_MALLEATED_P2SH);
         if (stack.size() < 3) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
 
@@ -2111,8 +2161,8 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
         eutxo_stack.push_back(datum);
         eutxo_stack.push_back(redeemer);
         return ExecuteWitnessScript(Span<const valtype>{eutxo_stack}, exec_script, flags, SigVersion::WITNESS_V0, checker, execdata, serror);
-    } else if (witversion == static_cast<int>(QUANTUM_MIGRATION_WITNESS_VERSION) && IsQuantumMigrationWitnessProgram(witversion, program)) {
-        if (!(flags & SCRIPT_VERIFY_QUANTUM_ML_DSA)) return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
+    } else if (witversion == static_cast<int>(QUANTUM_MIGRATION_WITNESS_VERSION) && IsQuantumMigrationWitnessProgram(witversion, program) &&
+               (flags & SCRIPT_VERIFY_QUANTUM_ML_DSA)) {
         if (program.size() == QUANTUM_TIERED_PROGRAM_SIZE && !(flags & SCRIPT_VERIFY_QUANTUM_STAKE_TIERS)) return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
         if (is_p2sh) return set_error(serror, SCRIPT_ERR_WITNESS_MALLEATED_P2SH);
         if (stack.size() != 2) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
@@ -2128,8 +2178,8 @@ static bool VerifyWitnessProgram(const CScriptWitness& witness, int witversion, 
             return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
         }
         return checker.CheckMLDSASignature(signature, pubkey, serror);
-    } else if (witversion == static_cast<int>(QUANTUM_COLDSTAKE_WITNESS_VERSION) && IsQuantumColdStakeWitnessProgram(witversion, program)) {
-        if (!(flags & SCRIPT_VERIFY_QUANTUM_COLDSTAKE)) return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
+    } else if (witversion == static_cast<int>(QUANTUM_COLDSTAKE_WITNESS_VERSION) && IsQuantumColdStakeWitnessProgram(witversion, program) &&
+               (flags & SCRIPT_VERIFY_QUANTUM_COLDSTAKE)) {
         if (program.size() == QUANTUM_TIERED_PROGRAM_SIZE && !(flags & SCRIPT_VERIFY_QUANTUM_STAKE_TIERS)) return set_error(serror, SCRIPT_ERR_DISCOURAGE_UPGRADABLE_WITNESS_PROGRAM);
         if (is_p2sh) return set_error(serror, SCRIPT_ERR_WITNESS_MALLEATED_P2SH);
         if (stack.size() != 4) return set_error(serror, SCRIPT_ERR_WITNESS_PROGRAM_MISMATCH);
@@ -2299,7 +2349,8 @@ bool VerifyScript(const CScript& scriptSig, const CScript& scriptPubKey, const C
     return set_success(serror);
 }
 
-size_t static WitnessSigOps(int witversion, const std::vector<unsigned char>& witprogram, const CScriptWitness& witness)
+size_t static WitnessSigOps(int witversion, const std::vector<unsigned char>& witprogram,
+                            const CScriptWitness& witness, unsigned int flags)
 {
     if (witversion == 0) {
         if (witprogram.size() == WITNESS_V0_KEYHASH_SIZE)
@@ -2311,17 +2362,20 @@ size_t static WitnessSigOps(int witversion, const std::vector<unsigned char>& wi
         }
     }
 
-    if (witversion == static_cast<int>(QUANTUM_MIGRATION_WITNESS_VERSION) &&
+    if ((flags & SCRIPT_VERIFY_QUANTUM_ML_DSA) &&
+        witversion == static_cast<int>(QUANTUM_MIGRATION_WITNESS_VERSION) &&
         IsQuantumMigrationWitnessProgram(witversion, witprogram)) {
         return QUANTUM_ML_DSA_WITNESS_SIGOPS;
     }
 
-    if (witversion == static_cast<int>(QUANTUM_COLDSTAKE_WITNESS_VERSION) &&
+    if ((flags & SCRIPT_VERIFY_QUANTUM_COLDSTAKE) &&
+        witversion == static_cast<int>(QUANTUM_COLDSTAKE_WITNESS_VERSION) &&
         IsQuantumColdStakeWitnessProgram(witversion, witprogram)) {
         return QUANTUM_COLDSTAKE_WITNESS_SIGOPS;
     }
 
-    if (witversion == static_cast<int>(EUTXO_WITNESS_VERSION) &&
+    if ((flags & SCRIPT_VERIFY_EUTXO) &&
+        witversion == static_cast<int>(EUTXO_WITNESS_VERSION) &&
         witprogram.size() == EUTXO_PROGRAM_SIZE &&
         witness.stack.size() >= 3) {
         const auto& validator_script = witness.stack.back();
@@ -2344,7 +2398,7 @@ size_t CountWitnessSigOps(const CScript& scriptSig, const CScript& scriptPubKey,
     int witnessversion;
     std::vector<unsigned char> witnessprogram;
     if (scriptPubKey.IsWitnessProgram(witnessversion, witnessprogram)) {
-        return WitnessSigOps(witnessversion, witnessprogram, witness ? *witness : witnessEmpty);
+        return WitnessSigOps(witnessversion, witnessprogram, witness ? *witness : witnessEmpty, flags);
     }
 
     if (scriptPubKey.IsPayToScriptHash() && scriptSig.IsPushOnly()) {
@@ -2356,7 +2410,7 @@ size_t CountWitnessSigOps(const CScript& scriptSig, const CScript& scriptPubKey,
         }
         CScript subscript(data.begin(), data.end());
         if (subscript.IsWitnessProgram(witnessversion, witnessprogram)) {
-            return WitnessSigOps(witnessversion, witnessprogram, witness ? *witness : witnessEmpty);
+            return WitnessSigOps(witnessversion, witnessprogram, witness ? *witness : witnessEmpty, flags);
         }
     }
 

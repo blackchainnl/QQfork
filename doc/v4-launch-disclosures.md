@@ -5,11 +5,10 @@ reviewers before Blackcoin Core Protocol V4 (Quantum Quasar) is deployed.
 
 ## Gold Rush reward model
 
-Gold Rush rewards are credited only to quantum migration addresses. A reward
-credited to the address that mined or claimed it must be moved once to a fresh
-quantum address before ordinary wallet funding, cold-stake delegation, or node
-bonding uses it. Wallet workflows avoid selecting unmoved reward outputs by
-default, and consensus rejects same-address remigration attempts.
+Gold Rush rewards are credited only to quantum migration addresses and remain
+locked until the Gold Rush reward-height window ends. After normal maturity, a
+payout is an ordinary direct quantum UTXO. No fresh-address move, expiry, or
+remigration is required; optional consolidation is a wallet convenience only.
 
 PoS Gold Rush eligibility is based on the deterministic whitelist snapshot. The
 snapshot aggregates spendable balance by canonical spend target at the snapshot
@@ -39,7 +38,7 @@ and equalized across active eligible targets.
 
 Wallet code treats several outputs as protected by default:
 
-- unmoved Gold Rush quantum rewards;
+- Gold Rush quantum rewards while their phase lock is active;
 - bonded or still-unbonding tiered quantum staking outputs;
 - fully locked demurrage outputs;
 - RGB/EUTXO seal outputs.
@@ -49,8 +48,7 @@ reject invalid raw spends for the critical cases:
 
 - bonded tiered principal cannot be redirected outside the allowed covenant;
 - fully locked demurrage outputs cannot be spent;
-- unmoved Gold Rush rewards cannot satisfy the required first move by paying
-  back to the same quantum address.
+- phase-locked Gold Rush rewards cannot be spent before the Gold Rush boundary.
 
 The wallet also uses demurrage-adjusted effective input value for partially
 decayed outputs during automatic and manual coin selection, so transaction
@@ -80,3 +78,8 @@ The final red-team pass identified four items that were handled before export:
 - wallet exclusions have consensus backstop tests for raw crafted spends;
 - the PoW winner-take-claim model is explicitly disclosed as a launch tradeoff;
 - partially decayed outputs use effective-value accounting in wallet funding.
+- pre-Gold-Rush unknown-witness block behavior, signed transaction wire format,
+  PoS kernel flags, and legacy coin timestamps were red-team checked against
+  the designated legacy implementation;
+- Final/demurrage activation is height-authoritative and survives restart,
+  reorg, and `-reindex-chainstate`.

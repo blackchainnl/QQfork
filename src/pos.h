@@ -49,7 +49,9 @@ bool CheckKernel(CBlockIndex* pindexPrev, unsigned int nBits, uint32_t nTime, co
 bool CheckKernel(CBlockIndex* pindexPrev, unsigned int nBits, uint32_t nTime, const COutPoint& prevout, CCoinsViewCache& view, const std::map<COutPoint, CStakeCache>& cache);
 bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, uint32_t blockFromTime, CAmount prevoutValue, const COutPoint& prevout, const CScript& scriptPubKey, unsigned int nTimeTx, bool fPrintProofOfStake = false);
 bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, uint32_t blockFromTime, CAmount prevoutValue, const COutPoint& prevout, const CScript& scriptPubKey, unsigned int nTimeTx, const StakeWeightContext& weight_context, bool fPrintProofOfStake);
-bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned int nBits, BlockValidationState& state, CCoinsViewCache& view, unsigned int nTimeTx);
+bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned int nBits,
+                       BlockValidationState& state, CCoinsViewCache& view,
+                       unsigned int nTimeTx, const ChainstateManager& chainman);
 void CacheKernel(std::map<COutPoint, CStakeCache>& cache, const COutPoint& prevout, CBlockIndex* pindexPrev, CCoinsViewCache& view);
 CAmount GetKernelStakeValue(const Coin& coin, const CCoinsViewCache& view, const Consensus::Params& consensus, int spend_height, int64_t spend_time);
 

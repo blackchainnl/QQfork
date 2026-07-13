@@ -212,7 +212,7 @@ static std::unique_ptr<CWallet> NewWallet(const node::NodeContext& m_node, const
 {
     std::unique_ptr<CWallet> wallet = std::make_unique<CWallet>(m_node.chain.get(), wallet_name, CreateMockableWalletDatabase());
     BOOST_CHECK(wallet->LoadWallet() == DBErrors::LOAD_OK);
-    LOCK(wallet->cs_wallet);
+    LOCK2(::cs_main, wallet->cs_wallet);
     wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
     wallet->SetupDescriptorScriptPubKeyMans();
     return wallet;
@@ -1346,7 +1346,7 @@ BOOST_AUTO_TEST_CASE(SelectCoins_effective_value_test)
     cc.SetInputWeight(output.outpoint, 148);
     cc.SelectExternal(output.outpoint, output.txout);
 
-    LOCK(wallet->cs_wallet);
+    LOCK2(::cs_main, wallet->cs_wallet);
     const auto preset_inputs = *Assert(FetchSelectedInputs(*wallet, cc, cs_params));
     available_coins.Erase({available_coins.coins[OutputType::BECH32].begin()->outpoint});
 

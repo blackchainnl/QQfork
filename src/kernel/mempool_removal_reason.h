@@ -19,6 +19,7 @@ enum class MemPoolRemovalReason {
     BLOCK,       //!< Removed for block
     CONFLICT,    //!< Removed for conflict with in-block transaction
     REPLACED,    //!< Removed for replacement
+    SHADOW_STALE, //!< Tip-bound Gold Rush shadow proof became invalid after tip advancement
 };
 
 std::string RemovalReasonToString(const MemPoolRemovalReason& r) noexcept;

@@ -7,6 +7,7 @@
 #include <util/fs.h>
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -17,6 +18,7 @@ class CBlockIndex;
 class CBlockUndo;
 class CCoinsView;
 class CCoinsViewCache;
+struct Coin;
 namespace Consensus {
 struct Params;
 }
@@ -59,6 +61,14 @@ struct ShadowSyntheticPayoutTransaction {
     bool proof_of_work{false};
 };
 
+// Immutable mainnet lifecycle anchors. Mutable schedule globals below exist
+// only so one test-chain process can compress the window; production
+// chainparams must derive consensus boundaries from these constants.
+static constexpr int MAINNET_SHADOW_WHITELIST_HEIGHT = 5945000;
+static constexpr int MAINNET_SHADOW_REWARD_START_HEIGHT = 5950000;
+static constexpr int MAINNET_SHADOW_GOLD_RUSH_BLOCKS = (180 * 24 * 60 * 60) / 64;
+static constexpr int MAINNET_SHADOW_REWARD_END_HEIGHT = MAINNET_SHADOW_REWARD_START_HEIGHT + MAINNET_SHADOW_GOLD_RUSH_BLOCKS - 1;
+
 // Gold Rush schedule heights. Defaults are the mainnet values. The dedicated
 // testnet schedule branch may override them on testnet/regtest only via
 // -shadowwhitelistheight / -shadowgoldrushstartheight / -shadowgoldrushblocks so
@@ -71,6 +81,7 @@ extern int SHADOW_GOLD_RUSH_BLOCKS;
 extern int SHADOW_PHASE1_END_HEIGHT;
 extern int SHADOW_REWARD_END_HEIGHT;
 extern int SHADOW_HALVING_INTERVAL_BLOCKS;
+static constexpr int MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS = 43200;
 
 /** Test-only: shift the Gold Rush schedule to a small, reachable window. */
 void SetShadowTestSchedule(int whitelist_height, int reward_start_height, int gold_rush_blocks);
@@ -87,6 +98,8 @@ bool IsShadowGoldRushRewardActive(const Consensus::Params& consensus, int64_t nM
 /** Quantum witness spends stay disabled through the legacy-compatible Gold Rush
  * and activate only after the reward-height window and in the migration/final-lockout phases. */
 bool IsQuantumWitnessSpendActive(const Consensus::Params& consensus, int64_t nMedianTimePast, int nSpendHeight);
+/** Tiered staking can activate only after quantum spending and its scheduled height are both active. */
+bool IsQuantumStakeTiersActive(const Consensus::Params& consensus, int64_t nMedianTimePast, int nSpendHeight);
 static constexpr unsigned int SHADOW_EQUAL_FOOTING_TIME = 1713938400;
 static constexpr CAmount SHADOW_WHITELIST_MIN_BALANCE = 10000 * COIN;
 static constexpr int SHADOW_SOLVER_ACTIVITY_SECONDS = 14 * 24 * 60 * 60;
@@ -108,8 +121,8 @@ void SaveLegacyWhitelist(const fs::path& path, const std::set<CScript>& whitelis
 bool LoadLegacyWhitelist(const fs::path& path, std::set<CScript>& whitelist);
 
 /** Apply/remove deterministic chainstate markers for the legacy whitelist snapshot. */
-void ApplyLegacyWhitelistSnapshot(CCoinsViewCache& view, const CBlockIndex* pindex, const fs::path* dump_path = nullptr);
-void UndoLegacyWhitelistSnapshot(CCoinsViewCache& view, const CBlockIndex* pindex);
+bool ApplyLegacyWhitelistSnapshot(CCoinsViewCache& view, const CBlockIndex* pindex, const fs::path* dump_path = nullptr);
+bool UndoLegacyWhitelistSnapshot(CCoinsViewCache& view, const CBlockIndex* pindex);
 bool HasLegacyWhitelistSnapshot(const CCoinsViewCache& view);
 
 /** Check if a script is in the deterministic height-5,945,000 whitelist. */
@@ -125,7 +138,7 @@ const std::string& GetQuantumQuasarBlockNotice();
 CScript BuildQuantumQuasarBlockNoticeScript();
 
 /** Legacy direct-emission helper retained for stale marker tests and migration cleanup.
- *  ConnectBlock no longer uses this path during the 24-month compatibility bridge; Gold Rush
+ *  ConnectBlock no longer uses this path during the staged compatibility bridge; Gold Rush
  *  note transactions update the upgraded shadow ledger without increasing base block rewards. */
 CAmount ShadowMaxBlockDirectTotal(const CCoinsViewCache& view, const CBlockIndex* pindex);
 
@@ -182,6 +195,9 @@ bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block,
 bool TransactionHasShadowProof(const CTransaction& tx);
 bool TransactionHasShadowSignal(const CTransaction& tx);
 bool CheckShadowPowClaimForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);
+bool CheckShadowSignalForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev,
+                                 const CCoinsViewCache& view, bool gold_rush_active,
+                                 std::string& reject_reason);
 
 /** Obsolete direct-emission helper retained for stale test-build marker cleanup. */
 bool CheckShadowDirectPayoutOutputs(const CTransaction& tx, const std::map<CScript, CAmount>& expected_payouts, std::string& reject_reason);
@@ -194,6 +210,29 @@ bool DecodeShadowClaimMarker(const CTxOut& txout, ShadowClaimMarkerInfo& info);
 
 /** Return true for Quantum Quasar's zero-value internal chainstate marker records. */
 bool IsShadowMarkerScript(const CScript& script);
+/** Authenticate a marker by its reserved deterministic outpoint before destructive maintenance. */
+bool IsAuthenticatedShadowMarkerOutpoint(const COutPoint& outpoint, const Coin& coin, const CBlockIndex* pindexTip);
+using ShadowBlockReader = std::function<bool(const CBlockIndex&, CBlock&)>;
+/** Versioned schedule/semantics marker used to decide whether startup must
+ *  rebuild exact shadow state even when aggregate obligation is unchanged. */
+void WriteShadowReplayStateMarker(CCoinsViewCache& view, const CBlockIndex* pindex, const Consensus::Params& consensus);
+void RewindShadowReplayStateMarker(CCoinsViewCache& view, const CBlockIndex* disconnected, const Consensus::Params& consensus);
+/** O(1) rolling inventory checkpoint maintenance. The checkpoint is anchored
+ * to every connected tip from the first Gold Rush reward height onward. */
+bool AdvanceGoldRushInventoryTip(CCoinsViewCache& view, const CBlockIndex* pindex);
+bool RewindGoldRushInventoryTip(CCoinsViewCache& view, const CBlockIndex* disconnected);
+bool HasShadowReplayState(const CCoinsViewCache& view);
+bool HasCurrentShadowReplayState(const CCoinsViewCache& view, const Consensus::Params& consensus,
+                                 const CBlockIndex* pindex,
+                                 const ShadowBlockReader* read_block = nullptr);
+/** Remove every authenticated internal shadow-state family while preserving
+ *  marker-shaped user UTXOs at ordinary outpoints. The block reader is used
+ *  only to authenticate legacy base-transaction payout markers. */
+bool CollectAuthenticatedShadowStateOutpoints(const CCoinsViewCache& view, const CBlockIndex* pindexTip,
+                                              const ShadowBlockReader& read_block,
+                                              std::set<COutPoint>& authenticated);
+bool PurgeAuthenticatedShadowState(CCoinsViewCache& view, const CBlockIndex* pindexTip,
+                                   const ShadowBlockReader& read_block, uint64_t& removed);
 
 /** Build wallet-indexable synthetic payout transactions for applied claim markers in one block. */
 std::vector<CTransactionRef> GetAppliedShadowClaimPayoutTransactions(const CCoinsViewCache& view, int height, const uint256& block_hash, int64_t block_time);
@@ -208,8 +247,54 @@ std::vector<ShadowSyntheticPayoutCoin> GetAppliedShadowClaimPayoutCoins(const CC
 void MarkGoldRushDirectPayoutOutputs(CCoinsViewCache& view, const CTransaction& coinstake, const CBlockIndex* pindex, const std::map<CScript, CAmount>& payouts);
 void UndoGoldRushDirectPayoutOutputMarkers(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex);
 bool IsGoldRushDirectPayoutOutput(const CCoinsViewCache& view, const COutPoint& outpoint, CScript* payout_script = nullptr);
+enum class GoldRushPayoutStatus {
+    NOT_CANDIDATE,
+    AUTHENTICATED,
+    CORRUPT,
+};
+/** Distinguish an ordinary coin from a strictly authenticated synthetic
+ * payout and from a fail-closed payout-shaped coin whose provenance marker is
+ * missing or corrupt. */
+GoldRushPayoutStatus GetGoldRushPayoutStatus(const CCoinsViewCache& view,
+                                             const COutPoint& outpoint,
+                                             const Consensus::Params& consensus,
+                                             CScript* payout_script = nullptr,
+                                             const CBlockIndex* pindex_tip = nullptr);
+/** Wallet/policy helper for the only lifecycle restriction on authenticated
+ * Gold Rush payouts: they are locked through the reward window. Once quantum
+ * witness spends activate, the payout is an ordinary v16 UTXO (including at
+ * Final Lockout), subject only to normal maturity and demurrage rules. */
+bool IsLockedGoldRushPayoutOutput(const CCoinsViewCache& view, const COutPoint& outpoint,
+                                  const Consensus::Params& consensus, int64_t nMedianTimePast,
+                                  int nSpendHeight, CScript* payout_script = nullptr);
+/** Consensus-side synthetic-payout classifier. In addition to exact QQGRPAY
+ * provenance, this fails closed on production-style schedules where positive
+ * coinbase-class outputs after nLastPOWBlock can only be auxiliary payouts. */
+bool IsGoldRushSyntheticPayoutInput(const CCoinsViewCache& view, const COutPoint& outpoint,
+                                    const Consensus::Params& consensus,
+                                    CScript* payout_script = nullptr);
+/** Record/remove authenticated active-chain provenance when a synthetic payout
+ * is spent, allowing startup to distinguish a legitimate spent UTXO from a
+ * locally missing/corrupt unspent payout. */
+bool RecordSpentGoldRushPayouts(CCoinsViewCache& view, const CTransaction& tx,
+                                const CBlockIndex* pindex);
+bool UndoSpentGoldRushPayouts(CCoinsViewCache& view, const CBlock& block,
+                              const CBlockUndo& block_undo,
+                              const CBlockIndex* pindex);
+/** Snapshot-friendly helpers used by explorers/accounting RPCs. */
+COutPoint GetGoldRushPayoutMarkerOutpoint(const COutPoint& payout_outpoint);
+bool IsGoldRushPayoutMarkerScript(const CScript& script);
+
+/** Applying shadow state can fail because of a local cryptographic/storage
+ *  fault. Such a failure must stop the local node; it must never classify the
+ *  otherwise legacy-valid base block as consensus-invalid. */
+enum class ShadowApplyResult {
+    OK,
+    LOCAL_INTERNAL_ERROR,
+};
 
 /** Apply/remove deterministic shadow claim state for one shadow-epoch block. */
+ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
 bool ApplyShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
 bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
 

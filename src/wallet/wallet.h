@@ -69,6 +69,19 @@ class Wallet;
 }
 namespace wallet {
 class CWallet;
+
+enum class WalletCommitStatus {
+    ACCEPTED,
+    PERSISTED_PENDING,
+    REJECTED_NOT_ADDED,
+    REJECTED_ABANDONED,
+};
+
+/** Block timing captured before taking cs_wallet. */
+struct WalletBlockTime {
+    int64_t block_time{0};
+    int64_t block_max_time{0};
+};
 class WalletBatch;
 enum class DBErrors : int;
 } // namespace wallet
@@ -589,7 +602,8 @@ private:
      * Should be called with rescanning_old_block set to true, if the transaction is
      * not discovered in real time, but during a rescan of old blocks.
      */
-    bool AddToWalletIfInvolvingMe(const CTransactionRef& tx, const SyncTxState& state, bool fUpdate, bool rescanning_old_block) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool AddToWalletIfInvolvingMe(const CTransactionRef& tx, const SyncTxState& state, bool fUpdate, bool rescanning_old_block,
+                                  std::optional<WalletBlockTime> block_time = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** Mark a transaction (and its in-wallet descendants) as conflicting with a particular block. */
     void MarkConflicted(const uint256& hashBlock, int conflicting_height, const uint256& hashTx);
@@ -606,7 +620,8 @@ private:
 
     void SyncMetaData(std::pair<TxSpends::iterator, TxSpends::iterator>) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    void SyncTransaction(const CTransactionRef& tx, const SyncTxState& state, bool update_tx = true, bool rescanning_old_block = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SyncTransaction(const CTransactionRef& tx, const SyncTxState& state, bool update_tx = true, bool rescanning_old_block = false,
+                         std::optional<WalletBlockTime> block_time = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** WalletFlags set on this wallet. */
     std::atomic<uint64_t> m_wallet_flags{0};
@@ -818,7 +833,9 @@ public:
     bool EncryptWallet(const SecureString& strWalletPassphrase);
 
     void GetKeyBirthTimes(std::map<CKeyID, int64_t> &mapKeyBirth) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const;
+    unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block,
+                                  std::optional<WalletBlockTime> block_time = std::nullopt) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /**
      * Increment the next transaction order id
@@ -841,7 +858,9 @@ public:
      * Add the transaction to the wallet, wrapping it up inside a CWalletTx
      * @return the recently added wtx pointer or nullptr if there was a db write error.
      */
-    CWalletTx* AddToWallet(CTransactionRef tx, const TxState& state, const UpdateWalletTxFn& update_wtx=nullptr, bool fFlushOnClose=true, bool rescanning_old_block = false);
+    CWalletTx* AddToWallet(CTransactionRef tx, const TxState& state, const UpdateWalletTxFn& update_wtx=nullptr,
+                           bool fFlushOnClose=true, bool rescanning_old_block = false,
+                           std::optional<WalletBlockTime> block_time = std::nullopt);
     bool LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void transactionAddedToMempool(const CTransactionRef& tx) override;
     void blockConnected(ChainstateRole role, const interfaces::BlockInfo& block) override;
@@ -870,6 +889,8 @@ public:
     void SetNextResend() { m_next_resend = GetDefaultNextResend(); }
     /** Return true if all conditions for periodically resending transactions are met. */
     bool ShouldResend() const;
+    /** Validate and repair stale Gold Rush proofs independently of relay policy. */
+    void RepairStaleShadowTransactions(bool force);
     void ResubmitWalletTransactions(bool relay, bool force);
 
     OutputType TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const;
@@ -921,12 +942,12 @@ public:
      * @param[in] mapValue key-values to be set on the transaction.
      * @param[in] orderForm BIP 70 / BIP 21 order form details to be set on the transaction.
      */
-    bool CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm, std::string* broadcast_error = nullptr);
+    bool CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm,
+                           std::string* broadcast_error = nullptr, WalletCommitStatus* commit_status = nullptr);
     bool CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm, const RGBTxCommitData& rgb_data, std::string& error);
 
     /** Pass this transaction to node for mempool insertion and relay to peers if flag set to true */
-    bool SubmitTxMemoryPoolAndRelay(CWalletTx& wtx, std::string& err_string, bool relay) const
-        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SubmitTxMemoryPoolAndRelay(const uint256& txid, std::string& err_string, bool relay);
 
     bool ImportScripts(const std::set<CScript> scripts, int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool ImportPrivKeys(const std::map<CKeyID, CKey>& privkey_map, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -964,6 +985,7 @@ public:
     std::atomic<bool> m_wallet_unlock_staking_only{false};
     int64_t m_last_coin_stake_search_time{0};
     int64_t m_last_coin_stake_search_interval{0};
+    uint256 m_last_coin_stake_search_tip{};
     CAmount m_min_staking_amount{DEFAULT_MIN_STAKING_AMOUNT};
     CAmount m_reserve_balance{DEFAULT_RESERVE_BALANCE};
     unsigned int m_donation_percentage{DEFAULT_DONATION_PERCENTAGE};
@@ -992,8 +1014,9 @@ public:
     Mutex m_pow_miner_mutex;
     uint256 m_pow_tip_hash GUARDED_BY(m_pow_miner_mutex);
     bool m_pow_claim_inflight GUARDED_BY(m_pow_miner_mutex){false};
+    std::set<uint256> m_inflight_wallet_broadcasts GUARDED_BY(cs_wallet);
 
-    uint64_t GetStakeWeight() const;
+    uint64_t GetStakeWeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
 
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */
     int64_t m_keypool_size{DEFAULT_KEYPOOL_SIZE};
@@ -1083,7 +1106,7 @@ public:
     std::set<COutPoint> GetProtectedRGBSeals() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Sync each owned RGB assignment's spent flag to the chain (IsSpent of its seal) so a
      *  reorged-out / abandoned / conflicted transfer no longer desyncs the RGB ledger. */
-    void ReconcileRGBAssignments() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void ReconcileRGBAssignments() LOCKS_EXCLUDED(cs_wallet);
     bool HasPlaintextQuantumKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool HasCryptedQuantumKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool EncryptQuantumKeys(const CKeyingMaterial& master_key, WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1180,7 +1203,7 @@ public:
     bool TransactionCanBeAbandoned(const uint256& hashTx) const;
 
     /* Mark a transaction (and it in-wallet descendants) as abandoned so its inputs may be respent. */
-    bool AbandonTransaction(const uint256& hashTx);
+    bool AbandonTransaction(const uint256& hashTx, bool automatic_shadow_stale = false);
 
     /* Initializes the wallet, returns a new CWallet instance or a null pointer in case of an error */
     static std::shared_ptr<CWallet> Create(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bilingual_str& error, std::vector<bilingual_str>& warnings);

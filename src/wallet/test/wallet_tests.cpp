@@ -58,6 +58,12 @@ static_assert(DEFAULT_TRANSACTION_MINFEE >= DEFAULT_MIN_RELAY_TX_FEE, "wallet mi
 
 BOOST_FIXTURE_TEST_SUITE(wallet_tests, WalletTestingSetup)
 
+BOOST_AUTO_TEST_CASE(abandon_unknown_transaction_is_safe)
+{
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_CHECK(!wallet.AbandonTransaction(uint256::ONE));
+}
+
 static CMutableTransaction TestSimpleSpend(const CTransaction& from, uint32_t index, const CKey& key, const CScript& pubkey)
 {
     CMutableTransaction mtx;
@@ -657,13 +663,16 @@ static int64_t AddTx(ChainstateManager& chainman, CWallet& wallet, uint32_t lock
         block->phashBlock = &hash;
         state = TxStateConfirmed{hash, block->nHeight, /*index=*/0};
     }
+    const std::optional<WalletBlockTime> block_time = blockTime > 0
+        ? std::make_optional(WalletBlockTime{blockTime, blockTime})
+        : std::nullopt;
     return wallet.AddToWallet(MakeTransactionRef(tx), state, [&](CWalletTx& wtx, bool /* new_tx */) {
         // Assign wtx.m_state to simplify test and avoid the need to simulate
         // reorg events. Without this, AddToWallet asserts false when the same
         // transaction is confirmed in different blocks.
         wtx.m_state = state;
         return true;
-    })->nTimeSmart;
+    }, /*fFlushOnClose=*/true, /*rescanning_old_block=*/false, block_time)->nTimeSmart;
 }
 
 // Simple test to verify assignment of CWalletTx::nSmartTime value. Could be
@@ -1087,6 +1096,45 @@ BOOST_FIXTURE_TEST_CASE(DemurrageAttestationBuilderPreservesReplayAnchor, ListCo
         witness_program = info->witness_program;
     }
 
+    // Create a valid base-chain transaction, then replace its recipient before
+    // signing and mine it directly. Gold Rush relay policy intentionally
+    // forbids ordinary quantum funding, while consensus remains legacy-v26
+    // compatible; this fixture needs a live quantum target without weakening
+    // that relay policy.
+    CMutableTransaction funding_tx;
+    {
+        const CScript placeholder = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
+        CCoinControl control;
+        constexpr int RANDOM_CHANGE_POSITION = -1;
+        auto funding = CreateTransaction(
+            *wallet, {CRecipient{placeholder, COIN, /*subtract_fee=*/false}},
+            RANDOM_CHANGE_POSITION, control, /*sign=*/false);
+        BOOST_REQUIRE_MESSAGE(funding, util::ErrorString(funding).original);
+        funding_tx = CMutableTransaction(*funding->tx);
+        const auto recipient = std::find_if(funding_tx.vout.begin(), funding_tx.vout.end(), [&](const CTxOut& out) {
+            return out.nValue == COIN && out.scriptPubKey == placeholder;
+        });
+        BOOST_REQUIRE(recipient != funding_tx.vout.end());
+        recipient->scriptPubKey = GetScriptForDestination(quantum_dest);
+        LOCK(wallet->cs_wallet);
+        BOOST_REQUIRE(wallet->SignTransaction(funding_tx));
+    }
+    CreateAndProcessBlock({funding_tx}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+    const CBlockIndex* funding_index = WITH_LOCK(
+        Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain().Tip());
+    BOOST_REQUIRE(funding_index);
+    WalletRescanReserver reserver(*wallet);
+    BOOST_REQUIRE(reserver.reserve());
+    const CWallet::ScanResult scan = wallet->ScanForWalletTransactions(
+        funding_index->GetBlockHash(), funding_index->nHeight,
+        /*max_height=*/funding_index->nHeight, reserver,
+        /*fUpdate=*/false, /*save_progress=*/false);
+    BOOST_REQUIRE_EQUAL(scan.status, CWallet::ScanResult::SUCCESS);
+    {
+        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+        wallet->SetLastBlockProcessed(funding_index->nHeight, funding_index->GetBlockHash());
+    }
+
     DemurrageAttestationTxResult tx_result;
     bilingual_str error;
     CCoinControl coin_control;
@@ -1103,8 +1151,14 @@ BOOST_FIXTURE_TEST_CASE(DemurrageAttestationBuilderPreservesReplayAnchor, ListCo
     const Consensus::DemurrageAttestation& attestation = attestations.front();
     BOOST_CHECK_GE(attestation.height, 0);
     BOOST_CHECK_EQUAL(attestation.replay_anchor.ToString(), tx_result.replay_anchor.ToString());
+    BOOST_CHECK_EQUAL(attestation.target_outpoint.ToString(), tx_result.target_outpoint.ToString());
     BOOST_CHECK_EQUAL_COLLECTIONS(attestation.pubkey.begin(), attestation.pubkey.end(), tx_result.public_key.begin(), tx_result.public_key.end());
-    const uint256 message_hash = Consensus::DemurrageAttestationMessageHash(tx_result.replay_anchor, tx_result.public_key);
+    const uint256 message_hash = Consensus::DemurrageAttestationMessageHash(
+        tx_result.replay_anchor, tx_result.target_outpoint,
+        attestation.previous_height, attestation.previous_time,
+        attestation.previous_coverage_start_height,
+        attestation.previous_source,
+        tx_result.public_key, Params().GetConsensus().nQuantumSighashChainId);
     BOOST_CHECK(ML_DSA::Verify(tx_result.public_key, message_hash.begin(), uint256::size(), attestation.signature));
 }
 
@@ -1116,10 +1170,10 @@ BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsTestingSetup)
     // address.
     std::map<CTxDestination, std::vector<COutput>> list;
     {
-        LOCK(wallet->cs_wallet);
+        LOCK2(::cs_main, wallet->cs_wallet);
         list = ListCoins(*wallet);
     }
-    CoinsResult initial_available = WITH_LOCK(wallet->cs_wallet, return AvailableCoins(*wallet));
+    CoinsResult initial_available = WITH_LOCK(::cs_main, return WITH_LOCK(wallet->cs_wallet, return AvailableCoins(*wallet)));
     const size_t initial_available_count = initial_available.Size();
     const CAmount initial_available_amount = initial_available.GetTotalAmount();
 
@@ -1128,7 +1182,7 @@ BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsTestingSetup)
     BOOST_CHECK_EQUAL(list.begin()->second.size(), initial_available_count);
 
     // Check initial balance from the fixture's mature coinbase transactions.
-    BOOST_CHECK_EQUAL(initial_available_amount, WITH_LOCK(wallet->cs_wallet, return AvailableCoins(*wallet).GetTotalAmount()));
+    BOOST_CHECK_EQUAL(initial_available_amount, WITH_LOCK(::cs_main, return WITH_LOCK(wallet->cs_wallet, return AvailableCoins(*wallet).GetTotalAmount())));
 
     // Add a transaction creating a change address, and confirm ListCoins still
     // returns the coin associated with the change address underneath the
@@ -1136,7 +1190,7 @@ BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsTestingSetup)
     // pubkey.
     AddTx(CRecipient{PubKeyDestination{{}}, 1 * COIN, /*subtract_fee=*/false});
     {
-        LOCK(wallet->cs_wallet);
+        LOCK2(::cs_main, wallet->cs_wallet);
         list = ListCoins(*wallet);
     }
     const size_t post_tx_available_count = initial_available_count + 1;
@@ -1147,7 +1201,7 @@ BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsTestingSetup)
 
     // Lock both coins. Confirm number of available coins drops to 0.
     {
-        LOCK(wallet->cs_wallet);
+        LOCK2(::cs_main, wallet->cs_wallet);
         BOOST_CHECK_EQUAL(AvailableCoinsListUnspent(*wallet).Size(), post_tx_available_count);
     }
     for (const auto& group : list) {
@@ -1157,13 +1211,13 @@ BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsTestingSetup)
         }
     }
     {
-        LOCK(wallet->cs_wallet);
+        LOCK2(::cs_main, wallet->cs_wallet);
         BOOST_CHECK_EQUAL(AvailableCoinsListUnspent(*wallet).Size(), 0U);
     }
     // Confirm ListCoins still returns same result as before, despite coins
     // being locked.
     {
-        LOCK(wallet->cs_wallet);
+        LOCK2(::cs_main, wallet->cs_wallet);
         list = ListCoins(*wallet);
     }
     BOOST_REQUIRE_EQUAL(list.size(), 1U);
@@ -1173,7 +1227,7 @@ BOOST_FIXTURE_TEST_CASE(ListCoinsTest, ListCoinsTestingSetup)
 
 void TestCoinsResult(ListCoinsTest& context, OutputType out_type, CAmount amount)
 {
-    LOCK(context.wallet->cs_wallet);
+    LOCK2(::cs_main, context.wallet->cs_wallet);
     util::Result<CTxDestination> dest = Assert(context.wallet->GetNewDestination(out_type, ""));
     const CScript recipient_script = GetScriptForDestination(*dest);
     CWalletTx& wtx = context.AddTx(CRecipient{*dest, amount, /*fSubtractFeeFromAmount=*/true});
@@ -1194,7 +1248,7 @@ void TestCoinsResult(ListCoinsTest& context, OutputType out_type, CAmount amount
 BOOST_FIXTURE_TEST_CASE(BasicOutputTypesTest, ListCoinsTest)
 {
     // The fixture's P2PK coinbase UTXOs should show up in the Other bucket.
-    CoinsResult available_coins = WITH_LOCK(wallet->cs_wallet, return AvailableCoins(*wallet));
+    CoinsResult available_coins = WITH_LOCK(::cs_main, return WITH_LOCK(wallet->cs_wallet, return AvailableCoins(*wallet)));
     BOOST_CHECK_GT(available_coins.coins[OutputType::UNKNOWN].size(), 0U);
 
     // We will create a self transfer for each of the OutputTypes and

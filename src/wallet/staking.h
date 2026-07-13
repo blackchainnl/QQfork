@@ -18,12 +18,13 @@ void StartStake(CWallet& wallet);
 /* Stop staking */
 void StopStake(CWallet& wallet);
 
-uint64_t GetStakeWeight(const CWallet& wallet);
+uint64_t GetStakeWeight(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 void AvailableCoinsForStaking(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl = nullptr,
-                           const CoinFilterParams& params = {}) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
-bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::set<std::pair<const CWalletTx *, unsigned int> > &setCoinsRet, CAmount& nValueRet);
+                           const CoinFilterParams& params = {}) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::set<std::pair<const CWalletTx *, unsigned int> > &setCoinsRet, CAmount& nValueRet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval, CMutableTransaction& tx, CAmount& nFees, CTxDestination destination, const std::vector<CTransactionRef>& selected_txs = {});
 
 struct DemurrageAttestationTxResult
@@ -32,6 +33,7 @@ struct DemurrageAttestationTxResult
     std::vector<unsigned char> public_key;
     std::vector<unsigned char> witness_program;
     COutPoint replay_anchor;
+    COutPoint target_outpoint;
     int attestation_vout{-1};
     CAmount fee{0};
 };

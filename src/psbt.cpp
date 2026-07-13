@@ -357,7 +357,9 @@ void UpdatePSBTOutput(const SigningProvider& provider, PartiallySignedTransactio
     psbt_out.FromSignatureData(sigdata);
 }
 
-PrecomputedTransactionData PrecomputePSBTData(const PartiallySignedTransaction& psbt)
+PrecomputedTransactionData PrecomputePSBTData(const PartiallySignedTransaction& psbt,
+                                              uint32_t quantum_chain_id,
+                                              bool sighash_forkid_active)
 {
     const CMutableTransaction& tx = *psbt.tx;
     bool have_all_spent_outputs = true;
@@ -371,6 +373,8 @@ PrecomputedTransactionData PrecomputePSBTData(const PartiallySignedTransaction& 
     } else {
         txdata.Init(tx, {}, true);
     }
+    txdata.m_quantum_sighash_chain_id = quantum_chain_id;
+    txdata.m_sighash_forkid_active = sighash_forkid_active;
     return txdata;
 }
 
@@ -417,7 +421,8 @@ bool SignPSBTInput(const SigningProvider& provider, PartiallySignedTransaction& 
     if (txdata == nullptr) {
         sig_complete = ProduceSignature(provider, DUMMY_SIGNATURE_CREATOR, utxo.scriptPubKey, sigdata);
     } else {
-        MutableTransactionSignatureCreator creator(tx, index, utxo.nValue, txdata, sighash);
+        MutableTransactionSignatureCreator creator(tx, index, utxo.nValue, txdata, sighash,
+                                                   verify_flags);
         sig_complete = ProduceSignature(provider, creator, utxo.scriptPubKey, sigdata);
     }
     // Verify that a witness signature was produced in case one was required.
@@ -479,26 +484,34 @@ void RemoveUnnecessaryTransactions(PartiallySignedTransaction& psbtx, const int&
     }
 }
 
-bool FinalizePSBT(PartiallySignedTransaction& psbtx, unsigned int verify_flags)
+bool FinalizePSBT(PartiallySignedTransaction& psbtx, unsigned int verify_flags,
+                  uint32_t quantum_chain_id)
 {
     // Finalize input signatures -- in case we have partial signatures that add up to a complete
     //   signature, but have not combined them yet (e.g. because the combiner that created this
     //   PartiallySignedTransaction did not understand them), this will combine them into a final
     //   script.
     bool complete = true;
-    const PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
+    if ((verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID) && quantum_chain_id == 0) return false;
+    const PrecomputedTransactionData txdata = PrecomputePSBTData(
+        psbtx, quantum_chain_id, verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID);
+    const int finalize_sighash = (verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID)
+        ? (SIGHASH_ALL | SIGHASH_FORKID)
+        : SIGHASH_ALL;
     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
-        complete &= SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata, SIGHASH_ALL, nullptr, true, verify_flags);
+        complete &= SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata,
+                                  finalize_sighash, nullptr, true, verify_flags);
     }
 
     return complete;
 }
 
-bool FinalizeAndExtractPSBT(PartiallySignedTransaction& psbtx, CMutableTransaction& result, unsigned int verify_flags)
+bool FinalizeAndExtractPSBT(PartiallySignedTransaction& psbtx, CMutableTransaction& result,
+                            unsigned int verify_flags, uint32_t quantum_chain_id)
 {
     // It's not safe to extract a PSBT that isn't finalized, and there's no easy way to check
     //   whether a PSBT is finalized without finalizing it, so we just do this.
-    if (!FinalizePSBT(psbtx, verify_flags)) {
+    if (!FinalizePSBT(psbtx, verify_flags, quantum_chain_id)) {
         return false;
     }
 

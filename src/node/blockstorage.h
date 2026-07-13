@@ -215,10 +215,7 @@ private:
      * @note Internally, only blocks at height (height_first - PRUNE_LOCK_BUFFER - 1) and
      * below will be pruned, but callers should avoid assuming any particular buffer size.
      */
-    /*
-    // Blackcoin
     std::unordered_map<std::string, PruneLockInfo> m_prune_locks GUARDED_BY(::cs_main);
-    */
 
     BlockfileType BlockfileTypeForHeight(int height);
 

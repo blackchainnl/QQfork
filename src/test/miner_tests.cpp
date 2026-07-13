@@ -412,14 +412,26 @@ void MinerTestingSetup::TestBasicMining(const CScript& scriptPubKey, const std::
         CScript script = CScript() << OP_0;
         tx.vout[0].scriptPubKey = GetScriptForDestination(ScriptHash(script));
         hash = tx.GetHash();
+        const uint256 invalid_parent_hash = hash;
         tx_mempool.addUnchecked(entry.Fee(LOWFEE).Time(Now<NodeSeconds>()).SpendsCoinbase(true).FromTx(tx));
         tx.vin[0].prevout.hash = hash;
         tx.vin[0].scriptSig = CScript() << std::vector<unsigned char>(script.begin(), script.end());
         tx.vout[0].nValue -= LOWFEE;
         hash = tx.GetHash();
+        const uint256 invalid_child_hash = hash;
         tx_mempool.addUnchecked(entry.Fee(LOWFEE).Time(Now<NodeSeconds>()).SpendsCoinbase(false).FromTx(tx));
-        // Should throw block-validation-failed
-        BOOST_CHECK_EXCEPTION(AssemblerForTest(tx_mempool).CreateNewBlock(scriptPubKey), std::runtime_error, HasReason("block-validation-failed"));
+        // The hardened assembler revalidates candidate transactions and skips
+        // an invalid parent together with its descendants instead of building
+        // an invalid template and throwing at the final validity check.
+        const std::unique_ptr<CBlockTemplate> filtered_template =
+            AssemblerForTest(tx_mempool).CreateNewBlock(scriptPubKey);
+        BOOST_REQUIRE(filtered_template);
+        bool found_valid_parent{false};
+        for (const CTransactionRef& template_tx : filtered_template->block.vtx) {
+            if (template_tx->GetHash() == invalid_parent_hash) found_valid_parent = true;
+            BOOST_CHECK(template_tx->GetHash() != invalid_child_hash);
+        }
+        BOOST_CHECK(found_valid_parent);
 
         // Delete the dummy blocks again.
         while (m_node.chainman->ActiveChain().Tip()->nHeight > nHeight) {

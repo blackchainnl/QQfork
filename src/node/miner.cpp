@@ -20,6 +20,7 @@
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/merkle.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
@@ -90,10 +91,9 @@ static bool IsFinalLockoutAllowedOutput(const CTransaction& tx, unsigned int out
     const CTxOut& txout = tx.vout[output_index];
     if (tx.IsCoinStake() && output_index == 0 && txout.IsEmpty()) return true;
     if (txout.IsEmpty()) return true;
-    if (IsOpReturnOutput(txout)) return true;
+    if (IsOpReturnOutput(txout)) return txout.nValue == 0;
     return IsQuantumMigrationScript(txout.scriptPubKey) ||
-           IsQuantumColdStakeScript(txout.scriptPubKey) ||
-           IsEUTXOScript(txout.scriptPubKey);
+           IsQuantumColdStakeScript(txout.scriptPubKey);
 }
 
 static bool IsPackageTxAllowedAfterFinalLockout(const CTransaction& tx, CCoinsViewCache& inputs, unsigned int flags, int spend_height, const Consensus::Params& consensus_params, int64_t spend_time)
@@ -105,9 +105,7 @@ static bool IsPackageTxAllowedAfterFinalLockout(const CTransaction& tx, CCoinsVi
         const Coin& coin = inputs.AccessCoin(txin.prevout);
         const bool is_quantum_spend = IsQuantumMigrationScript(coin.out.scriptPubKey) ||
                                       IsQuantumColdStakeScript(coin.out.scriptPubKey);
-        const bool is_eutxo_spend = IsEUTXOScript(coin.out.scriptPubKey);
-        if (!is_quantum_spend && !is_eutxo_spend) return false;
-        if (IsGoldRushDirectPayoutOutput(inputs, txin.prevout)) return false;
+        if (!is_quantum_spend) return false;
     }
 
     for (unsigned int i = 0; i < tx.vout.size(); ++i) {
@@ -218,6 +216,10 @@ void BlockAssembler::resetBlock()
     nFees = 0;
     m_shadow_proof_selected = false;
     m_building_pos_template = false;
+    m_demurrage_attestation_keys.clear();
+    m_demurrage_attestation_targets.clear();
+    m_demurrage_attestation_count = 0;
+    m_next_block_fees.clear();
 }
 
 std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn, CWallet* pwallet, bool* pfPoSCancel, int64_t* pFees, CTxDestination destination)
@@ -266,7 +268,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     // not activated.
     // TODO: replace this with a call to main to assess validity of a mempool
     // transaction (which in most cases can be a no-op).
-    fIncludeWitness = DeploymentActiveAfter(pindexPrev, m_chainstate.m_chainman, Consensus::DEPLOYMENT_SEGWIT);
+    fIncludeWitness = DeploymentActiveAfter(pindexPrev, m_chainstate.m_chainman, Consensus::DEPLOYMENT_SEGWIT) ||
+        IsQuantumWitnessSpendActive(chainparams.GetConsensus(), pindexPrev->GetMedianTimePast(), nHeight);
 
     int nPackagesSelected = 0;
     int nDescendantsUpdated = 0;
@@ -315,7 +318,10 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
             pwallet->m_last_coin_stake_search_time = nSearchTime - 1;
         }
 
-        if (nSearchTime > pwallet->m_last_coin_stake_search_time) {
+        const uint256 current_tip_hash = pindexPrev->GetBlockHash();
+        if (nSearchTime > pwallet->m_last_coin_stake_search_time ||
+            (nSearchTime == pwallet->m_last_coin_stake_search_time &&
+             current_tip_hash != pwallet->m_last_coin_stake_search_tip)) {
             std::vector<CTransactionRef> selected_txs;
             selected_txs.reserve(pblock->vtx.size() > 0 ? pblock->vtx.size() - 1 : 0);
             for (size_t i = 1; i < pblock->vtx.size(); ++i) {
@@ -332,6 +338,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
             }
             pwallet->m_last_coin_stake_search_interval = nSearchTime - pwallet->m_last_coin_stake_search_time;
             pwallet->m_last_coin_stake_search_time = nSearchTime;
+            pwallet->m_last_coin_stake_search_tip = current_tip_hash;
         }
         if (*pfPoSCancel)
             return nullptr; // peercoin: there is no point to continue if we failed to create coinstake
@@ -406,7 +413,7 @@ bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost
 // - premature witness (in case segwit transactions are added to mempool before
 //   segwit activation)
 // - transaction timestamp limit
-bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package, uint32_t nTime) const
+bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package, uint32_t nTime)
 {
     CBlockIndex* tip{Assert(m_chainstate.m_chain.Tip())};
     CCoinsViewMemPool view_mempool{&m_chainstate.CoinsTip(), *Assert(m_mempool)};
@@ -419,12 +426,14 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
         !IsQuantumWitnessSpendActive(chainparams.GetConsensus(), next_block_mtp, next_height);
     const bool final_quantum_lockout =
         chainparams.GetConsensus().IsQuantumFinalLockout(next_block_mtp, next_height);
+    std::set<uint256> attested_keys{m_demurrage_attestation_keys};
+    std::set<COutPoint> attestation_targets{m_demurrage_attestation_targets};
+    size_t attestation_count{m_demurrage_attestation_count};
+    std::map<uint256, CAmount> package_fees;
     unsigned int final_lockout_flags = SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT |
                                        SCRIPT_VERIFY_QUANTUM_ML_DSA |
-                                       SCRIPT_VERIFY_QUANTUM_COLDSTAKE |
-                                       SCRIPT_VERIFY_EUTXO |
-                                       SCRIPT_VERIFY_V4_LARGE_SCRIPT_ELEMENT;
-    if (chainparams.GetConsensus().IsStakeTiersActive(next_height)) {
+                                       SCRIPT_VERIFY_QUANTUM_COLDSTAKE;
+    if (IsQuantumStakeTiersActive(chainparams.GetConsensus(), next_block_mtp, next_height)) {
         final_lockout_flags |= SCRIPT_VERIFY_QUANTUM_STAKE_TIERS;
     }
 
@@ -440,7 +449,8 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
             return false;
         }
         for (const CTxIn& txin : tx.vin) {
-            if (txin.prevout.IsNull() || !spent_outpoints.insert(txin.prevout).second) {
+            if (txin.prevout.IsNull() || attestation_targets.count(txin.prevout) ||
+                !spent_outpoints.insert(txin.prevout).second) {
                 return false;
             }
         }
@@ -469,24 +479,82 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
             !IsPackageTxAllowedAfterFinalLockout(tx, package_view, final_lockout_flags, next_height, chainparams.GetConsensus(), next_block_mtp)) {
             return false;
         }
+        std::string demurrage_reject_reason;
+        const std::vector<Consensus::DemurrageAttestation> demurrage_attestations =
+            Consensus::ExtractDemurrageAttestations(tx);
+        if (!chainparams.GetConsensus().IsDemurrageActive(next_height, next_block_mtp) &&
+            !demurrage_attestations.empty()) {
+            return false;
+        }
+        for (const Consensus::DemurrageAttestation& attestation : demurrage_attestations) {
+            if (spent_outpoints.count(attestation.target_outpoint)) return false;
+            attestation_targets.insert(attestation.target_outpoint);
+        }
+        if (!Consensus::CheckDemurrageAttestations(tx, package_view, chainparams.GetConsensus(), next_height,
+                                                   next_block_mtp, attested_keys,
+                                                   attestation_count, demurrage_reject_reason)) {
+            LogPrint(BCLog::MEMPOOL, "Skipping transaction %s from block template: %s\n",
+                     tx.GetHash().ToString(), demurrage_reject_reason);
+            return false;
+        }
+        TxValidationState tx_state;
+        CAmount next_block_fee{0};
+        if (!Consensus::CheckTxInputs(tx, tx_state, package_view, next_height, nTime,
+                                      next_block_mtp, next_block_fee)) {
+            LogPrint(BCLog::MEMPOOL, "Skipping transaction %s from block template after next-block input recheck: %s\n",
+                     tx.GetHash().ToString(), tx_state.ToString());
+            return false;
+        }
+        std::string quantum_reject_reason;
+        const unsigned int next_block_flags = GetNextBlockPolicyScriptFlags(
+            tip, m_chainstate.m_chainman);
+        if (!CheckQuantumQuasarTransaction(tx, package_view, next_block_flags,
+                                           next_height, chainparams.GetConsensus(),
+                                           next_block_mtp, quantum_reject_reason)) {
+            LogPrint(BCLog::MEMPOOL, "Skipping transaction %s from block template after Quantum Quasar contextual recheck: %s\n",
+                     tx.GetHash().ToString(), quantum_reject_reason);
+            return false;
+        }
+        PrecomputedTransactionData txdata;
+        if (!CheckInputScripts(tx, tx_state, package_view,
+                               next_block_flags,
+                               /*cacheSigStore=*/true,
+                               /*cacheFullScriptStore=*/true, txdata)) {
+            LogPrint(BCLog::MEMPOOL, "Skipping transaction %s from block template after next-block script recheck: %s\n",
+                     tx.GetHash().ToString(), tx_state.ToString());
+            return false;
+        }
+        package_fees.emplace(tx.GetHash(), next_block_fee);
         // peercoin: timestamp limit
         if (tx.nTime > GetAdjustedTimeSeconds() || (nTime && tx.nTime > nTime)) {
             return false;
         }
     }
+    m_next_block_fees.insert(package_fees.begin(), package_fees.end());
     return true;
 }
 
 void BlockAssembler::AddToBlock(CTxMemPool::txiter iter)
 {
+    const CTransaction& tx = iter->GetTx();
+    const auto fee_it = m_next_block_fees.find(tx.GetHash());
+    // Every entry reaches AddToBlock only after TestPackageTransactions has
+    // recomputed its fee in the exact next-block demurrage context.
+    assert(fee_it != m_next_block_fees.end());
+    const CAmount next_block_fee = fee_it->second;
     pblocktemplate->block.vtx.emplace_back(iter->GetSharedTx());
-    pblocktemplate->vTxFees.push_back(iter->GetFee());
+    pblocktemplate->vTxFees.push_back(next_block_fee);
     pblocktemplate->vTxSigOpsCost.push_back(iter->GetSigOpCost());
     nBlockWeight += iter->GetTxWeight();
     ++nBlockTx;
     nBlockSigOpsCost += iter->GetSigOpCost();
-    nFees += iter->GetFee();
+    nFees += next_block_fee;
     inBlock.insert(iter);
+    for (const Consensus::DemurrageAttestation& attestation : Consensus::ExtractDemurrageAttestations(tx)) {
+        m_demurrage_attestation_keys.insert(attestation.pubkey_hash);
+        m_demurrage_attestation_targets.insert(attestation.target_outpoint);
+        ++m_demurrage_attestation_count;
+    }
 
     bool fPrintPriority = gArgs.GetBoolArg("-printpriority", DEFAULT_PRINTPRIORITY);
     if (fPrintPriority) {
@@ -739,7 +807,7 @@ static bool ProcessBlockFound(const CBlock* pblock, ChainstateManager& chainman)
     {
         LOCK(cs_main);
         BlockValidationState state;
-        if (!CheckProofOfStake(&chainman.BlockIndex()[pblock->hashPrevBlock], *pblock->vtx[1], pblock->nBits, state, chainman.ActiveChainstate().CoinsTip(), pblock->vtx[1]->nTime ? pblock->vtx[1]->nTime : pblock->nTime))
+        if (!CheckProofOfStake(&chainman.BlockIndex()[pblock->hashPrevBlock], *pblock->vtx[1], pblock->nBits, state, chainman.ActiveChainstate().CoinsTip(), pblock->vtx[1]->nTime ? pblock->vtx[1]->nTime : pblock->nTime, chainman))
             return error("ProcessBlockFound(): proof-of-stake checking failed");
         
         if (pblock->hashPrevBlock != chainman.ActiveChain().Tip()->GetBlockHash())
@@ -960,6 +1028,7 @@ void PoSMiner(CWallet *pwallet)
                     continue;
                 }
                 pwallet->WalletLogPrintf("Error in PoSMiner: Keypool ran out, please call keypoolrefill before restarting the mining thread\n");
+                pwallet->m_enabled_staking = false;
                 if (!SleepStaker(pwallet, 10000))
                    return;
 

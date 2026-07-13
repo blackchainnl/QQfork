@@ -129,6 +129,10 @@ void AddOutputs(CMutableTransaction& rawTx, const UniValue& outputs_in)
             CTxOut out(0, CreateRGBCommitment(state_hash));
             rawTx.vout.push_back(out);
         } else if (name_ == "eutxo") {
+            if (!EUTXO_ENABLED) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                    "EUTXO v15 is disabled in v30.1.1 because it has no quantum ownership authorization");
+            }
             if (has_eutxo) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "Invalid parameter, duplicate key: eutxo");
             }
@@ -331,14 +335,18 @@ void ParsePrevouts(const UniValue& prevTxsUnival, FillableSigningProvider* keyst
     }
 }
 
-void SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, const std::map<COutPoint, Coin>& coins, const UniValue& hashType, UniValue& result)
+void SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore,
+                     const std::map<COutPoint, Coin>& coins, const UniValue& hashType,
+                     UniValue& result, uint32_t quantum_chain_id,
+                     unsigned int extra_verify_flags)
 {
     int nHashType = ParseSighashString(hashType);
 
     // Script verification errors
     std::map<int, bilingual_str> input_errors;
 
-    bool complete = SignTransaction(mtx, keystore, coins, nHashType, input_errors);
+    bool complete = SignTransaction(mtx, keystore, coins, nHashType, input_errors,
+                                    quantum_chain_id, extra_verify_flags);
     SignTransactionResultToJSON(mtx, complete, coins, input_errors, result);
 }
 

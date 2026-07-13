@@ -44,7 +44,9 @@ class QuantumStakingTiersTest(BitcoinTestFramework):
         args = [
             "-txindex=1",
             "-staketimio=50",
-            "-donatetodevfund=0",
+            # Regression: a legacy dev-fund output must be suppressed when a
+            # migration-phase coinstake spends a quantum input.
+            "-donatetodevfund=1",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=10",
             "-qqgoldrushendtime=1",

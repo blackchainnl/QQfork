@@ -468,10 +468,10 @@ class RawTransactionsTest(BitcoinTestFramework):
     def transaction_version_number_tests(self):
         self.log.info("Test transaction version numbers")
 
-        # Test the minimum transaction version number that fits in a signed 32-bit integer.
-        # As transaction version is unsigned, this should convert to its unsigned equivalent.
+        # Test the first transaction version with the high bit set. Transaction
+        # versions are unsigned in the legacy Blackcoin wire format.
         tx = CTransaction()
-        tx.nVersion = -0x80000000
+        tx.nVersion = 0x80000000
         rawtx = tx.serialize().hex()
         decrawtx = self.nodes[0].decoderawtransaction(rawtx)
         assert_equal(decrawtx['version'], 0x80000000)

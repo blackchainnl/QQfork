@@ -103,8 +103,8 @@ bool IsQuantumProtectedSpendAllowedOutput(const CTransaction& tx, unsigned int o
 {
     const CTxOut& txout = tx.vout[output_index];
     if (tx.IsCoinStake() && output_index == 0 && txout.IsEmpty()) return true;
-    if (!txout.scriptPubKey.empty() && txout.scriptPubKey[0] == OP_RETURN) return true;
-    return IsQuantumProtectedScript(txout.scriptPubKey) || IsEUTXOScript(txout.scriptPubKey);
+    if (!txout.scriptPubKey.empty() && txout.scriptPubKey[0] == OP_RETURN) return txout.nValue == 0;
+    return IsQuantumProtectedScript(txout.scriptPubKey);
 }
 
 bool IsValidQuantumColdStakeSelector(const std::vector<unsigned char>& selector)
@@ -115,6 +115,45 @@ bool IsValidQuantumColdStakeSelector(const std::vector<unsigned char>& selector)
 bool IsQuantumColdStakeStakerBranch(const std::vector<unsigned char>& selector)
 {
     return selector.size() == 1 && selector[0] == 1;
+}
+
+bool CheckNextBlockQuantumContext(const NodeContext& node, const CTransaction& tx,
+                                  std::string& reject_reason,
+                                  const std::map<COutPoint, Coin>* supplied_coins = nullptr)
+{
+    ChainstateManager& chainman = *Assert(node.chainman);
+    const CTxMemPool& mempool = *Assert(node.mempool);
+    LOCK2(::cs_main, mempool.cs);
+    const CBlockIndex* tip = chainman.ActiveChain().Tip();
+    const int next_height = tip ? tip->nHeight + 1 : 0;
+    const int64_t next_mtp = tip ? tip->GetMedianTimePast() : 0;
+    CCoinsViewCache& chain_view = chainman.ActiveChainstate().CoinsTip();
+    CCoinsViewMemPool mempool_view(&chain_view, mempool);
+    CCoinsViewCache view(&mempool_view);
+    // Raw-signing RPCs support offline/external prevouts. Overlay the exact
+    // caller-supplied Coin records above chain+mempool so contextual signing
+    // checks do not discard the same prevtx data used by SignTransaction.
+    if (supplied_coins) {
+        for (const CTxIn& txin : tx.vin) {
+            const auto it = supplied_coins->find(txin.prevout);
+            if (it == supplied_coins->end() || it->second.IsSpent()) continue;
+            Coin authoritative;
+            if (view.GetCoin(txin.prevout, authoritative) && !authoritative.IsSpent()) {
+                continue;
+            }
+            view.AddCoin(txin.prevout, Coin{it->second}, /*possible_overwrite=*/true);
+        }
+    }
+    const unsigned int flags = GetNextBlockPolicyScriptFlags(tip, chainman);
+    if (!view.HaveInputs(tx)) {
+        // Offline PSBT/signing workflows can still prove signatures from their
+        // embedded UTXOs. Validate every output rule now, but leave input
+        // provenance/isolation admission to testmempoolaccept or broadcast.
+        return CheckQuantumQuasarOutputs(tx, flags, reject_reason);
+    }
+    return CheckQuantumQuasarTransaction(
+        tx, view, flags, next_height,
+        chainman.GetConsensus(), next_mtp, reject_reason);
 }
 
 void QuantumTxInErrorToJSON(const CTxIn& txin, UniValue& errors, const std::string& message)
@@ -297,6 +336,14 @@ PartiallySignedTransaction ProcessPSBT(const std::string& psbt_string, const std
 
     if (g_txindex) g_txindex->BlockUntilSyncedToCurrentChain();
     const NodeContext& node = EnsureAnyNodeContext(context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    const unsigned int psbt_verify_flags{WITH_LOCK(::cs_main,
+        return GetNextBlockPolicyScriptFlags(chainman.ActiveChain().Tip(), chainman);)};
+    const bool forkid_active = psbt_verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID;
+    if ((sighash_type & SIGHASH_FORKID) && !forkid_active) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "SIGHASH_FORKID is not active until the post-Gold-Rush migration phase");
+    }
 
     // If we can't find the corresponding full transaction for all of our inputs,
     // this will be used to find just the utxos for the segwit inputs for which
@@ -347,7 +394,8 @@ PartiallySignedTransaction ProcessPSBT(const std::string& psbt_string, const std
         }
     }
 
-    const PrecomputedTransactionData& txdata = PrecomputePSBTData(psbtx);
+    const PrecomputedTransactionData& txdata = PrecomputePSBTData(
+        psbtx, chainman.GetConsensus().nQuantumSighashChainId, forkid_active);
 
     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
         if (PSBTInputSigned(psbtx.inputs.at(i))) {
@@ -358,7 +406,8 @@ PartiallySignedTransaction ProcessPSBT(const std::string& psbt_string, const std
         // Note that SignPSBTInput does a lot more than just constructing ECDSA signatures.
         // We only actually care about those if our signing provider doesn't hide private
         // information, as is the case with `descriptorprocesspsbt`
-        SignPSBTInput(provider, psbtx, /*index=*/i, &txdata, sighash_type, /*out_sigdata=*/nullptr, finalize);
+        SignPSBTInput(provider, psbtx, /*index=*/i, &txdata, sighash_type,
+                      /*out_sigdata=*/nullptr, finalize, psbt_verify_flags);
     }
 
     // Update script/keypath information using descriptor data.
@@ -367,6 +416,21 @@ PartiallySignedTransaction ProcessPSBT(const std::string& psbt_string, const std
     }
 
     RemoveUnnecessaryTransactions(psbtx, /*sighash_type=*/1);
+
+    if (finalize && std::all_of(psbtx.inputs.begin(), psbtx.inputs.end(),
+                               [](const PSBTInput& input) { return PSBTInputSigned(input); })) {
+        PartiallySignedTransaction checked_psbt{psbtx};
+        CMutableTransaction checked_mtx;
+        if (!FinalizeAndExtractPSBT(checked_psbt, checked_mtx, psbt_verify_flags,
+                                    chainman.GetConsensus().nQuantumSighashChainId)) {
+            throw JSONRPCError(RPC_VERIFY_ERROR, "PSBT signatures do not verify in the active Quantum Quasar lifecycle");
+        }
+        std::string reject_reason;
+        if (!CheckNextBlockQuantumContext(node, CTransaction{checked_mtx}, reject_reason)) {
+            throw JSONRPCError(RPC_VERIFY_ERROR,
+                strprintf("PSBT is not valid for the next Quantum Quasar block: %s", reject_reason));
+        }
+    }
 
     return psbtx;
 }
@@ -1154,11 +1218,18 @@ static RPCHelpMan combinerawtransaction()
     // Fetch previous transactions (inputs):
     CCoinsView viewDummy;
     CCoinsViewCache view(&viewDummy);
+    bool forkid_active{false};
+    uint32_t quantum_chain_id{0};
     {
         NodeContext& node = EnsureAnyNodeContext(request.context);
         const CTxMemPool& mempool = EnsureMemPool(node);
         ChainstateManager& chainman = EnsureChainman(node);
         LOCK2(cs_main, mempool.cs);
+        quantum_chain_id = chainman.GetConsensus().nQuantumSighashChainId;
+        if (const CBlockIndex* tip = chainman.ActiveChain().Tip()) {
+            forkid_active = IsQuantumWitnessSpendActive(
+                chainman.GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1);
+        }
         CCoinsViewCache &viewChain = chainman.ActiveChainstate().CoinsTip();
         CCoinsViewMemPool viewMempool(&viewChain, mempool);
         view.SetBackend(viewMempool); // temporarily switch cache backend to db+mempool view
@@ -1173,6 +1244,24 @@ static RPCHelpMan combinerawtransaction()
     // Use CTransaction for the constant parts of the
     // transaction to avoid rehashing.
     const CTransaction txConst(mergedTx);
+    std::vector<CTxOut> spent_outputs;
+    spent_outputs.reserve(mergedTx.vin.size());
+    for (const CTxIn& txin : mergedTx.vin) {
+        const Coin& coin = view.AccessCoin(txin.prevout);
+        if (coin.IsSpent()) throw JSONRPCError(RPC_VERIFY_ERROR, "Input not found or already spent");
+        if (IsEUTXOScript(coin.out.scriptPubKey)) {
+            throw JSONRPCError(RPC_VERIFY_ERROR, "EUTXO v15 spends are disabled in v30.1.1");
+        }
+        spent_outputs.push_back(coin.out);
+    }
+    if (forkid_active && quantum_chain_id == 0) {
+        throw JSONRPCError(RPC_VERIFY_ERROR, "Quantum Quasar ForkID is active but the network chain id is missing");
+    }
+    PrecomputedTransactionData txdata;
+    txdata.Init(txConst, std::move(spent_outputs), true);
+    txdata.m_quantum_sighash_chain_id = quantum_chain_id;
+    txdata.m_sighash_forkid_active = forkid_active;
+    const unsigned int extra_verify_flags = forkid_active ? SCRIPT_ENABLE_SIGHASH_FORKID : 0;
     // Sign what we can:
     for (unsigned int i = 0; i < mergedTx.vin.size(); i++) {
         CTxIn& txin = mergedTx.vin[i];
@@ -1185,14 +1274,24 @@ static RPCHelpMan combinerawtransaction()
         // ... and merge in other signatures:
         for (const CMutableTransaction& txv : txVariants) {
             if (txv.vin.size() > i) {
-                sigdata.MergeSignatureData(DataFromTransaction(txv, i, coin.out));
+                sigdata.MergeSignatureData(DataFromTransaction(txv, i, coin.out, &txdata, extra_verify_flags));
             }
         }
-        ProduceSignature(DUMMY_SIGNING_PROVIDER, MutableTransactionSignatureCreator(mergedTx, i, coin.out.nValue, 1), coin.out.scriptPubKey, sigdata);
+        ProduceSignature(DUMMY_SIGNING_PROVIDER,
+            MutableTransactionSignatureCreator(mergedTx, i, coin.out.nValue, &txdata,
+                forkid_active ? (SIGHASH_ALL | SIGHASH_FORKID) : SIGHASH_ALL,
+                extra_verify_flags ? extra_verify_flags : STANDARD_SCRIPT_VERIFY_FLAGS),
+            coin.out.scriptPubKey, sigdata);
 
         UpdateInput(txin, sigdata);
     }
 
+    std::string reject_reason;
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    if (!CheckNextBlockQuantumContext(node, CTransaction{mergedTx}, reject_reason)) {
+        throw JSONRPCError(RPC_VERIFY_ERROR,
+            strprintf("Combined transaction is not valid for the next Quantum Quasar block: %s", reject_reason));
+    }
     return EncodeHexTx(CTransaction(mergedTx));
 },
     };
@@ -1301,11 +1400,25 @@ static RPCHelpMan signrawtransactionwithkey()
 
     UniValue result(UniValue::VOBJ);
     UniValue sighash{request.params[3]};
-    const bool use_forkid_default{WITH_LOCK(::cs_main, return chainman.ActiveChain().Tip() && chainman.GetConsensus().IsNewNetworkStakeOnly(chainman.ActiveChain().Tip()->GetMedianTimePast(), chainman.ActiveChain().Tip()->nHeight + 1);)};
+    const bool use_forkid_default{WITH_LOCK(::cs_main, return chainman.ActiveChain().Tip() && IsQuantumWitnessSpendActive(chainman.GetConsensus(), chainman.ActiveChain().Tip()->GetMedianTimePast(), chainman.ActiveChain().Tip()->nHeight + 1);)};
     if (sighash.isNull() && use_forkid_default) {
         sighash = UniValue{UniValue::VSTR, "ALL|FORKID"};
     }
-    SignTransaction(mtx, &keystore, coins, sighash, result);
+    if (!sighash.isNull() && (ParseSighashString(sighash) & SIGHASH_FORKID) &&
+        !use_forkid_default) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+            "SIGHASH_FORKID is not active until the post-Gold-Rush migration phase");
+    }
+    const unsigned int verify_flags{WITH_LOCK(::cs_main,
+        return GetNextBlockPolicyScriptFlags(chainman.ActiveChain().Tip(), chainman);)};
+    SignTransaction(mtx, &keystore, coins, sighash, result,
+                    chainman.GetConsensus().nQuantumSighashChainId,
+                    verify_flags);
+    // This is an offline signing RPC, not a mempool-admission RPC. The
+    // caller-supplied prevtx view is sufficient to sign and verify scripts;
+    // testmempoolaccept/sendrawtransaction remain the authoritative contextual
+    // lifecycle checks. In particular, do not prevent construction of a
+    // transaction intended for a later activation boundary.
     return result;
 },
     };
@@ -1422,23 +1535,13 @@ static RPCHelpMan signrawtransactionwithquantumkey()
     FindCoins(node, coins);
     ParsePrevouts(request.params[2], nullptr, coins);
 
-    bool v4_active{false};
-    bool quantum_spend_active{false};
-    bool eutxo_spend_active{false};
-    bool final_lockout_active{false};
-    bool stake_tiers_active{false};
+    unsigned int contextual_flags{0};
     {
         LOCK(::cs_main);
-        if (const CBlockIndex* tip = chainman.ActiveChain().Tip()) {
-            const int64_t tip_mtp = tip->GetMedianTimePast();
-            const auto& consensus = chainman.GetConsensus();
-            v4_active = consensus.IsProtocolV4(tip_mtp);
-            quantum_spend_active = IsQuantumWitnessSpendActive(consensus, tip_mtp, tip->nHeight + 1);
-            eutxo_spend_active = quantum_spend_active;
-            final_lockout_active = consensus.IsQuantumFinalLockout(tip_mtp, tip->nHeight + 1);
-            stake_tiers_active = consensus.IsStakeTiersActive(tip->nHeight + 1);
-        }
+        contextual_flags = GetNextBlockPolicyScriptFlags(chainman.ActiveChain().Tip(), chainman);
     }
+    const bool quantum_spend_active = contextual_flags & SCRIPT_VERIFY_QUANTUM_ML_DSA;
+    const bool final_lockout_active = contextual_flags & SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT;
 
     std::map<unsigned int, std::string> input_errors;
     std::vector<bool> quantum_inputs(mtx.vin.size(), false);
@@ -1469,11 +1572,16 @@ static RPCHelpMan signrawtransactionwithquantumkey()
             }
             mtx.vin[i].scriptSig.clear();
         } else if (eutxo_inputs[i]) {
-            if (!eutxo_spend_active) {
-                input_errors[i] = "EUTXO spends are not active until the post-Gold-Rush migration window";
-            }
+            input_errors[i] = "EUTXO v15 spends are disabled in v30.1.1 because they have no quantum ownership authorization";
         } else if (final_lockout_active) {
             input_errors[i] = "Legacy spends are disabled after the Blackcoin migration deadline";
+        }
+    }
+
+    for (unsigned int i = 0; i < mtx.vout.size(); ++i) {
+        if (IsEUTXOScript(mtx.vout[i].scriptPubKey)) {
+            input_errors[0] = strprintf("EUTXO v15 outputs are disabled in v30.1.1 (output %u)", i);
+            break;
         }
     }
 
@@ -1581,6 +1689,7 @@ static RPCHelpMan signrawtransactionwithquantumkey()
     PrecomputedTransactionData txdata;
     txdata.Init(tx_const, std::move(spent_outputs), true);
     txdata.m_quantum_sighash_chain_id = chainman.GetConsensus().nQuantumSighashChainId;
+    txdata.m_sighash_forkid_active = quantum_spend_active;
 
     for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
         if (input_errors.count(i)) continue;
@@ -1590,29 +1699,7 @@ static RPCHelpMan signrawtransactionwithquantumkey()
             continue;
         }
         ScriptError serror = SCRIPT_ERR_OK;
-        unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS;
-        if (v4_active) {
-            verify_flags |= SCRIPT_VERIFY_ISCOINSTAKE;
-            verify_flags |= SCRIPT_VERIFY_STRICTENC;
-        }
-        if (final_lockout_active) {
-            verify_flags |= SCRIPT_ENABLE_SIGHASH_FORKID;
-        }
-        if (quantum_spend_active) {
-            verify_flags |= SCRIPT_VERIFY_V4_LARGE_SCRIPT_ELEMENT;
-            verify_flags |= SCRIPT_VERIFY_QUANTUM_ML_DSA;
-            verify_flags |= SCRIPT_VERIFY_QUANTUM_COLDSTAKE;
-        }
-        if (eutxo_spend_active) {
-            verify_flags |= SCRIPT_VERIFY_EUTXO;
-        }
-        if (stake_tiers_active) {
-            verify_flags |= SCRIPT_VERIFY_QUANTUM_STAKE_TIERS;
-        }
-        if (final_lockout_active) {
-            verify_flags |= SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT;
-        }
-        if (!VerifyScript(mtx.vin[i].scriptSig, coin.out.scriptPubKey, &mtx.vin[i].scriptWitness, verify_flags,
+        if (!VerifyScript(mtx.vin[i].scriptSig, coin.out.scriptPubKey, &mtx.vin[i].scriptWitness, contextual_flags,
                           TransactionSignatureChecker(&tx_const, i, coin.out.nValue, txdata, MissingDataBehavior::FAIL), &serror)) {
             input_errors[i] = ScriptErrorString(serror);
         }
@@ -1621,12 +1708,21 @@ static RPCHelpMan signrawtransactionwithquantumkey()
     if (final_lockout_active && input_errors.empty()) {
         for (unsigned int i = 0; i < mtx.vout.size(); ++i) {
             const CTxOut& txout = mtx.vout[i];
-            if (txout.IsEmpty() || (!txout.scriptPubKey.empty() && txout.scriptPubKey[0] == OP_RETURN) ||
-                IsQuantumProtectedScript(txout.scriptPubKey) || IsEUTXOScript(txout.scriptPubKey)) {
+            if (txout.IsEmpty() || (txout.nValue == 0 && !txout.scriptPubKey.empty() && txout.scriptPubKey[0] == OP_RETURN) ||
+                IsQuantumProtectedScript(txout.scriptPubKey)) {
                 continue;
             }
             input_errors[0] = strprintf("Legacy outputs are disabled after the Blackcoin migration deadline (output %u)", i);
             break;
+        }
+    }
+
+    if (input_errors.empty()) {
+        std::string reject_reason;
+        if (!CheckNextBlockQuantumContext(node, tx_const, reject_reason, &coins)) {
+            input_errors[0] = strprintf(
+                "Transaction is not valid for the next Quantum Quasar block: %s",
+                reject_reason);
         }
     }
 
@@ -2379,8 +2475,19 @@ static RPCHelpMan finalizepsbt()
 
     bool extract = request.params[1].isNull() || (!request.params[1].isNull() && request.params[1].get_bool());
 
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    const unsigned int verify_flags{WITH_LOCK(::cs_main,
+        return GetNextBlockPolicyScriptFlags(chainman.ActiveChain().Tip(), chainman);)};
     CMutableTransaction mtx;
-    bool complete = FinalizeAndExtractPSBT(psbtx, mtx);
+    bool complete = FinalizeAndExtractPSBT(
+        psbtx, mtx, verify_flags, chainman.GetConsensus().nQuantumSighashChainId);
+    if (complete) {
+        std::string reject_reason;
+        if (!CheckNextBlockQuantumContext(node, CTransaction{mtx}, reject_reason)) {
+            complete = false;
+        }
+    }
 
     UniValue result(UniValue::VOBJ);
     CDataStream ssTx(SER_NETWORK);
@@ -2703,7 +2810,24 @@ static RPCHelpMan analyzepsbt()
         throw JSONRPCError(RPC_DESERIALIZATION_ERROR, strprintf("TX decode failed %s", error));
     }
 
-    PSBTAnalysis psbta = AnalyzePSBT(psbtx);
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    ChainstateManager& chainman = EnsureChainman(node);
+    const unsigned int verify_flags{WITH_LOCK(::cs_main,
+        return GetNextBlockPolicyScriptFlags(chainman.ActiveChain().Tip(), chainman);)};
+    PSBTAnalysis psbta = AnalyzePSBT(
+        psbtx, verify_flags, chainman.GetConsensus().nQuantumSighashChainId);
+    if (psbta.next == PSBTRole::EXTRACTOR) {
+        PartiallySignedTransaction checked_psbt{psbtx};
+        CMutableTransaction checked_mtx;
+        std::string reject_reason;
+        if (!FinalizeAndExtractPSBT(checked_psbt, checked_mtx, verify_flags,
+                                    chainman.GetConsensus().nQuantumSighashChainId) ||
+            !CheckNextBlockQuantumContext(node, CTransaction{checked_mtx}, reject_reason)) {
+            psbta.SetInvalid(reject_reason.empty()
+                ? "PSBT signatures do not verify in the active Quantum Quasar lifecycle"
+                : strprintf("PSBT is not valid for the next Quantum Quasar block: %s", reject_reason));
+        }
+    }
 
     UniValue result(UniValue::VOBJ);
     UniValue inputs_result(UniValue::VARR);
@@ -2817,7 +2941,7 @@ RPCHelpMan descriptorprocesspsbt()
     const NodeContext& node = EnsureAnyNodeContext(request.context);
     ChainstateManager& chainman = EnsureChainman(node);
     UniValue sighash{request.params[2]};
-    const bool use_forkid_default{WITH_LOCK(::cs_main, return chainman.ActiveChain().Tip() && chainman.GetConsensus().IsNewNetworkStakeOnly(chainman.ActiveChain().Tip()->GetMedianTimePast(), chainman.ActiveChain().Tip()->nHeight + 1);)};
+    const bool use_forkid_default{WITH_LOCK(::cs_main, return chainman.ActiveChain().Tip() && IsQuantumWitnessSpendActive(chainman.GetConsensus(), chainman.ActiveChain().Tip()->GetMedianTimePast(), chainman.ActiveChain().Tip()->nHeight + 1);)};
     if (sighash.isNull() && use_forkid_default) {
         sighash = UniValue{UniValue::VSTR, "ALL|FORKID"};
     }
@@ -2848,7 +2972,11 @@ RPCHelpMan descriptorprocesspsbt()
     if (complete) {
         CMutableTransaction mtx;
         PartiallySignedTransaction psbtx_copy = psbtx;
-        CHECK_NONFATAL(FinalizeAndExtractPSBT(psbtx_copy, mtx));
+        const unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS |
+            (use_forkid_default ? SCRIPT_ENABLE_SIGHASH_FORKID : 0);
+        CHECK_NONFATAL(FinalizeAndExtractPSBT(
+            psbtx_copy, mtx, verify_flags,
+            chainman.GetConsensus().nQuantumSighashChainId));
         DataStream ssTx_final;
         ssTx_final << TX_WITH_WITNESS(mtx);
         result.pushKV("hex", HexStr(ssTx_final));
@@ -2871,7 +2999,7 @@ static RPCHelpMan verifyeutxospend()
         },
         RPCResult{RPCResult::Type::OBJ, "", "",
             {
-                {RPCResult::Type::STR, "validity", "\"enforced\" if SCRIPT_VERIFY_EUTXO is active at the tip, else \"premature\""},
+                {RPCResult::Type::STR, "validity", "Always \"disabled\" in v30.1.1; decoded details are inspection-only"},
                 {RPCResult::Type::ARR, "spends", "Confirmed EUTXO spends in this transaction",
                  {
                      {RPCResult::Type::OBJ, "", "",
@@ -2916,21 +3044,17 @@ static RPCHelpMan verifyeutxospend()
     }
     const CTransaction& tx = *txref;
 
-    bool v4_active{false};
     bool enforced{false};
     bool final_lockout_active{false};
-    bool new_network_stake_only{false};
     bool stake_tiers_active{false};
     {
         LOCK(::cs_main);
         if (const CBlockIndex* tip = chainman.ActiveChain().Tip()) {
             const int64_t tip_mtp = tip->GetMedianTimePast();
             const auto& consensus = chainman.GetConsensus();
-            v4_active = consensus.IsProtocolV4(tip_mtp);
-            enforced = IsQuantumWitnessSpendActive(consensus, tip_mtp, tip->nHeight + 1);
+            enforced = false;
             final_lockout_active = consensus.IsQuantumFinalLockout(tip_mtp, tip->nHeight + 1);
-            new_network_stake_only = consensus.IsNewNetworkStakeOnly(tip_mtp, tip->nHeight + 1);
-            stake_tiers_active = consensus.IsStakeTiersActive(tip->nHeight + 1);
+            stake_tiers_active = IsQuantumStakeTiersActive(consensus, tip_mtp, tip->nHeight + 1);
         }
     }
 
@@ -2947,18 +3071,16 @@ static RPCHelpMan verifyeutxospend()
     PrecomputedTransactionData txdata;
     txdata.Init(tx, std::move(spent_outputs), true);
     txdata.m_quantum_sighash_chain_id = chainman.GetConsensus().nQuantumSighashChainId;
+    txdata.m_sighash_forkid_active = enforced;
 
     unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS;
-    if (v4_active) {
-        verify_flags |= SCRIPT_VERIFY_ISCOINSTAKE;
+    if (enforced) {
         verify_flags |= SCRIPT_VERIFY_STRICTENC;
     }
-    if (new_network_stake_only) {
+    if (enforced) {
         verify_flags |= SCRIPT_ENABLE_SIGHASH_FORKID;
     }
     if (enforced) {
-        verify_flags |= SCRIPT_VERIFY_V4_LARGE_SCRIPT_ELEMENT;
-        verify_flags |= SCRIPT_VERIFY_EUTXO;
         verify_flags |= SCRIPT_VERIFY_QUANTUM_ML_DSA;
         verify_flags |= SCRIPT_VERIFY_QUANTUM_COLDSTAKE;
     }
@@ -3030,7 +3152,7 @@ static RPCHelpMan verifyeutxospend()
     }
 
     UniValue r(UniValue::VOBJ);
-    r.pushKV("validity", enforced ? "enforced" : "premature");
+    r.pushKV("validity", "disabled");
     r.pushKV("spends", spends);
     return r;
 },
@@ -3076,6 +3198,9 @@ static RPCHelpMan createeutxospend()
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    throw JSONRPCError(RPC_INVALID_PARAMETER,
+        "EUTXO v15 is disabled in v30.1.1 because it has no quantum ownership authorization");
+
     const UniValue& c = request.params[0].get_obj();
     RPCTypeCheckObj(c, {
         {"txid", UniValueType(UniValue::VSTR)},
@@ -3170,6 +3295,9 @@ static RPCHelpMan createeutxotransition()
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    throw JSONRPCError(RPC_INVALID_PARAMETER,
+        "EUTXO v15 is disabled in v30.1.1 because it has no quantum ownership authorization");
+
     const UniValue& c = request.params[0].get_obj();
     RPCTypeCheckObj(c, {
         {"txid", UniValueType(UniValue::VSTR)},

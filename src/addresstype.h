@@ -23,6 +23,10 @@
 
 static constexpr unsigned int EUTXO_WITNESS_VERSION = 15;
 static constexpr unsigned int EUTXO_PROGRAM_SIZE = 32;
+// v15 commitments have no quantum ownership authentication in v30.1.1.
+// Keep decoding support for recovery/inspection, but never construct, relay,
+// mine, or sign them until a future consensus design supplies that authority.
+static constexpr bool EUTXO_ENABLED = false;
 
 class CNoDestination
 {

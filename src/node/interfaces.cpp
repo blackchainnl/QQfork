@@ -810,9 +810,19 @@ public:
     void requestMempoolTransactions(Notifications& notifications) override
     {
         if (!m_node.mempool) return;
-        LOCK2(::cs_main, m_node.mempool->cs);
-        for (const CTxMemPoolEntry& entry : m_node.mempool->entryAll()) {
-            notifications.transactionAddedToMempool(entry.GetSharedTx());
+        std::vector<CTransactionRef> transactions;
+        {
+            LOCK2(::cs_main, m_node.mempool->cs);
+            transactions.reserve(m_node.mempool->size());
+            for (const CTxMemPoolEntry& entry : m_node.mempool->entryAll()) {
+                transactions.push_back(entry.GetSharedTx());
+            }
+        }
+        // Wallet notification code takes cs_wallet and may query current
+        // mempool state. Never invoke it while holding cs_main or mempool.cs;
+        // callbacks already tolerate entries disappearing after a snapshot.
+        for (const CTransactionRef& tx : transactions) {
+            notifications.transactionAddedToMempool(tx);
         }
     }
     bool isTaprootActive() const override

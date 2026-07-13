@@ -61,6 +61,7 @@ using wallet::CWallet;
 class Chainstate;
 class CTxMemPool;
 class CTxUndo;
+class CScriptCheck;
 class ChainstateManager;
 struct ChainTxData;
 class DisconnectedBlockTransactions;
@@ -118,6 +119,27 @@ extern const std::vector<std::string> CHECKLEVEL_DOC;
 void StartScriptCheckWorkerThreads(int threads_num);
 /** Stop all of the script checking worker threads */
 void StopScriptCheckWorkerThreads();
+
+unsigned int GetNextBlockScriptFlags(const CBlockIndex* active_tip, const ChainstateManager& chainman);
+/** Exact next-block mempool/tooling flags, including deployment gating and
+ * Quantum Quasar lifecycle flags. */
+unsigned int GetNextBlockPolicyScriptFlags(const CBlockIndex* active_tip, const ChainstateManager& chainman);
+/** Output-only lifecycle rules, usable by offline signing/PSBT workflows that
+ * do not have authoritative input provenance. */
+bool CheckQuantumQuasarOutputs(const CTransaction& tx, unsigned int flags,
+                               std::string& reject_reason);
+/** Full non-script Quantum Quasar transaction rules shared by mempool,
+ * assembler, and block connection. */
+bool CheckQuantumQuasarTransaction(const CTransaction& tx, const CCoinsViewCache& inputs,
+                                   unsigned int flags, int spend_height,
+                                   const Consensus::Params& consensus_params,
+                                   int64_t spend_time, std::string& reject_reason);
+bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
+                       const CCoinsViewCache& inputs, unsigned int flags,
+                       bool cacheSigStore, bool cacheFullScriptStore,
+                       PrecomputedTransactionData& txdata,
+                       std::vector<CScriptCheck>* pvChecks = nullptr)
+                       EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams, bool fProofOfStake = false);
 CAmount GetProofOfWorkSubsidy();
@@ -391,7 +413,10 @@ bool CheckTieredStakePrincipalCovenant(const CTransaction& tx, const CCoinsViewC
  *  quantum cold-staking output must return at least the spent principal to the
  *  same scriptPubKey. Shadow/dev emissions do not count as returned principal.
  *  Exposed for unit testing; ConnectBlock calls it for coinstakes once V4 is active. */
-bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinstake_undo, const std::map<CScript, CAmount>& shadow_direct_payouts, const CScript& dev_reward_script, std::string& reject_reason);
+bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinstake_undo,
+                            const std::map<CScript, CAmount>& shadow_direct_payouts,
+                            const CScript& dev_reward_script, std::string& reject_reason,
+                            const std::vector<CAmount>* effective_principals = nullptr);
 bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinstake_undo, std::string& reject_reason);
 
 /** Check a block is completely valid from start to finish (only works on top of our current best block) */
@@ -712,7 +737,8 @@ public:
         LOCKS_EXCLUDED(::cs_main);
 
     // Block (dis)connection on a given view:
-    DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
+    DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view,
+                                     bool disconnect_auxiliary_state = true)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
                       CCoinsViewCache& view, bool fJustCheck = false, bool fCheckBlockSig = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -784,7 +810,8 @@ private:
     void InvalidBlockFound(CBlockIndex* pindex, const BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     CBlockIndex* FindMostWorkChain() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
-    bool RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& inputs) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    bool RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& inputs,
+                          bool apply_auxiliary_state = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     void CheckForkWarningConditions() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void InvalidChainFound(CBlockIndex* pindexNew) EXCLUSIVE_LOCKS_REQUIRED(cs_main);

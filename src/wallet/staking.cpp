@@ -19,6 +19,7 @@
 #include <wallet/receive.h>
 #include <wallet/redelegation.h>
 #include <wallet/staking.h>
+#include <wallet/spend.h>
 #include <hash.h>
 #include <node/miner.h>
 #include <script/signingprovider.h>
@@ -91,8 +92,12 @@ bool IsGeneratedQuantumStakeCandidate(const CWallet& wallet, const COutPoint& ou
 {
     if (!IsQuantumMigrationScript(script_pub_key)) return false;
 
+    const CBlockIndex* tip = wallet.chain().getTip();
+    const int spend_height = tip ? tip->nHeight + 1 : 0;
+    const int64_t spend_time = tip ? tip->GetMedianTimePast() : 0;
     CScript marker_script;
-    return IsGoldRushDirectPayoutOutput(wallet.chain().getCoinsTip(), outpoint, &marker_script) && marker_script == script_pub_key;
+    return IsLockedGoldRushPayoutOutput(wallet.chain().getCoinsTip(), outpoint,
+        Params().GetConsensus(), spend_time, spend_height, &marker_script) && marker_script == script_pub_key;
 }
 
 bool IsDemurrageLockedStakeCandidate(const CWallet& wallet, const COutPoint& outpoint, const CScript& script_pub_key, int spend_height, int64_t spend_time)
@@ -106,57 +111,12 @@ bool IsDemurrageLockedStakeCandidate(const CWallet& wallet, const COutPoint& out
     const auto it = coins.find(outpoint);
     if (it == coins.end() || it->second.out.IsNull()) return false;
 
-    const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(
+    const std::optional<Consensus::DemurrageAttestationState> latest_attestation = Consensus::LatestDemurrageAttestationStateForScript(
         wallet.chain().getCoinsTip(), script_pub_key);
-    return Consensus::EvaluateDemurrage(it->second, consensus, spend_height, spend_time, latest_attestation).locked;
-}
-
-bool IsGoldRushStakeHeight(const CBlockIndex* tip)
-{
-    if (!tip) return false;
-    const int next_height = tip->nHeight + 1;
-    return next_height >= SHADOW_REWARD_START_HEIGHT && next_height <= SHADOW_REWARD_END_HEIGHT;
-}
-
-std::set<CScript> WhitelistedGoldRushStakeScripts(
-    const CCoinsViewCache& view,
-    const std::set<std::pair<const CWalletTx*, unsigned int>>& coins)
-{
-    std::set<CScript> scripts;
-    for (const auto& coin : coins) {
-        if (!coin.first || !coin.first->tx || coin.second >= coin.first->tx->vout.size()) continue;
-        const CScript script = CanonicalizeLegacyStakeScript(coin.first->tx->vout[coin.second].scriptPubKey);
-        if (IsWhitelisted(view, script)) {
-            scripts.insert(script);
-        }
-    }
-    return scripts;
-}
-
-void RestrictToGoldRushStakeScripts(
-    const std::set<CScript>& allowed_scripts,
-    std::set<std::pair<const CWalletTx*, unsigned int>>& coins,
-    CAmount& value_in)
-{
-    if (allowed_scripts.empty()) return;
-
-    value_in = 0;
-    for (auto it = coins.begin(); it != coins.end();) {
-        const CWalletTx* wtx = it->first;
-        const unsigned int n = it->second;
-        if (!wtx || !wtx->tx || n >= wtx->tx->vout.size()) {
-            it = coins.erase(it);
-            continue;
-        }
-        const CTxOut& txout = wtx->tx->vout[n];
-        const CScript script = CanonicalizeLegacyStakeScript(txout.scriptPubKey);
-        if (!allowed_scripts.count(script)) {
-            it = coins.erase(it);
-            continue;
-        }
-        value_in += txout.nValue;
-        ++it;
-    }
+    return Consensus::EvaluateDemurrage(
+        it->second, consensus, spend_height, spend_time,
+        latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+        latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt).locked;
 }
 
 bool HasUnderCapRedelegationAlternative(const CCoinsViewCache& view, const uint256& source_staker_hash, const uint256& target_staker_hash, CAmount delegation_amount)
@@ -444,8 +404,12 @@ bool IsSafeDemurrageAttestationFeeOutput(const COutput& out, const Coin& coin, c
         return !consensus.IsDemurrageActive(evaluation_height, evaluation_time);
     }
 
-    const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(view, out.txout.scriptPubKey);
-    const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin, consensus, evaluation_height, evaluation_time, latest_attestation);
+    const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+        Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
+    const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+        coin, consensus, evaluation_height, evaluation_time,
+        latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+        latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
     return !eval.locked && eval.burned_value == 0;
 }
 
@@ -458,8 +422,12 @@ bool GetCoinStakeInputPrincipal(const CCoinsViewCache& view, const COutPoint& ou
         return principal > 0 && MoneyRange(principal);
     }
 
-    const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(view, coin.out.scriptPubKey);
-    const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin, consensus, spend_height, spend_time, latest_attestation);
+    const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+        Consensus::LatestDemurrageAttestationStateForScript(view, coin.out.scriptPubKey);
+    const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+        coin, consensus, spend_height, spend_time,
+        latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+        latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
     if (eval.locked) return false;
     principal = eval.effective_value;
     return principal > 0 && MoneyRange(principal);
@@ -568,7 +536,7 @@ bool CreateDemurrageAttestationTransaction(
     std::vector<unsigned char> public_key;
     CKeyingMaterial private_key;
     {
-        LOCK(wallet.cs_wallet);
+        LOCK2(::cs_main, wallet.cs_wallet);
         if (wallet.IsLocked()) {
             error = _("Wallet is locked");
             return false;
@@ -590,55 +558,115 @@ bool CreateDemurrageAttestationTransaction(
         if (!private_key_bytes.empty()) memory_cleanse(private_key_bytes.data(), private_key_bytes.size());
     };
 
+    const Consensus::Params& consensus = Params().GetConsensus();
+    int evaluation_height{-1};
+    int64_t evaluation_time{0};
+    COutPoint target_outpoint;
+    std::optional<Consensus::DemurrageAttestationRecord> previous_record;
+    std::optional<Consensus::DemurrageAttestationState> previous_state;
+    {
+        LOCK2(cs_main, wallet.cs_wallet);
+        const CBlockIndex* tip = wallet.chain().getTip();
+        if (!tip) {
+            cleanse_private_key_bytes();
+            error = _("Unable to build a demurrage attestation without an active chain tip");
+            return false;
+        }
+        evaluation_height = tip->nHeight + 1;
+        evaluation_time = tip->GetMedianTimePast();
+
+        const CScript target_script = GetScriptForDestination(WitnessUnknown{
+            QUANTUM_MIGRATION_WITNESS_VERSION, witness_program});
+        const uint256 controlling_key = Consensus::DemurragePubKeyHash(public_key);
+        const CCoinsViewCache& coins_view = wallet.chain().getCoinsTip();
+        previous_record = Consensus::LatestDemurrageAttestationRecord(coins_view, controlling_key);
+        if (previous_record) previous_state = previous_record->state;
+        CoinsResult available = AvailableCoinsListUnspent(wallet);
+        std::vector<COutPoint> candidates;
+        for (const COutput& out : available.All()) {
+            if (out.txout.scriptPubKey == target_script) candidates.push_back(out.outpoint);
+        }
+        std::sort(candidates.begin(), candidates.end());
+        std::map<COutPoint, Coin> target_coins;
+        for (const COutPoint& outpoint : candidates) target_coins.emplace(outpoint, Coin{});
+        wallet.chain().findCoins(target_coins);
+        for (const COutPoint& outpoint : candidates) {
+            const auto it = target_coins.find(outpoint);
+            if (it == target_coins.end() || it->second.IsSpent()) continue;
+            const Consensus::DemurrageEvaluation target_evaluation = Consensus::EvaluateDemurrage(
+                it->second, consensus, evaluation_height, evaluation_time,
+                previous_state ? std::optional<int>{previous_state->height} : std::nullopt,
+                previous_state ? std::optional<int>{static_cast<int>(previous_state->coverage_start_height)} : std::nullopt);
+            if (target_evaluation.locked) continue;
+            target_outpoint = outpoint;
+            break;
+        }
+        if (target_outpoint.IsNull()) {
+            cleanse_private_key_bytes();
+            error = _("Demurrage attestation requires a live wallet UTXO controlled by this quantum key");
+            return false;
+        }
+    }
+
+    if (previous_state &&
+        evaluation_height - previous_state->height < consensus.DemurrageAutoAttestBlocks()) {
+        cleanse_private_key_bytes();
+        error = _("This quantum key was attested too recently");
+        return false;
+    }
+
     const std::vector<unsigned char> dummy_signature(ML_DSA::SIGNATURE_BYTES, 0);
     const COutPoint placeholder_anchor{};
-    const CScript placeholder_script = Consensus::BuildDemurrageAttestationScript(placeholder_anchor, public_key, dummy_signature);
+    const CScript placeholder_script = Consensus::BuildDemurrageAttestationScript(
+        placeholder_anchor, target_outpoint,
+        previous_state ? std::optional<int>{previous_state->height} : std::nullopt,
+        previous_state ? previous_state->time : 0,
+        previous_state ? previous_state->coverage_start_height : 0,
+        previous_record
+            ? std::optional<Consensus::DemurrageAttestationSource>{
+                  Consensus::DemurrageAttestationSource{
+                      previous_record->source_block_hash,
+                      previous_record->source_txid,
+                      previous_record->source_output_index}}
+            : std::nullopt,
+        public_key, dummy_signature);
 
     constexpr int RANDOM_CHANGE_POSITION = -1;
     std::vector<CRecipient> placeholder_recipients;
     placeholder_recipients.push_back({placeholder_script, 0, /*subtract_fee=*/false});
 
-    const Consensus::Params& consensus = Params().GetConsensus();
-    int evaluation_height{-1};
-    int64_t evaluation_time{0};
-    {
-        LOCK(cs_main);
-        const CBlockIndex* tip = wallet.chain().getTip();
-        if (tip) {
-            evaluation_height = tip->nHeight + 1;
-            evaluation_time = tip->GetMedianTimePast();
-        }
-    }
-
     std::vector<CCoinControl> attempts;
-    const bool demurrage_active = consensus.IsDemurrageActive(evaluation_height, evaluation_time);
-    if (demurrage_active) {
-        if (coin_control.HasSelected()) {
-            bilingual_str selected_error;
-            if (!ValidateSelectedDemurrageAttestationFeeOutpoints(wallet, coin_control, consensus, evaluation_height, evaluation_time, selected_error)) {
-                cleanse_private_key_bytes();
-                error = selected_error;
-                return false;
-            }
-            CCoinControl selected_attempt = coin_control;
-            selected_attempt.m_allow_other_inputs = false;
-            attempts.push_back(std::move(selected_attempt));
-        } else {
-            const std::vector<COutPoint> safe_outpoints = SafeDemurrageAttestationFeeOutpoints(wallet, consensus, evaluation_height, evaluation_time);
-            if (safe_outpoints.empty()) {
-                cleanse_private_key_bytes();
-                error = _("Unable to select a safe non-decaying fee input for demurrage attestation");
-                return false;
-            }
-            for (const COutPoint& outpoint : safe_outpoints) {
-                CCoinControl attempt = coin_control;
-                attempt.m_allow_other_inputs = false;
-                attempt.Select(outpoint);
-                attempts.push_back(std::move(attempt));
-            }
+    if (coin_control.HasSelected()) {
+        if (coin_control.IsSelected(target_outpoint)) {
+            cleanse_private_key_bytes();
+            error = _("Demurrage attestation target cannot also fund the attestation transaction");
+            return false;
         }
+        bilingual_str selected_error;
+        if (!ValidateSelectedDemurrageAttestationFeeOutpoints(wallet, coin_control, consensus, evaluation_height, evaluation_time, selected_error)) {
+            cleanse_private_key_bytes();
+            error = selected_error;
+            return false;
+        }
+        CCoinControl selected_attempt = coin_control;
+        selected_attempt.m_allow_other_inputs = false;
+        attempts.push_back(std::move(selected_attempt));
     } else {
-        attempts.push_back(coin_control);
+        std::vector<COutPoint> safe_outpoints = SafeDemurrageAttestationFeeOutpoints(
+            wallet, consensus, evaluation_height, evaluation_time);
+        safe_outpoints.erase(std::remove(safe_outpoints.begin(), safe_outpoints.end(), target_outpoint),
+                             safe_outpoints.end());
+        if (safe_outpoints.empty()) {
+            cleanse_private_key_bytes();
+            error = _("Unable to select a safe non-decaying fee input for demurrage attestation");
+            return false;
+        }
+        for (const COutPoint& outpoint : safe_outpoints) {
+            CCoinControl attempt = coin_control;
+            attempt.m_allow_other_inputs = false;
+            attempt.Select(outpoint);
+            attempts.push_back(std::move(attempt));
+        }
     }
 
     bilingual_str last_error;
@@ -654,7 +682,28 @@ bool CreateDemurrageAttestationTransaction(
         }
 
         const COutPoint replay_anchor = planned->tx->vin.front().prevout;
-        const uint256 msg_hash = Consensus::DemurrageAttestationMessageHash(replay_anchor, public_key);
+        if (std::any_of(planned->tx->vin.begin(), planned->tx->vin.end(), [&](const CTxIn& txin) {
+                return txin.prevout == target_outpoint;
+            })) {
+            last_error = _("Demurrage attestation target cannot also fund the attestation transaction");
+            continue;
+        }
+        const std::optional<int> previous_height = previous_state
+            ? std::optional<int>{previous_state->height}
+            : std::nullopt;
+        const uint32_t previous_time = previous_state ? previous_state->time : 0;
+        const uint32_t previous_coverage_start_height = previous_state ? previous_state->coverage_start_height : 0;
+        const std::optional<Consensus::DemurrageAttestationSource> previous_source = previous_record
+            ? std::optional<Consensus::DemurrageAttestationSource>{
+                  Consensus::DemurrageAttestationSource{
+                      previous_record->source_block_hash,
+                      previous_record->source_txid,
+                      previous_record->source_output_index}}
+            : std::nullopt;
+        const uint256 msg_hash = Consensus::DemurrageAttestationMessageHash(
+            replay_anchor, target_outpoint, previous_height, previous_time,
+            previous_coverage_start_height, previous_source, public_key,
+            consensus.nQuantumSighashChainId);
         std::vector<unsigned char> signature;
         if (!ML_DSA::Sign(private_key_bytes, msg_hash.begin(), uint256::size(), signature)) {
             cleanse_private_key_bytes();
@@ -662,7 +711,9 @@ bool CreateDemurrageAttestationTransaction(
             return false;
         }
 
-        const CScript attestation_script = Consensus::BuildDemurrageAttestationScript(replay_anchor, public_key, signature);
+        const CScript attestation_script = Consensus::BuildDemurrageAttestationScript(
+            replay_anchor, target_outpoint, previous_height, previous_time,
+            previous_coverage_start_height, previous_source, public_key, signature);
         CCoinControl anchored_control = attempt_control;
         anchored_control.m_allow_other_inputs = false;
         for (const CTxIn& txin : planned->tx->vin) {
@@ -692,6 +743,7 @@ bool CreateDemurrageAttestationTransaction(
         result.tx = tx;
         result.public_key = std::move(public_key);
         result.replay_anchor = replay_anchor;
+        result.target_outpoint = target_outpoint;
         result.attestation_vout = static_cast<int>(std::distance(tx->vout.begin(), attestation_out));
         result.fee = res->fee;
         return true;
@@ -739,7 +791,7 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     uint256 source_staker_hash;
     uint256 source_owner_hash;
     {
-        LOCK(wallet.cs_wallet);
+        LOCK2(::cs_main, wallet.cs_wallet);
         if (wallet.IsLocked()) {
             error = _("Wallet is locked");
             return false;
@@ -983,8 +1035,12 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
             const auto coin_it = chain_coins.find(out.outpoint);
             if (coin_it == chain_coins.end() || coin_it->second.IsSpent()) continue;
 
-            const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(view, out.txout.scriptPubKey);
-            const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin_it->second, consensus, evaluation_height, evaluation_time, latest_attestation);
+            const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+                Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
+            const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+                coin_it->second, consensus, evaluation_height, evaluation_time,
+                latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+                latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
             if (eval.locked || eval.inactive_blocks < consensus.DemurrageAutoAttestBlocks()) continue;
 
             const int retry_blocks = std::max(1, consensus.DemurrageBlocksPerMonth() / 30);
@@ -1033,6 +1089,11 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
     bool logged_no_fee{false};
     std::set<COutPoint> used_fee_outpoints;
     for (const AutoDemurrageAttestCandidate& candidate : candidates) {
+        if (submitted >= static_cast<int>(Consensus::MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK)) {
+            wallet.WalletLogPrintf("Demurrage auto-attest deferred %u additional key(s) to a later block to respect the consensus attestation cap\n",
+                                   static_cast<unsigned int>(candidates.size() - submitted));
+            break;
+        }
         {
             LOCK(wallet.cs_wallet);
             wallet.m_demurrage_last_auto_attest_attempt_height[candidate.key_hash] = evaluation_height;
@@ -1400,6 +1461,8 @@ void StopStake(CWallet& wallet) {
 
 uint64_t GetStakeWeight(const CWallet& wallet)
 {
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
     std::set<std::pair<const CWalletTx*, unsigned int> > setCoins;
     CAmount nValueIn = 0;
     CAmount nTargetValue = MAX_MONEY;
@@ -1432,6 +1495,7 @@ void AvailableCoinsForStaking(const CWallet& wallet,
                            const CCoinControl* coinControl,
                            const CoinFilterParams& params)
 {
+    AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
 
     vCoins.clear();
@@ -1445,6 +1509,8 @@ void AvailableCoinsForStaking(const CWallet& wallet,
     const CBlockIndex* tip = wallet.chain().getTip();
     const int spend_height = tip ? tip->nHeight + 1 : 0;
     const int64_t spend_time = tip ? tip->GetMedianTimePast() : 0;
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const bool lineage_active = IsQuantumWitnessSpendActive(consensus, spend_time, spend_height);
 
     // Never stake UTXOs carrying live RGB single-use-seal or EUTXO state.
     const std::set<COutPoint> protected_rgb_seals = wallet.GetProtectedRGBSeals();
@@ -1455,8 +1521,7 @@ void AvailableCoinsForStaking(const CWallet& wallet,
         const uint256& wtxid = entry.first;
         const CWalletTx& wtx = entry.second;
 
-        if (wallet.IsTxImmature(wtx))
-            continue;
+        const bool tx_immature = wallet.IsTxImmature(wtx);
 
         int nDepth = wallet.GetTxDepthInMainChain(wtx);
         if (nDepth < 0)
@@ -1481,6 +1546,11 @@ void AvailableCoinsForStaking(const CWallet& wallet,
             const CTxOut& output = wtx.tx->vout[i];
             const COutPoint outpoint(wtxid, i);
 
+            if (tx_immature &&
+                !IsNextBlockMatureGoldRushPayout(wallet, outpoint, spend_height, spend_time)) {
+                continue;
+            }
+
             if (output.nValue < wallet.m_min_staking_amount)
                 continue;
 
@@ -1492,6 +1562,14 @@ void AvailableCoinsForStaking(const CWallet& wallet,
 
             if (wallet.IsSpent(outpoint))
                 continue;
+
+            if (lineage_active) {
+                const Coin& coin = wallet.chain().getCoinsTip().AccessCoin(outpoint);
+                if (coin.IsSpent() || !IsWalletProtectedLineageInput(
+                        wallet, outpoint, coin, consensus, spend_time, spend_height)) {
+                    continue;
+                }
+            }
 
             if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey))
                 continue;
@@ -1608,11 +1686,19 @@ bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::se
 typedef std::vector<unsigned char> valtype;
 bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval, CMutableTransaction& txNew, CAmount& nFees, CTxDestination destination, const std::vector<CTransactionRef>& selected_txs)
 {
-    CBlockIndex* pindexPrev = wallet.chain().getTip();
     arith_uint256 bnTargetPerCoinDay;
     bnTargetPerCoinDay.SetCompact(nBits);
 
-    LOCK2(cs_main, wallet.cs_wallet);
+    LOCK(cs_main);
+    TRY_LOCK(wallet.cs_wallet, wallet_lock);
+    if (!wallet_lock) {
+        // Wallet RPCs and coin selection may need short active-chain queries.
+        // Never wait here while holding cs_main; skip this staking iteration
+        // and let the next kernel interval retry.
+        return false;
+    }
+    CBlockIndex* pindexPrev = wallet.chain().getTip();
+    if (!pindexPrev) return false;
     txNew.vin.clear();
     txNew.vout.clear();
 
@@ -1629,7 +1715,6 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     const int stake_height = pindexPrev->nHeight + 1;
     const Consensus::Params& consensus = Params().GetConsensus();
     const bool quantum_stake_rules_active = IsQuantumWitnessSpendActive(consensus, stake_mtp, stake_height);
-    const bool new_network_stake_only = consensus.IsNewNetworkStakeOnly(stake_mtp, stake_height);
     const bool final_quantum_lockout = consensus.IsQuantumFinalLockout(stake_mtp, stake_height);
     const bool stake_reward_split_active = consensus.IsStakeRewardSplitActive(stake_height);
 
@@ -1642,27 +1727,20 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
 
     CAmount nAllowedBalance = nValueIn - wallet.m_reserve_balance;
 
-    if (IsGoldRushStakeHeight(pindexPrev) && !final_quantum_lockout) {
-        const std::set<CScript> whitelisted_scripts = WhitelistedGoldRushStakeScripts(wallet.chain().getCoinsTip(), setCoins);
-        if (!whitelisted_scripts.empty()) {
-            const size_t original_size = setCoins.size();
-            RestrictToGoldRushStakeScripts(whitelisted_scripts, setCoins, nValueIn);
-            if (setCoins.empty()) {
-                return false;
-            }
-            if (setCoins.size() != original_size) {
-                LogPrint(BCLog::COINSTAKE,
-                         "CreateCoinStake : restricted Gold Rush staking to %u whitelisted scripts (%u/%u UTXOs eligible)\n",
-                         whitelisted_scripts.size(), setCoins.size(), original_size);
-            }
-        }
-    }
-
-    std::set<COutPoint> selected_tx_inputs;
+    // Reserve both transaction inputs and demurrage-attestation targets. The
+    // target is not spent by its attestation, but consensus requires it to
+    // remain live at the end of the block. A coinstake must therefore not use
+    // it as either its kernel or an aggregated input.
+    std::set<COutPoint> selected_tx_reserved_outpoints;
     for (const CTransactionRef& tx : selected_txs) {
         if (!tx) continue;
         for (const CTxIn& txin : tx->vin) {
-            if (!txin.prevout.IsNull()) selected_tx_inputs.insert(txin.prevout);
+            if (!txin.prevout.IsNull()) selected_tx_reserved_outpoints.insert(txin.prevout);
+        }
+        for (const Consensus::DemurrageAttestation& attestation : Consensus::ExtractDemurrageAttestations(*tx)) {
+            if (attestation.height >= 0 && !attestation.target_outpoint.IsNull()) {
+                selected_tx_reserved_outpoints.insert(attestation.target_outpoint);
+            }
         }
     }
 
@@ -1676,7 +1754,7 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
 
     for (const std::pair<const CWalletTx*, unsigned int> &pcoin : setCoins)
     {
-        if (selected_tx_inputs.count(COutPoint(pcoin.first->GetHash(), pcoin.second))) continue;
+        if (selected_tx_reserved_outpoints.count(COutPoint(pcoin.first->GetHash(), pcoin.second))) continue;
         if (final_quantum_lockout &&
             !IsQuantumMigrationScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey) &&
             !IsQuantumColdStakeScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey)) {
@@ -1838,7 +1916,7 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
 
     for (const std::pair<const CWalletTx*, unsigned int> &pcoin : setCoins)
     {
-        if (selected_tx_inputs.count(COutPoint(pcoin.first->GetHash(), pcoin.second))) continue;
+        if (selected_tx_reserved_outpoints.count(COutPoint(pcoin.first->GetHash(), pcoin.second))) continue;
         CTransactionRef tx = pcoin.first->tx;
         if (!tx) {
             LogPrint(BCLog::COINSTAKE, "CreateCoinStake : wallet transaction unavailable for %s\n", pcoin.first->GetHash().ToString());
@@ -1915,10 +1993,10 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     if (stake_reward_split_active) {
         isDevFundEnabled = false; // The stake-reward split enforces exact participant/operator split; no wallet-level extra value outputs.
     }
-    if (isDevFundEnabled && final_quantum_lockout) {
+    if (isDevFundEnabled && (fQuantumKernel || final_quantum_lockout)) {
         const CScript dev_reward_script = Params().GetDevRewardScript();
         if (!IsQuantumMigrationScript(dev_reward_script) && !IsQuantumColdStakeScript(dev_reward_script) && !IsEUTXOScript(dev_reward_script)) {
-            wallet.WalletLogPrintf("Dev fund contribution disabled after Quantum lockout because the configured dev reward script is legacy\n");
+            wallet.WalletLogPrintf("Dev fund contribution disabled for a quantum coinstake because the configured dev reward script is legacy\n");
             isDevFundEnabled = false;
         }
     }
@@ -1968,35 +2046,25 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
     }
 
     // Sign
-    int nIn = 0;
-    const int nStakeHashType = SIGHASH_ALL | (new_network_stake_only ? SIGHASH_FORKID : 0);
+    const int nStakeHashType = SIGHASH_ALL | (quantum_stake_rules_active ? SIGHASH_FORKID : 0);
 
-    if (wallet.IsLegacy() && !fQuantumKernel) {
-        for (const auto &pcoin : vwtxPrev) {
-            SignatureData empty;
-            if (!SignSignature(*wallet.GetLegacyScriptPubKeyMan(), *pcoin, txNew, nIn++, nStakeHashType, empty))
-                return error("CreateCoinStake : failed to sign coinstake");
-        }
+    // Use the wallet's phase-aware transaction signer for every wallet type.
+    // The historical legacy-only SignSignature path has no spent-output/domain
+    // context and would create a legacy digest carrying byte 0x41 after G.
+    std::map<COutPoint, Coin> coins;
+    for (const CTxIn& txin : txNew.vin) {
+        coins[txin.prevout];
     }
-    else
-    {
-        // Fetch previous transactions (inputs):
-        std::map<COutPoint, Coin> coins;
-        for (const CTxIn& txin : txNew.vin) {
-            coins[txin.prevout]; // Create empty map entry keyed by prevout.
+    wallet.chain().findCoins(coins);
+    std::map<int, bilingual_str> input_errors;
+    const int nTime = txNew.nTime;
+    if (!wallet.SignTransaction(txNew, coins, nStakeHashType, input_errors)) {
+        for (const auto& [input_index, error] : input_errors) {
+            LogPrintf("CreateCoinStake : failed to sign input %d: %s\n", input_index, error.original);
         }
-        wallet.chain().findCoins(coins);
-        // Script verification errors
-        std::map<int, bilingual_str> input_errors;
-        int nTime = txNew.nTime;
-        if (!wallet.SignTransaction(txNew, coins, nStakeHashType, input_errors)) {
-            for (const auto& [input_index, error] : input_errors) {
-                LogPrintf("CreateCoinStake : failed to sign input %d: %s\n", input_index, error.original);
-            }
-            return error("CreateCoinStake : failed to sign coinstake");
-        }
-        txNew.nTime = nTime;
+        return error("CreateCoinStake : failed to sign coinstake");
     }
+    txNew.nTime = nTime;
 
     // Limit size
     unsigned int nBytes = ::GetSerializeSize(TX_WITH_WITNESS(txNew));

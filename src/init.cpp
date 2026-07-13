@@ -935,6 +935,9 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         const int64_t migration_deadline = Params().GetConsensus().nQuantumMigrationDeadlineTime;
         const int goldrush_end_height = Params().GetConsensus().nGoldRushEndHeight;
         const int migration_end_height = Params().GetConsensus().nQuantumMigrationEndHeight;
+        if (args.IsArgSet("-qqgoldrushendheight") != args.IsArgSet("-qqmigrationendheight")) {
+            return InitError(_("-qqgoldrushendheight and -qqmigrationendheight must be provided together; mixed height/time lifecycle boundaries are not supported."));
+        }
         if (v4_time < 0 || goldrush_end < 0 || migration_deadline < 0) {
             return InitError(_("-qqv4time, -qqgoldrushendtime, and -qqmigrationdeadlinetime must be non-negative."));
         }
@@ -949,6 +952,9 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         }
         if (goldrush_end_height != 0 && goldrush_end_height < SHADOW_REWARD_END_HEIGHT) {
             return InitError(strprintf(_("-qqgoldrushendheight (%d) must not be below the shadow reward end height (%d); the Gold Rush reward window would outlive the Gold Rush phase."), goldrush_end_height, SHADOW_REWARD_END_HEIGHT));
+        }
+        if ((goldrush_end_height > 0) != (migration_end_height > 0)) {
+            return InitError(_("-qqgoldrushendheight and -qqmigrationendheight must be set together; mixed height/time lifecycle boundaries are not supported."));
         }
         LogPrintf("Quantum Quasar: %s phase boundaries overridden: v4=%d goldrush_end=%d migration_deadline=%d goldrush_end_height=%d migration_end_height=%d\n",
                   ChainTypeToString(chain), v4_time, goldrush_end, migration_deadline, goldrush_end_height, migration_end_height);

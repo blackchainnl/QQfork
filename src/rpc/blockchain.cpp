@@ -24,6 +24,7 @@
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <kernel/coinstats.h>
+#include <key_io.h>
 #include <logging/timer.h>
 #include <net.h>
 #include <net_processing.h>
@@ -1001,26 +1002,40 @@ static RPCHelpMan gettxoutsetinfo()
 static RPCHelpMan getcirculatingsupply()
 {
     return RPCHelpMan{"getcirculatingsupply",
-        "\nScans the current UTXO set and returns the demurrage-adjusted circulating supply.\n"
+        "\nScans a consistent UTXO-set snapshot and returns the demurrage-adjusted supply spendable in the next block.\n"
         "This is computed on demand and may take some time. It does not use or maintain an in-block accumulator.\n",
         {},
         RPCResult{
             RPCResult::Type::OBJ, "", "",
             {
                 {RPCResult::Type::NUM, "height", "The active-chain height used for the scan"},
+                {RPCResult::Type::NUM, "evaluation_height", "The next-block height used for consensus spendability and demurrage"},
                 {RPCResult::Type::STR_HEX, "bestblock", "The active-chain block hash used for the scan"},
                 {RPCResult::Type::BOOL, "demurrage_active", "Whether demurrage is active at this height"},
                 {RPCResult::Type::NUM, "demurrage_activation_height", "The configured demurrage activation height"},
                 {RPCResult::Type::NUM, "demurrage_effective_activation_height", "The demurrage activation height after the post-Gold-Rush clamp"},
-                {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "Final quantum migration deadline time used by the demurrage post-migration guard"},
+                {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "Forecast final migration time; non-authoritative when height boundaries are enabled"},
+                {RPCResult::Type::NUM, "quantum_migration_end_height", "Authoritative last Migration block height, or 0 for a time-only test schedule"},
+                {RPCResult::Type::BOOL, "height_boundaries_authoritative", "Whether exact heights govern Final Lockout and demurrage"},
                 {RPCResult::Type::BOOL, "demurrage_height_guard_satisfied", "Whether the height is at or above demurrage_effective_activation_height"},
-                {RPCResult::Type::BOOL, "demurrage_post_migration_guard_satisfied", "Whether MedianTimePast is after quantum_migration_deadline_time"},
+                {RPCResult::Type::BOOL, "demurrage_post_migration_guard_satisfied", "Whether the authoritative migration-end boundary has passed"},
                 {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal UTXO-set amount before demurrage"},
-                {RPCResult::Type::STR_AMOUNT, "circulating_amount", "Demurrage-adjusted effective circulating amount"},
-                {RPCResult::Type::STR_AMOUNT, "decayed_amount", "Nominal minus effective amount"},
+                {RPCResult::Type::STR_AMOUNT, "circulating_amount", "Consensus-spendable, demurrage-adjusted circulating amount"},
+                {RPCResult::Type::STR_AMOUNT, "decayed_amount", "Amount removed from effective value by demurrage"},
+                {RPCResult::Type::STR_AMOUNT, "goldrush_locked_payout_amount", "Gold Rush payout value not yet spendable before Migration"},
+                {RPCResult::Type::STR_AMOUNT, "immature_amount", "Coinbase/coinstake value not mature for the next block"},
+                {RPCResult::Type::STR_AMOUNT, "final_conditional_eutxo_amount", "Final-phase EUTXO value whose committed validator cannot be classified from the UTXO alone"},
+                {RPCResult::Type::STR_AMOUNT, "final_locked_legacy_amount", "Nominal legacy UTXO value permanently locked after Final activation"},
+                {RPCResult::Type::STR_AMOUNT, "final_locked_unmoved_goldrush_amount", "Deprecated compatibility field; always zero because matured Gold Rush payouts remain ordinary quantum UTXOs"},
+                {RPCResult::Type::STR_AMOUNT, "noncirculating_amount", "Nominal amount excluded from circulation by demurrage or Final legacy lockout"},
                 {RPCResult::Type::NUM, "txouts", "The number of scanned UTXOs"},
                 {RPCResult::Type::NUM, "decayed_txouts", "The number of non-exempt UTXOs with realized decay at this height"},
                 {RPCResult::Type::NUM, "locked_txouts", "The number of non-exempt UTXOs that have reached the 24-month lock"},
+                {RPCResult::Type::NUM, "goldrush_locked_payout_txouts", "The number of Gold Rush payout UTXOs not yet spendable before Migration"},
+                {RPCResult::Type::NUM, "immature_txouts", "The number of coinbase/coinstake UTXOs not mature for the next block"},
+                {RPCResult::Type::NUM, "final_conditional_eutxo_txouts", "The number of Final-phase EUTXOs excluded from guaranteed circulating supply"},
+                {RPCResult::Type::NUM, "final_locked_legacy_txouts", "The number of legacy UTXOs permanently locked by Final consensus"},
+                {RPCResult::Type::NUM, "final_locked_unmoved_goldrush_txouts", "Deprecated compatibility field; always zero"},
             }
         },
         RPCExamples{
@@ -1036,53 +1051,147 @@ static RPCHelpMan getcirculatingsupply()
 
     const CBlockIndex* tip{nullptr};
     std::unique_ptr<CCoinsViewCursor> cursor;
-    std::unique_ptr<CCoinsViewCache> lookup_view;
+    std::unique_ptr<CCoinsViewCursor> marker_cursor;
     {
         LOCK(::cs_main);
         active_chainstate.ForceFlushStateToDisk();
         CCoinsView& coins_db = active_chainstate.CoinsDB();
         tip = CHECK_NONFATAL(active_chainstate.m_blockman.LookupBlockIndex(coins_db.GetBestBlock()));
+        // LevelDB cursors own immutable snapshots. Create both under cs_main so
+        // marker classification and monetary UTXOs come from the same tip even
+        // while the lengthy scan proceeds without blocking validation.
+        marker_cursor = coins_db.Cursor();
         cursor = coins_db.Cursor();
-        lookup_view = std::make_unique<CCoinsViewCache>(&coins_db);
+    }
+
+    std::map<uint256, Consensus::DemurrageAttestationState> attestation_states;
+    COutPoint marker_key;
+    Coin marker_coin;
+    while (marker_cursor->Valid()) {
+        node.rpc_interruption_point();
+        if (marker_cursor->GetKey(marker_key) && marker_cursor->GetValue(marker_coin) && !marker_coin.IsSpent()) {
+            uint256 pubkey_hash;
+            Consensus::DemurrageAttestationState state;
+            if (Consensus::DecodeAuthenticatedDemurrageLatestState(
+                    marker_key, marker_coin, tip, pubkey_hash, state)) {
+                attestation_states[pubkey_hash] = state;
+            }
+        }
+        marker_cursor->Next();
     }
 
     CAmount nominal{0};
     CAmount circulating{0};
+    CAmount demurrage_decayed{0};
+    CAmount goldrush_locked_payout{0};
+    CAmount immature{0};
+    CAmount final_conditional_eutxo{0};
+    CAmount final_locked_legacy{0};
+    CAmount final_locked_unmoved_goldrush{0};
     int64_t txouts{0};
     int64_t decayed_txouts{0};
     int64_t locked_txouts{0};
+    int64_t goldrush_locked_payout_txouts{0};
+    int64_t immature_txouts{0};
+    int64_t final_conditional_eutxo_txouts{0};
+    int64_t final_locked_legacy_txouts{0};
+    int64_t final_locked_unmoved_goldrush_txouts{0};
     const int64_t tip_mtp = tip->GetMedianTimePast();
+    const int evaluation_height = tip->nHeight + 1;
+    const bool quantum_spend_active = IsQuantumWitnessSpendActive(consensus, tip_mtp, evaluation_height);
+    const bool final_lockout = consensus.IsQuantumFinalLockout(tip_mtp, evaluation_height);
     COutPoint key;
     Coin coin;
     while (cursor->Valid()) {
         node.rpc_interruption_point();
         if (cursor->GetKey(key) && cursor->GetValue(coin)) {
+            if (coin.out.nValue == 0 &&
+                (IsAuthenticatedShadowMarkerOutpoint(key, coin, tip) ||
+                 Consensus::IsAuthenticatedDemurrageStateOutpoint(key, coin, tip))) {
+                cursor->Next();
+                continue;
+            }
             ++txouts;
             nominal += coin.out.nValue;
-            const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(*lookup_view, coin.out.scriptPubKey);
-            const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin, consensus, tip->nHeight, tip_mtp, latest_attestation);
-            circulating += eval.effective_value;
-            if (eval.locked) ++locked_txouts;
-            if (eval.burned_value > 0) ++decayed_txouts;
+            std::optional<Consensus::DemurrageAttestationState> latest_attestation;
+            if (const std::optional<uint256> controlling_key =
+                    Consensus::DemurrageControllingKeyHashForScript(coin.out.scriptPubKey)) {
+                const auto state_it = attestation_states.find(*controlling_key);
+                if (state_it != attestation_states.end()) latest_attestation = state_it->second;
+            }
+            const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+                coin, consensus, evaluation_height, tip_mtp,
+                latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+                latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
+            const std::optional<QuantumStakeTierProgram> payout_tier =
+                GetQuantumStakeTierProgram(coin.out.scriptPubKey);
+            const bool goldrush_payout_output = coin.out.nValue > 0 && coin.fCoinBase &&
+                !coin.fCoinStake &&
+                coin.nHeight >= static_cast<uint32_t>(SHADOW_REWARD_START_HEIGHT) &&
+                coin.nHeight <= static_cast<uint32_t>(SHADOW_REWARD_END_HEIGHT) &&
+                coin.nHeight > static_cast<uint32_t>(consensus.nLastPOWBlock) &&
+                payout_tier && !payout_tier->tiered && !payout_tier->cold_stake;
+            const bool goldrush_locked_payout_output = goldrush_payout_output && !quantum_spend_active;
+            const bool final_locked_legacy_output = final_lockout && coin.out.nValue > 0 &&
+                !IsQuantumMigrationScript(coin.out.scriptPubKey) &&
+                !IsQuantumColdStakeScript(coin.out.scriptPubKey) &&
+                !IsEUTXOScript(coin.out.scriptPubKey);
+            const bool final_conditional_eutxo_output = final_lockout && coin.out.nValue > 0 &&
+                IsEUTXOScript(coin.out.scriptPubKey);
+            const bool immature_output = coin.out.nValue > 0 &&
+                (coin.IsCoinBase() || coin.IsCoinStake()) &&
+                evaluation_height - static_cast<int>(coin.nHeight) < consensus.nCoinbaseMaturity;
+            if (goldrush_locked_payout_output) {
+                goldrush_locked_payout += coin.out.nValue;
+                ++goldrush_locked_payout_txouts;
+            } else if (final_locked_legacy_output) {
+                final_locked_legacy += coin.out.nValue;
+                ++final_locked_legacy_txouts;
+            } else if (final_conditional_eutxo_output) {
+                final_conditional_eutxo += coin.out.nValue;
+                ++final_conditional_eutxo_txouts;
+            } else if (immature_output) {
+                immature += coin.out.nValue;
+                ++immature_txouts;
+            } else {
+                circulating += eval.effective_value;
+                demurrage_decayed += eval.burned_value;
+                if (eval.locked) ++locked_txouts;
+                if (eval.burned_value > 0) ++decayed_txouts;
+            }
         }
         cursor->Next();
     }
 
     UniValue ret(UniValue::VOBJ);
     ret.pushKV("height", tip->nHeight);
+    ret.pushKV("evaluation_height", evaluation_height);
     ret.pushKV("bestblock", tip->GetBlockHash().GetHex());
-    ret.pushKV("demurrage_active", consensus.IsDemurrageActive(tip->nHeight, tip_mtp));
+    ret.pushKV("demurrage_active", consensus.IsDemurrageActive(evaluation_height, tip_mtp));
     ret.pushKV("demurrage_activation_height", consensus.nDemurrageActivationHeight);
     ret.pushKV("demurrage_effective_activation_height", consensus.EffectiveDemurrageActivationHeight());
     ret.pushKV("quantum_migration_deadline_time", consensus.nQuantumMigrationDeadlineTime);
-    ret.pushKV("demurrage_height_guard_satisfied", tip->nHeight >= consensus.EffectiveDemurrageActivationHeight());
-    ret.pushKV("demurrage_post_migration_guard_satisfied", consensus.IsMigrationEndScheduled() && consensus.MigrationDeadlinePassed(tip_mtp, tip->nHeight));
+    ret.pushKV("quantum_migration_end_height", consensus.nQuantumMigrationEndHeight);
+    ret.pushKV("height_boundaries_authoritative", consensus.UsesHeightLifecycle());
+    ret.pushKV("demurrage_height_guard_satisfied", evaluation_height >= consensus.EffectiveDemurrageActivationHeight());
+    ret.pushKV("demurrage_post_migration_guard_satisfied", consensus.IsMigrationEndScheduled() && consensus.MigrationDeadlinePassed(tip_mtp, evaluation_height));
     ret.pushKV("nominal_amount", ValueFromAmount(nominal));
     ret.pushKV("circulating_amount", ValueFromAmount(circulating));
-    ret.pushKV("decayed_amount", ValueFromAmount(nominal - circulating));
+    ret.pushKV("decayed_amount", ValueFromAmount(demurrage_decayed));
+    ret.pushKV("goldrush_locked_payout_amount", ValueFromAmount(goldrush_locked_payout));
+    ret.pushKV("immature_amount", ValueFromAmount(immature));
+    ret.pushKV("final_conditional_eutxo_amount", ValueFromAmount(final_conditional_eutxo));
+    ret.pushKV("final_locked_legacy_amount", ValueFromAmount(final_locked_legacy));
+    ret.pushKV("final_locked_unmoved_goldrush_amount", ValueFromAmount(final_locked_unmoved_goldrush));
+    ret.pushKV("noncirculating_amount", ValueFromAmount(nominal - circulating));
     ret.pushKV("txouts", txouts);
     ret.pushKV("decayed_txouts", decayed_txouts);
     ret.pushKV("locked_txouts", locked_txouts);
+    ret.pushKV("goldrush_locked_payout_txouts", goldrush_locked_payout_txouts);
+    ret.pushKV("immature_txouts", immature_txouts);
+    ret.pushKV("final_conditional_eutxo_txouts", final_conditional_eutxo_txouts);
+    ret.pushKV("final_locked_legacy_txouts", final_locked_legacy_txouts);
+    ret.pushKV("final_locked_unmoved_goldrush_txouts", final_locked_unmoved_goldrush_txouts);
     return ret;
 },
     };
@@ -1326,6 +1435,12 @@ static int64_t SecondsUntilAfterBoundary(int64_t now, int64_t boundary)
     return boundary - now + 1;
 }
 
+static int BlocksUntilAfterBoundary(int next_height, int boundary_height)
+{
+    if (boundary_height <= 0 || next_height > boundary_height) return 0;
+    return boundary_height - next_height + 1;
+}
+
 static const char* QuantumReadinessStateName(const ThresholdState state)
 {
     switch (state) {
@@ -1365,8 +1480,10 @@ static UniValue QuantumQuasarStatus(const CBlockIndex& tip, const ChainstateMana
 {
     const Consensus::Params& consensus = chainman.GetConsensus();
     const int64_t mtp = tip.GetMedianTimePast();
+    const int64_t tip_validation_mtp = tip.pprev ? tip.pprev->GetMedianTimePast() : tip.GetBlockTime();
     const int next_height = tip.nHeight + 1;
     const Consensus::QuantumQuasarPhase phase = consensus.GetQuantumQuasarPhase(mtp, next_height);
+    const Consensus::QuantumQuasarPhase active_tip_phase = consensus.GetQuantumQuasarPhase(tip_validation_mtp, tip.nHeight);
     const bool quantum_spend_active = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
     const bool new_network_stake_only = consensus.IsNewNetworkStakeOnly(mtp, next_height);
     const bool base_network_stake_compatible = consensus.IsBaseNetworkStakeCompatible(mtp, next_height);
@@ -1376,15 +1493,24 @@ static UniValue QuantumQuasarStatus(const CBlockIndex& tip, const ChainstateMana
 
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("phase", QuantumQuasarPhaseName(phase));
+    obj.pushKV("phase_context", "next_block");
+    obj.pushKV("active_tip_height", tip.nHeight);
+    obj.pushKV("active_tip_phase", QuantumQuasarPhaseName(active_tip_phase));
+    obj.pushKV("next_block_height", next_height);
+    obj.pushKV("next_block_phase", QuantumQuasarPhaseName(phase));
     obj.pushKV("mediantime", mtp);
     obj.pushKV("v4_activation_time", consensus.nProtocolV4Time);
     obj.pushKV("gold_rush_end_time", consensus.nGoldRushEndTime);
     obj.pushKV("quantum_migration_deadline_time", consensus.nQuantumMigrationDeadlineTime);
     obj.pushKV("gold_rush_end_height", consensus.nGoldRushEndHeight);
     obj.pushKV("quantum_migration_end_height", consensus.nQuantumMigrationEndHeight);
+    obj.pushKV("height_boundaries_authoritative", consensus.nGoldRushEndHeight > 0 && consensus.nQuantumMigrationEndHeight > 0);
+    obj.pushKV("time_boundaries_are_estimates", consensus.UsesHeightLifecycle());
     obj.pushKV("seconds_until_v4", SecondsUntilAfterBoundary(mtp, consensus.nProtocolV4Time));
     obj.pushKV("seconds_until_gold_rush_end", SecondsUntil(mtp, consensus.nGoldRushEndTime));
     obj.pushKV("seconds_until_quantum_migration_deadline", SecondsUntil(mtp, consensus.nQuantumMigrationDeadlineTime));
+    obj.pushKV("blocks_until_gold_rush_end", BlocksUntilAfterBoundary(next_height, consensus.nGoldRushEndHeight));
+    obj.pushKV("blocks_until_quantum_migration_end", BlocksUntilAfterBoundary(next_height, consensus.nQuantumMigrationEndHeight));
     obj.pushKV("base_network_stake_compatible", base_network_stake_compatible);
     obj.pushKV("shadow_merge_mining_active", shadow_merge_mining_active);
     obj.pushKV("shadow_reward_height_active", shadow_reward_height_active);
@@ -1392,18 +1518,30 @@ static UniValue QuantumQuasarStatus(const CBlockIndex& tip, const ChainstateMana
     obj.pushKV("shadow_reward_start_height", SHADOW_REWARD_START_HEIGHT);
     obj.pushKV("shadow_reward_end_height", SHADOW_REWARD_END_HEIGHT);
     obj.pushKV("new_network_stake_only", new_network_stake_only);
-    obj.pushKV("replay_protection_active", new_network_stake_only);
+    obj.pushKV("replay_protection_active", quantum_spend_active);
+    obj.pushKV("sighash_forkid_active", quantum_spend_active);
+    obj.pushKV("quantum_signature_domain_separation_active", quantum_spend_active);
+    obj.pushKV("replay_protection_scope", "post-Gold-Rush signature digests; shared pre-migration future-witness lineage still requires an anchored first move");
+    obj.pushKV("legacy_unknown_witness_replay_protected", false);
     obj.pushKV("legacy_address_lockout_scheduled", consensus.IsMigrationEndScheduled());
     obj.pushKV("quantum_address_required_by_schedule", final_lockout_active);
     obj.pushKV("legacy_addresses_accepted", !final_lockout_active);
     obj.pushKV("quantum_address_required", final_lockout_active);
     obj.pushKV("quantum_spend_enforcement_active", quantum_spend_active);
-    obj.pushKV("quantum_migration_outputs_fundable", true);
+    obj.pushKV("quantum_migration_outputs_fundable", quantum_spend_active);
+    obj.pushKV("eutxo_enabled", false);
+    obj.pushKV("eutxo_policy", "v15 EUTXO commitments are frozen/disabled in v30.1.1 because they lack quantum ownership authorization");
     UniValue readiness(UniValue::VOBJ);
     readiness.pushKV(VersionBitsDeploymentInfo[Consensus::DEPLOYMENT_QUANTUM_QUASAR].name, QuantumReadinessStatus(tip, chainman, Consensus::DEPLOYMENT_QUANTUM_QUASAR));
     readiness.pushKV(VersionBitsDeploymentInfo[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].name, QuantumReadinessStatus(tip, chainman, Consensus::DEPLOYMENT_QUANTUM_MIGRATION));
     obj.pushKV("readiness_signalling", readiness);
-    obj.pushKV("migration_policy", "Quantum witness-v16 addresses are fundable now. Gold Rush credits accrue in the upgraded shadow ledger while legacy nodes can still follow the base chain. ML-DSA spends activate after the Gold Rush reward-height window during migration/final lockout. After the migration deadline, consensus rejects non-quantum spends and value-bearing non-quantum outputs.");
+    if (!quantum_spend_active) {
+        obj.pushKV("migration_policy", "Quantum address generation and dry-run planning are available, but base-chain funding and spending of v14/v16 outputs are disabled until Gold Rush ends. Gold Rush credits accrue only in the upgraded shadow ledger while legacy nodes follow the same base chain. v15 EUTXO is disabled.");
+    } else if (!final_lockout_active) {
+        obj.pushKV("migration_policy", "The migration window is active. Exact Blackcoin v14/v16 outputs may be funded and spent; v15 EUTXO and unknown future-witness program shapes are rejected. Legacy coins remain spendable for migration until the scheduled deadline.");
+    } else {
+        obj.pushKV("migration_policy", "Final lockout is active. Consensus rejects legacy spends and value-bearing legacy outputs; exact Blackcoin v14/v16 quantum programs remain enabled, v15 EUTXO remains frozen, and demurrage applies automatically.");
+    }
     return obj;
 }
 
@@ -1419,16 +1557,25 @@ static const std::vector<RPCResult> RPCHelpForQuantumReadiness{
 };
 
 static const std::vector<RPCResult> RPCHelpForQuantumQuasar{
-    {RPCResult::Type::STR, "phase", "current Blackcoin upgrade phase"},
+    {RPCResult::Type::STR, "phase", "Blackcoin upgrade phase governing the next candidate block (compatibility alias)"},
+    {RPCResult::Type::STR, "phase_context", "explicit context for the compatibility phase field"},
+    {RPCResult::Type::NUM, "active_tip_height", "current connected tip height"},
+    {RPCResult::Type::STR, "active_tip_phase", "phase under which the connected tip was validated"},
+    {RPCResult::Type::NUM, "next_block_height", "next candidate block height"},
+    {RPCResult::Type::STR, "next_block_phase", "phase governing the next candidate block"},
     {RPCResult::Type::NUM_TIME, "mediantime", "current tip median time used for schedule state"},
     {RPCResult::Type::NUM_TIME, "v4_activation_time", "first V4 hard-fork activation boundary"},
-    {RPCResult::Type::NUM_TIME, "gold_rush_end_time", "end of the Gold Rush phase"},
-    {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "planned final post-quantum migration deadline"},
-    {RPCResult::Type::NUM, "gold_rush_end_height", "height-based Gold Rush end boundary override, or 0 when the boundary is time-based"},
-    {RPCResult::Type::NUM, "quantum_migration_end_height", "height-based migration end boundary override, or 0 when the boundary is time-based"},
+    {RPCResult::Type::NUM_TIME, "gold_rush_end_time", "forecast Gold Rush end time; non-authoritative when height boundaries are enabled"},
+    {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "forecast final migration time; non-authoritative when height boundaries are enabled"},
+    {RPCResult::Type::NUM, "gold_rush_end_height", "authoritative last Gold Rush block height, or 0 for a time-only test schedule"},
+    {RPCResult::Type::NUM, "quantum_migration_end_height", "authoritative last Migration block height, or 0 for a time-only test schedule"},
+    {RPCResult::Type::BOOL, "height_boundaries_authoritative", "whether exact block heights govern both lifecycle boundaries"},
+    {RPCResult::Type::BOOL, "time_boundaries_are_estimates", "whether the time fields and second countdowns are forecasts only"},
     {RPCResult::Type::NUM, "seconds_until_v4", "seconds until V4 rules become active, or 0 if reached"},
-    {RPCResult::Type::NUM, "seconds_until_gold_rush_end", "seconds until Gold Rush end, or 0 if reached"},
-    {RPCResult::Type::NUM, "seconds_until_quantum_migration_deadline", "seconds until final migration deadline, or 0 if reached"},
+    {RPCResult::Type::NUM, "seconds_until_gold_rush_end", "forecast seconds until the Gold Rush end time, or 0 if reached"},
+    {RPCResult::Type::NUM, "seconds_until_quantum_migration_deadline", "forecast seconds until the final migration time, or 0 if reached"},
+    {RPCResult::Type::NUM, "blocks_until_gold_rush_end", "exact remaining Gold Rush blocks when height boundaries are authoritative"},
+    {RPCResult::Type::NUM, "blocks_until_quantum_migration_end", "exact remaining Migration blocks when height boundaries are authoritative"},
     {RPCResult::Type::BOOL, "base_network_stake_compatible", "whether stakers should keep producing base-network-compatible coinstakes"},
     {RPCResult::Type::BOOL, "shadow_merge_mining_active", "whether Gold Rush shadow proof merge-mining is active"},
     {RPCResult::Type::BOOL, "shadow_reward_height_active", "whether the next block is inside the deterministic height-based Gold Rush payout window"},
@@ -1436,13 +1583,19 @@ static const std::vector<RPCResult> RPCHelpForQuantumQuasar{
     {RPCResult::Type::NUM, "shadow_reward_start_height", "first deterministic Gold Rush payout height"},
     {RPCResult::Type::NUM, "shadow_reward_end_height", "last deterministic Gold Rush payout height"},
     {RPCResult::Type::BOOL, "new_network_stake_only", "whether staking has crossed the final quantum-only lockout cutover"},
-    {RPCResult::Type::BOOL, "replay_protection_active", "whether SIGHASH_FORKID replay protection is enforced by schedule"},
+    {RPCResult::Type::BOOL, "replay_protection_active", "whether post-Gold-Rush signature replay protection is active"},
+    {RPCResult::Type::BOOL, "sighash_forkid_active", "whether legacy ECDSA signatures must use the fork-protected digest"},
+    {RPCResult::Type::BOOL, "quantum_signature_domain_separation_active", "whether ML-DSA signatures use the configured chain domain"},
+    {RPCResult::Type::STR, "replay_protection_scope", "scope of the reported replay protection"},
+    {RPCResult::Type::BOOL, "legacy_unknown_witness_replay_protected", "whether legacy clients that ignore future witnesses reject replayed quantum transactions"},
     {RPCResult::Type::BOOL, "legacy_address_lockout_scheduled", "whether the upgrade schedule contains a final legacy lockout deadline"},
     {RPCResult::Type::BOOL, "quantum_address_required_by_schedule", "whether the upgrade schedule has reached the scheduled quantum-address phase"},
     {RPCResult::Type::BOOL, "legacy_addresses_accepted", "whether this node currently accepts legacy addresses under implemented rules"},
     {RPCResult::Type::BOOL, "quantum_address_required", "whether this node currently enforces quantum-only destinations"},
     {RPCResult::Type::BOOL, "quantum_spend_enforcement_active", "whether ML-DSA spend enforcement is implemented and active"},
     {RPCResult::Type::BOOL, "quantum_migration_outputs_fundable", "whether ordinary wallet/RPC policy permits funding reserved migration outputs"},
+    {RPCResult::Type::BOOL, "eutxo_enabled", "false in v30.1.1; v15 commitments are frozen pending a quantum-authenticated design"},
+    {RPCResult::Type::STR, "eutxo_policy", "human-readable v15 safety status"},
     {RPCResult::Type::OBJ_DYN, "readiness_signalling", "versionbits readiness signals keyed by deployment name", {
         {RPCResult::Type::OBJ, "deployment", "readiness signal", RPCHelpForQuantumReadiness},
     }},
@@ -1887,6 +2040,136 @@ static RPCHelpMan getgoldrushstate()
     obj.pushKV("pow_target_bits", (uint64_t)info.pow_target_bits);
 
     return obj;
+},
+    };
+}
+
+static RPCHelpMan getgoldrushblock()
+{
+    return RPCHelpMan{"getgoldrushblock",
+        "\nReturns block-scoped, explorer-ready Gold Rush shadow-ledger payouts.\n"
+        "Synthetic payout transaction IDs are deterministic upgraded-ledger identifiers; they are not entries in the legacy block transaction array.\n",
+        {
+            {"hash_or_height", RPCArg::Type::NUM, RPCArg::Optional::NO, "Block hash or height",
+                RPCArgOptions{.skip_type_check = true, .type_str = {"", "string or numeric"}}},
+            {"offset", RPCArg::Type::NUM, RPCArg::Default{0}, "Zero-based payout offset"},
+            {"count", RPCArg::Type::NUM, RPCArg::Default{100}, "Maximum payouts to return (1-1000)"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "height", "Active-chain block height"},
+                {RPCResult::Type::STR_HEX, "blockhash", "Active-chain block hash"},
+                {RPCResult::Type::NUM_TIME, "time", "Block timestamp"},
+                {RPCResult::Type::NUM_TIME, "mediantime", "Parent MedianTimePast used by the shadow schedule"},
+                {RPCResult::Type::BOOL, "gold_rush_reward_active", "Whether this block accrued the deterministic shadow reward"},
+                {RPCResult::Type::STR_AMOUNT, "scheduled_reward", "Scheduled shadow reward for this block"},
+                {RPCResult::Type::NUM, "confirmations", "Active-chain confirmations"},
+                {RPCResult::Type::BOOL, "quantum_spends_active", "Whether synthetic payouts are spendable in the next block"},
+                {RPCResult::Type::NUM, "total_payouts", "Total synthetic payouts recorded for this block"},
+                {RPCResult::Type::NUM, "offset", "Returned page offset"},
+                {RPCResult::Type::NUM, "count", "Number of payouts in this page"},
+                {RPCResult::Type::STR_AMOUNT, "pow_payout_total", "Total PoW payout value in this block"},
+                {RPCResult::Type::STR_AMOUNT, "pos_payout_total", "Total PoS payout value in this block"},
+                {RPCResult::Type::ARR, "observed_pow_claim_txids", "Base-block transactions carrying QQSPROOF data",
+                    {{RPCResult::Type::STR_HEX, "txid", "Base transaction id"}}},
+                {RPCResult::Type::ARR, "observed_signal_txids", "Base-block transactions carrying QQSIGNAL data",
+                    {{RPCResult::Type::STR_HEX, "txid", "Base transaction id"}}},
+                {RPCResult::Type::ARR, "payouts", "Synthetic upgraded-ledger payouts",
+                    {{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::NUM, "index", "Deterministic payout index in this block"},
+                            {RPCResult::Type::STR_HEX, "synthetic_txid", "Deterministic synthetic payout transaction id"},
+                            {RPCResult::Type::NUM, "vout", "Synthetic payout output index"},
+                            {RPCResult::Type::STR, "mode", "pow or pos"},
+                            {RPCResult::Type::STR_AMOUNT, "amount", "Payout value"},
+                            {RPCResult::Type::STR, "address", /*optional=*/true, "Quantum destination address"},
+                            {RPCResult::Type::STR_HEX, "scriptPubKey", "Quantum destination script"},
+                            {RPCResult::Type::BOOL, "unspent", "Whether the synthetic payout remains unspent"},
+                        }}}},
+            }},
+        RPCExamples{
+            HelpExampleCli("getgoldrushblock", "5950003") +
+            HelpExampleRpc("getgoldrushblock", "5950003, 0, 100")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const int offset = request.params[1].isNull() ? 0 : request.params[1].getInt<int>();
+    const int count = request.params[2].isNull() ? 100 : request.params[2].getInt<int>();
+    if (offset < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "offset must be non-negative");
+    if (count < 1 || count > 1000) throw JSONRPCError(RPC_INVALID_PARAMETER, "count must be between 1 and 1000");
+
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const CBlockIndex* pindex = ParseHashOrHeight(request.params[0], chainman);
+    LOCK(::cs_main);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+    if (!chainstate.m_chain.Contains(pindex)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block is not in the active chain");
+    }
+    const CBlock block = GetBlockChecked(chainman.m_blockman, pindex);
+    const Consensus::Params& consensus = chainman.GetConsensus();
+    const int64_t block_mtp = pindex->pprev ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
+    const bool reward_active = IsShadowGoldRushRewardActive(consensus, block_mtp, pindex->nHeight);
+    const CAmount scheduled_reward = reward_active ? ShadowBaseReward(pindex->nHeight) : 0;
+    const CBlockIndex* tip = chainstate.m_chain.Tip();
+    const int64_t tip_mtp = tip ? tip->GetMedianTimePast() : block_mtp;
+    const bool quantum_spends_active = tip &&
+        IsQuantumWitnessSpendActive(consensus, tip_mtp, tip->nHeight + 1);
+
+    const std::vector<ShadowSyntheticPayoutTransaction> payouts =
+        GetAppliedShadowClaimPayoutTransactionRecords(chainstate.CoinsTip(), pindex->nHeight,
+                                                      pindex->GetBlockHash(), pindex->GetBlockTime());
+    CAmount pow_total{0};
+    CAmount pos_total{0};
+    for (const auto& payout : payouts) {
+        (payout.proof_of_work ? pow_total : pos_total) += payout.amount;
+    }
+
+    UniValue observed_pow(UniValue::VARR);
+    UniValue observed_signals(UniValue::VARR);
+    for (const CTransactionRef& tx : block.vtx) {
+        if (TransactionHasShadowProof(*tx)) observed_pow.push_back(tx->GetHash().GetHex());
+        if (TransactionHasShadowSignal(*tx)) observed_signals.push_back(tx->GetHash().GetHex());
+    }
+
+    UniValue payout_values(UniValue::VARR);
+    const size_t page_begin = std::min<size_t>(static_cast<size_t>(offset), payouts.size());
+    const size_t page_end = std::min<size_t>(page_begin + static_cast<size_t>(count), payouts.size());
+    for (size_t i = page_begin; i < page_end; ++i) {
+        const ShadowSyntheticPayoutTransaction& payout = payouts[i];
+        const COutPoint outpoint{payout.tx->GetHash(), 0};
+        UniValue item(UniValue::VOBJ);
+        item.pushKV("index", static_cast<uint64_t>(i));
+        item.pushKV("synthetic_txid", outpoint.hash.GetHex());
+        item.pushKV("vout", outpoint.n);
+        item.pushKV("mode", payout.proof_of_work ? "pow" : "pos");
+        item.pushKV("amount", ValueFromAmount(payout.amount));
+        CTxDestination destination;
+        if (ExtractDestination(payout.target, destination)) {
+            item.pushKV("address", EncodeDestination(destination));
+        }
+        item.pushKV("scriptPubKey", HexStr(payout.target));
+        item.pushKV("unspent", chainstate.CoinsTip().HaveCoin(outpoint));
+        payout_values.push_back(std::move(item));
+    }
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("height", pindex->nHeight);
+    result.pushKV("blockhash", pindex->GetBlockHash().GetHex());
+    result.pushKV("time", pindex->GetBlockTime());
+    result.pushKV("mediantime", block_mtp);
+    result.pushKV("gold_rush_reward_active", reward_active);
+    result.pushKV("scheduled_reward", ValueFromAmount(scheduled_reward));
+    result.pushKV("confirmations", tip->nHeight - pindex->nHeight + 1);
+    result.pushKV("quantum_spends_active", quantum_spends_active);
+    result.pushKV("total_payouts", static_cast<uint64_t>(payouts.size()));
+    result.pushKV("offset", offset);
+    result.pushKV("count", static_cast<uint64_t>(page_end - page_begin));
+    result.pushKV("pow_payout_total", ValueFromAmount(pow_total));
+    result.pushKV("pos_payout_total", ValueFromAmount(pos_total));
+    result.pushKV("observed_pow_claim_txids", std::move(observed_pow));
+    result.pushKV("observed_signal_txids", std::move(observed_signals));
+    result.pushKV("payouts", std::move(payout_values));
+    return result;
 },
     };
 }
@@ -3114,6 +3397,16 @@ static RPCHelpMan dumptxoutset()
     // to avoid confusion due to an interruption.
     const fs::path temppath = fsbridge::AbsPathJoin(args.GetDataDirNet(), fs::u8path(request.params[0].get_str() + ".incomplete"));
 
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    const int snapshot_height = WITH_LOCK(::cs_main, return node.chainman->ActiveChain().Height());
+    if (snapshot_height >= SHADOW_WHITELIST_HEIGHT) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            strprintf("Quantum Quasar snapshots are disabled at and after shadow whitelist height %d in v30.1.1. "
+                      "The current snapshot format cannot carry authenticated shadow-state markers safely.",
+                      SHADOW_WHITELIST_HEIGHT));
+    }
+
     if (fs::exists(path)) {
         throw JSONRPCError(
             RPC_INVALID_PARAMETER,
@@ -3129,7 +3422,6 @@ static RPCHelpMan dumptxoutset()
             "Couldn't open file " + temppath.u8string() + " for writing.");
     }
 
-    NodeContext& node = EnsureAnyNodeContext(request.context);
     UniValue result = CreateUTXOSnapshot(
         node, node.chainman->ActiveChainstate(), afile, path, temppath);
     fs::rename(temppath, path);
@@ -3166,6 +3458,11 @@ UniValue CreateUTXOSnapshot(
         //
         LOCK(::cs_main);
 
+        if (chainstate.m_chain.Height() >= SHADOW_WHITELIST_HEIGHT) {
+            throw JSONRPCError(RPC_MISC_ERROR,
+                "Quantum Quasar post-whitelist snapshots require a versioned authenticated shadow-state section");
+        }
+
         chainstate.ForceFlushStateToDisk();
 
         maybe_stats = GetUTXOStats(&chainstate.CoinsDB(), chainstate.m_blockman, CoinStatsHashType::HASH_SERIALIZED, node.rpc_interruption_point);
@@ -3194,10 +3491,9 @@ UniValue CreateUTXOSnapshot(
         if (iter % 5000 == 0) node.rpc_interruption_point();
         ++iter;
         if (pcursor->GetKey(key) && pcursor->GetValue(coin)) {
-            if (kernel::IsQuantumQuasarInternalMarkerScript(coin.out.scriptPubKey)) {
-                pcursor->Next();
-                continue;
-            }
+            // Preserve the complete physical chainstate. Quantum Quasar
+            // markers authenticate included synthetic payout coins and are
+            // required for deterministic replay and spend classification.
             afile << key;
             afile << coin;
             ++coins_written;
@@ -3401,6 +3697,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
     static const CRPCCommand commands[]{
         {"blockchain", &getblockchaininfo},
         {"blockchain", &getgoldrushstate},
+        {"blockchain", &getgoldrushblock},
         {"blockchain", &submitquantumpoolclaim},
         {"blockchain", &getquantumpoolinfo},
         {"blockchain", &getchaintxstats},

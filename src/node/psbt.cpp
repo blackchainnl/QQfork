@@ -15,7 +15,9 @@
 #include <numeric>
 
 namespace node {
-PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
+PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx,
+                         unsigned int verify_flags,
+                         uint32_t quantum_chain_id)
 {
     // Go through each input and build status
     PSBTAnalysis result;
@@ -26,7 +28,12 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
 
     result.inputs.resize(psbtx.tx->vin.size());
 
-    const PrecomputedTransactionData txdata = PrecomputePSBTData(psbtx);
+    if ((verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID) && quantum_chain_id == 0) {
+        result.SetInvalid("PSBT analysis requires a nonzero Quantum Quasar chain id while SIGHASH_FORKID is active");
+        return result;
+    }
+    const PrecomputedTransactionData txdata = PrecomputePSBTData(
+        psbtx, quantum_chain_id, verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID);
 
     for (unsigned int i = 0; i < psbtx.tx->vin.size(); ++i) {
         PSBTInput& input = psbtx.inputs[i];
@@ -61,12 +68,13 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
         }
 
         // Check if it is final
-        if (!PSBTInputSignedAndVerified(psbtx, i, &txdata)) {
+        if (!PSBTInputSignedAndVerified(psbtx, i, &txdata, verify_flags)) {
             input_analysis.is_final = false;
 
             // Figure out what is missing
             SignatureData outdata;
-            bool complete = SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata, 1, &outdata);
+            bool complete = SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata, 1,
+                                          &outdata, true, verify_flags);
 
             // Things are missing
             if (!complete) {
@@ -126,7 +134,12 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
             PSBTInput& input = psbtx.inputs[i];
             Coin newcoin;
 
-            if (!SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, nullptr, 1) || !psbtx.GetInputUTXO(newcoin.out, i)) {
+            const int estimate_sighash = (verify_flags & SCRIPT_ENABLE_SIGHASH_FORKID)
+                ? (SIGHASH_ALL | SIGHASH_FORKID)
+                : SIGHASH_ALL;
+            if (!SignPSBTInput(DUMMY_SIGNING_PROVIDER, psbtx, i, &txdata,
+                               estimate_sighash, nullptr, true, verify_flags) ||
+                !psbtx.GetInputUTXO(newcoin.out, i)) {
                 success = false;
                 break;
             } else {
@@ -139,7 +152,7 @@ PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx)
 
         if (success) {
             CTransaction ctx = CTransaction(mtx);
-            size_t size(GetVirtualTransactionSize(ctx, GetTransactionSigOpCost(ctx, view, STANDARD_SCRIPT_VERIFY_FLAGS), ::nBytesPerSigOp));
+            size_t size(GetVirtualTransactionSize(ctx, GetTransactionSigOpCost(ctx, view, verify_flags), ::nBytesPerSigOp));
             result.estimated_vsize = size;
             // Estimate fee rate
             CFeeRate feerate(fee, size);

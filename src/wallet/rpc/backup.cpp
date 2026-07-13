@@ -525,6 +525,8 @@ RPCHelpMan importwallet()
 
     int64_t nTimeBegin = 0;
     bool fGood = true;
+    const uint256 last_block_hash = WITH_LOCK(pwallet->cs_wallet, return pwallet->GetLastBlockHash());
+    CHECK_NONFATAL(pwallet->chain().findBlock(last_block_hash, FoundBlock().time(nTimeBegin)));
     {
         LOCK(pwallet->cs_wallet);
 
@@ -535,8 +537,6 @@ RPCHelpMan importwallet()
         if (!file.is_open()) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot open wallet dump file");
         }
-        CHECK_NONFATAL(pwallet->chain().findBlock(pwallet->GetLastBlockHash(), FoundBlock().time(nTimeBegin)));
-
         int64_t nFilesize = std::max((int64_t)1, (int64_t)file.tellg());
         file.seekg(0, file.beg);
 
@@ -777,7 +777,7 @@ RPCHelpMan dumpwallet()
     // the user could have gotten from another RPC command prior to now
     wallet.BlockUntilSyncedToCurrentChain();
 
-    LOCK(wallet.cs_wallet);
+    LOCK2(::cs_main, wallet.cs_wallet);
 
     EnsureWalletIsUnlocked(wallet);
 
@@ -1438,7 +1438,7 @@ RPCHelpMan importmulti()
     int64_t nLowestTimestamp = 0;
     UniValue response(UniValue::VARR);
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
 
         // Check all requests are watchonly
         bool is_watchonly{true};
@@ -1761,7 +1761,7 @@ RPCHelpMan importdescriptors()
     bool rescan = false;
     UniValue response(UniValue::VARR);
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         EnsureWalletIsUnlocked(*pwallet);
 
         CHECK_NONFATAL(pwallet->chain().findBlock(pwallet->GetLastBlockHash(), FoundBlock().time(lowest_timestamp).mtpTime(now)));

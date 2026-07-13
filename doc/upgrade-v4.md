@@ -25,10 +25,12 @@ The V4 transition is designed to run in phases.
    reward-height window.
 
 3. Quantum migration period, approximately eighteen months after Gold Rush.
-   Users move spendable value to quantum migration addresses. This is the
-   hard-fork spend phase: legacy-only nodes do not validate ML-DSA quantum
-   spends or upgraded UTXO-set credits, so stake-majority coordination must be
-   complete before this phase begins.
+   Mature Gold Rush payouts are ordinary spendable quantum UTXOs; no fresh
+   address move, expiry, or remigration is required. Users may optionally
+   consolidate them and migrate remaining legacy value to quantum addresses.
+   This is the hard-fork spend phase: legacy-only nodes do not validate ML-DSA
+   quantum spends, so stake-majority coordination must be complete before this
+   phase begins.
 
 4. Final lockout.
    After the migration deadline, non-migrated legacy spends are disabled on the
@@ -70,13 +72,14 @@ The primary wallet flow is:
 1. Generate or select a wallet-backed quantum migration address.
 2. Use `migratetoquantum` to build and send the migration transaction.
 3. Confirm the migrated output is wallet-backed and spendable.
-4. For Gold Rush rewards credited during the Gold Rush period, move those coins
-   to a fresh quantum wallet during the migration period.
+4. Treat matured Gold Rush payouts as ordinary quantum UTXOs. Optional
+   consolidation is available, but it does not establish ownership and is not
+   a prerequisite for spending, staking, or Final lockout.
 
-Gold Rush reward outputs are intentionally held until quantum witness spends
+Gold Rush reward outputs are intentionally locked until quantum witness spends
 activate after the Gold Rush reward-height window. This keeps the Gold Rush
-bridge legacy-compatible while still forcing every reward holder to perform the
-required fresh quantum move before normal use.
+bridge legacy-compatible. After normal coinbase maturity, the payout is an
+ordinary quantum UTXO and remains valid through Migration and Final.
 
 Wallets and UI surfaces should clearly separate legacy receiving addresses from
 quantum migration addresses so users do not confuse pre-migration legacy sends
@@ -104,11 +107,28 @@ principal safety while improving operator distribution.
 
 ## Demurrage And Liveness
 
-Demurrage applies only after the migration deadline and only to post-migration
-quantum outputs that are not exempt. It is inactive during Gold Rush and the
-migration window. Wallet-backed liveness attestations can refresh inactive
-quantum keys, and staking wallets can create periodic attestations while
-staking.
+Demurrage activates automatically at the first Final height after the
+migration deadline and applies only to direct quantum outputs that are not
+exempt. It is inactive during Gold Rush and Migration. Wallet-backed liveness
+attestations can refresh inactive quantum keys, and staking wallets can create
+periodic attestations while staking.
+
+## Existing-node upgrade and chainstate rebuild
+
+v30.1.1 changes the persisted shadow and demurrage state schema and normalizes
+legacy-compatible pre-Gold-Rush coin timestamps. Operators upgrading from
+v30.1.0 must back up wallets, stop the daemon, and run one bounded
+`-reindex-chainstate` before relying on the node for staking or mining:
+
+```bash
+blackcoind -datadir=/path/to/data -reindex-chainstate -daemonwait
+```
+
+The rebuild may require the full block files on pruned nodes. Do not delete the
+wallet or block files; if the rebuild cannot authenticate the local state, the
+daemon stops and prints the exact recovery action. Allow sufficient disk space
+and keep the pre-upgrade backup until the rebuilt node has synchronized and
+produced a matching UTXO-state hash.
 
 Wallet RPCs include `getdemurragewalletinfo`, `senddemurrageattestation`,
 `sweepdemurragedecay`, and `getcirculatingsupply`.

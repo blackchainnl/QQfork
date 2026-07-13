@@ -2536,9 +2536,16 @@ void StakingMiningPage::updateStatus()
     const interfaces::WalletMigrationStatus migration = w.getMigrationStatus();
     if (migration.available) {
         m_migration_phase->setText(QString::fromStdString(migration.phase));
-        m_migration_deadline->setText(migration.deadline_scheduled
-            ? tr("%1 blocks estimated").arg(QString::number(migration.blocks_until_deadline_est))
-            : tr("Not scheduled"));
+        if (!migration.deadline_scheduled) {
+            m_migration_deadline->setText(tr("Not scheduled"));
+        } else if (migration.height_boundaries_authoritative) {
+            m_migration_deadline->setText(tr("%1 blocks (ends at height %2)")
+                .arg(QString::number(migration.blocks_until_deadline))
+                .arg(QString::number(migration.deadline_height)));
+        } else {
+            m_migration_deadline->setText(tr("%1 blocks estimated")
+                .arg(QString::number(migration.blocks_until_deadline_est)));
+        }
         m_migration_legacy_amount->setText(tr("%1 across %2 inputs")
             .arg(formatBLK(migration.eligible_legacy_amount))
             .arg(QString::number(migration.eligible_legacy_inputs)));

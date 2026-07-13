@@ -54,7 +54,9 @@ struct PSBTAnalysis {
  * @param[in] psbtx the PSBT to analyze
  * @return A PSBTAnalysis with information about the provided PSBT.
  */
-PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx);
+PSBTAnalysis AnalyzePSBT(PartiallySignedTransaction psbtx,
+                         unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS,
+                         uint32_t quantum_chain_id = 0);
 } // namespace node
 
 #endif // BITCOIN_NODE_PSBT_H

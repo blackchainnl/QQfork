@@ -136,10 +136,11 @@ struct Params {
     int64_t nProtocolV4Time;
     int64_t nGoldRushEndTime;
     int64_t nQuantumMigrationDeadlineTime;
-    /** Optional height-based phase boundaries (testnet/regtest schedule overrides only;
-     *  0 = disabled, phase boundaries stay time-based). When set, the block AT the
-     *  boundary height is the last block of its phase, matching the inclusive
-     *  SHADOW_REWARD_END_HEIGHT reward-window semantics. Mainnet never sets these. */
+    /** Optional height-based phase boundaries (0 = disabled). When set, the block
+     *  AT the boundary height is the last block of its phase. Mainnet uses these
+     *  as the authoritative lifecycle so the reward window, migration, final
+     *  lockout, and demurrage cannot disagree when block production drifts from
+     *  wall-clock estimates. Test chains may override them. */
     int nGoldRushEndHeight{0};
     int nQuantumMigrationEndHeight{0};
     uint32_t nQuantumSighashChainId{0};
@@ -159,21 +160,43 @@ struct Params {
      *  next-block/mempool contexts: tip height + 1; for tip-status contexts: tip height).
      *  When a height override is set (testnet/regtest schedule branch) the height is
      *  authoritative and the paired time is ignored for that boundary. */
-    bool IsGoldRushEndScheduled() const { return nGoldRushEndHeight > 0 || nGoldRushEndTime != 0; }
-    bool IsMigrationEndScheduled() const { return nQuantumMigrationEndHeight > 0 || nQuantumMigrationDeadlineTime != 0; }
+    bool HasAnyHeightLifecycleBoundary() const { return nGoldRushEndHeight > 0 || nQuantumMigrationEndHeight > 0; }
+    bool UsesHeightLifecycle() const { return nGoldRushEndHeight > 0 && nQuantumMigrationEndHeight > 0; }
+    bool IsGoldRushEndScheduled() const { return UsesHeightLifecycle() ? nGoldRushEndHeight > 0 : nGoldRushEndTime != 0; }
+    bool IsMigrationEndScheduled() const { return UsesHeightLifecycle() ? nQuantumMigrationEndHeight > 0 : nQuantumMigrationDeadlineTime != 0; }
+    bool IsQuantumLifecycleScheduleOrdered() const
+    {
+        if (UsesHeightLifecycle()) {
+            return nGoldRushEndHeight > 0 && nQuantumMigrationEndHeight > nGoldRushEndHeight;
+        }
+        return nGoldRushEndTime != 0 &&
+               nQuantumMigrationDeadlineTime > nGoldRushEndTime;
+    }
     bool GoldRushEndPassed(int64_t nTime, int nHeight) const
     {
-        if (nGoldRushEndHeight > 0) return nHeight > nGoldRushEndHeight;
+        if (UsesHeightLifecycle()) return nHeight > nGoldRushEndHeight;
         return nGoldRushEndTime != 0 && nTime > nGoldRushEndTime;
     }
     bool MigrationDeadlinePassed(int64_t nTime, int nHeight) const
     {
-        if (nQuantumMigrationEndHeight > 0) return nHeight > nQuantumMigrationEndHeight;
+        if (UsesHeightLifecycle()) return nHeight > nQuantumMigrationEndHeight;
         return nQuantumMigrationDeadlineTime != 0 && nTime > nQuantumMigrationDeadlineTime;
     }
-    bool IsQuantumFinalLockout(int64_t nTime, int nHeight) const { return IsProtocolV4(nTime) && IsMigrationEndScheduled() && MigrationDeadlinePassed(nTime, nHeight); }
-    bool IsGoldRushEpoch(int64_t nTime, int nHeight) const { return IsProtocolV4(nTime) && !IsQuantumFinalLockout(nTime, nHeight) && !GoldRushEndPassed(nTime, nHeight); }
-    bool IsQuantumMigrationWindow(int64_t nTime, int nHeight) const { return IsProtocolV4(nTime) && !IsGoldRushEpoch(nTime, nHeight) && !IsQuantumFinalLockout(nTime, nHeight) && IsGoldRushEndScheduled() && GoldRushEndPassed(nTime, nHeight) && !MigrationDeadlinePassed(nTime, nHeight); }
+    bool IsQuantumFinalLockout(int64_t nTime, int nHeight) const
+    {
+        return IsProtocolV4(nTime) && IsGoldRushEndScheduled() && GoldRushEndPassed(nTime, nHeight) &&
+               IsMigrationEndScheduled() && IsQuantumLifecycleScheduleOrdered() &&
+               MigrationDeadlinePassed(nTime, nHeight);
+    }
+    bool IsGoldRushEpoch(int64_t nTime, int nHeight) const
+    {
+        return IsProtocolV4(nTime) && (!IsGoldRushEndScheduled() || !GoldRushEndPassed(nTime, nHeight));
+    }
+    bool IsQuantumMigrationWindow(int64_t nTime, int nHeight) const
+    {
+        return IsProtocolV4(nTime) && IsGoldRushEndScheduled() && GoldRushEndPassed(nTime, nHeight) &&
+               !IsQuantumFinalLockout(nTime, nHeight);
+    }
     bool IsQuantumSpendEnforcementActive(int64_t nTime, int nHeight) const { return IsQuantumMigrationWindow(nTime, nHeight) || IsQuantumFinalLockout(nTime, nHeight); }
     bool IsQuantumStakeRulesActive(int64_t nTime, int nHeight) const { return IsQuantumSpendEnforcementActive(nTime, nHeight); }
     bool IsNewNetworkStakeOnly(int64_t nTime, int nHeight) const { return IsQuantumFinalLockout(nTime, nHeight); }
@@ -188,16 +211,15 @@ struct Params {
     int DemurrageAutoAttestBlocks() const { return 3 * DemurrageBlocksPerMonth(); }
     bool IsDemurrageActive(int nHeight, int64_t nParentMedianTimePast) const
     {
-        return IsMigrationEndScheduled() &&
-               MigrationDeadlinePassed(nParentMedianTimePast, nHeight) &&
+        return IsQuantumFinalLockout(nParentMedianTimePast, nHeight) &&
                nHeight >= EffectiveDemurrageActivationHeight();
     }
     QuantumQuasarPhase GetQuantumQuasarPhase(int64_t nTime, int nHeight) const
     {
         if (!IsProtocolV4(nTime)) return QuantumQuasarPhase::LEGACY;
         if (IsGoldRushEpoch(nTime, nHeight)) return QuantumQuasarPhase::GOLD_RUSH;
-        if (IsQuantumMigrationWindow(nTime, nHeight)) return QuantumQuasarPhase::MIGRATION;
-        return QuantumQuasarPhase::FINAL_LOCKOUT;
+        if (IsQuantumFinalLockout(nTime, nHeight)) return QuantumQuasarPhase::FINAL_LOCKOUT;
+        return QuantumQuasarPhase::MIGRATION;
     }
     int nLastPOWBlock;
     int nStakeTimestampMask;

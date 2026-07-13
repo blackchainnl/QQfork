@@ -65,7 +65,8 @@ static void CommitWalletTransactionOrThrow(CWallet& wallet, const CTransactionRe
     std::string broadcast_error;
     if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error)) {
         const std::string reason = broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error;
-        if (!wallet.AbandonTransaction(tx->GetHash())) {
+        const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
+        if (added_to_wallet && !wallet.AbandonTransaction(tx->GetHash())) {
             wallet.WalletLogPrintf("%s transaction could not be abandoned after broadcast failure: txid=%s\n", action, tx->GetHash().ToString());
         }
         throw JSONRPCError(RPC_WALLET_ERROR, strprintf("%s transaction was created but could not be broadcast: %s", action, reason));
@@ -187,7 +188,7 @@ static std::map<uint256, std::vector<node::QuantumPoolClaim>> FindRpcWalletQuant
 {
     std::map<uint256, std::vector<node::QuantumPoolClaim>> claims_by_operator;
 
-    LOCK(wallet.cs_wallet);
+    LOCK2(::cs_main, wallet.cs_wallet);
     CoinFilterParams filter;
     filter.only_spendable = false;
     filter.skip_locked = false;
@@ -385,7 +386,7 @@ static RPCHelpMan getstakinginfo()
 
     if (pwallet)
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         nWeight = pwallet->GetStakeWeight();
         lastCoinStakeSearchInterval = pwallet->m_enabled_staking ? pwallet->m_last_coin_stake_search_interval : 0;
     }
@@ -944,20 +945,19 @@ static RPCHelpMan fundquantumcoldstakeaddress()
 {
     return RPCHelpMan{"fundquantumcoldstakeaddress",
         "\nFunds a quantum cold-stake delegation address from direct quantum funds.\n"
-        "If direct quantum funds are not available, wallet-owned Gold Rush reward outputs are first moved to a fresh quantum address unless options.allow_goldrush_migration is false.\n"
-        "When that migration is required, this call returns completed_delegation=false; wait for the migration transaction to confirm, then call this RPC again to fund the delegation.\n" +
+        "Mature Gold Rush payouts are ordinary direct quantum funds after Gold Rush; no preliminary move or remigration is required.\n"
+        "The options.allow_goldrush_migration field is retained for compatibility and has no effect.\n" +
         HELP_REQUIRING_PASSPHRASE,
         {
             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-backed quantum cold-stake delegation address."},
             {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount to delegate."},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Delegation funding options.", {
-                {"allow_goldrush_migration", RPCArg::Type::BOOL, RPCArg::Default{true}, "Allow this RPC to first move wallet-owned Gold Rush reward outputs to a fresh quantum address if direct quantum funds are not currently available."},
+                {"allow_goldrush_migration", RPCArg::Type::BOOL, RPCArg::Default{true}, "Deprecated compatibility field; ignored."},
             }},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", QuantumStakeTxResult()},
         RPCExamples{
             HelpExampleCli("fundquantumcoldstakeaddress", "\"coldstake_delegation_address\" 1000")
-          + HelpExampleCli("fundquantumcoldstakeaddress", "\"coldstake_delegation_address\" 1000 '{\"allow_goldrush_migration\":false}'")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -1157,7 +1157,7 @@ static RPCHelpMan sendshadowsignal()
     CAmount change{0};
     int64_t vsize{-1};
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         const int64_t current_time = GetAdjustedTimeSeconds();
         const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
         if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
@@ -1350,7 +1350,7 @@ static RPCHelpMan sendshadowpowclaim()
     }
 
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         const int64_t current_time = GetAdjustedTimeSeconds();
         const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
         if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
@@ -1420,7 +1420,7 @@ static RPCHelpMan sendshadowpowclaim()
     CAmount change{0};
     int64_t vsize{-1};
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         const int64_t current_time = GetAdjustedTimeSeconds();
         const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
         if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
@@ -1560,7 +1560,7 @@ static RPCHelpMan getgoldrushinfo()
 
     std::set<CScript> wallet_scripts;
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         CCoinControl coin_control;
         coin_control.m_avoid_address_reuse = false;
         for (const COutput& output : AvailableCoins(*pwallet, &coin_control).All()) {
@@ -2229,6 +2229,7 @@ static RPCHelpMan senddemurrageattestation()
             {RPCResult::Type::STR_HEX, "witness_program", "Attested witness program / public-key hash."},
             {RPCResult::Type::STR_HEX, "public_key", "Attested ML-DSA public key."},
             {RPCResult::Type::STR_HEX, "replay_anchor", "First input outpoint bound into the ML-DSA attestation signature."},
+            {RPCResult::Type::STR_HEX, "target_outpoint", "Live quantum UTXO proving that the attested key is relevant."},
             {RPCResult::Type::NUM, "attestation_vout", "Output index carrying the zero-value demurrage attestation."},
             {RPCResult::Type::STR_AMOUNT, "fee", "Transaction fee."},
             {RPCResult::Type::NUM, "vsize", "Virtual transaction size."},
@@ -2286,6 +2287,7 @@ static RPCHelpMan senddemurrageattestation()
     obj.pushKV("witness_program", HexStr(witness->GetWitnessProgram()));
     obj.pushKV("public_key", HexStr(tx_result.public_key));
     obj.pushKV("replay_anchor", tx_result.replay_anchor.ToString());
+    obj.pushKV("target_outpoint", tx_result.target_outpoint.ToString());
     obj.pushKV("attestation_vout", tx_result.attestation_vout);
     obj.pushKV("fee", ValueFromAmount(tx_result.fee));
     obj.pushKV("vsize", (int)GetVirtualTransactionSize(*tx, 0, 0));
@@ -2336,6 +2338,7 @@ static RPCHelpMan getdemurragewalletinfo()
                     {RPCResult::Type::NUM, "coin_height", "Consensus coin height used for evaluation"},
                     {RPCResult::Type::BOOL, "chainstate_backed", "Whether the output was found in chainstate/mempool lookup"},
                     {RPCResult::Type::NUM, "latest_attestation_height", /*optional=*/true, "Latest mined liveness attestation height for this key"},
+                    {RPCResult::Type::NUM, "attestation_coverage_start_height", /*optional=*/true, "Beginning of the uninterrupted attestation coverage epoch"},
                     {RPCResult::Type::NUM, "inactive_blocks", "Blocks since the effective last-active height"},
                     {RPCResult::Type::NUM, "remaining_ppm", "Remaining value in parts per million"},
                     {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal output value"},
@@ -2399,8 +2402,12 @@ static RPCHelpMan getdemurragewalletinfo()
         const auto coin_it = chain_coins.find(out.outpoint);
         const bool chainstate_backed = coin_it != chain_coins.end() && !coin_it->second.IsSpent();
         Coin coin = chainstate_backed ? coin_it->second : Coin{out.txout, out.depth > 0 ? tip_height - out.depth + 1 : evaluation_height, false, false, static_cast<int>(out.time)};
-        const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(view, out.txout.scriptPubKey);
-        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin, consensus, evaluation_height, evaluation_time, latest_attestation);
+        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+            Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
+        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+            coin, consensus, evaluation_height, evaluation_time,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
         const bool attestation_due = demurrage_active && !eval.locked && eval.inactive_blocks >= consensus.DemurrageAutoAttestBlocks();
 
         nominal_total += eval.nominal_value;
@@ -2417,7 +2424,10 @@ static RPCHelpMan getdemurragewalletinfo()
         entry.pushKV("depth", out.depth);
         entry.pushKV("coin_height", static_cast<int>(coin.nHeight));
         entry.pushKV("chainstate_backed", chainstate_backed);
-        if (latest_attestation) entry.pushKV("latest_attestation_height", *latest_attestation);
+        if (latest_attestation) {
+            entry.pushKV("latest_attestation_height", latest_attestation->height);
+            entry.pushKV("attestation_coverage_start_height", latest_attestation->coverage_start_height);
+        }
         entry.pushKV("inactive_blocks", eval.inactive_blocks);
         entry.pushKV("remaining_ppm", eval.remaining_ppm);
         entry.pushKV("nominal_amount", ValueFromAmount(eval.nominal_value));
@@ -2623,8 +2633,12 @@ static RPCHelpMan sweepdemurragedecay()
     for (const COutput& out : candidates) {
         const auto coin_it = chain_coins.find(out.outpoint);
         if (coin_it == chain_coins.end() || coin_it->second.IsSpent()) continue;
-        const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(view, out.txout.scriptPubKey);
-        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin_it->second, consensus, evaluation_height, evaluation_time, latest_attestation);
+        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+            Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
+        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+            coin_it->second, consensus, evaluation_height, evaluation_time,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
         if (eval.locked) {
             ++skipped_locked_outputs;
             skipped_locked_amount += eval.nominal_value;

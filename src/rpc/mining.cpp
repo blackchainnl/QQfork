@@ -605,8 +605,14 @@ static RPCHelpMan getblocktemplate()
                 {RPCResult::Type::OBJ, "quantumquasar", "Blackcoin V4 roadmap data for miners", {
                     {RPCResult::Type::STR, "phase", "current Blackcoin roadmap phase for the template"},
                     {RPCResult::Type::NUM_TIME, "v4_activation_time", "first V4 hard-fork activation boundary"},
-                    {RPCResult::Type::NUM_TIME, "gold_rush_end_time", "end of the Gold Rush phase"},
-                    {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "planned final post-quantum migration deadline"},
+                    {RPCResult::Type::NUM_TIME, "gold_rush_end_time", "forecast Gold Rush end time; non-authoritative when height boundaries are enabled"},
+                    {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "forecast final migration time; non-authoritative when height boundaries are enabled"},
+                    {RPCResult::Type::NUM, "gold_rush_end_height", "authoritative last Gold Rush block height, or 0 for a time-only test schedule"},
+                    {RPCResult::Type::NUM, "quantum_migration_end_height", "authoritative last Migration block height, or 0 for a time-only test schedule"},
+                    {RPCResult::Type::BOOL, "height_boundaries_authoritative", "whether exact block heights govern both lifecycle boundaries"},
+                    {RPCResult::Type::BOOL, "time_boundaries_are_estimates", "whether the time fields are forecasts only"},
+                    {RPCResult::Type::NUM, "blocks_until_gold_rush_end", "exact remaining Gold Rush blocks when height boundaries are authoritative"},
+                    {RPCResult::Type::NUM, "blocks_until_quantum_migration_end", "exact remaining Migration blocks when height boundaries are authoritative"},
                     {RPCResult::Type::BOOL, "base_network_stake_compatible", "whether stakers should keep producing base-network-compatible coinstakes"},
                     {RPCResult::Type::BOOL, "shadow_merge_mining_active", "whether Gold Rush shadow proof merge-mining is active"},
                     {RPCResult::Type::BOOL, "shadow_reward_height_active", "whether this template is inside the deterministic height-based Gold Rush payout window"},
@@ -615,6 +621,8 @@ static RPCHelpMan getblocktemplate()
                     {RPCResult::Type::NUM, "shadow_reward_end_height", "last deterministic Gold Rush payout height"},
                     {RPCResult::Type::BOOL, "new_network_stake_only", "whether staking has crossed the final quantum-only lockout cutover"},
                     {RPCResult::Type::BOOL, "replay_protection_active", "whether SIGHASH_FORKID replay protection is enforced by schedule"},
+                    {RPCResult::Type::BOOL, "sighash_forkid_active", "whether legacy ECDSA signatures must use the fork-protected digest"},
+                    {RPCResult::Type::BOOL, "quantum_signature_domain_separation_active", "whether ML-DSA signatures use the configured chain domain"},
                     {RPCResult::Type::BOOL, "legacy_address_lockout_scheduled", "whether the roadmap contains a final legacy lockout deadline"},
                     {RPCResult::Type::BOOL, "quantum_address_required_by_schedule", "whether the roadmap has reached the scheduled quantum-address phase"},
                     {RPCResult::Type::BOOL, "legacy_addresses_accepted", "whether this node currently accepts legacy addresses under implemented rules"},
@@ -780,7 +788,12 @@ static RPCHelpMan getblocktemplate()
 
     // Use the active tip, not the cached template tip, so activation status cannot
     // lag behind a block transition while the template is being refreshed below.
-    const bool fPreSegWit = !DeploymentActiveAfter(active_chain.Tip(), chainman, Consensus::DEPLOYMENT_SEGWIT);
+    const CBlockIndex* active_tip = active_chain.Tip();
+    const int64_t active_tip_mtp = active_tip->GetMedianTimePast();
+    const int active_next_height = active_tip->nHeight + 1;
+    const bool fPreSegWit = !(
+        DeploymentActiveAfter(active_tip, chainman, Consensus::DEPLOYMENT_SEGWIT) ||
+        IsQuantumWitnessSpendActive(consensusParams, active_tip_mtp, active_next_height));
 
     // GBT must be called with 'segwit' set in the rules
     if (!fPreSegWit && setClientRules.count("segwit") != 1) {
@@ -959,6 +972,14 @@ static RPCHelpMan getblocktemplate()
     quantumquasar.pushKV("v4_activation_time", consensusParams.nProtocolV4Time);
     quantumquasar.pushKV("gold_rush_end_time", consensusParams.nGoldRushEndTime);
     quantumquasar.pushKV("quantum_migration_deadline_time", consensusParams.nQuantumMigrationDeadlineTime);
+    quantumquasar.pushKV("gold_rush_end_height", consensusParams.nGoldRushEndHeight);
+    quantumquasar.pushKV("quantum_migration_end_height", consensusParams.nQuantumMigrationEndHeight);
+    quantumquasar.pushKV("height_boundaries_authoritative", consensusParams.nGoldRushEndHeight > 0 && consensusParams.nQuantumMigrationEndHeight > 0);
+    quantumquasar.pushKV("time_boundaries_are_estimates", consensusParams.UsesHeightLifecycle());
+    quantumquasar.pushKV("blocks_until_gold_rush_end", consensusParams.nGoldRushEndHeight > 0 && template_height <= consensusParams.nGoldRushEndHeight
+        ? consensusParams.nGoldRushEndHeight - template_height + 1 : 0);
+    quantumquasar.pushKV("blocks_until_quantum_migration_end", consensusParams.nQuantumMigrationEndHeight > 0 && template_height <= consensusParams.nQuantumMigrationEndHeight
+        ? consensusParams.nQuantumMigrationEndHeight - template_height + 1 : 0);
     quantumquasar.pushKV("base_network_stake_compatible", base_network_stake_compatible);
     quantumquasar.pushKV("shadow_merge_mining_active", shadow_merge_mining_active);
     quantumquasar.pushKV("shadow_reward_height_active", shadow_reward_height_active);
@@ -966,13 +987,15 @@ static RPCHelpMan getblocktemplate()
     quantumquasar.pushKV("shadow_reward_start_height", SHADOW_REWARD_START_HEIGHT);
     quantumquasar.pushKV("shadow_reward_end_height", SHADOW_REWARD_END_HEIGHT);
     quantumquasar.pushKV("new_network_stake_only", new_network_stake_only);
-    quantumquasar.pushKV("replay_protection_active", new_network_stake_only);
-    quantumquasar.pushKV("legacy_address_lockout_scheduled", consensusParams.nQuantumMigrationDeadlineTime != 0);
+    quantumquasar.pushKV("replay_protection_active", quantum_spend_active);
+    quantumquasar.pushKV("sighash_forkid_active", quantum_spend_active);
+    quantumquasar.pushKV("quantum_signature_domain_separation_active", quantum_spend_active);
+    quantumquasar.pushKV("legacy_address_lockout_scheduled", consensusParams.IsMigrationEndScheduled());
     quantumquasar.pushKV("quantum_address_required_by_schedule", final_lockout_active);
     quantumquasar.pushKV("legacy_addresses_accepted", !final_lockout_active);
     quantumquasar.pushKV("quantum_address_required", final_lockout_active);
     quantumquasar.pushKV("quantum_spend_enforcement_active", quantum_spend_active);
-    quantumquasar.pushKV("quantum_migration_outputs_fundable", true);
+    quantumquasar.pushKV("quantum_migration_outputs_fundable", quantum_spend_active);
     UniValue readiness_signalling(UniValue::VOBJ);
     readiness_signalling.pushKV(VersionBitsDeploymentInfo[Consensus::DEPLOYMENT_QUANTUM_QUASAR].name, consensusParams.vDeployments[Consensus::DEPLOYMENT_QUANTUM_QUASAR].bit);
     readiness_signalling.pushKV(VersionBitsDeploymentInfo[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].name, consensusParams.vDeployments[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].bit);

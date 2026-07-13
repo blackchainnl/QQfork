@@ -61,12 +61,10 @@ public:
     int m_max_depth = DEFAULT_MAX_DEPTH;
     //! Restrict automatic and selected inputs to a wallet-family bucket.
     std::optional<InputFamily> m_input_family;
-    //! Exclude generated quantum credits from ordinary sends. Gold Rush reward
-    //! credits have a special migration-window spend path and should only be
-    //! consumed by that guided workflow.
+    //! Exclude generated quantum credits while the Gold Rush reward window is
+    //! active. The exclusion automatically ends when v16 spends activate.
     bool m_exclude_generated_quantum_inputs = false;
-    //! Allow selected Gold Rush reward outputs. Only the guided remigration
-    //! workflow should set this.
+    //! Allow explicit selection by the optional reward-consolidation workflow.
     bool m_include_generated_quantum_inputs = false;
     //! Allow selected bonded or still-unbonding tiered quantum staking outputs.
     //! Only guided unbond/withdrawal workflows should set this.

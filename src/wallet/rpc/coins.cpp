@@ -647,7 +647,7 @@ RPCHelpMan listunspent()
         cctl.m_min_depth = nMinDepth;
         cctl.m_max_depth = nMaxDepth;
         cctl.m_include_unsafe_inputs = include_unsafe;
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         vecOutputs = AvailableCoinsListUnspent(*pwallet, &cctl, filter_coins).All();
     }
 

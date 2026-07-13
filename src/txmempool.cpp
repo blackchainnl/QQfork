@@ -11,6 +11,7 @@
 #include <coins.h>
 #include <common/system.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <logging.h>
@@ -459,6 +460,11 @@ void CTxMemPool::addUnchecked(const CTxMemPoolEntry &entry, setEntries &setAnces
     cachedInnerUsage += entry.DynamicMemoryUsage();
 
     const CTransaction& tx = newit->GetTx();
+    for (const Consensus::DemurrageAttestation& attestation : Consensus::ExtractDemurrageAttestations(tx)) {
+        ++m_demurrage_attestation_key_counts[attestation.pubkey_hash];
+        ++m_demurrage_attestation_target_counts[attestation.target_outpoint];
+        ++m_demurrage_attestation_count;
+    }
     std::set<uint256> setParentTransactions;
     for (unsigned int i = 0; i < tx.vin.size(); i++) {
         mapNextTx.insert(std::make_pair(&tx.vin[i].prevout, &tx));
@@ -520,6 +526,16 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
     );
 
     const uint256 hash = it->GetTx().GetHash();
+    for (const Consensus::DemurrageAttestation& attestation : Consensus::ExtractDemurrageAttestations(it->GetTx())) {
+        auto key_it = m_demurrage_attestation_key_counts.find(attestation.pubkey_hash);
+        assert(key_it != m_demurrage_attestation_key_counts.end() && key_it->second > 0);
+        if (--key_it->second == 0) m_demurrage_attestation_key_counts.erase(key_it);
+        auto target_it = m_demurrage_attestation_target_counts.find(attestation.target_outpoint);
+        assert(target_it != m_demurrage_attestation_target_counts.end() && target_it->second > 0);
+        if (--target_it->second == 0) m_demurrage_attestation_target_counts.erase(target_it);
+        assert(m_demurrage_attestation_count > 0);
+        --m_demurrage_attestation_count;
+    }
     for (const CTxIn& txin : it->GetTx().vin)
         mapNextTx.erase(txin.prevout);
 
@@ -542,6 +558,23 @@ void CTxMemPool::removeUnchecked(txiter it, MemPoolRemovalReason reason)
     nTransactionsUpdated++;
     // Blackcoin
     // if (minerPolicyEstimator) {minerPolicyEstimator->removeTx(hash, false);}
+}
+
+void CTxMemPool::GetDemurrageAttestationState(std::set<uint256>& attested_keys, size_t& attestation_count) const
+{
+    AssertLockHeld(cs);
+    attested_keys.clear();
+    for (const auto& [key, count] : m_demurrage_attestation_key_counts) {
+        if (count > 0) attested_keys.insert(key);
+    }
+    attestation_count = m_demurrage_attestation_count;
+}
+
+bool CTxMemPool::HasDemurrageAttestationTarget(const COutPoint& outpoint) const
+{
+    AssertLockHeld(cs);
+    const auto it = m_demurrage_attestation_target_counts.find(outpoint);
+    return it != m_demurrage_attestation_target_counts.end() && it->second > 0;
 }
 
 // Calculates descendants of entry that are not already in setDescendants, and adds to
@@ -675,7 +708,8 @@ void CTxMemPool::removeForBlock(const std::vector<CTransactionRef>& vtx, unsigne
     // blockSinceLastRollingFeeBump = true;
 }
 
-void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendheight, int64_t spendtime) const
+void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendheight,
+                       int64_t spendtime, int64_t demurragetime) const
 {
     if (m_check_ratio == 0) return;
 
@@ -692,6 +726,7 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
 
     CCoinsViewCache mempoolDuplicate(const_cast<CCoinsViewCache*>(&active_coins_tip));
     const int64_t check_spend_time{spendtime > 0 ? spendtime : GetAdjustedTimeSeconds()};
+    const int64_t check_demurrage_time{demurragetime > 0 ? demurragetime : check_spend_time};
 
     for (const auto& it : GetSortedDepthAndScore()) {
         checkTotal += it->GetTxSize();
@@ -769,7 +804,8 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
         // caller-supplied next-block spend time rather than the wall-clock
         // entry time, which can be earlier than input coin times under
         // mocktime or immediately after connecting a block.
-        assert(Consensus::CheckTxInputs(tx, dummy_state, mempoolDuplicate, spendheight, check_spend_time, check_spend_time, txfee));
+        assert(Consensus::CheckTxInputs(tx, dummy_state, mempoolDuplicate, spendheight,
+                                        check_spend_time, check_demurrage_time, txfee));
         for (const auto& input: tx.vin) mempoolDuplicate.SpendCoin(input.prevout);
         AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max());
     }

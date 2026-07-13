@@ -47,6 +47,7 @@
 #include <scheduler.h>
 #include <script/sign.h>
 #include <script/sigcache.h>
+#include <shadow.h>
 #include <shutdown.h>
 #include <streams.h>
 #include <test/util/net.h>
@@ -381,7 +382,7 @@ CMutableTransaction TestChain100Setup::CreateValidMempoolTransaction(CTransactio
     {
         LOCK(cs_main);
         const CBlockIndex* tip{Assert(m_node.chainman)->ActiveChain().Tip()};
-        if (tip && Params().GetConsensus().IsNewNetworkStakeOnly(tip->GetMedianTimePast(), tip->nHeight + 1)) {
+        if (tip && IsQuantumWitnessSpendActive(Params().GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1)) {
             nHashType |= SIGHASH_FORKID;
         }
     }
@@ -402,7 +403,8 @@ CMutableTransaction TestChain100Setup::CreateValidMempoolTransaction(CTransactio
 
     unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS;
     if ((nHashType & SIGHASH_FORKID) != 0) {
-        verify_flags |= SCRIPT_ENABLE_SIGHASH_FORKID | SCRIPT_VERIFY_ISCOINSTAKE | SCRIPT_VERIFY_V4_LARGE_SCRIPT_ELEMENT;
+        verify_flags |= SCRIPT_ENABLE_SIGHASH_FORKID |
+                        SCRIPT_VERIFY_STRICTENC;
     }
     ScriptError serror = SCRIPT_ERR_OK;
     assert(VerifyScript(

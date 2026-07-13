@@ -14,17 +14,21 @@
 #ifndef BITCOIN_NODE_MINER_H
 #define BITCOIN_NODE_MINER_H
 
+#include <node/context.h>
 #include <policy/policy.h>
 #include <primitives/block.h>
 #include <txmempool.h>
-#include <node/context.h>
+#include <uint256.h>
 #include <wallet/wallet.h>
 #ifdef ENABLE_WALLET
 #include <wallet/staking.h>
 #endif
 
+#include <cstddef>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdint.h>
 
 #include <boost/multi_index/identity.hpp>
@@ -169,6 +173,10 @@ private:
     CTxMemPool::setEntries inBlock;
     bool m_shadow_proof_selected{false};
     bool m_building_pos_template{false};
+    std::set<uint256> m_demurrage_attestation_keys;
+    std::set<COutPoint> m_demurrage_attestation_targets;
+    size_t m_demurrage_attestation_count{0};
+    std::map<uint256, CAmount> m_next_block_fees;
 
     // Chain context for the block
     int nHeight;
@@ -226,7 +234,7 @@ private:
       * locktime, premature-witness, serialized size (if necessary)
       * These checks should always succeed, and they're here
       * only as an extra check in case of suboptimal node configuration */
-    bool TestPackageTransactions(const CTxMemPool::setEntries& package, uint32_t nTime) const;
+    bool TestPackageTransactions(const CTxMemPool::setEntries& package, uint32_t nTime);
     /** Sort the package in an order that is valid to appear in a block */
     void SortForBlock(const CTxMemPool::setEntries& package, std::vector<CTxMemPool::txiter>& sortedEntries);
 };

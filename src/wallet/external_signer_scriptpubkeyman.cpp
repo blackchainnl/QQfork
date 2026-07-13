@@ -72,6 +72,14 @@ TransactionError ExternalSignerScriptPubKeyMan::FillPSBT(PartiallySignedTransact
         return DescriptorScriptPubKeyMan::FillPSBT(psbt, txdata, sighash_type, false, bip32derivs, n_signed, finalize);
     }
 
+    // Existing HWI/external-signer protocol messages do not carry the custom
+    // Blackcoin ForkID digest domain or quantum chain id. Never solicit an
+    // ordinary SIGHASH_ALL signature that post-Gold-Rush nodes will reject.
+    if (txdata.m_sighash_forkid_active) {
+        tfm::format(std::cerr, "External signer lacks Quantum Quasar ForkID capability\n");
+        return TransactionError::EXTERNAL_SIGNER_FAILED;
+    }
+
     // Already complete if every input is now signed
     bool complete = true;
     for (const auto& input : psbt.inputs) {
@@ -85,7 +93,10 @@ TransactionError ExternalSignerScriptPubKeyMan::FillPSBT(PartiallySignedTransact
         tfm::format(std::cerr, "Failed to sign: %s\n", strFailReason);
         return TransactionError::EXTERNAL_SIGNER_FAILED;
     }
-    if (finalize) FinalizePSBT(psbt); // This won't work in a multisig setup
+    if (finalize && !FinalizePSBT(psbt, STANDARD_SCRIPT_VERIFY_FLAGS,
+                                 txdata.m_quantum_sighash_chain_id)) {
+        return TransactionError::INVALID_PSBT;
+    } // This won't work in a multisig setup
     return TransactionError::OK;
 }
 } // namespace wallet

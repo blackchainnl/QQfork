@@ -214,6 +214,8 @@ public:
 
     //! Finalize and extract PSBT with wallet/chain-aware script verification flags.
     virtual bool finalizePSBT(PartiallySignedTransaction& psbtx, CMutableTransaction& mtx) = 0;
+    //! Return next-block script flags and Quantum Quasar chain id for PSBT analysis.
+    virtual std::pair<unsigned int, uint32_t> getPSBTAnalysisContext() const = 0;
 
     //! Get balances.
     virtual WalletBalances getBalances() = 0;
@@ -379,7 +381,7 @@ public:
     //! Sweep spendable legacy coins into a wallet-backed quantum address.
     virtual util::Result<WalletQuantumActionTx> migrateLegacyToQuantum() = 0;
 
-    //! Move wallet-owned Gold Rush reward outputs to a fresh quantum address once quantum reward spends are active.
+    //! Optionally consolidate matured wallet-owned Gold Rush reward outputs to a fresh quantum address.
     virtual util::Result<WalletQuantumActionTx> migrateGoldRushRewards() = 0;
 
     //! List wallet-owned RGB assets and assignments.
@@ -746,8 +748,11 @@ struct WalletMigrationStatus
     std::string phase{"unknown"};
     int64_t median_time{0};
     int64_t deadline_mtp{0};
+    int deadline_height{0};
     bool deadline_scheduled{false};
+    bool height_boundaries_authoritative{false};
     int64_t seconds_until_deadline{0};
+    int64_t blocks_until_deadline{0};
     int64_t blocks_until_deadline_est{0};
     bool deadline_passed{false};
     unsigned int eligible_legacy_inputs{0};

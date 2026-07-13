@@ -677,8 +677,6 @@ RPCHelpMan simulaterawtransaction()
     if (!rpc_wallet) return UniValue::VNULL;
     const CWallet& wallet = *rpc_wallet;
 
-    LOCK(wallet.cs_wallet);
-
     UniValue include_watchonly(UniValue::VNULL);
     if (request.params[1].isObject()) {
         UniValue options = request.params[1];
@@ -691,29 +689,36 @@ RPCHelpMan simulaterawtransaction()
         include_watchonly = options["include_watchonly"];
     }
 
+    const auto& txs = request.params[0].get_array();
+    std::vector<CMutableTransaction> decoded_txs;
+    decoded_txs.reserve(txs.size());
+    std::map<COutPoint, Coin> coins;
+    for (const UniValue& raw_tx : txs.getValues()) {
+        CMutableTransaction mtx;
+        if (!DecodeHexTx(mtx, raw_tx.get_str(), /* try_no_witness */ true, /* try_witness */ true)) {
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "Transaction hex string decoding failure.");
+        }
+        for (const CTxIn& txin : mtx.vin) {
+            coins.try_emplace(txin.prevout);
+        }
+        decoded_txs.push_back(std::move(mtx));
+    }
+    // Chain lookup is intentionally outside cs_wallet. The results are a
+    // point-in-time simulation input and need not be held atomically with
+    // wallet ownership accounting.
+    wallet.chain().findCoins(coins);
+
+    LOCK(wallet.cs_wallet);
     isminefilter filter = ISMINE_SPENDABLE;
     if (ParseIncludeWatchonly(include_watchonly, wallet)) {
         filter |= ISMINE_WATCH_ONLY;
     }
 
-    const auto& txs = request.params[0].get_array();
     CAmount changes{0};
     std::map<COutPoint, CAmount> new_utxos; // UTXO:s that were made available in transaction array
     std::set<COutPoint> spent;
 
-    for (size_t i = 0; i < txs.size(); ++i) {
-        CMutableTransaction mtx;
-        if (!DecodeHexTx(mtx, txs[i].get_str(), /* try_no_witness */ true, /* try_witness */ true)) {
-            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "Transaction hex string decoding failure.");
-        }
-
-        // Fetch previous transactions (inputs)
-        std::map<COutPoint, Coin> coins;
-        for (const CTxIn& txin : mtx.vin) {
-            coins[txin.prevout]; // Create empty map entry keyed by prevout.
-        }
-        wallet.chain().findCoins(coins);
-
+    for (const CMutableTransaction& mtx : decoded_txs) {
         // Fetch debit; we are *spending* these; if the transaction is signed and
         // broadcast, we will lose everything in these
         for (const auto& txin : mtx.vin) {

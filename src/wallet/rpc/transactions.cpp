@@ -29,8 +29,9 @@ static bool IsGoldRushWalletControlTx(const CWalletTx& wtx)
 }
 
 static void WalletTxToJSON(const CWallet& wallet, const CWalletTx& wtx, UniValue& entry)
-    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
 {
+    AssertLockHeld(::cs_main);
     interfaces::Chain& chain = wallet.chain();
     int confirms = wallet.GetTxDepthInMainChain(wtx);
     entry.pushKV("confirmations", confirms);
@@ -321,7 +322,7 @@ template <class Vec>
 static void ListTransactions(const CWallet& wallet, const CWalletTx& wtx, int nMinDepth, bool fLong,
                              Vec& ret, const isminefilter& filter_ismine, const std::optional<std::string>& filter_label,
                              bool include_change = false)
-    EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
 {
     CAmount nFee;
     std::list<COutputEntry> listReceived;
@@ -451,6 +452,10 @@ static std::vector<RPCResult> TransactionDescriptionString()
            {RPCResult::Type::NUM_TIME, "time", "The transaction time expressed in " + UNIX_EPOCH_TIME + "."},
            {RPCResult::Type::NUM_TIME, "timereceived", "The time received expressed in " + UNIX_EPOCH_TIME + "."},
            {RPCResult::Type::STR, "comment", /*optional=*/true, "If a comment is associated with the transaction, only present if not empty."},
+           {RPCResult::Type::STR, "qq_auto_shadow_stale", /*optional=*/true, "Set to \"1\" when a Gold Rush shadow proof is pending automatic tip validation or was automatically abandoned as stale."},
+           {RPCResult::Type::STR, "qq_manual_shadow_abandon", /*optional=*/true, "Set to \"1\" when the transaction was manually abandoned and must not be reopened automatically after a reorganization."},
+           {RPCResult::Type::STR, "qq_reorg_shadow_resubmit", /*optional=*/true, "Set to \"1\" while an automatically restored Gold Rush proof is awaiting immediate resubmission after a reorganization."},
+           {RPCResult::Type::STR, "qq_synthetic_goldrush_payout", /*optional=*/true, "Set to \"1\" for a wallet-recognized synthetic Gold Rush payout transaction."},
            {RPCResult::Type::ARR, "parent_descs", /*optional=*/true, "Only if 'category' is 'received'. List of parent descriptors for the scriptPubKey of this coin.", {
                {RPCResult::Type::STR, "desc", "The descriptor string."},
            }},
@@ -537,7 +542,7 @@ RPCHelpMan listtransactions()
 
     std::vector<UniValue> ret;
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
 
         const CWallet::TxItems & txOrdered = pwallet->wtxOrdered;
 
@@ -628,7 +633,7 @@ RPCHelpMan listsinceblock()
     // the user could have gotten from another RPC command prior to now
     wallet.BlockUntilSyncedToCurrentChain();
 
-    LOCK(wallet.cs_wallet);
+    LOCK2(::cs_main, wallet.cs_wallet);
 
     std::optional<int> height;    // Height of the specified block or the common ancestor, if the block provided was in a deactivated chain.
     std::optional<int> altheight; // Height of the specified block, even if it's in a deactivated chain.
@@ -776,7 +781,7 @@ RPCHelpMan gettransaction()
     // the user could have gotten from another RPC command prior to now
     pwallet->BlockUntilSyncedToCurrentChain();
 
-    LOCK(pwallet->cs_wallet);
+    LOCK2(::cs_main, pwallet->cs_wallet);
 
     uint256 hash(ParseHashV(request.params[0], "txid"));
 
@@ -855,16 +860,16 @@ RPCHelpMan abandontransaction()
     // the user could have gotten from another RPC command prior to now
     pwallet->BlockUntilSyncedToCurrentChain();
 
-    LOCK(pwallet->cs_wallet);
-
     uint256 hash(ParseHashV(request.params[0], "txid"));
 
-    if (!pwallet->mapWallet.count(hash)) {
+    const bool known_transaction = WITH_LOCK(pwallet->cs_wallet, return pwallet->mapWallet.count(hash) != 0);
+    if (!known_transaction) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid or non-wallet transaction id");
     }
     if (!pwallet->AbandonTransaction(hash)) {
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Transaction not eligible for abandonment");
     }
+    pwallet->ReconcileRGBAssignments();
 
     return UniValue::VNULL;
 },
@@ -914,7 +919,7 @@ RPCHelpMan rescanblockchain()
 
     LOCK(pwallet->m_relock_mutex);
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         EnsureWalletIsUnlocked(*pwallet);
         int tip_height = pwallet->GetLastBlockHeight();
 
