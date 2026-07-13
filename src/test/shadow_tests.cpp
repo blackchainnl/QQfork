@@ -62,6 +62,13 @@ COutPoint PoolOutpointForTest()
     return COutPoint{ss.GetHash(), 0};
 }
 
+COutPoint ActiveSignalSetOutpointForTest()
+{
+    CHashWriter ss;
+    ss << std::string("Quantum Quasar Active Signal Set");
+    return COutPoint{ss.GetHash(), 0};
+}
+
 void AddPoolForTest(CCoinsViewCache& view, const CBlockIndex& index, CAmount pow_amount, CAmount pos_amount, CAmount claimed_amount)
 {
     static const std::vector<unsigned char> pool_tag{'Q', 'Q', 'P', 'O', 'O', 'L'};
@@ -731,6 +738,58 @@ BOOST_AUTO_TEST_CASE(pos_shadow_signal_lookback_pays_without_per_block_signal_an
     BOOST_CHECK_EQUAL(rewound_total, 0);
 
     BOOST_REQUIRE(UndoShadowBlock(view, solve_block, &solve_index, &solve_undo));
+}
+
+BOOST_AUTO_TEST_CASE(active_signal_and_pool_state_are_atomic_and_fail_closed)
+{
+    CCoinsView base;
+    CCoinsViewCache view{&base, true};
+
+    uint256 whitelist_hash;
+    CBlockIndex whitelist_index;
+    InitIndex(whitelist_index, SHADOW_WHITELIST_HEIGHT, nullptr, whitelist_hash);
+    BOOST_REQUIRE(ApplyLegacyWhitelistSnapshot(view, &whitelist_index));
+
+    uint256 first_hash;
+    CBlockIndex first_index;
+    InitIndex(first_index, SHADOW_REWARD_START_HEIGHT, &whitelist_index, first_hash);
+    CBlock first_block;
+    first_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_TRUE));
+    BOOST_REQUIRE(ApplyShadowBlock(view, first_block, &first_index));
+
+    Coin pool_coin;
+    Coin signal_coin;
+    BOOST_REQUIRE(view.GetCoin(PoolOutpointForTest(), pool_coin));
+    BOOST_REQUIRE(view.GetCoin(ActiveSignalSetOutpointForTest(), signal_coin));
+
+    uint256 second_hash;
+    CBlockIndex second_index;
+    InitIndex(second_index, SHADOW_REWARD_START_HEIGHT + 1, &first_index, second_hash);
+    CBlock second_block;
+    second_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_2));
+
+    BOOST_REQUIRE(view.SpendCoin(ActiveSignalSetOutpointForTest()));
+    BOOST_CHECK(ApplyShadowBlockResult(view, second_block, &second_index) ==
+                ShadowApplyResult::LOCAL_INTERNAL_ERROR);
+    view.AddCoin(ActiveSignalSetOutpointForTest(), Coin{signal_coin}, true);
+
+    BOOST_REQUIRE(view.SpendCoin(PoolOutpointForTest()));
+    BOOST_CHECK(ApplyShadowBlockResult(view, second_block, &second_index) ==
+                ShadowApplyResult::LOCAL_INTERNAL_ERROR);
+    view.AddCoin(PoolOutpointForTest(), Coin{pool_coin}, true);
+
+    BOOST_REQUIRE(view.SpendCoin(PoolOutpointForTest()));
+    BOOST_REQUIRE(view.SpendCoin(ActiveSignalSetOutpointForTest()));
+    BOOST_CHECK(ApplyShadowBlockResult(view, second_block, &second_index) ==
+                ShadowApplyResult::LOCAL_INTERNAL_ERROR);
+    view.AddCoin(PoolOutpointForTest(), Coin{pool_coin}, true);
+    view.AddCoin(ActiveSignalSetOutpointForTest(), Coin{signal_coin}, true);
+
+    BOOST_REQUIRE(ApplyShadowBlock(view, second_block, &second_index));
+    BOOST_REQUIRE(UndoShadowBlock(view, second_block, &second_index));
+    BOOST_REQUIRE(UndoShadowBlock(view, first_block, &first_index));
+    BOOST_CHECK(!view.HaveCoin(PoolOutpointForTest()));
+    BOOST_CHECK(!view.HaveCoin(ActiveSignalSetOutpointForTest()));
 }
 
 BOOST_AUTO_TEST_CASE(shadow_undo_inactive_gold_rush_epoch_is_noop)
@@ -1727,22 +1786,33 @@ BOOST_AUTO_TEST_CASE(shadow_apply_rejects_pool_obligation_over_emission_cap)
     CCoinsView base;
     CCoinsViewCache view{&base, true};
 
-    uint256 prev_hash;
-    CBlockIndex prev_index;
-    InitIndex(prev_index, SHADOW_REWARD_START_HEIGHT - 1, nullptr, prev_hash);
-    AddPoolForTest(view, prev_index, 0, 0, SHADOW_MAX_EMISSION - ShadowBaseReward(SHADOW_REWARD_START_HEIGHT) + 1);
+    uint256 whitelist_hash;
+    CBlockIndex whitelist_index;
+    InitIndex(whitelist_index, SHADOW_WHITELIST_HEIGHT, nullptr, whitelist_hash);
+    BOOST_REQUIRE(ApplyLegacyWhitelistSnapshot(view, &whitelist_index));
+
+    uint256 first_hash;
+    CBlockIndex first_index;
+    InitIndex(first_index, SHADOW_REWARD_START_HEIGHT, &whitelist_index, first_hash);
+    CBlock first_block;
+    first_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_TRUE));
+    BOOST_REQUIRE(ApplyShadowBlock(view, first_block, &first_index));
+
+    const CAmount corrupt_claimed =
+        SHADOW_MAX_EMISSION - ShadowBaseReward(SHADOW_REWARD_START_HEIGHT + 1) + 1;
+    AddPoolForTest(view, first_index, 0, 0, corrupt_claimed);
 
     uint256 reward_hash;
     CBlockIndex reward_index;
-    InitIndex(reward_index, SHADOW_REWARD_START_HEIGHT, &prev_index, reward_hash);
+    InitIndex(reward_index, SHADOW_REWARD_START_HEIGHT + 1, &first_index, reward_hash);
     CBlock block;
     block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_TRUE));
 
     BOOST_CHECK(!ApplyShadowBlock(view, block, &reward_index));
-    const ShadowGoldRushInfo info = GetShadowGoldRushInfo(view, &prev_index);
+    const ShadowGoldRushInfo info = GetShadowGoldRushInfo(view, &first_index);
     BOOST_CHECK_EQUAL(info.pow_amount, 0);
     BOOST_CHECK_EQUAL(info.pos_amount, 0);
-    BOOST_CHECK_EQUAL(info.claimed_amount, SHADOW_MAX_EMISSION - ShadowBaseReward(SHADOW_REWARD_START_HEIGHT) + 1);
+    BOOST_CHECK_EQUAL(info.claimed_amount, corrupt_claimed);
 }
 
 BOOST_AUTO_TEST_CASE(shadow_final_cap_block_accepts_dual_venue_claims_and_undoes_cleanly)
@@ -1821,9 +1891,20 @@ BOOST_AUTO_TEST_CASE(shadow_cap_rejects_without_creating_dual_venue_markers)
     const CScript pow_payout = QuantumScript(0x6d);
     AddCoinForScript(view, COutPoint{uint256::ONE, 0}, 10'000 * COIN, pos_target);
 
+    uint256 whitelist_hash;
+    CBlockIndex whitelist_index;
+    InitIndex(whitelist_index, SHADOW_WHITELIST_HEIGHT, nullptr, whitelist_hash);
+    BOOST_REQUIRE(ApplyLegacyWhitelistSnapshot(view, &whitelist_index));
+
     uint256 solve_hash;
     CBlockIndex solve_index;
-    InitIndex(solve_index, SHADOW_REWARD_START_HEIGHT, nullptr, solve_hash);
+    InitIndex(solve_index, SHADOW_REWARD_START_HEIGHT, &whitelist_index, solve_hash);
+    CBlock solve_block;
+    solve_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_3));
+    solve_block.vtx.push_back(MakeCoinstakeTx(pos_target));
+    CBlockUndo solve_undo = MakeUndoWithInputScripts(solve_block, {{1, pos_target}});
+    BOOST_REQUIRE(ApplyShadowBlock(view, solve_block, &solve_index, &solve_undo));
+
     AddPoolForTest(view,
                    solve_index,
                    290 * COIN,

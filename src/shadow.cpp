@@ -86,7 +86,7 @@ std::atomic<uint64_t> g_shadow_argon2_test_failures{0};
 // Increment whenever an auxiliary namespace or its authentication semantics
 // changes. This prevents a checkpoint produced by a prerelease schema from
 // authenticating merely because the affected inventory is currently empty.
-static constexpr uint32_t SHADOW_REPLAY_STATE_VERSION = 10;
+static constexpr uint32_t SHADOW_REPLAY_STATE_VERSION = 11;
 // Auxiliary marker payloads are serialized through the same 32 MiB bounded
 // deserializer as other chain data. Enforce the bound while constructing and
 // decoding the local authenticated state so a corrupt marker cannot trigger an
@@ -1041,6 +1041,7 @@ bool ReadWhitelistManifest(const CCoinsViewCache& view, const CBlockIndex* pinde
 {
     Coin manifest_coin;
     if (!view.GetCoin(WhitelistManifestOutpoint(), manifest_coin) || manifest_coin.IsSpent() ||
+        manifest_coin.out.nValue != 0 || !manifest_coin.fCoinBase || manifest_coin.fCoinStake ||
         manifest_coin.nHeight != static_cast<uint32_t>(SHADOW_WHITELIST_HEIGHT) ||
         manifest_coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
         !DecodeWhitelistManifest(manifest_coin.out.scriptPubKey, manifest)) return false;
@@ -1055,7 +1056,9 @@ bool ReadWhitelistManifest(const CCoinsViewCache& view, const CBlockIndex* pinde
         Coin shard_coin;
         valtype shard_data;
         if (!view.GetCoin(WhitelistManifestShardOutpoint(manifest.snapshot_hash, shard_index), shard_coin) ||
-            shard_coin.IsSpent() || shard_coin.nHeight != manifest_coin.nHeight ||
+            shard_coin.IsSpent() || shard_coin.out.nValue != 0 ||
+            !shard_coin.fCoinBase || shard_coin.fCoinStake ||
+            shard_coin.nHeight != manifest_coin.nHeight ||
             shard_coin.nTime != manifest_coin.nTime || shard_coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
             !DecodeBlobShard(shard_coin.out.scriptPubKey, MARKER_WHITELIST_SHARD,
                              manifest.snapshot_hash, shard_index, manifest.shard_count,
@@ -1456,6 +1459,12 @@ ShadowPoolReadResult ReadPoolState(const CCoinsViewCache& view, ShadowPoolState&
     pool = {};
     Coin coin;
     if (!view.GetCoin(PoolOutpoint(), coin) || coin.IsSpent()) return ShadowPoolReadResult::MISSING;
+    if (coin.out.nValue != 0 || !coin.fCoinBase || coin.fCoinStake ||
+        coin.nHeight < static_cast<uint32_t>(SHADOW_REWARD_START_HEIGHT) ||
+        coin.nHeight > static_cast<uint32_t>(SHADOW_REWARD_END_HEIGHT) ||
+        coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE) {
+        return ShadowPoolReadResult::INVALID;
+    }
     valtype payload;
     if (!ParseMarkerScript(coin.out.scriptPubKey, MARKER_POOL, &payload)) return ShadowPoolReadResult::INVALID;
     if (payload.size() != POOL_LEGACY_SIZE && payload.size() != POOL_V1_SIZE && payload.size() != POOL_V2_SIZE) {
@@ -2194,43 +2203,78 @@ void FilterActiveSignals(std::map<CScript, ShadowActiveSignal>& active, int eval
     }
 }
 
-std::map<CScript, ShadowActiveSignal> ReadLegacyActiveShadowSignals(const CCoinsViewCache& view,
-                                                                    const CBlockIndex* pindex,
-                                                                    int evaluation_height)
-{
-    std::map<CScript, ShadowActiveSignal> active;
-    if (!pindex) return active;
-    if (pindex->nHeight < SHADOW_REWARD_START_HEIGHT) return active;
-    std::vector<const CBlockIndex*> window;
-    for (const CBlockIndex* cursor = pindex;
-         cursor && cursor->nHeight <= evaluation_height && evaluation_height - cursor->nHeight <= SHADOW_SOLVER_ACTIVITY_WINDOW;
-         cursor = cursor->pprev) {
-        window.push_back(cursor);
-    }
-
-    // the active set is enumerable without a UTXO-set scan. Each block stores a
-    // contiguous list of validated signal markers keyed by height/block-hash/index; replaying
-    // only the 14-day chain window and upserting later entries derives target -> latest signal.
-    for (auto it = window.rbegin(); it != window.rend(); ++it) {
-        const CBlockIndex* block_index = *it;
-        for (uint32_t marker_index = 0; marker_index < MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK; ++marker_index) {
-            Coin coin;
-            if (!view.GetCoin(ActiveSignalOutpoint(block_index, marker_index), coin)) break;
-            ShadowActiveSignal signal;
-            if (!DecodeActiveSignalMarker(coin.out.scriptPubKey, signal)) continue;
-            if (signal.last_signal_height != static_cast<uint32_t>(block_index->nHeight)) continue;
-            if (evaluation_height - static_cast<int>(signal.last_signal_height) > SHADOW_SOLVER_ACTIVITY_WINDOW) continue;
-            active[signal.target] = signal;
-        }
-    }
-    return active;
-}
-
 enum class ActiveSignalStateReadResult {
     MISSING,
     VALID,
     INVALID,
 };
+
+std::optional<bool> HasAppliedShadowRewardTransition(const Consensus::Params& consensus,
+                                                     const CBlockIndex* pindex)
+{
+    if (!pindex || pindex->nHeight < SHADOW_REWARD_START_HEIGHT) return false;
+    const int last_height = std::min(pindex->nHeight, SHADOW_REWARD_END_HEIGHT);
+    if (last_height < SHADOW_REWARD_START_HEIGHT) return false;
+
+    if (consensus.HasAnyHeightLifecycleBoundary()) {
+        if (!consensus.UsesHeightLifecycle() ||
+            !consensus.IsQuantumLifecycleScheduleOrdered()) {
+            return std::nullopt;
+        }
+        const int first_active_height = std::max(
+            SHADOW_REWARD_START_HEIGHT, consensus.nQuantumLifecycleStartHeight);
+        const int last_active_height = std::min(
+            last_height, consensus.nGoldRushEndHeight);
+        return first_active_height <= last_active_height;
+    }
+
+    // Time-only schedules are retained for compatibility tests. MTP is
+    // monotonic, so locate the first reward-height block whose parent MTP is
+    // past V4, then verify that it did not jump directly beyond Gold Rush.
+    int low = SHADOW_REWARD_START_HEIGHT;
+    int high = last_height;
+    while (low < high) {
+        const int middle = low + (high - low) / 2;
+        const CBlockIndex* candidate = SafeGetAncestor(pindex, middle);
+        if (!candidate) return std::nullopt;
+        const int64_t mtp = candidate->pprev
+            ? candidate->pprev->GetMedianTimePast()
+            : candidate->GetBlockTime();
+        if (consensus.IsProtocolV4(mtp)) {
+            high = middle;
+        } else {
+            low = middle + 1;
+        }
+    }
+    const CBlockIndex* first_v4 = SafeGetAncestor(pindex, low);
+    if (!first_v4) return std::nullopt;
+    const int64_t first_v4_mtp = first_v4->pprev
+        ? first_v4->pprev->GetMedianTimePast()
+        : first_v4->GetBlockTime();
+    return IsShadowGoldRushRewardActive(consensus, first_v4_mtp, first_v4->nHeight);
+}
+
+bool ActiveSignalPoolPairValid(const Consensus::Params& consensus,
+                               const CBlockIndex* pindex,
+                               ShadowPoolReadResult pool_result,
+                               ActiveSignalStateReadResult signal_result)
+{
+    if (pool_result == ShadowPoolReadResult::INVALID ||
+        signal_result == ActiveSignalStateReadResult::INVALID) {
+        return false;
+    }
+    // The first applied Gold Rush reward writes both records in one cache
+    // transition. Before that transition both are absent; after it both are
+    // present for the rest of the lifecycle. An asymmetric pair is therefore
+    // an obsolete or interrupted auxiliary chainstate and must be replayed.
+    const bool pool_present = pool_result == ShadowPoolReadResult::VALID;
+    const bool signal_present = signal_result == ActiveSignalStateReadResult::VALID;
+    if (pool_present != signal_present) return false;
+    if (pool_present) return true;
+    const std::optional<bool> transition_applied =
+        HasAppliedShadowRewardTransition(consensus, pindex);
+    return transition_applied && !*transition_applied;
+}
 
 std::optional<uint32_t> ReadAuthenticatedWhitelistCount(const CCoinsViewCache& view,
                                                         const CBlockIndex* pindex)
@@ -2238,7 +2282,9 @@ std::optional<uint32_t> ReadAuthenticatedWhitelistCount(const CCoinsViewCache& v
     Coin coin;
     WhitelistManifest manifest;
     if (!pindex || !view.GetCoin(WhitelistManifestOutpoint(), coin) || coin.IsSpent() ||
+        coin.out.nValue != 0 || !coin.fCoinBase || coin.fCoinStake ||
         coin.nHeight != static_cast<uint32_t>(SHADOW_WHITELIST_HEIGHT) ||
+        coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
         !DecodeWhitelistManifest(coin.out.scriptPubKey, manifest)) return std::nullopt;
     const CBlockIndex* snapshot_block = SafeGetAncestor(pindex, manifest.snapshot_height);
     if (!snapshot_block || snapshot_block->GetBlockHash() != manifest.snapshot_hash ||
@@ -2261,7 +2307,9 @@ ActiveSignalStateReadResult ReadActiveSignalStateMarker(const CCoinsViewCache& v
     if (!view.GetCoin(ActiveSignalSetOutpoint(), coin) || coin.IsSpent()) {
         return ActiveSignalStateReadResult::MISSING;
     }
-    if (!pindex || coin.nHeight > static_cast<uint32_t>(pindex->nHeight)) {
+    if (!pindex || coin.out.nValue != 0 || !coin.fCoinBase || coin.fCoinStake ||
+        coin.nHeight < static_cast<uint32_t>(SHADOW_REWARD_START_HEIGHT) ||
+        coin.nHeight > static_cast<uint32_t>(pindex->nHeight)) {
         return ActiveSignalStateReadResult::INVALID;
     }
     const CBlockIndex* marker_block = SafeGetAncestor(pindex, static_cast<int>(coin.nHeight));
@@ -2282,7 +2330,8 @@ ActiveSignalStateReadResult ReadActiveSignalStateMarker(const CCoinsViewCache& v
         Coin shard_coin;
         valtype shard_data;
         if (!view.GetCoin(ActiveSignalShardOutpoint(manifest.marker_hash, shard_index), shard_coin) ||
-            shard_coin.IsSpent() || shard_coin.nHeight != coin.nHeight || shard_coin.nTime != coin.nTime ||
+            shard_coin.IsSpent() || shard_coin.out.nValue != 0 || !shard_coin.fCoinBase || shard_coin.fCoinStake ||
+            shard_coin.nHeight != coin.nHeight || shard_coin.nTime != coin.nTime ||
             shard_coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
             !DecodeBlobShard(shard_coin.out.scriptPubKey, MARKER_ACTIVE_SIGNAL_SHARD,
                              manifest.marker_hash, shard_index, manifest.shard_count,
@@ -2324,12 +2373,12 @@ std::map<CScript, ShadowActiveSignal> ReadActiveShadowSignals(const CCoinsViewCa
     uint256 marker_hash;
     const ActiveSignalStateReadResult result =
         ReadActiveSignalStateMarker(view, pindex, active, marker_height, marker_time, marker_hash);
-    if (result == ActiveSignalStateReadResult::INVALID) {
+    ShadowPoolState pool;
+    const ShadowPoolReadResult pool_result = ReadPoolState(view, pool);
+    if (!ActiveSignalPoolPairValid(Params().GetConsensus(), pindex,
+                                   pool_result, result)) {
         if (state_valid) *state_valid = false;
         return {};
-    }
-    if (result == ActiveSignalStateReadResult::MISSING) {
-        active = ReadLegacyActiveShadowSignals(view, pindex, evaluation_height);
     }
     FilterActiveSignals(active, evaluation_height);
     return active;
@@ -3160,7 +3209,8 @@ bool ReadActiveSignalUndoBlob(const CCoinsViewCache& view, const CBlockIndex* pi
                               const Coin& undo_coin, valtype& blob_out)
 {
     ActiveSignalUndoManifest manifest;
-    if (!pindex || undo_coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
+    if (!pindex || undo_coin.out.nValue != 0 || !undo_coin.fCoinBase || undo_coin.fCoinStake ||
+        undo_coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
         !DecodeActiveSignalUndoManifest(undo_coin.out.scriptPubKey, manifest) ||
         manifest.block_hash != pindex->GetBlockHash() ||
         manifest.previous_block_hash != (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{})) return false;
@@ -3170,7 +3220,9 @@ bool ReadActiveSignalUndoBlob(const CCoinsViewCache& view, const CBlockIndex* pi
         Coin shard_coin;
         valtype shard_data;
         if (!view.GetCoin(ActiveSignalUndoShardOutpoint(manifest.block_hash, shard_index), shard_coin) ||
-            shard_coin.IsSpent() || shard_coin.nHeight != undo_coin.nHeight || shard_coin.nTime != undo_coin.nTime ||
+            shard_coin.IsSpent() || shard_coin.out.nValue != 0 ||
+            !shard_coin.fCoinBase || shard_coin.fCoinStake ||
+            shard_coin.nHeight != undo_coin.nHeight || shard_coin.nTime != undo_coin.nTime ||
             shard_coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
             !DecodeBlobShard(shard_coin.out.scriptPubKey, MARKER_ACTIVE_SIGNAL_UNDO_SHARD,
                              manifest.block_hash, shard_index, manifest.shard_count,
@@ -3276,12 +3328,12 @@ bool WriteActiveSignalStateChange(CCoinsViewCache& view, const CBlockIndex* pind
     return true;
 }
 
-bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex)
+bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex,
+                             bool expected_previous_present)
 {
     if (!pindex) return false;
-    // Remove this block's legacy append-only compatibility markers first. If
-    // this was the first fixed-state block, the fallback view then exactly
-    // represents the logical state at pprev.
+    // Remove obsolete append-only compatibility markers if an old prerelease
+    // chainstate is being inspected. They are never used to authorize state.
     for (uint32_t marker_index = 0; marker_index < MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK; ++marker_index) {
         const COutPoint outpoint = ActiveSignalOutpoint(pindex, marker_index);
         if (!view.HaveCoin(outpoint)) break;
@@ -3292,11 +3344,13 @@ bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex)
     Coin undo_coin;
     if (!view.GetCoin(undo_outpoint, undo_coin) || undo_coin.IsSpent()) {
         Coin state_coin;
-        // A state coin written by this block without its matching delta is a
-        // partial/corrupt auxiliary flush. Fail closed so replay can rebuild.
-        if (view.GetCoin(ActiveSignalSetOutpoint(), state_coin) &&
-            state_coin.nHeight == static_cast<uint32_t>(pindex->nHeight)) return false;
-        return true;
+        // A block without a signal delta is valid only when it inherited an
+        // authenticated state from an earlier transition. The first state
+        // transition always has an undo record.
+        return expected_previous_present &&
+               view.GetCoin(ActiveSignalSetOutpoint(), state_coin) &&
+               !state_coin.IsSpent() &&
+               state_coin.nHeight < static_cast<uint32_t>(pindex->nHeight);
     }
     if (undo_coin.nHeight != static_cast<uint32_t>(pindex->nHeight) ||
         undo_coin.nTime != static_cast<uint32_t>(pindex->GetBlockTime())) return false;
@@ -3305,6 +3359,7 @@ bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex)
     ShadowActiveSignalUndo undo;
     if (!whitelist_count || !ReadActiveSignalUndoBlob(view, pindex, undo_coin, undo_blob) ||
         !DecodeActiveSignalUndoPayload(undo_blob, undo, *whitelist_count) ||
+        undo.state_was_present != expected_previous_present ||
         undo.block_hash != pindex->GetBlockHash() ||
         undo.previous_block_hash != (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{})) return false;
     for (const auto& [target, previous] : undo.previous_entries) {
@@ -3368,10 +3423,10 @@ bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex)
             shard_coin.nTime = undo.previous_marker_time;
             view.AddCoin(ActiveSignalShardOutpoint(undo.previous_marker_hash, shard_index), std::move(shard_coin), true);
         }
-    } else {
-        const std::map<CScript, ShadowActiveSignal> fallback = ReadLegacyActiveShadowSignals(
-            view, pindex->pprev, pindex->pprev ? pindex->pprev->nHeight : 0);
-        if (!ActiveSignalMapsEqual(restored, fallback)) return false;
+    } else if (!restored.empty()) {
+        // Absence of the predecessor marker is authenticated by the undo hash.
+        // It is valid only when disconnecting the first state transition.
+        return false;
     }
     const uint32_t undo_shard_count = BlobShardCount(undo_blob.size());
     for (uint32_t shard_index = 0; shard_index < undo_shard_count; ++shard_index) {
@@ -3847,13 +3902,15 @@ bool HasCurrentShadowReplayState(const CCoinsViewCache& view, const Consensus::P
     WhitelistManifest whitelist_manifest;
     if (!ReadWhitelistManifest(view, pindex, whitelist_manifest)) return false;
     ShadowPoolState pool;
-    if (ReadPoolState(view, pool) == ShadowPoolReadResult::INVALID) return false;
+    const ShadowPoolReadResult pool_result = ReadPoolState(view, pool);
     std::map<CScript, ShadowActiveSignal> active;
     uint32_t marker_height{0};
     uint32_t marker_time{0};
     uint256 marker_hash;
-    if (ReadActiveSignalStateMarker(view, pindex, active, marker_height, marker_time, marker_hash) ==
-        ActiveSignalStateReadResult::INVALID) return false;
+    const ActiveSignalStateReadResult active_state_result =
+        ReadActiveSignalStateMarker(view, pindex, active, marker_height, marker_time, marker_hash);
+    if (!ActiveSignalPoolPairValid(consensus, pindex, pool_result,
+                                   active_state_result)) return false;
     // Normal startup is constant-space and performs no block reads or UTXO
     // cursor scan. The rolling inventory marker and claim/provenance leaves are
     // one logical chainstate transition and are committed by QQRSTATE below;
@@ -4882,7 +4939,9 @@ bool HasLegacyWhitelistSnapshot(const CCoinsViewCache& view)
     Coin ready_coin;
     valtype payload;
     if (!view.GetCoin(WhitelistReadyOutpoint(), ready_coin) || ready_coin.IsSpent() ||
+        ready_coin.out.nValue != 0 || !ready_coin.fCoinBase || ready_coin.fCoinStake ||
         ready_coin.nHeight != manifest.snapshot_height ||
+        ready_coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
         !ParseMarkerScript(ready_coin.out.scriptPubKey, MARKER_WHITELIST_READY, &payload) ||
         payload.size() != 2 * sizeof(uint32_t) + uint256::size()) return false;
     uint256 ready_hash;
@@ -4901,12 +4960,17 @@ bool IsWhitelisted(const CCoinsViewCache& view, const CScript& scriptPubKey)
     WhitelistManifest manifest;
     Coin manifest_coin;
     if (!view.GetCoin(WhitelistManifestOutpoint(), manifest_coin) || manifest_coin.IsSpent() ||
+        manifest_coin.out.nValue != 0 || !manifest_coin.fCoinBase || manifest_coin.fCoinStake ||
+        manifest_coin.nHeight != static_cast<uint32_t>(SHADOW_WHITELIST_HEIGHT) ||
+        manifest_coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
         !DecodeWhitelistManifest(manifest_coin.out.scriptPubKey, manifest)) return false;
 
     Coin member_coin;
     valtype member_payload;
     if (view.GetCoin(WhitelistOutpoint(script), member_coin) && !member_coin.IsSpent() &&
+        member_coin.out.nValue == 0 && member_coin.fCoinBase && !member_coin.fCoinStake &&
         member_coin.nHeight == manifest.snapshot_height && member_coin.nTime == manifest_coin.nTime &&
+        member_coin.out.scriptPubKey.size() <= MAX_SCRIPT_SIZE &&
         ParseMarkerScript(member_coin.out.scriptPubKey, MARKER_WHITELIST, &member_payload)) {
         WhitelistMemberRecord member;
         if (DecodeWhitelistMember(member_payload, member) &&
@@ -5088,12 +5152,16 @@ ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& bl
     if (!gold_rush_active) return ShadowApplyResult::OK;
     if (!pindex || pindex->nHeight < SHADOW_REWARD_START_HEIGHT || pindex->nHeight > SHADOW_REWARD_END_HEIGHT) return ShadowApplyResult::OK;
     Coin undo_pool_coin;
-    const bool undo_pool_present = view.GetCoin(PoolOutpoint(), undo_pool_coin) && !undo_pool_coin.IsSpent();
-    bool pool_state_valid{true};
-    const ShadowPoolState undo_pool = ReadPool(view, &pool_state_valid);
-    if (!pool_state_valid) {
+    ShadowPoolState undo_pool;
+    const ShadowPoolReadResult pool_state_result = ReadPoolState(view, undo_pool);
+    if (pool_state_result == ShadowPoolReadResult::INVALID) {
         LogPrintf("ERROR: Quantum Quasar shadow pool state is malformed at height %d; refusing to overwrite it\n",
                   pindex->nHeight);
+        return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+    }
+    const bool undo_pool_present = pool_state_result == ShadowPoolReadResult::VALID;
+    if (undo_pool_present &&
+        (!view.GetCoin(PoolOutpoint(), undo_pool_coin) || undo_pool_coin.IsSpent())) {
         return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
     }
     ShadowPoolState pool = undo_pool;
@@ -5123,16 +5191,13 @@ ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& bl
     const ActiveSignalStateReadResult signal_state_result = ReadActiveSignalStateMarker(
         view, pindex->pprev, prior_signal_state, prior_signal_marker_height,
         prior_signal_marker_time, prior_signal_marker_hash);
-    if (signal_state_result == ActiveSignalStateReadResult::INVALID) {
-        LogPrintf("ERROR: Quantum Quasar active-signal state is malformed at height %d; refusing to overwrite it\n",
+    if (!ActiveSignalPoolPairValid(Params().GetConsensus(), pindex->pprev,
+                                   pool_state_result, signal_state_result)) {
+        LogPrintf("ERROR: Quantum Quasar shadow pool/active-signal state pair is missing or malformed at height %d; replay is required\n",
                   pindex->nHeight);
         return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
     }
     const bool prior_signal_state_present = signal_state_result == ActiveSignalStateReadResult::VALID;
-    if (!prior_signal_state_present) {
-        prior_signal_state = ReadLegacyActiveShadowSignals(
-            view, pindex->pprev, pindex->pprev ? pindex->pprev->nHeight : 0);
-    }
     const std::optional<uint32_t> whitelist_count = ReadAuthenticatedWhitelistCount(view, pindex);
     if (!whitelist_count || prior_signal_state.size() > *whitelist_count) {
         return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
@@ -5262,15 +5327,26 @@ bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockInd
     if (!pindex || pindex->nHeight < SHADOW_REWARD_START_HEIGHT || pindex->nHeight > SHADOW_REWARD_END_HEIGHT) return true;
     Coin current_pool_coin;
     if (!view.GetCoin(PoolOutpoint(), current_pool_coin) || current_pool_coin.IsSpent() ||
+        current_pool_coin.out.nValue != 0 || !current_pool_coin.fCoinBase || current_pool_coin.fCoinStake ||
         current_pool_coin.nHeight != static_cast<uint32_t>(pindex->nHeight) ||
         current_pool_coin.nTime != static_cast<uint32_t>(pindex->GetBlockTime())) return false;
-    bool pool_state_valid{true};
-    ShadowPoolState pool = ReadPool(view, &pool_state_valid);
-    if (!pool_state_valid) return false;
+    ShadowPoolState pool;
+    const ShadowPoolReadResult pool_result = ReadPoolState(view, pool);
+    if (pool_result != ShadowPoolReadResult::VALID) return false;
+    std::map<CScript, ShadowActiveSignal> active_signal_state;
+    uint32_t active_marker_height{0};
+    uint32_t active_marker_time{0};
+    uint256 active_marker_hash;
+    const ActiveSignalStateReadResult active_result = ReadActiveSignalStateMarker(
+        view, pindex, active_signal_state, active_marker_height,
+        active_marker_time, active_marker_hash);
+    if (!ActiveSignalPoolPairValid(Params().GetConsensus(), pindex,
+                                   pool_result, active_result)) return false;
     Coin pool_undo_coin;
     const COutPoint pool_undo_outpoint = PoolUndoOutpoint(pindex);
     ShadowPoolUndoState pool_undo;
     if (!view.GetCoin(pool_undo_outpoint, pool_undo_coin) || pool_undo_coin.IsSpent() ||
+        pool_undo_coin.out.nValue != 0 || !pool_undo_coin.fCoinBase || pool_undo_coin.fCoinStake ||
         pool_undo_coin.nHeight != static_cast<uint32_t>(pindex->nHeight) ||
         pool_undo_coin.nTime != static_cast<uint32_t>(pindex->GetBlockTime()) ||
         !DecodePoolUndo(pool_undo_coin.out.scriptPubKey, pool_undo) ||
@@ -5369,7 +5445,7 @@ bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockInd
             view.SpendCoin(solver_outpoint);
         }
     }
-    if (!UndoActiveSignalMarkers(view, pindex)) {
+    if (!UndoActiveSignalMarkers(view, pindex, pool_undo.previous_present)) {
         LogPrintf("ERROR: Quantum Quasar active-signal undo authentication failed at height %d\n", pindex->nHeight);
         return false;
     }
@@ -5385,5 +5461,19 @@ bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockInd
         view.AddCoin(PoolOutpoint(), std::move(restored_pool_coin), true);
     }
     view.SpendCoin(pool_undo_outpoint);
+    ShadowPoolState restored_pool;
+    const ShadowPoolReadResult restored_pool_result = ReadPoolState(view, restored_pool);
+    std::map<CScript, ShadowActiveSignal> restored_active;
+    uint32_t restored_active_height{0};
+    uint32_t restored_active_time{0};
+    uint256 restored_active_hash;
+    const ActiveSignalStateReadResult restored_active_result =
+        ReadActiveSignalStateMarker(view, pindex->pprev, restored_active,
+                                    restored_active_height, restored_active_time,
+                                    restored_active_hash);
+    if (!ActiveSignalPoolPairValid(Params().GetConsensus(), pindex->pprev,
+                                   restored_pool_result, restored_active_result)) {
+        return false;
+    }
     return true;
 }
