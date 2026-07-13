@@ -332,6 +332,8 @@ BOOST_AUTO_TEST_CASE(whitelist_snapshot_markers_have_exact_authenticatable_prove
     BOOST_REQUIRE(ApplyLegacyWhitelistSnapshot(view, &snapshot_index));
     BOOST_CHECK(IsWhitelisted(view, eligible));
 
+    uint256 wrong_outpoint_hash;
+    wrong_outpoint_hash.SetHex("0f423f");
     size_t authenticated_markers{0};
     std::unique_ptr<CCoinsViewCursor> cursor(view.Cursor());
     while (cursor->Valid()) {
@@ -343,7 +345,7 @@ BOOST_AUTO_TEST_CASE(whitelist_snapshot_markers_have_exact_authenticatable_prove
             BOOST_CHECK(IsAuthenticatedShadowMarkerOutpoint(
                 outpoint, coin, &snapshot_index));
             BOOST_CHECK(!IsAuthenticatedShadowMarkerOutpoint(
-                COutPoint{uint256{999999}, outpoint.n}, coin, &snapshot_index));
+                COutPoint{wrong_outpoint_hash, outpoint.n}, coin, &snapshot_index));
             ++authenticated_markers;
         }
         cursor->Next();
@@ -1291,7 +1293,7 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_winner_is_order_independent_and_replay
     uint256 claim_hash_b;
     CBlockIndex claim_index_b;
     InitIndex(claim_index_b, SHADOW_REWARD_START_HEIGHT + 1, &prev_index, claim_hash_b);
-    claim_hash_b = uint256{987654};
+    claim_hash_b.SetHex("0f1206");
     CBlock block_b;
     block_b.vtx = {MakeCoinbaseTx(CScript{} << OP_4), MakeCoinstakeTx(staker_target), tx_b, tx_a};
     CBlockUndo undo_b = MakeUndoWithInputScripts(

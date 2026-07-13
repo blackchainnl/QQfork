@@ -9,6 +9,7 @@
 #include <consensus/demurrage.h>
 #include <consensus/params.h>
 #include <consensus/tx_verify.h>
+#include <consensus/validation.h>
 #include <crypto/mldsa.h>
 #include <crypto/muhash.h>
 #include <hash.h>
@@ -248,7 +249,7 @@ BOOST_AUTO_TEST_CASE(decay_is_destroyed_and_never_reclassified_as_transaction_fe
 {
     using namespace Consensus;
 
-    const Params& params = ::Params().GetConsensus();
+    const Consensus::Params& params = ::Params().GetConsensus();
     const int coin_height = params.EffectiveDemurrageActivationHeight();
     const int spend_height = coin_height + params.DemurrageGraceBlocks() + 1000;
     const int64_t spend_time = params.nQuantumMigrationDeadlineTime + 1;
