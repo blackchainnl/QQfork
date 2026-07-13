@@ -2949,7 +2949,7 @@ void StakingMiningPage::updateStatus()
         .arg(formatBLK(wallet_pending_delegated_amount)));
 
     if (!unverified_quantum_keys.empty()) {
-        m_dashboard_action->setText(tr("<b>Backup required</b><br>%1 non-HD quantum key(s) are not in a reopened, cryptographically verified backup. Unlock this wallet and use Backup Wallet before mining, staking, or creating another quantum address.")
+        m_dashboard_action->setText(tr("<b>Backup required</b><br>%1 non-HD quantum key(s) do not have a completed reopen-and-sign backup verification event. Unlock this wallet and use Backup Wallet before mining, staking, or creating another quantum address. The wallet cannot track whether an external backup file is later moved or deleted.")
             .arg(static_cast<int>(unverified_quantum_keys.size())));
     } else if (goldrush_reward_outputs_needing_move > 0) {
         m_dashboard_action->setText(tr("<b>Recommended next step</b><br>Keep the wallet backed up and wait for %1 in Gold Rush rewards to unlock. After Gold Rush and normal maturity, no preliminary move is required.")

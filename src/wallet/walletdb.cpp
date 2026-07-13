@@ -1341,7 +1341,8 @@ static DBErrors LoadQuantumWalletRecords(CWallet* pwallet, DatabaseBatch& batch)
     // This record was introduced after v30.1.0. Its absence deliberately
     // means "unverified" so every pre-existing or imported non-HD key fails
     // closed until a new backup has been reopened and cryptographically
-    // checked. Malformed/stale status metadata must not make the private key
+    // checked. This event marker does not track later external-file deletion.
+    // Malformed/stale status metadata must not make the private key
     // itself unloadable; it is ignored with a noncritical warning.
     LoadResult backup_state_res = LoadRecords(pwallet, batch, DBKeys::QUANTUM_KEY_BACKUP_STATE,
         [] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) {

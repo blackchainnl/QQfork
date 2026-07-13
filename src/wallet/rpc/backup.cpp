@@ -235,7 +235,7 @@ RPCHelpMan importquantumkey()
                         {RPCResult::Type::NUM_TIME, "timestamp", "The stored key creation time"},
                         {RPCResult::Type::BOOL, "encrypted", "Whether the wallet stores this key encrypted"},
                         {RPCResult::Type::BOOL, "stored_in_wallet", "Whether the key was durably committed to the wallet database"},
-                        {RPCResult::Type::BOOL, "backup_verified", "Whether this key is present in a completed, reopened, cryptographically verified backup"},
+                        {RPCResult::Type::BOOL, "backup_verified", "Whether this wallet recorded a completed reopen-and-sign backup verification event for this key. External backup-file existence is not tracked."},
                         {RPCResult::Type::BOOL, "rescan", "Whether a rescan was requested"},
                         {RPCResult::Type::STR, "warning", "Backup warning"},
                     }},
@@ -1957,6 +1957,7 @@ RPCHelpMan backupwallet()
     return RPCHelpMan{"backupwallet",
                 "\nSafely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n"
                 "Wallets with non-HD quantum keys are staged separately, reopened, and required to sign and verify a fresh challenge with every key before the verified copy is atomically installed.\n"
+                "The wallet records that verification event, but cannot detect if the external backup file is later moved or deleted.\n"
                 "An encrypted wallet must be unlocked so this private-material check can run.\n",
                 {
                     {"destination", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination directory or file"},

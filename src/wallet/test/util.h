@@ -110,6 +110,7 @@ public:
     std::optional<size_t> m_fail_write_at;
     size_t m_write_calls{0};
     bool m_fail_commit{false};
+    bool m_fail_rewrite{false};
     bool m_last_txn_durable{false};
 
     MockableDatabase(MockableData records = {}) : WalletDatabase(), m_records(records) {}
@@ -119,7 +120,7 @@ public:
     void AddRef() override {}
     void RemoveRef() override {}
 
-    bool Rewrite(const char* pszSkip=nullptr) override { return m_pass; }
+    bool Rewrite(const char* pszSkip=nullptr) override { return m_pass && !m_fail_rewrite; }
     bool Backup(const std::string& strDest) const override { return m_pass; }
     void Flush() override {}
     void Close() override {}

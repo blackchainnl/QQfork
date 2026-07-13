@@ -147,7 +147,7 @@ RPCHelpMan getnewquantumaddress()
                         {RPCResult::Type::NUM_TIME, "timestamp", "The key creation time"},
                         {RPCResult::Type::BOOL, "encrypted", "Whether the wallet stores this key encrypted"},
                         {RPCResult::Type::BOOL, "stored_in_wallet", "Whether this key was inserted into the wallet database"},
-                        {RPCResult::Type::BOOL, "backup_verified", "Whether a completed backup containing this non-HD key was reopened and cryptographically verified"},
+                        {RPCResult::Type::BOOL, "backup_verified", "Whether this wallet recorded a completed reopen-and-sign backup verification event for this non-HD key. External file existence is not tracked."},
                         {RPCResult::Type::BOOL, "tiered", "Whether this address uses the tiered staking witness program."},
                         {RPCResult::Type::STR, "tier_state", /*optional=*/true, "Tier state when this is a tiered staking address."},
                         {RPCResult::Type::NUM, "unbonding_blocks", /*optional=*/true, "Bonded unbonding delay in blocks when tiered."},
@@ -206,7 +206,7 @@ RPCHelpMan getnewquantumstakeaddress()
                         {RPCResult::Type::NUM_TIME, "timestamp", "The key creation time"},
                         {RPCResult::Type::BOOL, "encrypted", "Whether the wallet stores this key encrypted"},
                         {RPCResult::Type::BOOL, "stored_in_wallet", "Whether this key was inserted into the wallet database"},
-                        {RPCResult::Type::BOOL, "backup_verified", "Whether a completed backup containing this non-HD key was reopened and cryptographically verified"},
+                        {RPCResult::Type::BOOL, "backup_verified", "Whether this wallet recorded a completed reopen-and-sign backup verification event for this non-HD key. External file existence is not tracked."},
                         {RPCResult::Type::STR, "warning", "Backup warning"},
                     }},
                 RPCExamples{
@@ -261,7 +261,7 @@ RPCHelpMan listquantumaddresses()
                             {RPCResult::Type::NUM_TIME, "timestamp", "The key creation time"},
                             {RPCResult::Type::BOOL, "encrypted", "Whether the wallet stores this key encrypted"},
                             {RPCResult::Type::BOOL, "stored_in_wallet", "Whether this key is in the wallet database"},
-                            {RPCResult::Type::BOOL, "backup_verified", "Whether a completed backup containing this non-HD key was reopened and cryptographically verified"},
+                            {RPCResult::Type::BOOL, "backup_verified", "Whether this wallet recorded a completed reopen-and-sign backup verification event for this non-HD key. External file existence is not tracked."},
                             {RPCResult::Type::BOOL, "tiered", "Whether this address uses the tiered staking witness program."},
                             {RPCResult::Type::STR, "tier_state", /*optional=*/true, "Tier state when this is a tiered staking address."},
                             {RPCResult::Type::NUM, "unbonding_blocks", /*optional=*/true, "Bonded unbonding delay in blocks when tiered."},
@@ -302,10 +302,10 @@ RPCHelpMan getquantumkeyinventory()
                     RPCResult::Type::OBJ, "", "",
                     {
                         {RPCResult::Type::NUM, "total", "Number of distinct non-HD ML-DSA keys"},
-                        {RPCResult::Type::NUM, "backup_verified", "Keys present in a completed, reopened, cryptographically verified backup"},
-                        {RPCResult::Type::NUM, "backup_unverified", "Keys not yet present in a verified backup"},
+                        {RPCResult::Type::NUM, "backup_verified", "Keys with a recorded completed reopen-and-sign backup verification event"},
+                        {RPCResult::Type::NUM, "backup_unverified", "Keys without a recorded completed backup verification event"},
                         {RPCResult::Type::BOOL, "all_durably_stored", "Whether every listed key was loaded from or committed to durable wallet storage"},
-                        {RPCResult::Type::BOOL, "all_backed_up", "Whether every listed key has verified-backup status"},
+                        {RPCResult::Type::BOOL, "all_backed_up", "Whether every listed key has a recorded successful backup verification event. External file existence is not tracked."},
                         {RPCResult::Type::STR, "warning", "Aggregate backup warning or confirmation"},
                         {RPCResult::Type::ARR, "keys", "Public-only per-key inventory", {
                             {RPCResult::Type::OBJ, "", "", {
@@ -316,7 +316,7 @@ RPCHelpMan getquantumkeyinventory()
                                 {RPCResult::Type::NUM_TIME, "timestamp", "Key creation time"},
                                 {RPCResult::Type::BOOL, "encrypted", "Whether private material is encrypted in the wallet"},
                                 {RPCResult::Type::BOOL, "stored_in_wallet", "Whether the key is durably stored"},
-                                {RPCResult::Type::BOOL, "backup_verified", "Whether this key is present in a verified backup"},
+                                {RPCResult::Type::BOOL, "backup_verified", "Whether this key has a recorded completed backup verification event"},
                                 {RPCResult::Type::BOOL, "tiered", "Whether the preferred address is a tiered staking address"},
                                 {RPCResult::Type::STR, "tier_state", /*optional=*/true, "Tier state for a tiered staking address"},
                                 {RPCResult::Type::NUM, "unbonding_blocks", /*optional=*/true, "Tiered staking unbonding delay"},
@@ -361,8 +361,8 @@ RPCHelpMan getquantumkeyinventory()
     result.pushKV("warning", total == 0
         ? "No wallet-backed quantum keys are stored."
         : all_backed_up
-            ? "Every wallet-backed quantum key is present in a completed, reopened, cryptographically verified backup."
-            : "One or more non-HD quantum keys are not in a verified backup. Run backupwallet after unlocking the wallet; an older backup cannot recover keys created later.");
+            ? "Every wallet-backed quantum key has a recorded completed reopen-and-sign backup verification event. External backup-file existence is not tracked; retain the produced backup securely."
+            : "One or more non-HD quantum keys do not have a completed backup verification event. Run backupwallet after unlocking the wallet; an older backup cannot recover keys created later.");
     result.pushKV("keys", std::move(keys));
     return result;
 },
@@ -1173,7 +1173,7 @@ RPCHelpMan getaddressinfo()
                         {RPCResult::Type::STR_HEX, "quantum_public_key", /*optional=*/true, "The wallet ML-DSA-44 public key for this migration address."},
                         {RPCResult::Type::BOOL, "quantum_key_encrypted", /*optional=*/true, "Whether the wallet stores this ML-DSA key encrypted."},
                         {RPCResult::Type::BOOL, "quantum_key_durably_stored", /*optional=*/true, "Whether this ML-DSA key was loaded from or committed to durable wallet storage."},
-                        {RPCResult::Type::BOOL, "quantum_key_backup_verified", /*optional=*/true, "Whether this ML-DSA key is present in a completed, reopened, cryptographically verified backup."},
+                        {RPCResult::Type::BOOL, "quantum_key_backup_verified", /*optional=*/true, "Whether this wallet recorded a completed reopen-and-sign backup verification event for this ML-DSA key. External backup-file existence is not tracked."},
                         {RPCResult::Type::BOOL, "isquantumcoldstake", /*optional=*/true, "Whether this is a Quantum Cold-Stake address."},
                         {RPCResult::Type::BOOL, "hascoldstakemetadata", /*optional=*/true, "Whether this wallet has the QCS delegation metadata for this address."},
                         {RPCResult::Type::STR_HEX, "staking_pubkey_hash", /*optional=*/true, "SHA256(staking_pubkey) for a known QCS delegation."},

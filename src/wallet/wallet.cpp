@@ -74,6 +74,7 @@
 #include <util/moneystr.h>
 #include <util/result.h>
 #include <util/string.h>
+#include <util/syserror.h>
 #include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
@@ -95,16 +96,23 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <cerrno>
 #include <condition_variable>
 #include <cstdio>
 #include <exception>
+#include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <tuple>
 #include <variant>
+
+#ifndef WIN32
+#include <sys/stat.h>
+#endif
 
 struct KeyOriginInfo;
 
@@ -389,6 +397,61 @@ public:
 private:
     std::vector<Byte>& m_bytes;
 };
+
+struct WalletBackupFileIdentity
+{
+    std::array<unsigned char, CSHA256::OUTPUT_SIZE> sha256{};
+    uint64_t size{0};
+
+    bool operator==(const WalletBackupFileIdentity& other) const
+    {
+        return size == other.size && sha256 == other.sha256;
+    }
+};
+
+static bool GetWalletBackupFileIdentity(const fs::path& path, WalletBackupFileIdentity& identity, bilingual_str& error)
+{
+    FILE* file = fsbridge::fopen(path, "rb");
+    if (file == nullptr) {
+        error = strprintf(_("Unable to open the staged wallet backup for identity verification: %s"), fs::PathToString(path));
+        return false;
+    }
+
+    CSHA256 hasher;
+    std::array<unsigned char, 64 * 1024> buffer{};
+    uint64_t total{0};
+    bool read_ok{true};
+    while (true) {
+        const size_t bytes_read = std::fread(buffer.data(), 1, buffer.size(), file);
+        if (bytes_read > 0) {
+            if (total > std::numeric_limits<uint64_t>::max() - bytes_read) {
+                read_ok = false;
+                break;
+            }
+            hasher.Write(buffer.data(), bytes_read);
+            total += bytes_read;
+        }
+        if (bytes_read < buffer.size()) {
+            if (std::ferror(file)) read_ok = false;
+            break;
+        }
+    }
+    const bool closed = std::fclose(file) == 0;
+    if (!read_ok || !closed) {
+        memory_cleanse(buffer.data(), buffer.size());
+        memory_cleanse(&hasher, sizeof(hasher));
+        error = _("Unable to read the complete staged wallet backup for identity verification");
+        return false;
+    }
+
+    WalletBackupFileIdentity result;
+    result.size = total;
+    hasher.Finalize(result.sha256.data());
+    memory_cleanse(buffer.data(), buffer.size());
+    memory_cleanse(&hasher, sizeof(hasher));
+    identity = result;
+    return true;
+}
 
 static bool VerifyFinalizedPSBTInput(const PartiallySignedTransaction& psbtx, unsigned int input_index, const PrecomputedTransactionData& txdata, unsigned int verify_flags, ScriptError* serror)
 {
@@ -763,7 +826,9 @@ std::shared_ptr<CWallet> CreateWallet(WalletContext& context, const std::string&
     // Encrypt the wallet
     if (!passphrase.empty() && !(wallet_creation_flags & WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         if (!wallet->EncryptWallet(passphrase)) {
-            error = Untranslated("Error: Wallet created but failed to encrypt.");
+            error = wallet->IsCrypted()
+                ? Untranslated("Critical: Wallet creation committed encryption, but post-encryption finalization failed. The wallet remains encrypted; restart it and create and verify a new encrypted backup.")
+                : Untranslated("Error: Wallet created but failed to encrypt.");
             status = DatabaseStatus::FAILED_ENCRYPT;
             return nullptr;
         }
@@ -1186,16 +1251,32 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
     if (!crypter.Encrypt(_vMasterKey, kMasterKey.vchCryptedKey))
         return false;
 
+    bool post_commit_ok{true};
     {
         LOCK2(m_relock_mutex, cs_wallet);
-        mapMasterKeys[++nMasterKeyMaxID] = kMasterKey;
+        const unsigned int master_key_id = ++nMasterKeyMaxID;
+        mapMasterKeys[master_key_id] = kMasterKey;
+        const auto rollback_uncommitted_master_key = [&] {
+            mapMasterKeys.erase(master_key_id);
+            --nMasterKeyMaxID;
+        };
         WalletBatch* encrypted_batch = new WalletBatch(GetDatabase());
-        if (!encrypted_batch->TxnBegin()) {
+        // Encryption replaces every non-HD quantum private-key record. Make
+        // the transaction durable so EncryptWallet cannot return success while
+        // the only encrypted representation remains in an unsynced DB log.
+        if (!encrypted_batch->TxnBegin(/*durable=*/true)) {
             delete encrypted_batch;
             encrypted_batch = nullptr;
+            rollback_uncommitted_master_key();
             return false;
         }
-        encrypted_batch->WriteMasterKey(nMasterKeyMaxID, kMasterKey);
+        if (!encrypted_batch->WriteMasterKey(master_key_id, kMasterKey)) {
+            encrypted_batch->TxnAbort();
+            delete encrypted_batch;
+            encrypted_batch = nullptr;
+            rollback_uncommitted_master_key();
+            return false;
+        }
 
         for (const auto& spk_man_pair : m_spk_managers) {
             auto spk_man = spk_man_pair.second.get();
@@ -1231,7 +1312,10 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
         encrypted_batch = nullptr;
 
         Lock();
-        Unlock(strWalletPassphrase);
+        if (!Unlock(strWalletPassphrase)) {
+            WalletLogPrintf("Wallet encryption committed, but the wallet could not be unlocked for post-encryption keypool regeneration\n");
+            post_commit_ok = false;
+        }
 
         // If we are using descriptors, make new descriptors with a new seed
         if (IsWalletFlagSet(WALLET_FLAG_DESCRIPTORS) && !IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET)) {
@@ -1240,7 +1324,8 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
             // if we are using HD, replace the HD seed with a new one
             if (spk_man->IsHDEnabled()) {
                 if (!spk_man->SetupGeneration(true)) {
-                    return false;
+                    WalletLogPrintf("Wallet encryption committed, but legacy HD keypool regeneration failed\n");
+                    post_commit_ok = false;
                 }
             }
         }
@@ -1248,7 +1333,10 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
 
         // Need to completely rewrite the wallet file; if we don't, bdb might keep
         // bits of the unencrypted private key in slack space in the database file.
-        GetDatabase().Rewrite();
+        if (!GetDatabase().Rewrite()) {
+            WalletLogPrintf("Wallet encryption committed, but the required secure database rewrite failed; the wallet remains encrypted\n");
+            post_commit_ok = false;
+        }
 
         // BDB seems to have a bad habit of writing old data into
         // slack space in .dat files; that is bad if the old data is
@@ -1258,7 +1346,11 @@ bool CWallet::EncryptWallet(const SecureString& strWalletPassphrase)
     }
     NotifyStatusChanged(this);
 
-    return true;
+    // Encryption is already durable if a later finalization step fails, so it
+    // cannot be rolled back. Return failure because every postcondition was
+    // not met, while still reloading the environment and notifying observers
+    // of the now-encrypted wallet state.
+    return post_commit_ok;
 }
 
 DBErrors CWallet::ReorderTransactions()
@@ -6230,7 +6322,8 @@ bool CWallet::VerifyQuantumBackup(const fs::path& backup_path, const QuantumKeyS
         }
 
         const fs::path scratch_random = GetUniquePath(backup_path.parent_path());
-        const fs::path scratch_dir = backup_path.parent_path() / fs::PathFromString(
+        fs::path scratch_dir{backup_path.parent_path()};
+        scratch_dir /= fs::PathFromString(
             ".blackcoin-quantum-backup-verify-" + fs::PathToString(scratch_random.filename()));
         if (!TryCreateDirectories(scratch_dir)) {
             error = _("Quantum-key backup verification could not create an isolated verification directory");
@@ -6246,7 +6339,10 @@ bool CWallet::VerifyQuantumBackup(const fs::path& backup_path, const QuantumKeyS
         options.use_unsafe_sync = false;
         DatabaseStatus status;
         bilingual_str database_error;
-        std::unique_ptr<WalletDatabase> database = MakeDatabase(scratch_wallet, options, status, database_error);
+        // Pass the wallet directory rather than the data file. BDB accepts
+        // either form, while SQLiteDataFile appends wallet.dat to the supplied
+        // wallet path and would otherwise probe wallet.dat/wallet.dat.
+        std::unique_ptr<WalletDatabase> database = MakeDatabase(scratch_dir, options, status, database_error);
         if (!database) {
             error = Untranslated("Quantum-key backup database verification failed. ") + database_error;
             return false;
@@ -6367,23 +6463,20 @@ bool CWallet::SetQuantumKeyBackupState(const QuantumKeySnapshot& expected_keys, 
 
 bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out, bool verify_quantum_keys)
 {
-    class ScopedPathRemoval
+    class ScopedDirectoryRemoval
     {
     public:
-        explicit ScopedPathRemoval(fs::path path) : m_path(std::move(path)) {}
-        ~ScopedPathRemoval()
+        explicit ScopedDirectoryRemoval(fs::path path) : m_path(std::move(path)) {}
+        ~ScopedDirectoryRemoval()
         {
-            if (!m_active) return;
             try {
-                fs::remove(m_path);
+                fs::remove_all(m_path);
             } catch (const std::exception&) {
             }
         }
-        void Release() { m_active = false; }
 
     private:
         fs::path m_path;
-        bool m_active{true};
     };
 
     bilingual_str local_error;
@@ -6434,43 +6527,69 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
         return false;
     }
 
-    const fs::path backup_directory = backup_path.has_parent_path() ? backup_path.parent_path() : fs::path{"."};
+    fs::path backup_directory{"."};
+    if (backup_path.has_parent_path()) backup_directory = fs::path{backup_path.parent_path()};
+    fs::path staged_directory;
     fs::path staged_path;
-    try {
-        for (int attempt = 0; attempt < 10; ++attempt) {
-            const fs::path random_path = GetUniquePath(backup_directory);
-            const fs::path candidate = backup_directory / fs::PathFromString(
-                fs::PathToString(backup_path.filename()) + ".tmp-" + fs::PathToString(random_path.filename()));
-            if (!fs::exists(fs::symlink_status(candidate))) {
-                staged_path = candidate;
-                break;
-            }
+    for (int attempt = 0; attempt < 10; ++attempt) {
+        const fs::path random_path = GetUniquePath(backup_directory);
+        const fs::path candidate = backup_directory / fs::PathFromString(
+            ".blackcoin-wallet-backup-stage-" + fs::PathToString(random_path.filename()));
+        bool created{false};
+#ifndef WIN32
+        // mkdir(0700) is one atomic operation. A create-then-chmod sequence
+        // would briefly expose the staged wallet in a shared destination.
+        if (::mkdir(candidate.c_str(), S_IRWXU) == 0) {
+            created = true;
+        } else if (errno != EEXIST) {
+            local_error = strprintf(_("Unable to create a private wallet backup staging directory: %s"), SysErrorString(errno));
+            if (error_out) *error_out = local_error;
+            return false;
         }
-    } catch (const fs::filesystem_error& e) {
-        local_error = strprintf(_("Unable to prepare wallet backup destination: %s"), fsbridge::get_filesystem_error_message(e));
-        if (error_out) *error_out = local_error;
-        return false;
+#else
+        // Windows creates the directory exclusively. Its ACL is inherited from
+        // the user-selected destination; content identity is independently
+        // revalidated immediately before the write-through replacement below.
+        std::error_code create_error;
+        created = fs::create_directory(candidate, create_error);
+        if (!created && create_error && create_error != std::errc::file_exists) {
+            local_error = strprintf(_("Unable to create an isolated wallet backup staging directory: %s"), create_error.message());
+            if (error_out) *error_out = local_error;
+            return false;
+        }
+#endif
+        if (created) {
+            staged_directory = candidate;
+            staged_path = staged_directory / "wallet.dat";
+            break;
+        }
     }
     if (staged_path.empty()) {
-        local_error = _("Unable to reserve a unique temporary wallet backup path");
+        local_error = _("Unable to reserve a private wallet backup staging directory");
         if (error_out) *error_out = local_error;
         return false;
     }
-    ScopedPathRemoval remove_staged{staged_path};
+    ScopedDirectoryRemoval remove_staged{staged_directory};
 
-    const auto commit_stage = [&]() {
+    const auto commit_stage = [&](bool marked_stage) {
         FILE* staged_file = fsbridge::fopen(staged_path, "rb+");
         if (staged_file == nullptr) {
             local_error = _("Unable to open the temporary wallet backup for durable commit");
             return false;
         }
+        const bool injected_file_commit_failure = failpoint(marked_stage ? "fail_marked_file_commit" : "fail_initial_file_commit");
         const bool committed = FileCommit(staged_file);
+        const bool injected_close_failure = failpoint(marked_stage ? "fail_marked_file_close" : "fail_initial_file_close");
         const bool closed = std::fclose(staged_file) == 0;
-        if (!committed || !closed) {
-            local_error = _("Unable to durably commit the temporary wallet backup");
+        if (injected_file_commit_failure || injected_close_failure || !committed || !closed) {
+            if (local_error.empty()) local_error = _("Unable to durably commit the temporary wallet backup");
             return false;
         }
-        if (failpoint("before_stage_directory_commit") || !DirectoryCommit(backup_directory)) {
+        bool injected_directory_failure = failpoint(marked_stage ? "fail_marked_stage_directory_commit" : "fail_initial_stage_directory_commit");
+        if (!marked_stage) injected_directory_failure = failpoint("before_stage_directory_commit") || injected_directory_failure;
+        const bool staged_directory_committed = DirectoryCommit(staged_directory);
+        const bool parent_directory_committed = DirectoryCommit(backup_directory);
+        if (injected_directory_failure || !staged_directory_committed || !parent_directory_committed) {
             if (local_error.empty()) local_error = _("Unable to durably commit the temporary wallet backup directory entry");
             return false;
         }
@@ -6479,8 +6598,8 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
 
     const auto copy_to_stage = [&]() {
         try {
-            if (fs::exists(staged_path) && !fs::remove(staged_path)) {
-                local_error = _("Unable to replace the temporary wallet backup file");
+            if (fs::symlink_status(staged_path).type() != fs::file_type::not_found) {
+                local_error = _("The private wallet backup staging path was unexpectedly occupied");
                 return false;
             }
         } catch (const fs::filesystem_error& e) {
@@ -6491,10 +6610,27 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
             local_error = _("Wallet database copy failed");
             return false;
         }
-        return commit_stage();
+#ifndef WIN32
+        std::error_code permissions_error;
+        fs::permissions(staged_path, fs::perms::owner_read | fs::perms::owner_write,
+                        fs::perm_options::replace, permissions_error);
+        if (permissions_error) {
+            local_error = strprintf(_("Unable to make the staged wallet backup private: %s"), permissions_error.message());
+            return false;
+        }
+#endif
+        return commit_stage(/*marked_stage=*/false);
     };
 
-    const auto promote_stage = [&](bool require_unchanged_quantum_snapshot = false) {
+    const auto promote_stage = [&](const WalletBackupFileIdentity& verified_identity, bool require_unchanged_quantum_snapshot = false) {
+        if (failpoint("before_final_identity_revalidation")) return false;
+        WalletBackupFileIdentity current_identity;
+        if (!GetWalletBackupFileIdentity(staged_path, current_identity, local_error)) return false;
+        if (!(current_identity == verified_identity)) {
+            local_error = _("The staged wallet backup changed after cryptographic verification");
+            return false;
+        }
+
         std::unique_lock<RecursiveMutex> wallet_lock;
         if (require_unchanged_quantum_snapshot) {
             wallet_lock = std::unique_lock<RecursiveMutex>{cs_wallet};
@@ -6511,16 +6647,29 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
                 }
             }
         }
-        if (!RenameOver(staged_path, backup_path)) {
+        if (failpoint("fail_rename") || !RenameOver(staged_path, backup_path)) {
             local_error = _("Unable to atomically install the verified wallet backup");
             return false;
         }
-        remove_staged.Release();
-        if (failpoint("before_final_directory_commit") || !DirectoryCommit(backup_directory)) {
+        const bool injected_destination_commit_failure = failpoint("before_final_directory_commit");
+        const bool destination_committed = DirectoryCommit(backup_directory);
+        const bool injected_stage_commit_failure = failpoint("before_final_stage_directory_commit");
+        const bool source_directory_committed = DirectoryCommit(staged_directory);
+        if (injected_destination_commit_failure || injected_stage_commit_failure ||
+            !destination_committed || !source_directory_committed) {
             if (local_error.empty()) local_error = _("Unable to durably commit the installed wallet backup directory entry");
             return false;
         }
-        if (require_unchanged_quantum_snapshot && !SetQuantumKeyBackupState(expected_keys, /*verified=*/true, local_error)) {
+        if (failpoint("before_installed_identity_revalidation")) return false;
+        WalletBackupFileIdentity installed_identity;
+        if (!GetWalletBackupFileIdentity(backup_path, installed_identity, local_error)) return false;
+        if (!(installed_identity == verified_identity)) {
+            local_error = _("The installed wallet backup changed during atomic promotion");
+            return false;
+        }
+        if (require_unchanged_quantum_snapshot &&
+            (failpoint("before_source_marker_commit") ||
+             !SetQuantumKeyBackupState(expected_keys, /*verified=*/true, local_error))) {
             // The promoted file is complete and independently verified. A
             // source-marker failure remains conservative and is reported so
             // the caller can retry; it must never delete the good backup.
@@ -6534,7 +6683,12 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
         return false;
     }
     if (!verify_quantum_keys || expected_keys.empty()) {
-        const bool promoted = promote_stage();
+        WalletBackupFileIdentity staged_identity;
+        if (!GetWalletBackupFileIdentity(staged_path, staged_identity, local_error)) {
+            if (error_out) *error_out = local_error;
+            return false;
+        }
+        const bool promoted = promote_stage(staged_identity);
         if (!promoted && error_out) *error_out = local_error;
         return promoted;
     }
@@ -6548,7 +6702,7 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
         if (error_out) *error_out = local_error;
         return false;
     }
-    if (!commit_stage() || failpoint("after_marker_commit")) {
+    if (!commit_stage(/*marked_stage=*/true) || failpoint("after_marker_commit")) {
         if (error_out) *error_out = local_error;
         return false;
     }
@@ -6562,9 +6716,16 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
                              /*require_verified_markers=*/true,
                              /*write_verified_markers=*/false,
                              local_error) ||
-        failpoint("after_final_verify") ||
+        failpoint("after_final_verify")) {
+        if (local_error.empty()) local_error = _("Final verified wallet database copy failed");
+        if (error_out) *error_out = local_error;
+        return false;
+    }
+
+    WalletBackupFileIdentity verified_identity;
+    if (!GetWalletBackupFileIdentity(staged_path, verified_identity, local_error) ||
         failpoint("before_promote") ||
-        !promote_stage(/*require_unchanged_quantum_snapshot=*/true)) {
+        !promote_stage(verified_identity, /*require_unchanged_quantum_snapshot=*/true)) {
         if (local_error.empty()) local_error = _("Final verified wallet database copy failed");
         if (error_out) *error_out = local_error;
         return false;

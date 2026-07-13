@@ -144,6 +144,7 @@ void AskPassphraseDialog::accept()
                                          "<qt>" +
                                          tr("Your wallet is about to be encrypted. ") + encryption_reminder +
                                          "</b></qt>");
+                    QDialog::accept();
                 } else {
                     assert(model != nullptr);
                     if (model->setWalletEncrypted(newpass1)) {
@@ -156,12 +157,21 @@ void AskPassphraseDialog::accept()
                                              "For security reasons, previous backups of the unencrypted wallet file "
                                              "will become useless as soon as you start using the new, encrypted wallet.") +
                                              "</b></qt>");
+                        QDialog::accept();
+                    } else if (model->getEncryptionStatus() != WalletModel::Unencrypted) {
+                        QMessageBox::critical(
+                            this, tr("Wallet encryption incomplete"),
+                            tr("Wallet encryption was committed, but post-encryption finalization failed. "
+                               "The wallet remains encrypted. Restart the wallet, replace every pre-encryption backup, "
+                               "and create and verify a new encrypted backup before continuing."));
+                        // Retrying encryption is impossible once the durable
+                        // encryption transaction has committed.
+                        QDialog::accept();
                     } else {
                         QMessageBox::critical(this, tr("Wallet encryption failed"),
                                              tr("Wallet encryption failed due to an internal error. Your wallet was not encrypted."));
                     }
                 }
-                QDialog::accept(); // Success
             }
             else
             {

@@ -506,7 +506,7 @@ void AccountPage::refresh()
         attention = tr("<b>Attention</b><br>Migration status is busy; refresh shortly.");
     }
     if (!unverified_quantum_keys.empty()) {
-        attention += tr("<br><b>Backup required:</b> %1 non-HD quantum key(s) are not in a reopened, cryptographically verified backup. Unlock the wallet and use Backup Wallet now.")
+        attention += tr("<br><b>Backup required:</b> %1 non-HD quantum key(s) do not have a completed reopen-and-sign backup verification event. Unlock the wallet and use Backup Wallet now. The wallet cannot track whether an external backup file is later moved or deleted.")
             .arg(static_cast<int>(unverified_quantum_keys.size()));
     }
     m_attention_card->setText(attention);

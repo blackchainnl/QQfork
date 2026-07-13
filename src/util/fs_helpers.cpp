@@ -156,18 +156,18 @@ bool DirectoryCommit(const fs::path& dirname)
 #ifndef WIN32
     FILE* file = fsbridge::fopen(dirname, "r");
     if (file == nullptr) {
-        LogPrintf("Unable to open directory %s for durable commit: %s\n", dirname.string(), SysErrorString(errno));
+        LogPrintf("Unable to open directory %s for durable commit: %s\n", fs::PathToString(dirname), SysErrorString(errno));
         return false;
     }
     bool committed = true;
     if (fsync(fileno(file)) != 0) {
         const int sync_error = errno;
-        LogPrintf("Unable to durably commit directory %s: %s\n", dirname.string(), SysErrorString(sync_error));
+        LogPrintf("Unable to durably commit directory %s: %s\n", fs::PathToString(dirname), SysErrorString(sync_error));
         committed = false;
     }
     if (fclose(file) != 0) {
         const int close_error = errno;
-        LogPrintf("Unable to close directory %s after durable commit: %s\n", dirname.string(), SysErrorString(close_error));
+        LogPrintf("Unable to close directory %s after durable commit: %s\n", fs::PathToString(dirname), SysErrorString(close_error));
         committed = false;
     }
     return committed;
@@ -277,13 +277,12 @@ fs::path GetSpecialFolderPath(int nFolder, bool fCreate)
 
 bool RenameOver(fs::path src, fs::path dest)
 {
-#ifdef __MINGW64__
-    // This is a workaround for a bug in libstdc++ which
-    // implements std::filesystem::rename with _wrename function.
-    // This bug has been fixed in upstream:
-    //  - GCC 10.3: 8dd1c1085587c9f8a21bb5e588dfe1e8cdbba79e
-    //  - GCC 11.1: 1dfd95f0a0ca1d9e6cbc00e6cbfd1fa20a98f312
-    // For more details see the commits mentioned above.
+#ifdef WIN32
+    // Use the native write-through replacement on every supported Windows
+    // toolchain. DirectoryCommit() cannot independently flush a Windows
+    // directory handle, so falling back to std::filesystem::rename here would
+    // allow callers to report a durable replacement without any durability
+    // barrier.
     return MoveFileExW(src.wstring().c_str(), dest.wstring().c_str(),
                        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
