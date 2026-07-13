@@ -94,6 +94,7 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
 #endif
     argsman.AddArg("-staking=<true/false>", strprintf("Enables or disables staking (default: %u)", node::DEFAULT_STAKE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-autostartstaking=<true/false>", "Automatically start wallet staking when a wallet is loaded (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqautoshadowsignal=<true/false>", "Automatically submit eligible Gold Rush PoS signals to the shadow ledger (default: true)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-stakecache=<true/false>", strprintf("Enables or disables the staking cache; significantly improves staking performance, but can use a lot of memory (default: %u)", node::DEFAULT_STAKE_CACHE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-staketimio=<n>", strprintf("Proof of stake timeout. (default: %u)", node::DEFAULT_STAKETIMIO), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-solostaking=<true/false>", strprintf("Stake on an isolated private chain without peers or a public-chain sync estimate (testnet/regtest only on this branch) (default: %u)", node::DEFAULT_SOLO_STAKING), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);
