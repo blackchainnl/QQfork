@@ -2,16 +2,17 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Verify startup replay repairs a legacy-consistent Gold Rush chainstate.
+"""Verify the explicit v30.1.0-to-v30.1.1 chainstate rebuild contract.
 
-A user may upgrade after Gold Rush has started with blocks already stored and
-connected by older software. Those blocks are base-ledger valid, but their coins
-DB is missing Blackcoin shadow-ledger pool/claim state. Startup must rewind
-only to the local fork boundary and replay local blocks, not require a full
-redownload or manual reindex.
+Blocks connected by v30.1.0 can be base-ledger valid while lacking the
+authenticated schema-11 auxiliary state and normalized UTXO timestamps required
+by v30.1.1. Normal startup must fail closed without changing the old logical
+chainstate. An explicit -reindex-chainstate must produce a deterministic result
+that survives a clean restart and matches later chainstate and full reindexes.
 """
 
 from test_framework.test_framework import BitcoinTestFramework
+from test_framework.test_node import ErrorMatch
 from test_framework.util import assert_equal
 
 
@@ -35,6 +36,18 @@ class GoldRushShadowReplayTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.extra_args = [PRE_UPGRADE_ARGS]
 
+    def state_fingerprint(self, node):
+        stats = node.gettxoutsetinfo("muhash")
+        return {
+            "height": stats["height"],
+            "bestblock": stats["bestblock"],
+            "txouts": stats["txouts"],
+            "bogosize": stats["bogosize"],
+            "muhash": stats["muhash"],
+            "total_amount": stats["total_amount"],
+            "goldrush": node.getgoldrushstate(),
+        }
+
     def run_test(self):
         node = self.nodes[0]
 
@@ -45,16 +58,49 @@ class GoldRushShadowReplayTest(BitcoinTestFramework):
         assert_equal(legacy_state["pow_amount"], 0)
         assert_equal(legacy_state["pos_amount"], 0)
         assert_equal(legacy_state["claimed_amount"], 0)
+        legacy_fingerprint = self.state_fingerprint(node)
+        legacy_tip = node.getbestblockhash()
 
-        self.log.info("Restarting as upgraded V30 software; startup should replay shadow state from local blocks")
-        self.restart_node(0, BASE_ARGS)
+        self.log.info("Refusing an obsolete chainstate without mutating its logical state")
+        self.stop_node(0)
+        node.assert_start_raises_init_error(
+            extra_args=BASE_ARGS,
+            expected_msg=(
+                r"Unable to replay Quantum Quasar Gold Rush state\. "
+                r"Restart with -reindex-chainstate"
+            ),
+            match=ErrorMatch.PARTIAL_REGEX,
+        )
 
-        repaired_state = self.nodes[0].getgoldrushstate()
+        self.start_node(0, extra_args=PRE_UPGRADE_ARGS)
+        node = self.nodes[0]
+        assert_equal(node.getbestblockhash(), legacy_tip)
+        assert_equal(self.state_fingerprint(node), legacy_fingerprint)
+
+        self.log.info("Rebuilding schema-11 state with an explicit -reindex-chainstate")
+        self.restart_node(0, BASE_ARGS + ["-reindex-chainstate"])
+        node = self.nodes[0]
+
+        repaired_state = node.getgoldrushstate()
         expected_half_pool = REWARD_BLOCKS_CONNECTED * 290 * COIN
         assert_equal(repaired_state["pow_amount"], expected_half_pool)
         assert_equal(repaired_state["pos_amount"], expected_half_pool)
         assert_equal(repaired_state["claimed_amount"], 0)
-        assert_equal(self.nodes[0].getblockcount(), 1 + REWARD_BLOCKS_CONNECTED)
+        assert_equal(node.getblockcount(), 1 + REWARD_BLOCKS_CONNECTED)
+        assert_equal(node.getbestblockhash(), legacy_tip)
+        rebuilt_fingerprint = self.state_fingerprint(node)
+
+        self.log.info("Confirming the rebuilt state survives a clean restart")
+        self.restart_node(0, BASE_ARGS)
+        assert_equal(self.state_fingerprint(self.nodes[0]), rebuilt_fingerprint)
+
+        self.log.info("Confirming a second chainstate rebuild is deterministic")
+        self.restart_node(0, BASE_ARGS + ["-reindex-chainstate"])
+        assert_equal(self.state_fingerprint(self.nodes[0]), rebuilt_fingerprint)
+
+        self.log.info("Confirming a full block reindex produces the same state")
+        self.restart_node(0, BASE_ARGS + ["-reindex"])
+        assert_equal(self.state_fingerprint(self.nodes[0]), rebuilt_fingerprint)
 
 
 if __name__ == "__main__":

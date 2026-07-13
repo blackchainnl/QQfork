@@ -6621,7 +6621,7 @@ bool Chainstate::ReplayShadowBlocks()
     const ShadowBlockReader replay_block_reader = [&](const CBlockIndex& index, CBlock& block) {
         return m_blockman.ReadBlockFromDisk(block, index);
     };
-    // The v9 replay marker commits the exact tip, schedule, pool, signal,
+    // The schema-11 replay marker commits the exact tip, schedule, pool, signal,
     // whitelist, Gold Rush inventory, and demurrage inventory. Check it before
     // any historical obligation calculation so every normal restart, including
     // Final, is bounded and performs no reward-height walk, block read, or UTXO
@@ -6633,12 +6633,12 @@ bool Chainstate::ReplayShadowBlocks()
     }
 
     // At/after the whitelist boundary there is no safe in-place repair path:
-    // the exact v9 checkpoint must authenticate or chainstate must be rebuilt.
+    // the exact schema-11 checkpoint must authenticate or chainstate must be rebuilt.
     // Return before the historical reward-obligation walk so a corrupt or old
     // checkpoint also fails in bounded time rather than delaying the recovery
     // instruction by up to the entire Gold Rush window.
     if (pindexTip->nHeight >= SHADOW_WHITELIST_HEIGHT) {
-        return error("ReplayShadowBlocks(): Quantum Quasar v30.1.1 auxiliary checkpoint is missing or inconsistent at height %d. Restart with -reindex-chainstate; if required block data was pruned, redownload the chainstate first",
+        return error("ReplayShadowBlocks(): Quantum Quasar v30.1.1 schema-11 auxiliary checkpoint is missing or inconsistent at height %d. Restart with -reindex-chainstate; if required block files were pruned or are incomplete, disable pruning and use a full -reindex to redownload and rebuild",
                      pindexTip->nHeight);
     }
 

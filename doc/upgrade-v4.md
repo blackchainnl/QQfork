@@ -120,7 +120,8 @@ periodic attestations while staking.
 
 ## Existing-node upgrade and chainstate rebuild
 
-v30.1.1 changes the persisted shadow and demurrage state schema, recomputes the
+v30.1.1 changes the persisted shadow and demurrage state to authenticated
+schema 11, recomputes the
 canonical competing-claim result from Gold Rush height 5,950,000, and normalizes
 legacy-compatible pre-Gold-Rush coin timestamps. Operators upgrading from
 v30.1.0 must back up wallets, stop the daemon, and run one full
@@ -130,11 +131,26 @@ v30.1.0 must back up wallets, stop the daemon, and run one full
 blackcoind -datadir=/path/to/data -reindex-chainstate -daemonwait
 ```
 
-The rebuild may require the full block files on pruned nodes. Do not delete the
-wallet or block files; if the rebuild cannot authenticate the local state, the
-daemon stops and prints the exact recovery action. Allow sufficient disk space
-and keep the pre-upgrade backup until the rebuilt node has synchronized and
-produced a matching UTXO-state hash.
+The rebuild requires complete active-chain block data for every height it must
+replay. `-reindex-chainstate` uses local block files and does not fetch history
+that pruning has deleted. If the datadir is pruned or its block files are
+incomplete, set `prune=0` and use a full `-reindex` to redownload missing
+history and rebuild both the block index and chainstate. Do not delete wallets
+or available block files. Allow sufficient disk space and keep the pre-upgrade
+backup until the rebuilt node has synchronized and passed a clean-restart
+comparison.
+
+After the rebuild, record these RPC results:
+
+```bash
+blackcoin-cli getblockchaininfo
+blackcoin-cli gettxoutsetinfo muhash
+blackcoin-cli getgoldrushstate
+```
+
+Stop cleanly, restart without either reindex option, and confirm that height,
+best-block hash, UTXO MuHash, and Gold Rush totals match. Do not enable staking
+or mining until this comparison succeeds.
 
 After the authenticated Quantum Quasar namespace begins, a process or power
 failure during a multi-batch chainstate flush also fails closed on restart and

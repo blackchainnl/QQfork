@@ -4991,7 +4991,7 @@ bool IsWhitelisted(const CCoinsViewCache& view, const CScript& scriptPubKey)
             return true;
         }
         // v30.1.0/v30.1.1 prerelease cache bridge. The sharded manifest below
-        // remains authoritative, and schema-10 replay rewrites this as v3.
+        // remains authoritative, and schema-11 replay rewrites this as v3.
         if (member_payload.size() == 1 + 3 * uint256::size() && member_payload[0] == 2) {
             uint256 snapshot_hash;
             uint256 manifest_hash;

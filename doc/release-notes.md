@@ -1,7 +1,8 @@
-30.0 Release Notes
-==================
+30.1.1 Release Notes
+====================
 
-Blackcoin version 30.0.0 is the major Blackcoin protocol upgrade release.
+Blackcoin version 30.1.1 is the Quantum Quasar safety and deterministic-state
+upgrade release.
 Release binaries will be made available from:
 
   <https://github.com/Blackcoin-Dev/Blackcoin/releases>
@@ -22,14 +23,27 @@ To receive security and update notifications, please subscribe to:
 How to Upgrade
 ==============
 
-If you are running an older version, shut it down. Wait until it has completely
-shut down (which might take a few minutes in some cases), then run the
-installer (on Windows) or just copy over `/Applications/Blackcoin` (on macOS)
-or `blackcoind`/`blackcoin-qt` (on Linux).
+Back up every wallet before upgrading. ML-DSA quantum keys are not derived from
+the legacy HD seed, so the backup must be newer than every quantum address it
+is expected to recover. Shut down every old daemon or GUI using the datadir and
+wait for complete shutdown before replacing the binaries.
 
-Upgrading directly from a version of Blackcoin that has reached its EOL is
-possible, but it might take some time if the data directory needs to be migrated. Old
-wallet versions of Blackcoin are generally supported.
+An existing v30.1.0 datadir requires one explicit authenticated schema-11
+chainstate rebuild before staking or mining under v30.1.1:
+
+```bash
+blackcoind -datadir=/path/to/data -reindex-chainstate -daemonwait
+```
+
+`-reindex-chainstate` reads local block files and does not fetch history removed
+by pruning. If block files are pruned or incomplete, set `prune=0` and use a
+full `-reindex` to redownload missing history and rebuild both the block index
+and chainstate. Preserve wallet files and all available block files.
+
+After synchronization, record `getblockchaininfo`, `gettxoutsetinfo muhash`, and
+`getgoldrushstate`. Stop cleanly, restart without a reindex option, and confirm
+that height, best-block hash, UTXO MuHash, and Gold Rush totals match before
+enabling staking or mining.
 
 Compatibility
 ==============
@@ -45,8 +59,8 @@ Notable changes
 
 ### Version line
 
-- Blackcoin moves the upgrade line from v26.2.x to v30.0.0 to reflect the
-  scope of the protocol transition.
+- v30.1.1 continues the v30 protocol line and makes the authenticated
+  auxiliary-state upgrade boundary explicit.
 
 ### Protocol transition
 
@@ -58,7 +72,7 @@ Notable changes
 - From Gold Rush height 5,950,000, competing valid PoW claims are ranked
   independently of transaction order. Evaluated valid losers recover their actual
   base fee up to 0.01 BLK from the fixed pool, the canonical winner receives the
-  remainder, and the authenticated shadow state is replayed under schema 10.
+  remainder, and the authenticated shadow state is replayed under schema 11.
 - ML-DSA quantum spends, EUTXO spends, larger post-quantum script elements, and
   expanded block limits are deferred until after the Gold Rush reward-height
   window, during the migration/final-lockout phases.

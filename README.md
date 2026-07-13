@@ -35,18 +35,50 @@ helping secure the chain**.
 
 ## The V4 timeline (mainnet)
 
-Protocol V4 activates at a fixed time (2026-07-12, ~block 5,950,000) and moves through four
-phases:
+The mainnet lifecycle is height-authoritative. Median-time-past cannot advance,
+delay, or reverse a production phase transition. Durations below are estimates
+based on Blackcoin's 64-second target spacing; the listed heights are the
+consensus boundaries.
 
-| Phase | Starts | Duration | Legacy spend? | Quantum spend? | Gold Rush? |
-|-------|--------|----------|:---:|:---:|:---:|
-| Legacy | (before V4) | — | ✅ | ❌ | ❌ |
-| Gold Rush | V4 | 180 days | ✅ | fundable | ✅ |
-| Migration | V4 + 180 d | 540 days | ✅ | ✅ | ❌ |
-| Final Lockout | V4 + 720 d | permanent | ❌ | ✅ | ❌ |
+| Phase | Mainnet heights | Approximate duration | Legacy spend? | Quantum spend? | Gold Rush? |
+|-------|-----------------|----------------------|:---:|:---:|:---:|
+| Legacy | through 5,949,999 | — | ✅ | ❌ | ❌ |
+| Gold Rush | 5,950,000–6,192,999 | 180 days | ✅ | fundable, locked | ✅ |
+| Migration | 6,193,000–6,921,999 | 540 days | ✅ | ✅ | ❌ |
+| Final Lockout | from 6,922,000 | permanent | ❌ | ✅ | ❌ |
 
 The 10,000 BLK Gold Rush whitelist snapshot is taken at height **5,945,000**. Full schedule
 and constants are in the [white paper](doc/whitepaper-quantum-quasar.md).
+
+## Required v30.1.0 chainstate rebuild
+
+v30.1.1 uses authenticated auxiliary-state schema 11 and normalizes historical
+UTXO timestamps. An existing v30.1.0 datadir must not be used for staking or
+mining under v30.1.1 until it has completed one explicit chainstate rebuild.
+Back up every wallet, stop the old process completely, and run:
+
+```bash
+blackcoind -datadir=/path/to/data -reindex-chainstate -daemonwait
+```
+
+`-reindex-chainstate` reconstructs state from local block files; it does not
+retrieve block history that has already been pruned. The datadir must contain
+the complete active-chain block data needed for the rebuild. If block files are
+pruned or incomplete, set `prune=0` and use a full `-reindex` so the missing
+history can be downloaded and the block index and chainstate rebuilt. Do not
+delete wallet files or available block files.
+
+After synchronization, record and compare the height, best-block hash, UTXO
+MuHash, and Gold Rush totals across a clean restart:
+
+```bash
+blackcoin-cli getblockchaininfo
+blackcoin-cli gettxoutsetinfo muhash
+blackcoin-cli getgoldrushstate
+```
+
+Keep the pre-upgrade wallet backup until those values remain stable after the
+clean restart.
 
 ## First run and data migration
 

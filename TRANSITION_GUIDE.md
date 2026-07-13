@@ -3,18 +3,20 @@
 ## Legacy Blackcoin Operators
 
 Blackcoin is the Protocol V4 upgrade path for the legacy Blackcoin
-network. The current build is intended for testnet validation before a public
-release.
+network. v30.1.1 retains the existing chain history and introduces an explicit
+upgrade boundary for v30.1.0 chainstate data.
 
 ## Current Schedule in Code
 
-- V4 activation opens the Gold Rush phase.
-- Gold Rush runs for the configured six-month epoch.
-- Quantum witness spends activate after the Gold Rush reward-height window,
-  during the migration phase.
-- The quantum migration window follows for the configured eighteen-month epoch.
-- After the migration deadline, final lockout rules disable remaining legacy
-  spends according to the consensus schedule.
+- The whitelist snapshot is fixed at height 5,945,000.
+- Legacy rules remain active through height 5,949,999.
+- Gold Rush is height 5,950,000 through 6,192,999, inclusive.
+- Quantum witness spends activate at Migration height 6,193,000.
+- Migration is height 6,193,000 through 6,921,999, inclusive.
+- Final lockout and automatic demurrage begin at height 6,922,000.
+
+These mainnet heights are authoritative. The time values retained in the code
+do not move a mainnet lifecycle boundary.
 
 Use RPC to inspect the active schedule and wallet migration status:
 
@@ -25,13 +27,37 @@ blackcoin-cli -rpcwallet=<wallet> getmigrationstatus
 
 ## Upgrade Test Flow
 
-1. Stop the legacy Blackcoin node.
-2. Build the Blackcoin branch.
-3. Start `blackcoind`.
-4. Back up the wallet before generating or funding quantum migration keys.
-5. Use `getmigrationstatus` to inspect remaining legacy funds.
-6. Use `migratetoquantum` during the migration window when ready to move legacy
+1. Back up every wallet. Quantum keys are not derived from the legacy HD seed,
+   so the backup must be newer than every quantum address it is expected to
+   recover.
+2. Stop every v30.1.0 daemon or GUI using the datadir and wait for complete
+   shutdown.
+3. Install v30.1.1.
+4. Run one explicit schema-11 rebuild before enabling staking or mining:
+
+   ```bash
+   blackcoind -datadir=/path/to/data -reindex-chainstate -daemonwait
+   ```
+
+5. Wait for synchronization, then record `getblockchaininfo`,
+   `gettxoutsetinfo muhash`, and `getgoldrushstate`.
+6. Stop cleanly, restart without a reindex option, and confirm the height,
+   best-block hash, UTXO MuHash, and Gold Rush totals match.
+7. Use `getmigrationstatus` to inspect remaining legacy funds.
+8. Use `migratetoquantum` during the migration window when ready to move legacy
    wallet coins into ML-DSA-backed quantum migration outputs.
+
+The v30.1.1 rebuild is mandatory because the release changes authenticated
+auxiliary-state schema, canonical competing-claim accounting from height
+5,950,000, and historical UTXO timestamp normalization. Normal startup refuses
+an obsolete or unauthenticated chainstate instead of attempting an in-place
+repair.
+
+`-reindex-chainstate` reads local block files and cannot recover blocks already
+deleted by pruning. It requires complete active-chain block data for the replay.
+If the datadir is pruned or block files are incomplete, set `prune=0` and use a
+full `-reindex` to redownload missing history and rebuild both the block index
+and chainstate. Preserve wallets and all available block files.
 
 ## Gold Rush
 
@@ -65,7 +91,8 @@ the built-in Gold Rush PoW miner and copy its quantum payout address.
 ## Validation Status
 
 The V4 Gold Rush, quantum migration, cold-staking, autonomous redelegation,
-tiered staking, stake-reward split, and demurrage paths are implemented for
-testnet validation in this branch. Do not treat this branch as a final mainnet
-release until the public activation parameters, packaging, and testnet sign-off
-are announced.
+tiered staking, stake-reward split, and demurrage paths are implemented in this
+branch. A source checkout, release candidate, or alpha artifact is not a final
+mainnet release. Operators should use only published binaries that have passed
+the v30.1.1 release gate, and should retain verified wallet backups throughout
+the transition.
