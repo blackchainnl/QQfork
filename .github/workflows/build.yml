@@ -373,7 +373,9 @@ jobs:
               mapfile -t files < <(cd "depends/$HOST/bin" && find . -maxdepth 1 -type f -name 'blackcoin*.exe' -printf '%P\n' | sort)
               test "${#files[@]}" -gt 0
               (cd "depends/$HOST/bin" && printf '%s\n' "${files[@]}" | zip -X -9j "$OUT/Blackcoin-$VERSION-Windows-x86_64-Portable.zip" -@)
-              cp "blackcoin-$VERSION-win64-setup.exe" "$OUT/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
+              mapfile -t installers < <(find . -maxdepth 1 -type f -name "blackcoin-$VERSION*-win64-setup.exe" -printf '%P\n' | sort)
+              test "${#installers[@]}" -eq 1
+              cp "${installers[0]}" "$OUT/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
               touch -d "@$SOURCE_DATE_EPOCH" "$OUT/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
               ;;
             macos-64-bit)
