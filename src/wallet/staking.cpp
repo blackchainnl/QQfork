@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <limits>
 #include <map>
 #include <set>
 #include <string_view>
@@ -530,6 +531,128 @@ bool FindAutoShadowSignalCandidate(CWallet& wallet, AutoShadowSignalCandidate& c
     return false;
 }
 
+struct AutoShadowSignalFeeCandidate
+{
+    COutPoint outpoint;
+    CTxOut txout;
+    int confirmed_height{0};
+    bool coinbase{false};
+    bool coinstake{false};
+    int64_t smart_time{0};
+};
+
+struct AutoShadowSignalFeeScan
+{
+    std::vector<AutoShadowSignalFeeCandidate> candidates;
+    size_t transactions_scanned{0};
+    size_t outputs_scanned{0};
+};
+
+AutoShadowSignalFeeScan FindAutoShadowSignalFeeCandidates(CWallet& wallet, const CScript& target)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
+{
+    AutoShadowSignalFeeScan result;
+    if (wallet.mapWallet.empty()) return result;
+
+    // Automatic QQSIGNAL construction used to call AvailableCoins(), sort its
+    // complete result, and only then discard every output not owned by target.
+    // Walk a resumable slice of wallet history instead. This deterministically
+    // bounds each attempt even for a long-lived wallet. Under stable wallet
+    // history the saved outpoint resumes at the following output on each retry.
+    auto tx_it = wallet.mapWallet.begin();
+    uint32_t first_vout{0};
+    const COutPoint resume_after = wallet.m_shadow_signal_coin_scan_cursor;
+    if (!resume_after.hash.IsNull()) {
+        tx_it = wallet.mapWallet.find(resume_after.hash);
+        if (tx_it != wallet.mapWallet.end()) {
+            if (!tx_it->second.tx) {
+                ++tx_it;
+            } else {
+                const size_t next_vout = resume_after.n == std::numeric_limits<uint32_t>::max()
+                    ? tx_it->second.tx->vout.size()
+                    : static_cast<size_t>(resume_after.n) + 1;
+                if (next_vout < tx_it->second.tx->vout.size()) {
+                    first_vout = static_cast<uint32_t>(next_vout);
+                } else {
+                    ++tx_it;
+                }
+            }
+        }
+    }
+    if (tx_it == wallet.mapWallet.end()) tx_it = wallet.mapWallet.begin();
+
+    const size_t transaction_budget = std::min(
+        wallet.mapWallet.size(), MAX_AUTO_SHADOW_SIGNAL_WALLET_TX_SCAN);
+    const std::set<COutPoint> protected_rgb_seals = wallet.GetProtectedRGBSeals();
+    static constexpr size_t MAX_CANDIDATES_PER_ATTEMPT{256};
+
+    while (result.transactions_scanned < transaction_budget &&
+           result.outputs_scanned < MAX_AUTO_SHADOW_SIGNAL_WALLET_OUTPUT_SCAN &&
+           result.candidates.size() < MAX_CANDIDATES_PER_ATTEMPT) {
+        if (wallet.IsStakeClosing()) break;
+        if (tx_it == wallet.mapWallet.end()) tx_it = wallet.mapWallet.begin();
+
+        const uint256 txid = tx_it->first;
+        const CWalletTx& wtx = tx_it->second;
+        ++result.transactions_scanned;
+
+        if (!wtx.tx) {
+            wallet.m_shadow_signal_coin_scan_cursor =
+                COutPoint{txid, std::numeric_limits<uint32_t>::max()};
+            ++tx_it;
+            continue;
+        }
+
+        const int depth = wallet.GetTxDepthInMainChain(wtx);
+        const TxStateConfirmed* confirmed = wtx.state<TxStateConfirmed>();
+        const bool eligible_transaction = confirmed && depth > 0 &&
+            depth <= DEFAULT_MAX_DEPTH && !wallet.IsTxImmature(wtx);
+
+        const size_t output_begin = std::min<size_t>(first_vout, wtx.tx->vout.size());
+        first_vout = 0;
+        if (wtx.tx->vout.empty()) {
+            wallet.m_shadow_signal_coin_scan_cursor =
+                COutPoint{txid, std::numeric_limits<uint32_t>::max()};
+        }
+        for (size_t output_index = output_begin;
+             output_index < wtx.tx->vout.size() &&
+             result.outputs_scanned < MAX_AUTO_SHADOW_SIGNAL_WALLET_OUTPUT_SCAN &&
+             result.candidates.size() < MAX_CANDIDATES_PER_ATTEMPT;
+             ++output_index) {
+            if (output_index > std::numeric_limits<uint32_t>::max()) break;
+            const COutPoint outpoint{txid, static_cast<uint32_t>(output_index)};
+            wallet.m_shadow_signal_coin_scan_cursor = outpoint;
+            ++result.outputs_scanned;
+            if (!eligible_transaction) continue;
+
+            const CTxOut& output = wtx.tx->vout[output_index];
+            if (output.nValue <= 0 ||
+                CanonicalizeLegacyStakeScript(output.scriptPubKey) != target ||
+                wallet.IsLockedCoin(outpoint) || wallet.IsSpent(outpoint) ||
+                protected_rgb_seals.count(outpoint) ||
+                (wallet.IsMine(output) & ISMINE_SPENDABLE) == ISMINE_NO) {
+                continue;
+            }
+            result.candidates.push_back(AutoShadowSignalFeeCandidate{
+                outpoint,
+                output,
+                confirmed->confirmed_block_height,
+                wtx.IsCoinBase(),
+                wtx.IsCoinStake(),
+                wtx.nTimeSmart,
+            });
+        }
+        ++tx_it;
+    }
+
+    std::sort(result.candidates.begin(), result.candidates.end(),
+              [](const AutoShadowSignalFeeCandidate& a, const AutoShadowSignalFeeCandidate& b) {
+        if (a.txout.nValue != b.txout.nValue) return a.txout.nValue < b.txout.nValue;
+        return a.outpoint < b.outpoint;
+    });
+    return result;
+}
+
 bool BuildAutoShadowSignalTransaction(CWallet& wallet, const AutoShadowSignalCandidate& candidate, const CScript& payout_script, CMutableTransaction& signal_tx, std::map<COutPoint, Coin>& coins, CAmount& fee, bilingual_str& error)
 {
     std::vector<unsigned char> signal;
@@ -571,15 +694,9 @@ bool BuildAutoShadowSignalTransaction(CWallet& wallet, const AutoShadowSignalCan
 
     const int64_t current_time = GetAdjustedTimeSeconds();
     const CFeeRate fee_rate = GetMinimumFeeRate(wallet, coin_control, current_time);
-    std::vector<COutput> outputs = AvailableCoins(wallet, &coin_control).All();
-    std::sort(outputs.begin(), outputs.end(), [](const COutput& a, const COutput& b) {
-        if (a.txout.nValue != b.txout.nValue) return a.txout.nValue < b.txout.nValue;
-        return a.outpoint < b.outpoint;
-    });
-
-    for (const COutput& output : outputs) {
-        if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != candidate.target) continue;
-
+    const AutoShadowSignalFeeScan fee_scan =
+        FindAutoShadowSignalFeeCandidates(wallet, candidate.target);
+    for (const AutoShadowSignalFeeCandidate& output : fee_scan.candidates) {
         CMutableTransaction tx;
         tx.nVersion = CTransaction::CURRENT_VERSION;
         tx.nTime = current_time;
@@ -599,11 +716,9 @@ bool BuildAutoShadowSignalTransaction(CWallet& wallet, const AutoShadowSignalCan
             return false;
         }
 
-        const auto tx_it = wallet.mapWallet.find(output.outpoint.hash);
-        if (tx_it == wallet.mapWallet.end()) continue;
-        const CWalletTx& wtx = tx_it->second;
-        const int prev_height = wtx.state<TxStateConfirmed>() ? wtx.state<TxStateConfirmed>()->confirmed_block_height : 0;
-        coins.emplace(output.outpoint, Coin(output.txout, prev_height, wtx.IsCoinBase(), wtx.IsCoinStake(), wtx.nTimeSmart));
+        coins.emplace(output.outpoint, Coin(output.txout, output.confirmed_height,
+                                            output.coinbase, output.coinstake,
+                                            output.smart_time));
 
         tx.vout[0].nValue = candidate_change;
         signal_tx = std::move(tx);
@@ -611,7 +726,10 @@ bool BuildAutoShadowSignalTransaction(CWallet& wallet, const AutoShadowSignalCan
         return true;
     }
 
-    error = _("No spendable non-dust UTXO found for the Gold Rush PoS signal address.");
+    error = strprintf(
+        _("No spendable non-dust UTXO found for the Gold Rush PoS signal address in the bounded wallet scan (%u transactions, %u outputs); retry will resume from the saved cursor."),
+        static_cast<unsigned int>(fee_scan.transactions_scanned),
+        static_cast<unsigned int>(fee_scan.outputs_scanned));
     return false;
 }
 
@@ -793,10 +911,24 @@ bool CreateDemurrageAttestationTransaction(
     result = {};
     result.witness_program = witness_program;
 
+    const Consensus::Params& consensus = Params().GetConsensus();
+    int evaluation_height{-1};
+    int64_t evaluation_time{0};
     std::vector<unsigned char> public_key;
     CKeyingMaterial private_key;
     {
         LOCK2(::cs_main, wallet.cs_wallet);
+        const CBlockIndex* tip = wallet.chain().getTip();
+        if (!tip) {
+            error = _("Unable to build a demurrage attestation without an active chain tip");
+            return false;
+        }
+        evaluation_height = tip->nHeight + 1;
+        evaluation_time = tip->GetMedianTimePast();
+        if (!consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
+            error = _("Demurrage is not active for the next block");
+            return false;
+        }
         if (wallet.IsLocked()) {
             error = _("Wallet is locked");
             return false;
@@ -818,9 +950,6 @@ bool CreateDemurrageAttestationTransaction(
         if (!private_key_bytes.empty()) memory_cleanse(private_key_bytes.data(), private_key_bytes.size());
     };
 
-    const Consensus::Params& consensus = Params().GetConsensus();
-    int evaluation_height{-1};
-    int64_t evaluation_time{0};
     COutPoint target_outpoint;
     std::optional<Consensus::DemurrageAttestationRecord> previous_record;
     std::optional<Consensus::DemurrageAttestationState> previous_state;
@@ -834,6 +963,11 @@ bool CreateDemurrageAttestationTransaction(
         }
         evaluation_height = tip->nHeight + 1;
         evaluation_time = tip->GetMedianTimePast();
+        if (!consensus.IsDemurrageActive(evaluation_height, evaluation_time)) {
+            cleanse_private_key_bytes();
+            error = _("Demurrage is not active for the next block");
+            return false;
+        }
 
         const CScript target_script = GetScriptForDestination(WitnessUnknown{
             QUANTUM_MIGRATION_WITNESS_VERSION, witness_program});
@@ -1501,6 +1635,8 @@ int MaybeAutoShadowSignal(CWallet& wallet)
         }
     }
 
+    if (wallet.IsStakeClosing()) return 0;
+
     mapValue_t map_value;
     map_value["comment"] = SHADOW_SIGNAL_COMMENT;
     try {
@@ -1516,6 +1652,11 @@ int MaybeAutoShadowSignal(CWallet& wallet)
         }
     } catch (const std::exception& e) {
         wallet.WalletLogPrintf("Broadcasting Gold Rush PoS signal failed: %s\n", e.what());
+        const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
+        if (added_to_wallet && !wallet.AbandonTransaction(tx->GetHash())) {
+            wallet.WalletLogPrintf("Gold Rush PoS signal could not be abandoned after broadcast exception: txid=%s\n",
+                                   tx->GetHash().ToString());
+        }
         ScheduleAutoShadowSignalRetry(wallet, candidate.scan_height, e.what());
         return 0;
     }
@@ -1719,6 +1860,14 @@ void StakeCoins(CWallet& wallet, bool fStake) {
 }
 
 void StartStake(CWallet& wallet) {
+    LOCK(wallet.m_staking_thread_mutex);
+    if (wallet.threadStakeMinerGroup && !wallet.threadStakeMinerGroup->empty()) {
+        // Concurrent/repeated enable requests must not join or replace the
+        // running thread. The worker is self-restarting until StopStake sets
+        // the closing flag.
+        wallet.m_enabled_staking = true;
+        return;
+    }
     if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         wallet.WalletLogPrintf("Wallet can't contain any private keys - staking disabled\n");
         wallet.m_enabled_staking = false;
@@ -1732,21 +1881,22 @@ void StartStake(CWallet& wallet) {
         wallet.m_enabled_staking = false;
     }
     else {
+        wallet.m_stop_staking_thread = false;
         wallet.m_enabled_staking = true;
     }
     StakeCoins(wallet, wallet.m_enabled_staking);
 }
 
 void StopStake(CWallet& wallet) {
+    LOCK(wallet.m_staking_thread_mutex);
     if (!wallet.threadStakeMinerGroup) {
-        if (wallet.m_enabled_staking)
-            wallet.m_enabled_staking = false;
+        wallet.m_enabled_staking = false;
     }
     else {
         wallet.m_stop_staking_thread = true;
         wallet.m_enabled_staking = false;
         StakeCoins(wallet, false);
-        wallet.threadStakeMinerGroup = 0;
+        wallet.threadStakeMinerGroup.reset();
         wallet.m_stop_staking_thread = false;
     }
 }
@@ -1969,6 +2119,18 @@ bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::se
             setCoinsRet.insert(coin.second);
             nValueRet += coin.first;
         }
+    }
+
+    // Both current callers request the complete staking set. Publish that
+    // completed scan for status RPC/GUI readers so they never need to repeat
+    // the O(wallet history) walk on a latency-sensitive thread.
+    if (nTargetValue == MAX_MONEY) {
+        const CAmount available = nValueRet > wallet.m_reserve_balance
+            ? nValueRet - wallet.m_reserve_balance
+            : 0;
+        wallet.m_cached_stake_weight.store(static_cast<uint64_t>(available), std::memory_order_relaxed);
+        const CBlockIndex* tip = wallet.chain().getTip();
+        wallet.m_cached_stake_weight_height.store(tip ? tip->nHeight : -1, std::memory_order_release);
     }
 
     return true;

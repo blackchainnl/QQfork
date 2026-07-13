@@ -2206,16 +2206,12 @@ public:
     }
     bool tryGetStakeWeight(uint64_t& nWeight) override
     {
-        TRY_LOCK(::cs_main, locked_main);
-        if (!locked_main) {
+        // The staking worker publishes a complete scan. GUI polling must not
+        // acquire chain/wallet locks and repeat the O(wallet-history) walk.
+        if (m_wallet->m_cached_stake_weight_height.load(std::memory_order_acquire) < 0) {
             return false;
         }
-        TRY_LOCK(m_wallet->cs_wallet, locked_wallet);
-        if (!locked_wallet) {
-            return false;
-        }
-
-        nWeight = m_wallet->GetStakeWeight();
+        nWeight = m_wallet->m_cached_stake_weight.load(std::memory_order_relaxed);
         return true;
     }
     uint64_t getStakeWeight() override
@@ -2225,8 +2221,7 @@ public:
     }
     int64_t getLastCoinStakeSearchInterval() override
     {
-        LOCK(m_wallet->cs_wallet);
-        return m_wallet->m_last_coin_stake_search_interval;
+        return m_wallet->m_last_coin_stake_search_interval.load(std::memory_order_relaxed);
     }
     bool getWalletUnlockStakingOnly() override
     {

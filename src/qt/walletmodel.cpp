@@ -622,7 +622,7 @@ CAmount WalletModel::getAvailableBalance(const CCoinControl* control)
 
 uint64_t WalletModel::getStakeWeight()
 {
-    return nWeight;
+    return nWeight.load(std::memory_order_relaxed);
 }
 
 bool WalletModel::getWalletUnlockStakingOnly()
@@ -637,7 +637,9 @@ void WalletModel::setWalletUnlockStakingOnly(bool unlock)
 
 void WalletModel::checkStakeWeightChanged()
 {
-    if (updateStakeWeight && m_wallet->tryGetStakeWeight(nWeight)) {
+    uint64_t weight{0};
+    if (updateStakeWeight && m_wallet->tryGetStakeWeight(weight)) {
+        nWeight.store(weight, std::memory_order_relaxed);
         updateStakeWeight = false;
     }
 }

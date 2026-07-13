@@ -364,6 +364,8 @@ struct QuantumKeyInfo
     int64_t creation_time{0};
     bool encrypted{false};
     bool durably_stored{false};
+    // A completed verification event was recorded; external file existence is
+    // intentionally not implied.
     bool backup_verified{false};
 };
 
@@ -548,6 +550,8 @@ private:
         std::vector<unsigned char> crypted_private_key;
         int64_t creation_time{0};
         bool durably_stored{false};
+        // Records a completed reopen-and-sign verification event. It cannot
+        // prove that an external backup file still exists.
         bool backup_verified{false};
 
         bool IsCrypted() const { return !crypted_private_key.empty(); }
@@ -1030,7 +1034,9 @@ public:
     // provides no real security
     std::atomic<bool> m_wallet_unlock_staking_only{false};
     int64_t m_last_coin_stake_search_time GUARDED_BY(cs_wallet){0};
-    int64_t m_last_coin_stake_search_interval GUARDED_BY(cs_wallet){0};
+    // Published by the staking thread and sampled by GUI/RPC health checks.
+    // Keep this atomic so status reads never have to wait behind a wallet scan.
+    std::atomic<int64_t> m_last_coin_stake_search_interval{0};
     uint256 m_last_coin_stake_search_tip GUARDED_BY(cs_wallet){};
     CAmount m_min_staking_amount{DEFAULT_MIN_STAKING_AMOUNT};
     CAmount m_reserve_balance{DEFAULT_RESERVE_BALANCE};
@@ -1047,6 +1053,13 @@ public:
     std::atomic<bool> m_shadow_signal_inflight{false};
     std::atomic<unsigned int> m_shadow_signal_retry_failures{0};
     std::atomic<int64_t> m_shadow_signal_next_retry_ms{0};
+    // Resume automatic QQSIGNAL fee-input discovery after the last bounded
+    // wallet-history slice instead of rescanning mapWallet from the beginning.
+    COutPoint m_shadow_signal_coin_scan_cursor GUARDED_BY(cs_wallet);
+    // GetStakeWeight is an O(wallet history) calculation. The staking worker
+    // publishes its most recent complete result for non-blocking RPC/GUI reads.
+    mutable std::atomic<uint64_t> m_cached_stake_weight{0};
+    mutable std::atomic<int> m_cached_stake_weight_height{-1};
     int m_redelegation_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_attempt_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_success_height GUARDED_BY(cs_wallet);
@@ -1379,6 +1392,12 @@ public:
         assert(m_last_block_processed_height >= 0);
         return m_last_block_processed_height;
     };
+    std::optional<int> GetLastBlockHeightIfSet() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        AssertLockHeld(cs_wallet);
+        if (m_last_block_processed_height < 0) return std::nullopt;
+        return m_last_block_processed_height;
+    }
     uint256 GetLastBlockHash() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         AssertLockHeld(cs_wallet);
@@ -1456,7 +1475,8 @@ public:
     bool IsStakeClosing();
 
     /* Staking thread group */
-    std::unique_ptr<std::vector<std::thread>> threadStakeMinerGroup;
+    Mutex m_staking_thread_mutex;
+    std::unique_ptr<std::vector<std::thread>> threadStakeMinerGroup GUARDED_BY(m_staking_thread_mutex);
 
     /* Built-in Gold Rush PoW miner */
     bool SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error, bool* created_payout = nullptr);

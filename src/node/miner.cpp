@@ -1155,16 +1155,20 @@ void static ThreadStakeMiner(CWallet *pwallet)
 // qtum
 void StakeCoins(bool fStake, CWallet *pwallet, std::unique_ptr<std::vector<std::thread>>& threadStakeMinerGroup)
 {
-    // If threadStakeMinerGroup is initialized join all threads and clear the vector
-    if (threadStakeMinerGroup) {
-        for (std::thread& thread : *threadStakeMinerGroup)
-            if (thread.joinable()) thread.join();
-        threadStakeMinerGroup->clear();
-    }
-
     if (fStake) {
+        // Start is idempotent. Joining a live worker here would wait forever
+        // because only the stop path publishes m_stop_staking_thread.
+        if (threadStakeMinerGroup && !threadStakeMinerGroup->empty()) return;
         threadStakeMinerGroup = std::make_unique<std::vector<std::thread>>();
         threadStakeMinerGroup->emplace_back(std::thread(&ThreadStakeMiner, pwallet));
+        return;
+    }
+
+    if (threadStakeMinerGroup) {
+        for (std::thread& thread : *threadStakeMinerGroup) {
+            if (thread.joinable()) thread.join();
+        }
+        threadStakeMinerGroup->clear();
     }
 }
 #endif

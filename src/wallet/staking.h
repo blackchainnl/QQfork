@@ -71,6 +71,15 @@ struct QuantumColdStakeRedelegationResult
 static constexpr size_t MAX_WALLET_SHADOW_SOLVE_REFERENCES{256};
 
 /**
+ * Per-attempt work budgets for automatic QQSIGNAL fee-input discovery.
+ * The cursor stored in CWallet resumes after the last inspected output, so a
+ * large historical wallet is covered over bounded retries without a stop-the-
+ * world AvailableCoins pass.
+ */
+static constexpr size_t MAX_AUTO_SHADOW_SIGNAL_WALLET_TX_SCAN{4096};
+static constexpr size_t MAX_AUTO_SHADOW_SIGNAL_WALLET_OUTPUT_SCAN{65536};
+
+/**
  * Return the newest confirmed wallet-owned coinstake solve per canonical
  * script. The wallet scan is in-memory; callers validate at most the fixed cap
  * above through HasRecentShadowSolverActivity while holding cs_main.

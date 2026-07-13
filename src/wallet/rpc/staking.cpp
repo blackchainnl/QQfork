@@ -40,6 +40,7 @@
 #include <univalue.h>
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <map>
 #include <optional>
@@ -48,6 +49,19 @@
 using node::BlockAssembler;
 
 namespace wallet {
+
+namespace {
+
+struct StakingRpcChainSnapshot
+{
+    std::atomic<int> height{-1};
+    std::atomic<uint64_t> network_weight{0};
+    std::atomic<double> difficulty{0.0};
+};
+
+StakingRpcChainSnapshot g_staking_rpc_chain_snapshot;
+
+} // namespace
 
 static CFeeRate FeeRateFromSatVbValue(const UniValue& value)
 {
@@ -368,8 +382,11 @@ static RPCHelpMan getstakinginfo()
                         {RPCResult::Type::NUM, "difficulty", "The current difficulty"},
                         {RPCResult::Type::NUM, "search-interval", "The staker search interval"},
                         {RPCResult::Type::NUM, "weight", "The staker weight"},
+                        {RPCResult::Type::BOOL, "weight_cached", "Whether weight is from a completed staking-wallet scan"},
+                        {RPCResult::Type::NUM, "weight_cache_height", "Active-chain height of the completed weight scan, or -1 when unavailable"},
                         {RPCResult::Type::NUM, "netstakeweight", "Network stake weight"},
                         {RPCResult::Type::NUM, "expectedtime", "Expected time to earn reward"},
+                        {RPCResult::Type::BOOL, "chainstate_cached", "Whether chain statistics were served from the last non-blocking snapshot"},
                         {RPCResult::Type::STR, "chain", "Current chain name"},
                         {RPCResult::Type::STR, "warnings", "Current network and wallet warnings"},
                     }
@@ -384,24 +401,52 @@ static RPCHelpMan getstakinginfo()
     if (!pwallet) return NullUniValue;
     ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
 
-    uint64_t nWeight = 0;
-    uint64_t lastCoinStakeSearchInterval = 0;
-
-    if (pwallet)
-    {
-        LOCK2(::cs_main, pwallet->cs_wallet);
-        nWeight = pwallet->GetStakeWeight();
-        lastCoinStakeSearchInterval = pwallet->m_enabled_staking ? pwallet->m_last_coin_stake_search_interval : 0;
-    }
+    // GetStakeWeight walks the complete wallet. The staking worker publishes
+    // the last completed result, so this health RPC remains responsive while
+    // block assembly or QQSIGNAL signing owns the chain/wallet locks.
+    const int weight_cache_height = pwallet->m_cached_stake_weight_height.load(std::memory_order_acquire);
+    const bool weight_cached = weight_cache_height >= 0;
+    const uint64_t nWeight = weight_cached
+        ? pwallet->m_cached_stake_weight.load(std::memory_order_relaxed)
+        : 0;
+    const uint64_t lastCoinStakeSearchInterval = pwallet->m_enabled_staking
+        ? static_cast<uint64_t>(std::max<int64_t>(0, pwallet->m_last_coin_stake_search_interval.load(std::memory_order_relaxed)))
+        : 0;
 
     const CTxMemPool& mempool = pwallet->chain().mempool();
     ChainstateManager& chainman = pwallet->chain().chainman();
-    LOCK(cs_main);
-    const CChain& active_chain = chainman.ActiveChain();
+    int blocks = g_staking_rpc_chain_snapshot.height.load(std::memory_order_acquire);
+    uint64_t nNetworkWeight = g_staking_rpc_chain_snapshot.network_weight.load(std::memory_order_relaxed);
+    double difficulty = g_staking_rpc_chain_snapshot.difficulty.load(std::memory_order_relaxed);
+    bool chainstate_cached{true};
+    std::optional<int64_t> current_block_weight;
+    std::optional<int64_t> current_block_txs;
+    {
+        TRY_LOCK(::cs_main, main_lock);
+        if (main_lock) {
+            chainstate_cached = false;
+            blocks = chainman.ActiveChain().Height();
+            nNetworkWeight = static_cast<uint64_t>(1.1429 * GetPoSKernelPS(chainman));
+            if (chainman.m_best_header) {
+                difficulty = GetDifficulty(GetLastBlockIndex(chainman.m_best_header, true));
+            }
+            if (BlockAssembler::m_last_block_weight) current_block_weight = *BlockAssembler::m_last_block_weight;
+            if (BlockAssembler::m_last_block_num_txs) current_block_txs = *BlockAssembler::m_last_block_num_txs;
+            g_staking_rpc_chain_snapshot.network_weight.store(nNetworkWeight, std::memory_order_relaxed);
+            g_staking_rpc_chain_snapshot.difficulty.store(difficulty, std::memory_order_relaxed);
+            g_staking_rpc_chain_snapshot.height.store(blocks, std::memory_order_release);
+        }
+    }
+    if (blocks < 0) {
+        TRY_LOCK(pwallet->cs_wallet, wallet_lock);
+        const std::optional<int> wallet_height = wallet_lock
+            ? pwallet->GetLastBlockHeightIfSet()
+            : std::nullopt;
+        blocks = wallet_height.value_or(0);
+    }
 
     UniValue obj(UniValue::VOBJ);
 
-    uint64_t nNetworkWeight = 1.1429 * GetPoSKernelPS(chainman);
     bool staking = lastCoinStakeSearchInterval && nWeight;
 
     const Consensus::Params& consensusParams = Params().GetConsensus();
@@ -411,17 +456,20 @@ static RPCHelpMan getstakinginfo()
     obj.pushKV("enabled", pwallet->m_enabled_staking.load());
     obj.pushKV("staking", staking);
 
-    obj.pushKV("blocks", active_chain.Height());
-    if (BlockAssembler::m_last_block_weight) obj.pushKV("currentblockweight", *BlockAssembler::m_last_block_weight);
-    if (BlockAssembler::m_last_block_num_txs) obj.pushKV("currentblocktx", *BlockAssembler::m_last_block_num_txs);
+    obj.pushKV("blocks", blocks);
+    if (current_block_weight) obj.pushKV("currentblockweight", *current_block_weight);
+    if (current_block_txs) obj.pushKV("currentblocktx", *current_block_txs);
     obj.pushKV("pooledtx", (uint64_t)mempool.size());
 
-    obj.pushKV("difficulty", GetDifficulty(GetLastBlockIndex(chainman.m_best_header, true)));
+    obj.pushKV("difficulty", difficulty);
 
     obj.pushKV("search-interval", (int)lastCoinStakeSearchInterval);
     obj.pushKV("weight", (uint64_t)nWeight);
+    obj.pushKV("weight_cached", weight_cached);
+    obj.pushKV("weight_cache_height", weight_cache_height);
     obj.pushKV("netstakeweight", (uint64_t)nNetworkWeight);
     obj.pushKV("expectedtime", nExpectedTime);
+    obj.pushKV("chainstate_cached", chainstate_cached);
 
     obj.pushKV("chain", chainman.GetParams().GetChainTypeString());
     obj.pushKV("warnings", GetWarnings(false).original);
