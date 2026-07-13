@@ -1,3 +1,4 @@
+// Copyright (c) 2016-present The Bitcoin Core developers
 // Copyright (c) 2016-present Blackcoin Core Developers
 // Copyright (c) 2016-present Blackcoin More Developers
 // Copyright (c) 2016-present Quantum Quasar Developers

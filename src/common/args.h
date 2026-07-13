@@ -1,3 +1,4 @@
+// Copyright (c) 2023 The Bitcoin Core developers
 // Copyright (c) 2023 Blackcoin Core Developers
 // Copyright (c) 2023 Blackcoin More Developers
 // Copyright (c) 2023 Blackcoin Developers

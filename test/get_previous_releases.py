@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #
+# Copyright (c) 2018-present The Bitcoin Core developers
 # Copyright (c) 2018-present Blackcoin Core Developers
 # Copyright (c) 2018-present Blackcoin More Developers
 # Copyright (c) 2018-present Blackcoin Developers

@@ -1,4 +1,5 @@
 #!/bin/sh
+# Copyright (c) 2017-2022 The Bitcoin Core developers
 # Copyright (c) 2017-2022 Blackcoin Core Developers
 # Copyright (c) 2017-2022 Blackcoin More Developers
 # Copyright (c) 2017-2022 Blackcoin Developers

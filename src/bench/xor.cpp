@@ -1,3 +1,4 @@
+// Copyright (c) The Bitcoin Core developers
 // Copyright (c) Blackcoin Core Developers
 // Copyright (c) Blackcoin More Developers
 // Copyright (c) Quantum Quasar Developers

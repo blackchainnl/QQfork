@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Copyright (c) 2014-2021 The Bitcoin Core developers
 # Copyright (c) 2014-2021 Blackcoin Core Developers
 # Copyright (c) 2014-2021 Blackcoin More Developers
 # Copyright (c) 2014-2021 Blackcoin Developers

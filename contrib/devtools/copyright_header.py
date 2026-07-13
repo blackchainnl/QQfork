@@ -77,6 +77,7 @@ def get_filenames_to_examine(base_directory):
 ################################################################################
 
 
+# Copyright (c) 2016-2022 The Bitcoin Core developers
 COPYRIGHT_WITH_C = r'Copyright \(c\)'
 COPYRIGHT_WITHOUT_C = 'Copyright'
 ANY_COPYRIGHT_STYLE = '(%s|%s)' % (COPYRIGHT_WITH_C, COPYRIGHT_WITHOUT_C)

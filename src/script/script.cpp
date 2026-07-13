@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2009-present The Bitcoin Core developers
 // Copyright (c) 2009-2021 Blackcoin Core Developers
 // Copyright (c) 2009-2021 Blackcoin More Developers
 // Copyright (c) 2009-2021 Quantum Quasar Developers

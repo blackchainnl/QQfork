@@ -18,6 +18,7 @@
 #error Client version information missing: version is not defined by bitcoin-config.h or in any other way
 #endif
 
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 //! Copyright string used in Windows .rc files
 #define COPYRIGHT_STR "2009-" STRINGIZE(COPYRIGHT_YEAR) " " COPYRIGHT_HOLDERS_FINAL
 
