@@ -159,7 +159,7 @@ QString outputSelectorLabel(const interfaces::WalletQuantumStakeOutputInfo& outp
     QString text = QObject::tr("%1  |  %2  |  %3")
         .arg(state.isEmpty() ? QObject::tr("Unknown") : state)
         .arg(formatBLK(output.amount))
-        .arg(shortenHex(output.txid + ":" + std::to_string(output.vout)));
+        .arg(shortenHex(outputSelectorKey(output.txid, output.vout).toStdString()));
     if (output.unlock_height > 0) {
         text += QObject::tr("  |  unlock %1").arg(output.unlock_height);
     }
@@ -1439,7 +1439,12 @@ void StakingMiningPage::onApplyPow()
         return;
     }
     m_pow_settings_dirty = false;
-    updateStatus();
+    m_pow_status->setText(enabled
+        ? tr("Gold Rush PoW mining is enabled with %1 core(s) at %2% target duty cycle. Press Refresh details for the payout address and live statistics.")
+              .arg(cores)
+              .arg(percent)
+        : tr("Gold Rush PoW mining is off."));
+    refreshControlsEnabled();
 }
 
 void StakingMiningPage::onCopyPayoutAddress()

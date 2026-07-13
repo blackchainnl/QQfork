@@ -59,6 +59,7 @@
 #include <QTextEdit>
 #include <QListView>
 #include <QDialogButtonBox>
+#include <QElapsedTimer>
 
 using wallet::AddWallet;
 using wallet::CWallet;
@@ -83,6 +84,20 @@ void ConfirmSend(QString* text = nullptr, QMessageBox::StandardButton confirm_ty
                 QAbstractButton* button = dialog->button(confirm_type);
                 button->setEnabled(true);
                 button->click();
+            }
+        }
+    });
+}
+
+//! Press a standard button in a modal message box.
+void ConfirmMessageBox(QMessageBox::StandardButton confirm_type)
+{
+    QTimer::singleShot(0, [confirm_type]() {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            if (auto* dialog = qobject_cast<QMessageBox*>(widget)) {
+                if (QAbstractButton* button = dialog->button(confirm_type)) {
+                    button->click();
+                }
             }
         }
     });
@@ -153,7 +168,7 @@ void CompareBalance(WalletModel& walletModel, CAmount expected_balance, QLabel* 
 {
     BitcoinUnit unit = walletModel.getOptionsModel()->getDisplayUnit();
     QString balanceComparison = BitcoinUnits::formatWithUnit(unit, expected_balance, false, BitcoinUnits::SeparatorStyle::ALWAYS);
-    QCOMPARE(balance_label_to_check->text().trimmed(), balanceComparison);
+    QTRY_COMPARE_WITH_TIMEOUT(balance_label_to_check->text().trimmed(), balanceComparison, 5000);
 }
 
 // Verify the 'useAvailableBalance' functionality. With and without manually selected coins.
@@ -294,6 +309,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     StakingMiningPage page(platformStyle);
     page.setClientModel(mini_gui.clientModel.get());
     page.setWalletModel(&walletModel);
+    page.show();
+    qApp->processEvents();
 
     QCheckBox* staking_enable = page.findChild<QCheckBox*>("stakingEnable");
     QCheckBox* unlock_staking_only = page.findChild<QCheckBox*>("unlockStakingOnly");
@@ -309,6 +326,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QPushButton* pow_copy = page.findChild<QPushButton*>("powCopy");
     QLabel* pow_status = page.findChild<QLabel*>("powStatus");
     QLabel* pow_warning = page.findChild<QLabel*>("powWarning");
+    QPushButton* refresh_details = page.findChild<QPushButton*>("stakingMiningRefresh");
     QLabel* migration_phase = page.findChild<QLabel*>("migrationPhase");
     QLabel* migration_deadline = page.findChild<QLabel*>("migrationDeadline");
     QLabel* migration_legacy_amount = page.findChild<QLabel*>("migrationLegacyAmount");
@@ -372,6 +390,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(pow_copy);
     QVERIFY(pow_status);
     QVERIFY(pow_warning);
+    QVERIFY(refresh_details);
     QVERIFY(migration_phase);
     QVERIFY(migration_deadline);
     QVERIFY(migration_legacy_amount);
@@ -421,7 +440,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(coldstake_withdraw);
     QVERIFY(coldstake_status);
 
-    QVERIFY(QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection));
+    refresh_details->click();
+    qApp->processEvents();
     QCOMPARE(staking_enable->isChecked(), false);
     QCOMPARE(unlock_staking_only->isChecked(), false);
     QVERIFY(!unlock_staking_only->isEnabled());
@@ -574,8 +594,10 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     const int requested_threads = std::min(2, pow_cores->maximum());
     pow_cores->setValue(requested_threads);
     pow_percent->setValue(25);
+    ConfirmMessageBox(QMessageBox::Yes);
     pow_enable->click();
     qApp->processEvents();
+    QVERIFY(pow_status->text().contains(QString("enabled")));
 
     interfaces::WalletPowMiningInfo info;
     for (int i = 0; i < 50; ++i) {
@@ -592,16 +614,20 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     const CTxDestination payout_dest = DecodeDestination(info.payout_address);
     QVERIFY(IsValidDestination(payout_dest));
     QVERIFY(IsQuantumMigrationDestination(payout_dest));
+    refresh_details->click();
+    qApp->processEvents();
     QCOMPARE(pow_payout->text(), QString::fromStdString(info.payout_address));
     QVERIFY(pow_copy->isEnabled());
 
     pow_copy->click();
     QCOMPARE(QApplication::clipboard()->text(), pow_payout->text());
-    QVERIFY(pow_warning->text().contains(QString("fresh quantum address")));
+    QVERIFY(pow_warning->text().contains(QString("Back up this wallet")));
+    QVERIFY(pow_warning->text().contains(QString("locked until Gold Rush ends")));
 
     pow_enable->click();
     qApp->processEvents();
     QVERIFY(!walletModel.wallet().getPowMiningInfo().enabled);
+    QCOMPARE(pow_status->text(), QString("Gold Rush PoW mining is off."));
 }
 
 void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet, const PlatformStyle* platformStyle)
@@ -615,6 +641,8 @@ void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, co
     StakingMiningPage page(platformStyle);
     page.setClientModel(mini_gui.clientModel.get());
     page.setWalletModel(wallet_model);
+    page.show();
+    qApp->processEvents();
 
     QCheckBox* staking_enable = page.findChild<QCheckBox*>("stakingEnable");
     QLabel* staking_status = page.findChild<QLabel*>("stakingStatus");
@@ -671,8 +699,11 @@ void TestWalletPagesScale(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
     QVERIFY(wallet_view.findChild<QTableView*>(QStringLiteral("transactionView")));
     QVERIFY(wallet_view.minimumSizeHint().width() <= 640);
 
+    QElapsedTimer staking_page_timer;
+    staking_page_timer.start();
     wallet_view.gotoStakingMiningPage();
     qApp->processEvents();
+    QVERIFY2(staking_page_timer.elapsed() < 5000, "Staking/Mining page switch exceeded 5 seconds");
     auto* staking_scroll = wallet_view.findChild<QScrollArea*>(QStringLiteral("stakingMiningScrollPage"));
     QVERIFY(staking_scroll);
     QCOMPARE(wallet_view.currentWidget(), staking_scroll);
