@@ -144,12 +144,14 @@ jobs:
             [[ "$IS_RELEASE" == "true" || "$IS_RELEASE" == "false" ]]
           fi
 
-          echo "target_sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
-          echo "source_date_epoch=$(git show -s --format=%ct "$TARGET_SHA")" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "target=$TARGET" >> "$GITHUB_OUTPUT"
-          echo "publish=$PUBLISH" >> "$GITHUB_OUTPUT"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          {
+            echo "target_sha=$TARGET_SHA"
+            echo "source_date_epoch=$(git show -s --format=%ct "$TARGET_SHA")"
+            echo "version=$VERSION"
+            echo "target=$TARGET"
+            echo "publish=$PUBLISH"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
 
   safety-gate:
     name: Exhaustive exact-SHA safety gate
@@ -433,7 +435,8 @@ jobs:
           for primary in "${primaries[@]}"; do
             artifact_name=$(basename "$primary")
             target="${artifact_name#release-}"
-            target="${target%-primary-$TARGET_SHA}"
+            suffix="-primary-$TARGET_SHA"
+            target="${target%"$suffix"}"
             verifier="artifacts/release-$target-verifier-$TARGET_SHA"
             test -d "$verifier"
             python3 ci/release/verify_reproducible.py \
@@ -656,7 +659,8 @@ jobs:
           test "${#archives[@]}" -eq 2
           for archive in "${archives[@]}"; do
             base=$(basename "$archive")
-            label="${base#Blackcoin-$VERSION-macOS-}"
+            prefix="Blackcoin-$VERSION-macOS-"
+            label="${base#"$prefix"}"
             label="${label%-Qt-app.tar.gz}"
             rm -rf work/*
             tar -C work -xzf "$archive"
@@ -694,7 +698,7 @@ jobs:
           UNIVERSAL_ROOT="Blackcoin-$VERSION-macOS-Universal-Qt-apps"
           mkdir -p "universal/$UNIVERSAL_ROOT/Intel-x86_64" \
             "universal/$UNIVERSAL_ROOT/Apple-Silicon-ARM64"
-          for archive in release-assets/Blackcoin-$VERSION-macOS-*-Qt-app.zip; do
+          for archive in "release-assets/Blackcoin-$VERSION-macOS-"*-Qt-app.zip; do
             rm -rf universal-work
             mkdir -p universal-work
             ditto -x -k "$archive" universal-work
