@@ -62,7 +62,7 @@ index 65e31724bc..f61b471953 100644
 )
 
 if [ "$RUN_FUZZ_TESTS" = "true" ]; then
-  export DIR_FUZZ_IN=${DIR_QA_ASSETS}/fuzz_seed_corpus/
+  export DIR_FUZZ_IN=${DIR_QA_ASSETS}/fuzz_corpora/
   if [ ! -d "$DIR_FUZZ_IN" ]; then
     rm -rf "${DIR_QA_ASSETS}"
     ${CI_RETRY_EXE} git clone --filter=blob:none --no-checkout https://github.com/bitcoin-core/qa-assets "${DIR_QA_ASSETS}"
