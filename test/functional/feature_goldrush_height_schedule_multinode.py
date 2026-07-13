@@ -51,6 +51,7 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
         # tens of seconds, so keep RPCs comfortably inside the socket timeout.
         self.rpc_timeout = 600
         common = [
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
             "-solostaking=1",

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 #
+# Copyright (c) 2018-2022 The Bitcoin Core developers
 # Copyright (c) 2018-2022 Blackcoin Core Developers
 # Copyright (c) 2018-2022 Blackcoin More Developers
 # Copyright (c) 2018-2022 Blackcoin Developers
@@ -18,6 +19,7 @@ from subprocess import check_output, CalledProcessError
 
 
 EXCLUDED_DIRS = ["contrib/devtools/bitcoin-tidy/",
+                 "src/crypto/argon2/",
                  "src/leveldb/",
                  "src/crc32c/",
                  "src/secp256k1/",
@@ -33,6 +35,7 @@ EXPECTED_BOOST_INCLUDES = ["boost/date_time/posix_time/posix_time.hpp",
                            "boost/multi_index/tag.hpp",
                            "boost/multi_index_container.hpp",
                            "boost/process.hpp",
+                           "boost/process/v1.hpp",
                            "boost/signals2/connection.hpp",
                            "boost/signals2/optional_last_value.hpp",
                            "boost/signals2/signal.hpp",

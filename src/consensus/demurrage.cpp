@@ -86,11 +86,28 @@ bool ParseAttestationScript(const CScript& script, valtype& payload)
 COutPoint LatestAttestationOutpoint(const uint256& pubkey_hash)
 {
     CHashWriter ss;
+    // v2 starts from the authenticated empty activation sentinel below. No
+    // pre-activation record is reachable in this namespace, so activation
+    // never needs to enumerate the UTXO set looking for development-era state.
+    ss << std::string("Quantum Quasar Demurrage Latest v2") << pubkey_hash;
+    return COutPoint{ss.GetHash(), 0};
+}
+
+COutPoint PrereleaseLatestAttestationOutpoint(const uint256& pubkey_hash)
+{
+    CHashWriter ss;
     ss << std::string("Quantum Quasar Demurrage Latest") << pubkey_hash;
     return COutPoint{ss.GetHash(), 0};
 }
 
 COutPoint DemurrageInventoryOutpoint()
+{
+    CHashWriter ss;
+    ss << std::string("Quantum Quasar Demurrage Inventory v2");
+    return COutPoint{ss.GetHash(), 0};
+}
+
+COutPoint PrereleaseDemurrageInventoryOutpoint()
 {
     CHashWriter ss;
     ss << std::string("Quantum Quasar Demurrage Inventory v1");
@@ -165,7 +182,7 @@ uint256 FinalizedMuHash(const MuHash3072& source)
 valtype DemurrageStateLeaf(const DemurrageLatestRecord& record)
 {
     DataStream stream;
-    stream << std::string("Quantum Quasar Demurrage Inventory Leaf v1")
+    stream << std::string("Quantum Quasar Demurrage Inventory Leaf v2")
            << LatestAttestationOutpoint(record.pubkey_hash)
            << EncodeLatestPayload(record);
     const auto bytes = MakeUCharSpan(stream);
@@ -175,13 +192,15 @@ valtype DemurrageStateLeaf(const DemurrageLatestRecord& record)
 valtype EncodeDemurrageInventory(const DemurrageInventoryState& state)
 {
     DataStream stream;
-    stream << uint8_t{3} << state.tip_height << state.tip_hash << state.live_count
+    stream << uint8_t{4} << state.tip_height << state.tip_hash << state.live_count
            << state.live_set << state.live_root;
     const auto bytes = MakeUCharSpan(stream);
     return valtype(bytes.begin(), bytes.end());
 }
 
-bool DecodeDemurrageInventory(const CScript& script, DemurrageInventoryState& state)
+bool DecodeDemurrageInventoryVersion(const CScript& script,
+                                     uint8_t expected_version,
+                                     DemurrageInventoryState& state)
 {
     state = {};
     valtype payload;
@@ -191,11 +210,22 @@ bool DecodeDemurrageInventory(const CScript& script, DemurrageInventoryState& st
         uint8_t version{0};
         stream >> version >> state.tip_height >> state.tip_hash >> state.live_count
                >> state.live_set >> state.live_root;
-        if (!stream.empty() || version != 3) return false;
+        if (!stream.empty() || version != expected_version) return false;
     } catch (const std::exception&) {
         return false;
     }
     return !state.tip_hash.IsNull() && FinalizedMuHash(state.live_set) == state.live_root;
+}
+
+bool DecodeDemurrageInventory(const CScript& script, DemurrageInventoryState& state)
+{
+    return DecodeDemurrageInventoryVersion(script, /*expected_version=*/4, state);
+}
+
+bool DecodePrereleaseDemurrageInventory(const CScript& script,
+                                        DemurrageInventoryState& state)
+{
+    return DecodeDemurrageInventoryVersion(script, /*expected_version=*/3, state);
 }
 
 enum class InventoryReadResult { MISSING, VALID, INVALID };
@@ -426,30 +456,12 @@ bool PrepareDemurrageActivationInventory(CCoinsViewCache& view,
     }
     if (result != InventoryReadResult::MISSING) return false;
 
-    std::unique_ptr<CCoinsViewCursor> cursor(view.Cursor());
-    if (!cursor) return false;
-    while (cursor->Valid()) {
-        COutPoint outpoint;
-        Coin coin;
-        if (!cursor->GetKey(outpoint) || !cursor->GetValue(coin)) return false;
-        if (!coin.IsSpent()) {
-            const bool latest_marker = HasMarkerTag(coin.out.scriptPubKey, TAG_LATEST);
-            if (latest_marker) {
-                valtype payload;
-                DemurrageLatestRecord record;
-                if (ParseMarkerScript(coin.out.scriptPubKey, TAG_LATEST, &payload) &&
-                    DecodeLatestPayload(payload, record) &&
-                    outpoint == LatestAttestationOutpoint(record.pubkey_hash)) {
-                    // A valid record at its reserved outpoint before A is stale
-                    // internal state. Ordinary marker-shaped outputs at normal
-                    // transaction outpoints remain ordinary UTXOs.
-                    return false;
-                }
-            }
-            if (outpoint == DemurrageInventoryOutpoint()) return false;
-        }
-        cursor->Next();
-    }
+    // Attestation-shaped outputs are inert before activation and cannot create
+    // private latest-record state. The v2 namespace has also never been written
+    // by a released node. The authenticated empty inventory is therefore the
+    // complete deterministic pre-state. A full UTXO cursor scan here would make
+    // the first Final block's connect time proportional to the lifetime
+    // chainstate and create a common liveness failure at the network-wide boundary.
     return WriteDemurrageInventory(view, pindex, {});
 }
 
@@ -722,7 +734,7 @@ std::vector<DemurrageAttestation> ExtractDemurrageAttestations(const CTransactio
     return attestations;
 }
 
-bool CheckDemurrageAttestations(const CTransaction& tx,
+static bool CheckDemurrageAttestationsImpl(const CTransaction& tx,
                                 const CCoinsViewCache& view,
                                 const Params& params,
                                 int spend_height,
@@ -766,7 +778,13 @@ bool CheckDemurrageAttestations(const CTransaction& tx,
             attestation.previous_coverage_start_height,
             attestation.previous_source,
             attestation.pubkey, params.nQuantumSighashChainId);
-        if (!ML_DSA::Verify(attestation.pubkey, msg_hash.begin(), uint256::size(), attestation.signature)) {
+        const MLDSAVerifyResult verify_result = ML_DSA::VerifyDetailed(
+            attestation.pubkey, msg_hash.begin(), uint256::size(), attestation.signature);
+        if (verify_result == MLDSAVerifyResult::INTERNAL_ERROR) {
+            reject_reason = "local-demurrage-mldsa-verification-error";
+            return false;
+        }
+        if (verify_result != MLDSAVerifyResult::VALID) {
             reject_reason = "bad-demurrage-attestation-signature";
             return false;
         }
@@ -828,6 +846,40 @@ bool CheckDemurrageAttestations(const CTransaction& tx,
     attested_keys = std::move(next_keys);
     attestation_count += attestations.size();
     return true;
+}
+
+DemurrageAttestationValidationResult CheckDemurrageAttestationsDetailed(
+                                const CTransaction& tx,
+                                const CCoinsViewCache& view,
+                                const Params& params,
+                                int spend_height,
+                                int64_t spend_time,
+                                std::set<uint256>& attested_keys,
+                                size_t& attestation_count,
+                                std::string& reject_reason)
+{
+    if (CheckDemurrageAttestationsImpl(tx, view, params, spend_height, spend_time,
+                                      attested_keys, attestation_count, reject_reason)) {
+        return DemurrageAttestationValidationResult::VALID;
+    }
+    return reject_reason.rfind("local-demurrage-", 0) == 0
+        ? DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR
+        : DemurrageAttestationValidationResult::INVALID;
+}
+
+bool CheckDemurrageAttestations(const CTransaction& tx,
+                                const CCoinsViewCache& view,
+                                const Params& params,
+                                int spend_height,
+                                int64_t spend_time,
+                                std::set<uint256>& attested_keys,
+                                size_t& attestation_count,
+                                std::string& reject_reason)
+{
+    return CheckDemurrageAttestationsDetailed(
+               tx, view, params, spend_height, spend_time,
+               attested_keys, attestation_count, reject_reason) ==
+           DemurrageAttestationValidationResult::VALID;
 }
 
 std::optional<uint256> DemurrageControllingKeyHashForScript(const CScript& script_pub_key)
@@ -932,23 +984,82 @@ bool DecodeAuthenticatedDemurrageLatestState(const COutPoint& outpoint, const Co
     return true;
 }
 
+/**
+ * Recognize obsolete, local-only demurrage records for deletion. These
+ * namespaces are deliberately never consulted by consensus evaluation,
+ * inventory application, or the replay fingerprint. Authentication requires
+ * the deterministic reserved outpoint, auxiliary-coin metadata, and an exact
+ * active-chain source anchor. A marker-shaped transaction output at any normal
+ * outpoint therefore remains an ordinary user UTXO.
+ */
+static bool IsAuthenticatedPrereleaseDemurrageStateOutpointForPurge(
+    const COutPoint& outpoint,
+    const Coin& coin,
+    const CBlockIndex* pindex_tip)
+{
+    if (!pindex_tip || coin.out.nValue != 0 || !coin.fCoinBase || coin.fCoinStake ||
+        coin.nHeight > static_cast<uint32_t>(pindex_tip->nHeight)) {
+        return false;
+    }
+    const CBlockIndex* marker_block = pindex_tip->GetAncestor(static_cast<int>(coin.nHeight));
+    if (!marker_block || coin.nTime != static_cast<uint32_t>(marker_block->GetBlockTime())) {
+        return false;
+    }
+
+    if (outpoint == PrereleaseDemurrageInventoryOutpoint()) {
+        DemurrageInventoryState inventory;
+        return DecodePrereleaseDemurrageInventory(coin.out.scriptPubKey, inventory) &&
+               inventory.tip_height == coin.nHeight &&
+               inventory.tip_hash == marker_block->GetBlockHash();
+    }
+
+    valtype payload;
+    if (!ParseMarkerScript(coin.out.scriptPubKey, TAG_LATEST, &payload)) return false;
+
+    // The unreleased rolling-inventory implementation used the current v2
+    // latest-record payload in the old outpoint namespace.
+    DemurrageLatestRecord record;
+    if (DecodeLatestPayload(payload, record)) {
+        const CBlockIndex* source_block = pindex_tip->GetAncestor(record.state.height);
+        return source_block && source_block->GetBlockHash() == record.source_block_hash &&
+               coin.nHeight == static_cast<uint32_t>(record.state.height) &&
+               coin.nTime == record.state.time &&
+               coin.nTime == static_cast<uint32_t>(source_block->GetBlockTime()) &&
+               outpoint == PrereleaseLatestAttestationOutpoint(record.pubkey_hash);
+    }
+
+    // v30.1.0 used the same reserved outpoint with a 32-byte key-hash payload.
+    // It can be authenticated without interpreting or accepting it as current
+    // state. Old undo records are not guessed here; the mandatory chainstate
+    // rebuild wipes the database before deterministic replay.
+    if (payload.size() != uint256::size()) return false;
+    uint256 legacy_pubkey_hash;
+    std::copy(payload.begin(), payload.end(), legacy_pubkey_hash.begin());
+    return !legacy_pubkey_hash.IsNull() &&
+           outpoint == PrereleaseLatestAttestationOutpoint(legacy_pubkey_hash);
+}
+
 bool PurgeAuthenticatedDemurrageState(CCoinsViewCache& view, const CBlockIndex* pindex_tip, uint64_t& removed)
 {
+    removed = 0;
     std::vector<COutPoint> authenticated;
     {
         std::unique_ptr<CCoinsViewCursor> cursor(view.Cursor());
+        if (!cursor) return false;
         while (cursor->Valid()) {
             COutPoint outpoint;
             Coin coin;
-            if (cursor->GetKey(outpoint) && cursor->GetValue(coin) && !coin.IsSpent() &&
-                IsAuthenticatedDemurrageStateOutpoint(outpoint, coin, pindex_tip)) {
+            if (!cursor->GetKey(outpoint) || !cursor->GetValue(coin)) return false;
+            if (!coin.IsSpent() &&
+                (IsAuthenticatedDemurrageStateOutpoint(outpoint, coin, pindex_tip) ||
+                 IsAuthenticatedPrereleaseDemurrageStateOutpointForPurge(
+                     outpoint, coin, pindex_tip))) {
                 authenticated.push_back(outpoint);
             }
             cursor->Next();
         }
     }
 
-    removed = 0;
     for (const COutPoint& outpoint : authenticated) {
         if (view.SpendCoin(outpoint)) ++removed;
     }
@@ -1034,6 +1145,8 @@ bool RollforwardDemurrageBlock(CCoinsViewCache& view, const CBlock& block, const
     // block's state transition from its signed attestations.
     std::set<uint256> keys;
     size_t count{0};
+    std::vector<std::pair<uint256, DemurrageAttestation>> verified_attestations;
+    verified_attestations.reserve(MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK);
     for (const CTransactionRef& tx : block.vtx) {
         const std::vector<DemurrageAttestation> attestations = ExtractDemurrageAttestations(*tx);
         if (attestations.size() > MAX_DEMURRAGE_ATTESTATIONS_PER_TX ||
@@ -1057,12 +1170,19 @@ bool RollforwardDemurrageBlock(CCoinsViewCache& view, const CBlock& block, const
                 attestation.previous_coverage_start_height, attestation.previous_source,
                 attestation.pubkey,
                 params.nQuantumSighashChainId);
-            if (!ML_DSA::Verify(attestation.pubkey, msg_hash.begin(), uint256::size(), attestation.signature)) {
+            if (ML_DSA::VerifyDetailed(attestation.pubkey, msg_hash.begin(), uint256::size(), attestation.signature) !=
+                MLDSAVerifyResult::VALID) {
                 return false;
             }
-            if (!ApplyAttestationInventoryTransition(view, inventory, attestation, tx->GetHash(),
-                                                     pindex, params)) return false;
+            verified_attestations.emplace_back(tx->GetHash(), attestation);
         }
+    }
+    // Complete all cryptographic verification before changing replay state.
+    // A transient verifier failure can therefore abort startup recovery
+    // without leaving a prefix of this block's attestations applied.
+    for (const auto& [txid, attestation] : verified_attestations) {
+        if (!ApplyAttestationInventoryTransition(view, inventory, attestation, txid,
+                                                 pindex, params)) return false;
     }
     return WriteDemurrageInventory(view, pindex, std::move(inventory));
 }

@@ -157,7 +157,7 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
         label->setTextInteractionFlags(Qt::LinksAccessibleByMouse | Qt::TextSelectableByKeyboard | Qt::TextSelectableByMouse);
     }
     m_label_legacy_balance->setToolTip(tr("Spendable balance held in legacy Blackcoin outputs."));
-    m_label_quantum_balance->setToolTip(tr("Wallet-controlled quantum-resistant Blackcoin outputs. Some outputs may need confirmation, a Gold Rush move, unbonding, or demurrage attestation before ordinary spending."));
+    m_label_quantum_balance->setToolTip(tr("Wallet-controlled quantum-resistant Blackcoin outputs. Some outputs may need confirmation, the end of Gold Rush, unbonding, or a demurrage attestation before ordinary spending."));
     ui->gridLayout->addWidget(m_label_legacy_balance_text, 8, 0);
     ui->gridLayout->addWidget(m_label_legacy_balance, 8, 1);
     ui->gridLayout->addWidget(m_label_quantum_balance_text, 9, 0);

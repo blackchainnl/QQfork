@@ -13,6 +13,7 @@ be double-spent by the next coinstake.
 from decimal import Decimal
 import time
 
+from test_framework.authproxy import JSONRPCException
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
@@ -108,6 +109,18 @@ class GoldRushPosSingleUtxoTest(BitcoinTestFramework):
         self.wait_until(lambda: len(self._get_quantum_utxos(wallet, address)) == 1, timeout=30)
         return self._get_quantum_utxos(wallet, address)[0]
 
+    @staticmethod
+    def _send_pow_claim(wallet, signal_address, payout_address):
+        last_error = None
+        for _ in range(5):
+            try:
+                return wallet.sendshadowpowclaim(signal_address, payout_address, 500000)
+            except JSONRPCException as e:
+                last_error = e
+                if e.error["code"] != -26 or "Active chain tip changed while grinding" not in e.error["message"]:
+                    raise
+        raise last_error
+
     def run_test(self):
         node = self.nodes[0]
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
@@ -172,6 +185,25 @@ class GoldRushPosSingleUtxoTest(BitcoinTestFramework):
             duplicate_payout_address,
         )
 
+        self.log.info("A restart without mempool persistence restores exactly one pending QQSIGNAL")
+        self.restart_node(0, self.extra_args[0] + ["-persistmempool=0", f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        node.loadwallet(WALLET_NAME)
+        wallet = node.get_wallet_rpc(WALLET_NAME)
+        # Wallet startup recovery may resubmit before the staking worker starts;
+        # the worker must recognize that transaction rather than constructing a
+        # competing signal for the same input.
+        wallet.staking(True)
+        try:
+            self.wait_until(lambda: signal["txid"] in node.getrawmempool(), timeout=15)
+        finally:
+            wallet.staking(False)
+        signal_records = [
+            tx for tx in wallet.listtransactions("*", 100, 0, True)
+            if tx.get("txid") == signal["txid"] and tx.get("comment") == "PoS Claim"
+        ]
+        assert_equal(len(signal_records), 1)
+
         self.log.info("Mining a PoS block with the pending signal does not double-spend the signaling input")
         payout_block_hash = self._mine_pos_block(wallet, expected_txids=[signal["txid"]])
         payout_block = node.getblock(payout_block_hash, 2)
@@ -191,7 +223,7 @@ class GoldRushPosSingleUtxoTest(BitcoinTestFramework):
         pow_payout_address = wallet.getnewquantumaddress("single-utxo-pow-payout")["address"]
         self.generatetoaddress(node, COINBASE_MATURITY, funder_address, sync_fun=self.no_op)
         self._sync_mocktime_to_tip()
-        pow_claim = wallet.sendshadowpowclaim(signal_address, pow_payout_address, 500000)
+        pow_claim = self._send_pow_claim(wallet, signal_address, pow_payout_address)
         assert pow_claim["txid"] in node.getrawmempool()
         decoded_pow = node.decoderawtransaction(pow_claim["hex"])
         assert any(QQSPROOF_HEX in vout["scriptPubKey"]["hex"] for vout in decoded_pow["vout"])

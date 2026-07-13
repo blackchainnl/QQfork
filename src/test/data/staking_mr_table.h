@@ -2,8 +2,8 @@
 // Regenerate/verify: python3 contrib/staking/gen_mr_table.py --check <thisfile>
 // Staking-weight table (fixed-point, no floats).
 // Frozen rule: m_ppm10k = round_half_up(10000*(0.25 + 0.75*sqrt(rem/NV_MAX))), rem in [0,NV_MAX]
-#ifndef BLACKCOIN_TEST_DATA_STAKING_MR_TABLE_H
-#define BLACKCOIN_TEST_DATA_STAKING_MR_TABLE_H
+#ifndef BITCOIN_TEST_DATA_STAKING_MR_TABLE_H
+#define BITCOIN_TEST_DATA_STAKING_MR_TABLE_H
 #include <array>
 #include <cstdint>
 namespace blackcoin_staking_canonical {
@@ -622,4 +622,4 @@ inline constexpr std::array<uint16_t, 9451> kStakingMrPpm10k = {{
     9996,9996,9997,9997,9998,9998,9998,9999,9999,10000,10000,
 }};
 }  // namespace blackcoin_staking_canonical
-#endif
+#endif // BITCOIN_TEST_DATA_STAKING_MR_TABLE_H

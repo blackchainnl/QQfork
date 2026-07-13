@@ -20,6 +20,7 @@ class QuantumRedelegationAutoTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.extra_args = [[
+            "-allowunsafequantumkeyrpc=1",
             "-donatetodevfund=0",
             "-staketimio=50",
             "-shadowwhitelistheight=1",

@@ -11,7 +11,9 @@ export LC_ALL=C.UTF-8
 export CI_IMAGE_NAME_TAG="docker.io/ubuntu:24.04"
 export CONTAINER_NAME=ci_native_fuzz
 export PACKAGES="clang-17 llvm-17 libclang-rt-17-dev libevent-dev libboost-dev libsqlite3-dev"
-export NO_DEPENDS=1
+# Build the consensus-critical pinned liboqs dependency.  Fuzzing against an
+# arbitrary host library would not exercise the release implementation.
+export DEP_OPTS="NO_QT=1 NO_UPNP=1 NO_NATPMP=1 CC=clang-17 CXX=clang++-17"
 export RUN_UNIT_TESTS=false
 export RUN_FUNCTIONAL_TESTS=false
 export RUN_FUZZ_TESTS=true

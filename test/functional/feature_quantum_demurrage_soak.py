@@ -21,6 +21,8 @@ from test_framework.util import assert_equal, assert_greater_than
 
 GOLD_RUSH_END_TIME = 2_000_000_000
 MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 5_000
+GOLD_RUSH_END_HEIGHT = 11
+MIGRATION_END_HEIGHT = 14
 DIRECT_AMOUNT = Decimal("2")
 COLD_BOOTSTRAP_AMOUNT = Decimal("100")
 COLD_SMALL_AMOUNT = Decimal("1")
@@ -38,13 +40,14 @@ class QuantumDemurrageSoakTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.extra_args = [[
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-donatetodevfund=0",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=10",
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
-            f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
-            "-qqdemurrageheight=1",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
+            f"-qqdemurrageheight={MIGRATION_END_HEIGHT + 1}",
             f"-qqdemurrageblockspermonth={BLOCKS_PER_MONTH}",
         ]]
 

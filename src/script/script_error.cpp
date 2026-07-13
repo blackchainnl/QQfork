@@ -119,6 +119,8 @@ std::string ScriptErrorString(const ScriptError serror)
             return "Invalid ML-DSA public key size";
         case SCRIPT_ERR_ML_DSA_SIG:
             return "Invalid ML-DSA signature";
+        case SCRIPT_ERR_ML_DSA_INTERNAL:
+            return "Local ML-DSA verification failure";
         case SCRIPT_ERR_QUANTUM_COLDSTAKE_BRANCH:
             return "Invalid Quantum cold-stake witness branch selector";
         case SCRIPT_ERR_QUANTUM_COLDSTAKE_NOT_COINSTAKE:

@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 // Copyright (c) 2009-2022 Blackcoin Core Developers
 // Copyright (c) 2009-2022 Blackcoin More Developers
 // Copyright (c) 2009-2022 Quantum Quasar Developers
@@ -190,6 +191,7 @@ protected:
     DbTxn* activeTxn{nullptr};
     bool fReadOnly;
     bool fFlushOnClose;
+    bool m_durable_txn{false};
     BerkeleyEnvironment *env;
     BerkeleyDatabase& m_database;
 
@@ -205,7 +207,7 @@ public:
 
     std::unique_ptr<DatabaseCursor> GetNewCursor() override;
     std::unique_ptr<DatabaseCursor> GetNewPrefixCursor(Span<const std::byte> prefix) override;
-    bool TxnBegin() override;
+    bool TxnBegin(bool durable = false) override;
     bool TxnCommit() override;
     bool TxnAbort() override;
     DbTxn* txn() const { return activeTxn; }

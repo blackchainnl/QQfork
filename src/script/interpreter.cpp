@@ -1804,11 +1804,11 @@ bool GenericTransactionSignatureChecker<T>::VerifySchnorrSignature(Span<const un
 }
 
 template <class T>
-bool GenericTransactionSignatureChecker<T>::VerifyMLDSASignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, const uint256& sighash) const
+MLDSAVerifyResult GenericTransactionSignatureChecker<T>::VerifyMLDSASignature(Span<const unsigned char> sig, Span<const unsigned char> pubkey, const uint256& sighash) const
 {
-    const std::vector<uint8_t> signature(sig.begin(), sig.end());
-    const std::vector<uint8_t> public_key(pubkey.begin(), pubkey.end());
-    return ML_DSA::Verify(public_key, sighash.begin(), uint256::size(), signature);
+    return ML_DSA::VerifyDetailed(pubkey.data(), pubkey.size(),
+                                  sighash.begin(), uint256::size(),
+                                  sig.data(), sig.size());
 }
 
 template <class T>
@@ -1853,7 +1853,9 @@ bool GenericTransactionSignatureChecker<T>::CheckMLDSASignature(Span<const unsig
     }
 
     const uint256 sighash = QuantumSignatureHashWithCache(*txTo, nIn, this->txdata);
-    if (!VerifyMLDSASignature(sig, pubkey, sighash)) return set_error(serror, SCRIPT_ERR_ML_DSA_SIG);
+    const MLDSAVerifyResult result = VerifyMLDSASignature(sig, pubkey, sighash);
+    if (result == MLDSAVerifyResult::INTERNAL_ERROR) return set_error(serror, SCRIPT_ERR_ML_DSA_INTERNAL);
+    if (result != MLDSAVerifyResult::VALID) return set_error(serror, SCRIPT_ERR_ML_DSA_SIG);
     return true;
 }
 

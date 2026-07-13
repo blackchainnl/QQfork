@@ -5,6 +5,8 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <core_io.h>
+#include <common/args.h>
+#include <common/system.h>
 #include <consensus/quantum_witness.h>
 #include <crypto/mldsa.h>
 #include <interfaces/chain.h>
@@ -37,7 +39,8 @@ static UniValue QuantumKeyInfoToJSON(const QuantumKeyInfo& info)
     result.pushKV("public_key", HexStr(info.public_key));
     result.pushKV("timestamp", info.creation_time);
     result.pushKV("encrypted", info.encrypted);
-    result.pushKV("stored_in_wallet", true);
+    result.pushKV("stored_in_wallet", info.durably_stored);
+    result.pushKV("backup_verified", info.backup_verified);
     QuantumStakeTierProgram tier;
     if (DecodeQuantumStakeTierProgram(QUANTUM_MIGRATION_WITNESS_VERSION, info.witness_program, tier) && tier.tiered) {
         result.pushKV("tiered", true);
@@ -144,6 +147,7 @@ RPCHelpMan getnewquantumaddress()
                         {RPCResult::Type::NUM_TIME, "timestamp", "The key creation time"},
                         {RPCResult::Type::BOOL, "encrypted", "Whether the wallet stores this key encrypted"},
                         {RPCResult::Type::BOOL, "stored_in_wallet", "Whether this key was inserted into the wallet database"},
+                        {RPCResult::Type::BOOL, "backup_verified", "Whether a completed backup containing this non-HD key was reopened and cryptographically verified"},
                         {RPCResult::Type::BOOL, "tiered", "Whether this address uses the tiered staking witness program."},
                         {RPCResult::Type::STR, "tier_state", /*optional=*/true, "Tier state when this is a tiered staking address."},
                         {RPCResult::Type::NUM, "unbonding_blocks", /*optional=*/true, "Bonded unbonding delay in blocks when tiered."},
@@ -202,6 +206,7 @@ RPCHelpMan getnewquantumstakeaddress()
                         {RPCResult::Type::NUM_TIME, "timestamp", "The key creation time"},
                         {RPCResult::Type::BOOL, "encrypted", "Whether the wallet stores this key encrypted"},
                         {RPCResult::Type::BOOL, "stored_in_wallet", "Whether this key was inserted into the wallet database"},
+                        {RPCResult::Type::BOOL, "backup_verified", "Whether a completed backup containing this non-HD key was reopened and cryptographically verified"},
                         {RPCResult::Type::STR, "warning", "Backup warning"},
                     }},
                 RPCExamples{
@@ -256,6 +261,7 @@ RPCHelpMan listquantumaddresses()
                             {RPCResult::Type::NUM_TIME, "timestamp", "The key creation time"},
                             {RPCResult::Type::BOOL, "encrypted", "Whether the wallet stores this key encrypted"},
                             {RPCResult::Type::BOOL, "stored_in_wallet", "Whether this key is in the wallet database"},
+                            {RPCResult::Type::BOOL, "backup_verified", "Whether a completed backup containing this non-HD key was reopened and cryptographically verified"},
                             {RPCResult::Type::BOOL, "tiered", "Whether this address uses the tiered staking witness program."},
                             {RPCResult::Type::STR, "tier_state", /*optional=*/true, "Tier state when this is a tiered staking address."},
                             {RPCResult::Type::NUM, "unbonding_blocks", /*optional=*/true, "Bonded unbonding delay in blocks when tiered."},
@@ -281,6 +287,83 @@ RPCHelpMan listquantumaddresses()
         entry.pushKV("label", address_book_entry ? address_book_entry->GetLabel() : "");
         result.push_back(std::move(entry));
     }
+    return result;
+},
+    };
+}
+
+RPCHelpMan getquantumkeyinventory()
+{
+    return RPCHelpMan{"getquantumkeyinventory",
+                "\nReturns a public-only inventory and verified-backup status for every wallet ML-DSA key.\n"
+                "This RPC never returns private key material.\n",
+                {},
+                RPCResult{
+                    RPCResult::Type::OBJ, "", "",
+                    {
+                        {RPCResult::Type::NUM, "total", "Number of distinct non-HD ML-DSA keys"},
+                        {RPCResult::Type::NUM, "backup_verified", "Keys present in a completed, reopened, cryptographically verified backup"},
+                        {RPCResult::Type::NUM, "backup_unverified", "Keys not yet present in a verified backup"},
+                        {RPCResult::Type::BOOL, "all_durably_stored", "Whether every listed key was loaded from or committed to durable wallet storage"},
+                        {RPCResult::Type::BOOL, "all_backed_up", "Whether every listed key has verified-backup status"},
+                        {RPCResult::Type::STR, "warning", "Aggregate backup warning or confirmation"},
+                        {RPCResult::Type::ARR, "keys", "Public-only per-key inventory", {
+                            {RPCResult::Type::OBJ, "", "", {
+                                {RPCResult::Type::STR, "address", "Wallet address or preferred address-book alias"},
+                                {RPCResult::Type::NUM, "witness_version", "Quantum witness version"},
+                                {RPCResult::Type::STR_HEX, "witness_program", "Witness program for the listed address"},
+                                {RPCResult::Type::STR_HEX, "public_key", "ML-DSA-44 public key"},
+                                {RPCResult::Type::NUM_TIME, "timestamp", "Key creation time"},
+                                {RPCResult::Type::BOOL, "encrypted", "Whether private material is encrypted in the wallet"},
+                                {RPCResult::Type::BOOL, "stored_in_wallet", "Whether the key is durably stored"},
+                                {RPCResult::Type::BOOL, "backup_verified", "Whether this key is present in a verified backup"},
+                                {RPCResult::Type::BOOL, "tiered", "Whether the preferred address is a tiered staking address"},
+                                {RPCResult::Type::STR, "tier_state", /*optional=*/true, "Tier state for a tiered staking address"},
+                                {RPCResult::Type::NUM, "unbonding_blocks", /*optional=*/true, "Tiered staking unbonding delay"},
+                                {RPCResult::Type::NUM, "unlock_height", /*optional=*/true, "Tiered staking unlock height"},
+                                {RPCResult::Type::STR, "label", "Address label"},
+                            }},
+                        }},
+                    }},
+                RPCExamples{
+                    HelpExampleCli("getquantumkeyinventory", "")
+            + HelpExampleRpc("getquantumkeyinventory", "")
+                },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return UniValue::VNULL;
+
+    LOCK(pwallet->cs_wallet);
+    UniValue keys(UniValue::VARR);
+    std::set<std::vector<unsigned char>> seen_keys;
+    size_t verified_count{0};
+    bool all_durable{true};
+    for (const QuantumKeyInfo& info : pwallet->ListQuantumKeyInfos()) {
+        const std::vector<unsigned char> key_program = QuantumMigrationProgramForPubkey(info.public_key);
+        if (!seen_keys.insert(key_program).second) continue;
+        UniValue entry = QuantumKeyInfoToJSON(info);
+        const auto* address_book_entry = pwallet->FindAddressBookEntry(info.destination);
+        entry.pushKV("label", address_book_entry ? address_book_entry->GetLabel() : "");
+        keys.push_back(std::move(entry));
+        verified_count += info.backup_verified ? 1 : 0;
+        all_durable = all_durable && info.durably_stored;
+    }
+
+    const size_t total = seen_keys.size();
+    const bool all_backed_up = verified_count == total;
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("total", static_cast<uint64_t>(total));
+    result.pushKV("backup_verified", static_cast<uint64_t>(verified_count));
+    result.pushKV("backup_unverified", static_cast<uint64_t>(total - verified_count));
+    result.pushKV("all_durably_stored", all_durable);
+    result.pushKV("all_backed_up", all_backed_up);
+    result.pushKV("warning", total == 0
+        ? "No wallet-backed quantum keys are stored."
+        : all_backed_up
+            ? "Every wallet-backed quantum key is present in a completed, reopened, cryptographically verified backup."
+            : "One or more non-HD quantum keys are not in a verified backup. Run backupwallet after unlocking the wallet; an older backup cannot recover keys created later.");
+    result.pushKV("keys", std::move(keys));
     return result;
 },
     };
@@ -529,7 +612,7 @@ RPCHelpMan dumpquantumkey()
 {
     return RPCHelpMan{"dumpquantumkey",
                 "\nReveals the wallet-backed ML-DSA private key for a Blackcoin migration address.\n"
-                "Requires an unlocked wallet. Keep the returned private key secret.\n",
+                "Requires a normally unlocked wallet and -allowunsafequantumkeyrpc. Keep the returned private key secret.\n",
                 {
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The wallet-backed Blackcoin migration address"},
                 },
@@ -549,11 +632,18 @@ RPCHelpMan dumpquantumkey()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    if (!gArgs.GetBoolArg("-allowunsafequantumkeyrpc", false)) {
+        throw JSONRPCError(RPC_FORBIDDEN_BY_SAFE_MODE,
+            "dumpquantumkey is disabled by default. Restart with -allowunsafequantumkeyrpc only for an explicit offline export workflow.");
+    }
     std::shared_ptr<const CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
     LOCK(pwallet->cs_wallet);
     EnsureWalletIsUnlocked(*pwallet);
+    if (pwallet->m_wallet_unlock_staking_only) {
+        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Wallet is unlocked for staking only");
+    }
 
     std::string error_msg;
     const CTxDestination dest = DecodeDestination(request.params[0].get_str(), error_msg);
@@ -1082,6 +1172,8 @@ RPCHelpMan getaddressinfo()
                         {RPCResult::Type::BOOL, "hasquantumkey", /*optional=*/true, "Whether this wallet contains the ML-DSA key for this migration address."},
                         {RPCResult::Type::STR_HEX, "quantum_public_key", /*optional=*/true, "The wallet ML-DSA-44 public key for this migration address."},
                         {RPCResult::Type::BOOL, "quantum_key_encrypted", /*optional=*/true, "Whether the wallet stores this ML-DSA key encrypted."},
+                        {RPCResult::Type::BOOL, "quantum_key_durably_stored", /*optional=*/true, "Whether this ML-DSA key was loaded from or committed to durable wallet storage."},
+                        {RPCResult::Type::BOOL, "quantum_key_backup_verified", /*optional=*/true, "Whether this ML-DSA key is present in a completed, reopened, cryptographically verified backup."},
                         {RPCResult::Type::BOOL, "isquantumcoldstake", /*optional=*/true, "Whether this is a Quantum Cold-Stake address."},
                         {RPCResult::Type::BOOL, "hascoldstakemetadata", /*optional=*/true, "Whether this wallet has the QCS delegation metadata for this address."},
                         {RPCResult::Type::STR_HEX, "staking_pubkey_hash", /*optional=*/true, "SHA256(staking_pubkey) for a known QCS delegation."},
@@ -1191,6 +1283,8 @@ RPCHelpMan getaddressinfo()
         if (quantum_info) {
             ret.pushKV("quantum_public_key", HexStr(quantum_info->public_key));
             ret.pushKV("quantum_key_encrypted", quantum_info->encrypted);
+            ret.pushKV("quantum_key_durably_stored", quantum_info->durably_stored);
+            ret.pushKV("quantum_key_backup_verified", quantum_info->backup_verified);
             if (!ret.exists("timestamp")) {
                 ret.pushKV("timestamp", quantum_info->creation_time);
             }

@@ -47,6 +47,43 @@ struct ShadowClaimMarkerInfo {
     bool proof_of_work{false};
 };
 
+enum class ShadowPowClaimDisposition : uint8_t {
+    INVALID_LOCATION,
+    MALFORMED_TRANSACTION,
+    INVALID_PROOF,
+    INPUT_MISMATCH,
+    INVALID_BASE_FEE,
+    EVALUATION_LIMIT,
+    WINNER,
+    REIMBURSED_LOSER,
+};
+
+struct ShadowPowClaimAccounting {
+    uint256 source_txid;
+    uint32_t source_vout{0};
+    uint256 canonical_rank;
+    CScript payout_script;
+    CAmount base_fee{0};
+    CAmount credited_amount{0};
+    bool base_fee_known{false};
+    ShadowPowClaimDisposition disposition{ShadowPowClaimDisposition::INVALID_PROOF};
+};
+
+/** Immutable, lock-free input to the bounded claim-accounting engine. */
+struct ShadowPowAccountingContext {
+    int height{0};
+    uint256 previous_block_hash;
+    CAmount credited_pow_pool{0};
+    unsigned int target_bits{0};
+    bool canonical_rule_active{false};
+    bool valid{false};
+};
+
+enum class ShadowPowAccountingResult {
+    OK,
+    LOCAL_INTERNAL_ERROR,
+};
+
 struct ShadowSyntheticPayoutCoin {
     COutPoint outpoint;
     CTxOut txout;
@@ -68,6 +105,13 @@ static constexpr int MAINNET_SHADOW_WHITELIST_HEIGHT = 5945000;
 static constexpr int MAINNET_SHADOW_REWARD_START_HEIGHT = 5950000;
 static constexpr int MAINNET_SHADOW_GOLD_RUSH_BLOCKS = (180 * 24 * 60 * 60) / 64;
 static constexpr int MAINNET_SHADOW_REWARD_END_HEIGHT = MAINNET_SHADOW_REWARD_START_HEIGHT + MAINNET_SHADOW_GOLD_RUSH_BLOCKS - 1;
+static constexpr int MAINNET_QUANTUM_MIGRATION_BLOCKS = (540 * 24 * 60 * 60) / 64;
+static constexpr int MAINNET_QUANTUM_MIGRATION_END_HEIGHT = MAINNET_SHADOW_REWARD_END_HEIGHT + MAINNET_QUANTUM_MIGRATION_BLOCKS;
+static constexpr int MAINNET_QUANTUM_FINAL_START_HEIGHT = MAINNET_QUANTUM_MIGRATION_END_HEIGHT + 1;
+static_assert(MAINNET_SHADOW_REWARD_START_HEIGHT == 5950000);
+static_assert(MAINNET_SHADOW_REWARD_END_HEIGHT == 6192999);
+static_assert(MAINNET_QUANTUM_MIGRATION_END_HEIGHT == 6921999);
+static_assert(MAINNET_QUANTUM_FINAL_START_HEIGHT == 6922000);
 
 // Gold Rush schedule heights. Defaults are the mainnet values. The dedicated
 // testnet schedule branch may override them on testnet/regtest only via
@@ -144,6 +188,26 @@ CAmount ShadowMaxBlockDirectTotal(const CCoinsViewCache& view, const CBlockIndex
 
 /** Read-only Gold Rush pool and participant diagnostics for RPC/status reporting. */
 ShadowGoldRushInfo GetShadowGoldRushInfo(const CCoinsViewCache& view, const CBlockIndex* pindex);
+
+/**
+ * Fail-fast scope for latency-sensitive wallet paths. The legacy global
+ * diagnostic enumerator walks the full UTXO database through Cursor(); GUI,
+ * RPC, and automatic staking paths must use deterministic per-script marker
+ * lookups instead. Functional tests exercise these scopes so reintroducing a
+ * chainstate cursor becomes an immediate regression rather than a field hang.
+ */
+class ScopedDisallowShadowSolverActivityFullScan
+{
+public:
+    ScopedDisallowShadowSolverActivityFullScan();
+    ~ScopedDisallowShadowSolverActivityFullScan();
+    ScopedDisallowShadowSolverActivityFullScan(const ScopedDisallowShadowSolverActivityFullScan&) = delete;
+    ScopedDisallowShadowSolverActivityFullScan& operator=(const ScopedDisallowShadowSolverActivityFullScan&) = delete;
+
+private:
+    bool m_previous;
+};
+
 std::map<CScript, ShadowSolverActivity> GetRecentShadowSolverActivity(const CCoinsViewCache& view, const CBlockIndex* pindex);
 std::optional<ShadowSolverActivity> GetRecentShadowSolverActivityForScript(const CCoinsViewCache& view, const CBlockIndex* pindex, const CScript& target);
 uint64_t GetActiveShadowSignalCount(const CCoinsViewCache& view, const CBlockIndex* pindex);
@@ -178,22 +242,67 @@ struct ShadowPowWork {
     uint256 prev_hash;
     unsigned int bits{0};
 };
+
+/** Typed validation result used wherever Argon2id evaluation can fail locally.
+ *  INVALID is deterministic for the supplied bytes. LOCAL_INTERNAL_ERROR is a
+ *  retryable node failure and must never be cached or reported as consensus
+ *  invalidity. */
+enum class ShadowProofValidationResult {
+    VALID,
+    INVALID,
+    LOCAL_INTERNAL_ERROR,
+};
+
+/** Typed result for a bounded PoW nonce search. */
+enum class ShadowPowGrindResult {
+    FOUND,
+    EXHAUSTED,
+    INVALID_WORK,
+    LOCAL_INTERNAL_ERROR,
+};
 /** Snapshot PoW work for the block after pindexPrev. Reads the shadow pool from `view`, so the
  *  caller must hold the chain state stable (cs_main). Cheap; does no Argon2id work. */
 ShadowPowWork PrepareShadowPowWork(const CScript& target, const CScript& quantum_payout_script, const CBlockIndex* pindexPrev, const CCoinsViewCache& view);
 /** Pure Argon2id grind over a nonce range. No chain/view access; safe to call with NO lock held. */
+ShadowPowGrindResult GrindShadowPowWorkDetailed(const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step, uint64_t max_tries, std::vector<unsigned char>& data_out, uint64_t* tries_done = nullptr);
 bool GrindShadowPowWork(const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step, uint64_t max_tries, std::vector<unsigned char>& data_out, uint64_t* tries_done = nullptr);
 /** Wallet/RPC guard for externally supplied QQSPROOF payloads. The proof must
  *  match the prepared next-block work exactly, including legacy target and
  *  quantum payout script, before the wallet broadcasts a claim transaction. */
+ShadowProofValidationResult ValidateShadowPowProofForWorkDetailed(const ShadowPowWork& work, const std::vector<unsigned char>& prefixed_proof);
 bool ValidateShadowPowProofForWork(const ShadowPowWork& work, const std::vector<unsigned char>& prefixed_proof);
+
+/** Test-only, process-local fault injection for one or more Argon2id calls.
+ *  No configuration, RPC, or network path can arm this hook. */
+void SetShadowArgon2FailuresForTesting(uint64_t count = 1);
+void ClearShadowArgon2FailuresForTesting();
 
 /** Compute PoW Gold Rush shadow-ledger credits implied by a candidate block. */
 bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, std::map<CScript, CAmount>& payouts_out, CAmount& total_out);
 
+/** Deterministically classify every QQSPROOF note in a block. This is the
+ *  bounded accounting engine used by ApplyShadowBlock itself and is exposed
+ *  so reorg-aware indexes can record source transaction provenance without
+ *  duplicating monetary logic or persisting extra chainstate. */
+ShadowPowAccountingResult GetShadowPowClaimAccounting(
+    const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
+    const CBlockUndo* blockundo, std::vector<ShadowPowClaimAccounting>& accounting_out);
+/** Copy and authenticate the small historical pool context while the caller
+ *  holds its chain/view lock. This performs no Argon2 work. */
+ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
+    const CCoinsViewCache& view, const CBlockIndex* pindex,
+    ShadowPowAccountingContext& context_out);
+/** Evaluate the immutable context, base block, and undo without reading
+ *  chainstate. The caller may release cs_main before invoking this function. */
+ShadowPowAccountingResult EvaluateShadowPowClaimAccounting(
+    const ShadowPowAccountingContext& context, const CBlock& block,
+    const CBlockUndo* blockundo,
+    std::vector<ShadowPowClaimAccounting>& accounting_out);
+
 /** Mempool policy helpers for next-block-only QQSPROOF claims. */
 bool TransactionHasShadowProof(const CTransaction& tx);
 bool TransactionHasShadowSignal(const CTransaction& tx);
+ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);
 bool CheckShadowPowClaimForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);
 bool CheckShadowSignalForMempool(const CTransaction& tx, const CBlockIndex* pindexPrev,
                                  const CCoinsViewCache& view, bool gold_rush_active,

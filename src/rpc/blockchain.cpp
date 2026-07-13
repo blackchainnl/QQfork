@@ -1490,6 +1490,7 @@ static UniValue QuantumQuasarStatus(const CBlockIndex& tip, const ChainstateMana
     const bool shadow_merge_mining_active = IsShadowGoldRushRewardActive(consensus, mtp, next_height);
     const bool final_lockout_active = consensus.IsQuantumFinalLockout(mtp, next_height);
     const bool shadow_reward_height_active = IsShadowGoldRushRewardHeight(next_height);
+    const auto lifecycle = consensus.GetQuantumLifecycleState(mtp, next_height);
 
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("phase", QuantumQuasarPhaseName(phase));
@@ -1498,13 +1499,15 @@ static UniValue QuantumQuasarStatus(const CBlockIndex& tip, const ChainstateMana
     obj.pushKV("active_tip_phase", QuantumQuasarPhaseName(active_tip_phase));
     obj.pushKV("next_block_height", next_height);
     obj.pushKV("next_block_phase", QuantumQuasarPhaseName(phase));
+    obj.pushKV("lifecycle_schedule_valid", lifecycle.schedule_valid);
     obj.pushKV("mediantime", mtp);
     obj.pushKV("v4_activation_time", consensus.nProtocolV4Time);
+    obj.pushKV("v4_activation_height", consensus.nQuantumLifecycleStartHeight);
     obj.pushKV("gold_rush_end_time", consensus.nGoldRushEndTime);
     obj.pushKV("quantum_migration_deadline_time", consensus.nQuantumMigrationDeadlineTime);
     obj.pushKV("gold_rush_end_height", consensus.nGoldRushEndHeight);
     obj.pushKV("quantum_migration_end_height", consensus.nQuantumMigrationEndHeight);
-    obj.pushKV("height_boundaries_authoritative", consensus.nGoldRushEndHeight > 0 && consensus.nQuantumMigrationEndHeight > 0);
+    obj.pushKV("height_boundaries_authoritative", lifecycle.height_authoritative);
     obj.pushKV("time_boundaries_are_estimates", consensus.UsesHeightLifecycle());
     obj.pushKV("seconds_until_v4", SecondsUntilAfterBoundary(mtp, consensus.nProtocolV4Time));
     obj.pushKV("seconds_until_gold_rush_end", SecondsUntil(mtp, consensus.nGoldRushEndTime));

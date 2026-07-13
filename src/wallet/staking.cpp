@@ -25,6 +25,7 @@
 #include <script/signingprovider.h>
 #include <shadow.h>
 #include <support/cleanse.h>
+#include <txmempool.h>
 #include <util/check.h>
 #include <util/moneystr.h>
 #include <util/result.h>
@@ -35,8 +36,12 @@
 #include <wallet/walletdb.h>
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <map>
 #include <set>
+#include <string_view>
+#include <thread>
 
 namespace wallet {
 
@@ -142,6 +147,7 @@ struct AutoShadowSignalCandidate
     CScript target;
     uint32_t solve_height{0};
     uint256 solve_hash;
+    int scan_height{-1};
 };
 
 static constexpr const char* SHADOW_SIGNAL_COMMENT{"PoS Claim"};
@@ -149,14 +155,234 @@ static constexpr const char* OLD_SHADOW_SIGNAL_COMMENT{"Quantum PoS Claim"};
 static constexpr const char* SHADOW_SIGNAL_PAYOUT_LABEL{"PoS - Quantum Stake Address"};
 static constexpr const char* OLD_SHADOW_SIGNAL_PAYOUT_LABEL{"Quantum PoS Reward Address"};
 static constexpr const char* LEGACY_SHADOW_SIGNAL_PAYOUT_LABEL{"goldrush-pos"};
+static constexpr unsigned int DEFAULT_SHADOW_SIGNAL_MAX_RETRY_FAILURES{6};
+static constexpr int64_t DEFAULT_SHADOW_SIGNAL_RETRY_BASE_MILLIS{1000};
+
+static unsigned int ShadowSignalMaxRetryFailures()
+{
+    if (!Params().IsTestChain()) return DEFAULT_SHADOW_SIGNAL_MAX_RETRY_FAILURES;
+    return static_cast<unsigned int>(std::clamp<int64_t>(
+        gArgs.GetIntArg("-qqshadowsignalmaxretryfailures", DEFAULT_SHADOW_SIGNAL_MAX_RETRY_FAILURES), 1, 64));
+}
+
+static int64_t ShadowSignalRetryBaseMillis()
+{
+    if (!Params().IsTestChain()) return DEFAULT_SHADOW_SIGNAL_RETRY_BASE_MILLIS;
+    return std::clamp<int64_t>(
+        gArgs.GetIntArg("-qqshadowsignalretrybasemillis", DEFAULT_SHADOW_SIGNAL_RETRY_BASE_MILLIS), 1, 60000);
+}
+
+static int64_t ShadowSignalSteadyMillis()
+{
+    return std::chrono::duration_cast<std::chrono::milliseconds>(SteadyClock::now().time_since_epoch()).count();
+}
+
+class AutoShadowSignalAttemptGuard
+{
+public:
+    explicit AutoShadowSignalAttemptGuard(CWallet& wallet) : m_wallet(wallet)
+    {
+        const int64_t now = ShadowSignalSteadyMillis();
+        if (now < wallet.m_shadow_signal_next_retry_ms.load()) return;
+
+        bool expected{false};
+        m_acquired = wallet.m_shadow_signal_inflight.compare_exchange_strong(expected, true);
+        // Recheck the deadline after winning the race in case the previous
+        // attempt published its backoff immediately before releasing inflight.
+        if (m_acquired && now < wallet.m_shadow_signal_next_retry_ms.load()) {
+            wallet.m_shadow_signal_inflight = false;
+            m_acquired = false;
+        }
+    }
+
+    AutoShadowSignalAttemptGuard(const AutoShadowSignalAttemptGuard&) = delete;
+    AutoShadowSignalAttemptGuard& operator=(const AutoShadowSignalAttemptGuard&) = delete;
+
+    ~AutoShadowSignalAttemptGuard()
+    {
+        if (m_acquired) m_wallet.m_shadow_signal_inflight = false;
+    }
+
+    explicit operator bool() const { return m_acquired; }
+
+private:
+    CWallet& m_wallet;
+    bool m_acquired{false};
+};
+
+void ResetAutoShadowSignalBackoff(CWallet& wallet)
+{
+    wallet.m_shadow_signal_retry_failures = 0;
+    wallet.m_shadow_signal_next_retry_ms = 0;
+}
+
+void ResetAutoShadowSignalScanHeight(CWallet& wallet, int scan_height)
+{
+    if (scan_height < 0) return;
+    LOCK(wallet.cs_wallet);
+    if (wallet.m_shadow_signal_last_auto_scan_height == scan_height) {
+        wallet.m_shadow_signal_last_auto_scan_height = scan_height - 1;
+    }
+}
+
+void ScheduleAutoShadowSignalRetry(CWallet& wallet, int scan_height, const std::string& reason)
+{
+    const unsigned int max_failures = ShadowSignalMaxRetryFailures();
+    const unsigned int failures = std::min(wallet.m_shadow_signal_retry_failures.fetch_add(1) + 1,
+                                           max_failures);
+    wallet.m_shadow_signal_retry_failures = failures;
+    const unsigned int delay_shift = std::min<unsigned int>(failures - 1, 16);
+    const int64_t delay_ms = std::min<int64_t>(ShadowSignalRetryBaseMillis() * (int64_t{1} << delay_shift), 60000);
+    wallet.m_shadow_signal_next_retry_ms = ShadowSignalSteadyMillis() + delay_ms;
+    ResetAutoShadowSignalScanHeight(wallet, scan_height);
+    LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: retry in %dms after %s\n", delay_ms, reason);
+}
+
+bool IsWalletShadowSignal(const CWalletTx& wtx)
+{
+    const auto comment = wtx.mapValue.find("comment");
+    return TransactionHasShadowSignal(*wtx.tx) && comment != wtx.mapValue.end() &&
+           (comment->second == SHADOW_SIGNAL_COMMENT || comment->second == OLD_SHADOW_SIGNAL_COMMENT);
+}
+
+bool IsTerminalShadowSignalReject(const std::string& reject_reason)
+{
+    static constexpr std::array<std::string_view, 6> TERMINAL_REJECTS{
+        "shadow-signal-inactive",
+        "shadow-signal-invalid-location",
+        "shadow-signal-invalid",
+        "shadow-signal-target",
+        "shadow-signal-input-mismatch",
+        "shadow-signal-stale-solve",
+    };
+    return std::any_of(TERMINAL_REJECTS.begin(), TERMINAL_REJECTS.end(), [&](const std::string_view reason) {
+        return reject_reason.find(reason) != std::string::npos;
+    });
+}
+
+enum class PendingShadowSignalState {
+    NONE,
+    LIVE,
+    RETRY,
+};
+
+bool TryAbandonInactiveShadowSignal(CWallet& wallet, const uint256& txid)
+{
+    // Regtest-only barrier used to prove a peer insertion racing cleanup is
+    // observed by the atomic mempool/wallet recheck below.
+    if (Params().IsTestChain()) {
+        const int64_t delay_ms = std::clamp<int64_t>(gArgs.GetIntArg("-qqshadowsignalcleanupdelaymillis", 0), 0, 10000);
+        if (delay_ms > 0) {
+            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: cleanup race barrier reached for %s\n", txid.ToString());
+            std::this_thread::sleep_for(std::chrono::milliseconds{delay_ms});
+        }
+    }
+
+    // Keep validation's authoritative mempool membership and wallet state in
+    // one snapshot. TRY_LOCK avoids waiting on cs_wallet while holding the
+    // canonical cs_main -> mempool.cs order. Holding mempool.cs until
+    // AbandonTransaction completes prevents a peer from inserting the exact
+    // transaction between the membership test and the state transition.
+    const CTxMemPool& mempool = wallet.chain().mempool();
+    LOCK2(::cs_main, mempool.cs);
+    TRY_LOCK(wallet.cs_wallet, wallet_lock);
+    if (!wallet_lock || mempool.exists(GenTxid::Txid(txid))) return false;
+    const CWalletTx* wtx = wallet.GetWalletTx(txid);
+    if (!wtx || !wtx->isUnconfirmed() || wtx->InMempool()) return false;
+    return wallet.AbandonTransaction(txid);
+}
+
+PendingShadowSignalState ReconcilePendingShadowSignals(CWallet& wallet, std::string& retry_reason)
+{
+    std::vector<std::pair<uint256, CTransactionRef>> pending;
+    {
+        LOCK(wallet.cs_wallet);
+        for (const uint256& txid : wallet.GetPendingShadowSignalTxids()) {
+            const auto it = wallet.mapWallet.find(txid);
+            if (it == wallet.mapWallet.end()) continue;
+            const CWalletTx& wtx = it->second;
+            if (!wtx.isUnconfirmed() || wtx.isAbandoned() || wtx.isConflicted() || !IsWalletShadowSignal(wtx)) continue;
+            pending.emplace_back(txid, wtx.tx);
+        }
+    }
+
+    for (const auto& pending_signal : pending) {
+        const uint256& txid = pending_signal.first;
+        const CTransactionRef& signal_tx = pending_signal.second;
+        if (wallet.chain().isInMempool(txid)) return PendingShadowSignalState::LIVE;
+
+        // Classify against a single active-tip snapshot even if wallet relay is
+        // disabled. Otherwise a terminally stale signal can reserve its input
+        // forever merely because SubmitTxMemoryPoolAndRelay returns before
+        // validation under -walletbroadcast=0.
+        const MempoolAcceptResult accept = [&] {
+            LOCK(::cs_main);
+            return wallet.chain().chainman().ProcessTransaction(signal_tx, /*test_accept=*/true);
+        }();
+        if (accept.m_result_type != MempoolAcceptResult::ResultType::VALID) {
+            if (wallet.chain().isInMempool(txid)) return PendingShadowSignalState::LIVE;
+            const std::string reject_reason = accept.m_state.GetRejectReason();
+            const std::string failure = reject_reason.empty() ? accept.m_state.ToString() : reject_reason;
+            const bool terminal_reject = IsTerminalShadowSignalReject(failure);
+            const unsigned int failed_attempt = wallet.m_shadow_signal_retry_failures.load() + 1;
+            if ((terminal_reject || failed_attempt >= ShadowSignalMaxRetryFailures()) &&
+                TryAbandonInactiveShadowSignal(wallet, txid)) {
+                wallet.WalletLogPrintf("Automatically abandoned Gold Rush PoS signal %s and released its inputs after %u failed validations: %s\n",
+                                       txid.ToString(), failed_attempt, failure);
+                continue;
+            }
+
+            // Policy rejects such as txn-mempool-conflict, missing inputs, or
+            // changing minimum fees can persist indefinitely. They are retried
+            // with bounded backoff, then enter the same safe abandonment path
+            // as a terminal phase reject. Confirmed, conflicted, or newly-live
+            // transactions cannot pass TryAbandonInactiveShadowSignal.
+            retry_reason = (terminal_reject || failed_attempt >= ShadowSignalMaxRetryFailures())
+                ? strprintf("signal cleanup is waiting for wallet state: %s", failure)
+                : failure;
+            return PendingShadowSignalState::RETRY;
+        }
+
+        // An evicted or restart-orphaned signal may still be valid. Resubmit it
+        // before considering a replacement so the wallet never double-spends
+        // its own signaling input.
+        std::string broadcast_error;
+        if (wallet.SubmitTxMemoryPoolAndRelay(txid, broadcast_error, /*relay=*/true) ||
+            wallet.chain().isInMempool(txid)) {
+            wallet.WalletLogPrintf("Gold Rush PoS signal resubmitted after mempool eviction: txid=%s\n", txid.ToString());
+            return PendingShadowSignalState::LIVE;
+        }
+
+        const unsigned int failed_attempt = wallet.m_shadow_signal_retry_failures.load() + 1;
+        if (failed_attempt >= ShadowSignalMaxRetryFailures() &&
+            broadcast_error != "wallet-broadcast-in-flight") {
+            // A locally valid but persistently dropped signal is replaceable:
+            // it has no shadow effect until confirmed. After the bounded retry
+            // window, release its wallet input instead of reserving that coin
+            // forever. The audit record remains in the wallet as abandoned.
+            if (TryAbandonInactiveShadowSignal(wallet, txid)) {
+                wallet.WalletLogPrintf("Abandoned unrelayed Gold Rush PoS signal %s after %u failed resubmissions and released its inputs: %s\n",
+                                       txid.ToString(), failed_attempt,
+                                       broadcast_error.empty() ? "wallet broadcasting is disabled" : broadcast_error);
+                continue;
+            }
+        }
+
+        retry_reason = broadcast_error.empty() ? "valid pending signal could not be resubmitted" : broadcast_error;
+        return PendingShadowSignalState::RETRY;
+    }
+    return PendingShadowSignalState::NONE;
+}
 
 bool HasPendingShadowSignal(CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
-    for (const auto& [txid, wtx] : wallet.mapWallet) {
+    for (const uint256& txid : wallet.GetPendingShadowSignalTxids()) {
+        const auto it = wallet.mapWallet.find(txid);
+        if (it == wallet.mapWallet.end()) continue;
+        const CWalletTx& wtx = it->second;
         const auto comment = wtx.mapValue.find("comment");
         if (comment == wtx.mapValue.end() || (comment->second != SHADOW_SIGNAL_COMMENT && comment->second != OLD_SHADOW_SIGNAL_COMMENT)) continue;
-        if (wtx.isAbandoned() || wtx.isConflicted()) continue;
-        if (wallet.GetTxDepthInMainChain(wtx) == 0) return true;
+        if (wtx.isUnconfirmed()) return true;
     }
     return false;
 }
@@ -171,7 +397,8 @@ bool EnsureShadowSignalPayout(CWallet& wallet, CScript& payout_script, std::stri
             const std::string label = entry.GetLabel();
             if (entry.IsChange() || (label != SHADOW_SIGNAL_PAYOUT_LABEL && label != OLD_SHADOW_SIGNAL_PAYOUT_LABEL && label != LEGACY_SHADOW_SIGNAL_PAYOUT_LABEL)) continue;
             if (!IsValidDestination(dest) || !IsQuantumMigrationDestination(dest)) continue;
-            if (wallet.IsMine(dest) == ISMINE_NO) continue;
+            const auto key_info = wallet.GetQuantumKeyInfo(dest);
+            if (!key_info || !key_info->durably_stored) continue;
             payout_address = EncodeDestination(dest);
             payout_script = GetScriptForDestination(dest);
             reused_dest = dest;
@@ -198,75 +425,108 @@ bool EnsureShadowSignalPayout(CWallet& wallet, CScript& payout_script, std::stri
     return true;
 }
 
-bool FindAutoShadowSignalCandidate(CWallet& wallet, AutoShadowSignalCandidate& candidate) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
+bool FindAutoShadowSignalCandidate(CWallet& wallet, AutoShadowSignalCandidate& candidate)
 {
-    const CBlockIndex* tip = wallet.chain().getTip();
-    if (!tip) return false;
     const Consensus::Params& consensus = Params().GetConsensus();
-    const int next_height = tip->nHeight + 1;
-    if (!IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), next_height)) {
-        LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: inactive at height=%d\n", tip->nHeight);
-        return false;
-    }
-    if (wallet.m_shadow_signal_last_auto_scan_height >= tip->nHeight) {
-        LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: already scanned height=%d\n", tip->nHeight);
-        return false;
-    }
-    wallet.m_shadow_signal_last_auto_scan_height = tip->nHeight;
-    if (HasPendingShadowSignal(wallet)) {
-        LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: pending signal already exists\n");
-        return false;
-    }
-
-    const CCoinsViewCache& view = wallet.chain().getCoinsTip();
-    const std::map<CScript, CScript> active_signals = GetActiveShadowSignalPayouts(view, tip);
-    const std::map<CScript, ShadowSolverActivity> recent_solvers = GetRecentShadowSolverActivity(view, tip);
-    if (recent_solvers.empty()) {
-        LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: no recent solver markers\n");
-        return false;
-    }
-
-    CCoinControl coin_control;
-    coin_control.m_avoid_address_reuse = false;
-    std::vector<COutput> outputs = AvailableCoins(wallet, &coin_control).All();
-    std::sort(outputs.begin(), outputs.end(), [](const COutput& a, const COutput& b) {
-        if (a.txout.nValue != b.txout.nValue) return a.txout.nValue < b.txout.nValue;
-        return a.outpoint < b.outpoint;
-    });
-
-    const CChain& active_chain = wallet.chain().chainman().ActiveChain();
-    unsigned int whitelisted_outputs{0};
-    unsigned int recent_outputs{0};
-    unsigned int already_active_outputs{0};
-    for (const COutput& output : outputs) {
-        if (output.txout.nValue <= 0) continue;
-        const CScript target = CanonicalizeLegacyStakeScript(output.txout.scriptPubKey);
-        if (target.empty() || target.IsUnspendable()) continue;
-        if (!IsWhitelisted(view, target)) continue;
-        ++whitelisted_outputs;
-        const auto solver_it = recent_solvers.find(target);
-        if (solver_it == recent_solvers.end()) continue;
-        ++recent_outputs;
-        if (active_signals.count(target)) {
-            ++already_active_outputs;
-            continue;
+    int scan_height{-1};
+    uint256 scan_tip_hash;
+    {
+        TRY_LOCK(::cs_main, main_lock);
+        if (!main_lock) {
+            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: skipped because chain lock is busy\n");
+            return false;
         }
-        const CBlockIndex* solved = active_chain[solver_it->second.height];
-        if (!solved) continue;
+        const CBlockIndex* tip = wallet.chain().chainman().ActiveChain().Tip();
+        if (!tip) return false;
+        scan_height = tip->nHeight;
+        scan_tip_hash = tip->GetBlockHash();
+        if (!IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), scan_height + 1)) {
+            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: inactive at height=%d\n", scan_height);
+            return false;
+        }
+    }
 
-        candidate.target = target;
-        candidate.solve_height = solver_it->second.height;
-        candidate.solve_hash = solved->GetBlockHash();
-        LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: candidate found solve_height=%u\n", candidate.solve_height);
-        return true;
+    // Derive exact solver references from this wallet's confirmed coinstakes.
+    // This in-memory wallet snapshot deliberately runs without cs_main. The
+    // former implementation held both locks while Cursor() scanned the entire
+    // chainstate UTXO database, freezing chain RPC and GUI progress on large
+    // nodes. Each entry below is later checked by its deterministic marker
+    // outpoint, so automatic discovery never needs CCoinsView::Cursor.
+    std::vector<WalletShadowSolveReference> wallet_solves;
+    {
+        TRY_LOCK(wallet.cs_wallet, wallet_lock);
+        if (!wallet_lock) {
+            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: skipped because wallet lock is busy\n");
+            return false;
+        }
+        if (wallet.m_shadow_signal_last_auto_scan_height >= scan_height) {
+            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: already scanned height=%d\n", scan_height);
+            return false;
+        }
+        wallet.m_shadow_signal_last_auto_scan_height = scan_height;
+        if (HasPendingShadowSignal(wallet)) {
+            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: pending signal already exists\n");
+            return false;
+        }
+
+        wallet_solves = GetWalletShadowSolveReferences(wallet, scan_height);
     }
-    if (already_active_outputs > 0) {
-        LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: wallet signal already active (wallet_active=%u recent_outputs=%u active_network=%u)\n",
-                 already_active_outputs, recent_outputs, active_signals.size());
-    } else {
-        LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: no eligible output needing a signal (wallet_whitelisted=%u wallet_recent=%u recent_network=%u active_network=%u)\n",
-                 whitelisted_outputs, recent_outputs, recent_solvers.size(), active_signals.size());
+
+    bool retry_scan{false};
+    {
+        TRY_LOCK(::cs_main, main_lock);
+        if (!main_lock) {
+            retry_scan = true;
+        } else {
+            const CBlockIndex* tip = wallet.chain().chainman().ActiveChain().Tip();
+            if (!tip || tip->nHeight != scan_height || tip->GetBlockHash() != scan_tip_hash) {
+                // The wallet snapshot belongs to a different active tip. Do
+                // not mix it with current chainstate; retry on the next loop.
+                retry_scan = true;
+            } else {
+                const CCoinsViewCache& view = wallet.chain().chainman().ActiveChainstate().CoinsTip();
+                const std::map<CScript, CScript> active_signals = GetActiveShadowSignalPayouts(view, tip);
+                unsigned int whitelisted_solves{0};
+                unsigned int recent_solves{0};
+                unsigned int already_active_solves{0};
+
+                // Prefer the newest qualified solve. Validation is an O(1)
+                // lookup of SolverOutpoint(target, height, hash), not a UTXO
+                // cursor or an 18,900-block reverse walk.
+                const CChain& active_chain = wallet.chain().chainman().ActiveChain();
+                for (const WalletShadowSolveReference& solve : wallet_solves) {
+                    if (!IsWhitelisted(view, solve.target)) continue;
+                    ++whitelisted_solves;
+                    const CBlockIndex* solved = active_chain[solve.solve_height];
+                    if (!solved || solved->GetBlockHash() != solve.solve_hash ||
+                        !HasRecentShadowSolverActivity(view, tip, solve.target, solve.solve_height, solve.solve_hash)) {
+                        continue;
+                    }
+                    ++recent_solves;
+                    if (active_signals.count(solve.target)) {
+                        ++already_active_solves;
+                        continue;
+                    }
+                    candidate.target = solve.target;
+                    candidate.solve_height = solve.solve_height;
+                    candidate.solve_hash = solve.solve_hash;
+                    candidate.scan_height = scan_height;
+                    LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: candidate found solve_height=%u wallet_solves=%u\n",
+                             candidate.solve_height, wallet_solves.size());
+                    return true;
+                }
+
+                if (already_active_solves > 0) {
+                    LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: wallet signal already active (wallet_active=%u wallet_recent=%u active_network=%u)\n",
+                             already_active_solves, recent_solves, active_signals.size());
+                } else {
+                    LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: no eligible wallet solve needing a signal (wallet_solves=%u wallet_whitelisted=%u wallet_recent=%u active_network=%u)\n",
+                             wallet_solves.size(), whitelisted_solves, recent_solves, active_signals.size());
+                }
+            }
+        }
     }
+    if (retry_scan) ResetAutoShadowSignalScanHeight(wallet, scan_height);
     return false;
 }
 
@@ -300,13 +560,7 @@ bool BuildAutoShadowSignalTransaction(CWallet& wallet, const AutoShadowSignalCan
         LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: candidate became active before build\n");
         return false;
     }
-    bool has_solver_activity = HasRecentShadowSolverActivity(view, tip, candidate.target, candidate.solve_height, candidate.solve_hash);
-    if (!has_solver_activity && candidate.solve_height == static_cast<uint32_t>(tip->nHeight)) {
-        const auto recent_solvers = GetRecentShadowSolverActivity(view, tip);
-        const auto it = recent_solvers.find(candidate.target);
-        has_solver_activity = it != recent_solvers.end() && it->second.height == candidate.solve_height;
-    }
-    if (!has_solver_activity) {
+    if (!HasRecentShadowSolverActivity(view, tip, candidate.target, candidate.solve_height, candidate.solve_hash)) {
         LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: candidate solve marker missing before build\n");
         return false;
     }
@@ -346,7 +600,7 @@ bool BuildAutoShadowSignalTransaction(CWallet& wallet, const AutoShadowSignalCan
         }
 
         const auto tx_it = wallet.mapWallet.find(output.outpoint.hash);
-        if (tx_it == wallet.mapWallet.end() || output.outpoint.n >= tx_it->second.tx->vout.size()) continue;
+        if (tx_it == wallet.mapWallet.end()) continue;
         const CWalletTx& wtx = tx_it->second;
         const int prev_height = wtx.state<TxStateConfirmed>() ? wtx.state<TxStateConfirmed>()->confirmed_block_height : 0;
         coins.emplace(output.outpoint, Coin(output.txout, prev_height, wtx.IsCoinBase(), wtx.IsCoinStake(), wtx.nTimeSmart));
@@ -521,6 +775,12 @@ bool ValidateSelectedDemurrageAttestationFeeOutpoints(CWallet& wallet,
 }
 
 } // namespace
+
+std::vector<WalletShadowSolveReference> GetWalletShadowSolveReferences(const CWallet& wallet, int tip_height)
+{
+    AssertLockHeld(wallet.cs_wallet);
+    return wallet.GetRecentShadowSolveReferences(tip_height, MAX_WALLET_SHADOW_SOLVE_REFERENCES);
+}
 
 bool CreateDemurrageAttestationTransaction(
     CWallet& wallet,
@@ -1148,10 +1408,34 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
 
 int MaybeAutoShadowSignal(CWallet& wallet)
 {
+    ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
     if (!gArgs.GetBoolArg("-qqautoshadowsignal", true)) return 0;
     if (!wallet.m_enabled_staking.load() || wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         return 0;
     }
+
+    AutoShadowSignalAttemptGuard attempt(wallet);
+    if (!attempt || wallet.IsStakeClosing()) return 0;
+
+    std::string pending_retry_reason;
+    const PendingShadowSignalState pending_state = ReconcilePendingShadowSignals(wallet, pending_retry_reason);
+    if (pending_state == PendingShadowSignalState::LIVE) {
+        ResetAutoShadowSignalBackoff(wallet);
+        return 0;
+    }
+    if (pending_state == PendingShadowSignalState::RETRY) {
+        ScheduleAutoShadowSignalRetry(wallet, /*scan_height=*/-1, pending_retry_reason);
+        return 0;
+    }
+
+    // Respect a non-broadcasting wallet after cleaning any terminal or
+    // retry-exhausted signal above. Creating another signed transaction here
+    // would immediately reserve a fresh input with no path to the mempool.
+    if (!wallet.GetBroadcastTransactions()) {
+        ResetAutoShadowSignalBackoff(wallet);
+        return 0;
+    }
+
     if (wallet.IsLocked() || wallet.m_wallet_unlock_staking_only) {
         LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: normal wallet unlock required (locked=%d staking_only=%d)\n",
                  wallet.IsLocked(), wallet.m_wallet_unlock_staking_only);
@@ -1159,27 +1443,23 @@ int MaybeAutoShadowSignal(CWallet& wallet)
     }
 
     AutoShadowSignalCandidate candidate;
-    {
-        TRY_LOCK(::cs_main, main_lock);
-        if (!main_lock) {
-            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: skipped because chain lock is busy\n");
-            return 0;
-        }
-        TRY_LOCK(wallet.cs_wallet, wallet_lock);
-        if (!wallet_lock) {
-            LogPrint(BCLog::COINSTAKE, "Gold Rush PoS auto-signal: skipped because wallet lock is busy\n");
-            return 0;
-        }
-        if (!FindAutoShadowSignalCandidate(wallet, candidate)) return 0;
+    if (!FindAutoShadowSignalCandidate(wallet, candidate)) {
+        ResetAutoShadowSignalBackoff(wallet);
+        return 0;
     }
+
+    if (wallet.IsStakeClosing()) return 0;
 
     CScript payout_script;
     std::string payout_address;
     bilingual_str error;
     if (!EnsureShadowSignalPayout(wallet, payout_script, payout_address, error)) {
         wallet.WalletLogPrintf("Gold Rush PoS signal skipped: %s\n", error.original);
+        ScheduleAutoShadowSignalRetry(wallet, candidate.scan_height, error.original);
         return 0;
     }
+
+    if (wallet.IsStakeClosing()) return 0;
 
     CMutableTransaction signal_tx;
     std::map<COutPoint, Coin> coins;
@@ -1188,8 +1468,12 @@ int MaybeAutoShadowSignal(CWallet& wallet)
         if (!error.empty()) {
             wallet.WalletLogPrintf("Gold Rush PoS signal skipped: %s\n", error.original);
         }
+        ScheduleAutoShadowSignalRetry(wallet, candidate.scan_height,
+                                      error.empty() ? "candidate changed during transaction construction" : error.original);
         return 0;
     }
+
+    if (wallet.IsStakeClosing()) return 0;
 
     std::map<int, bilingual_str> input_errors;
     if (!wallet.SignTransaction(signal_tx, coins, SIGHASH_DEFAULT, input_errors)) {
@@ -1199,8 +1483,11 @@ int MaybeAutoShadowSignal(CWallet& wallet)
             error = _("Signing Gold Rush PoS signal failed.");
         }
         wallet.WalletLogPrintf("%s\n", error.original);
+        ScheduleAutoShadowSignalRetry(wallet, candidate.scan_height, error.original);
         return 0;
     }
+
+    if (wallet.IsStakeClosing()) return 0;
 
     CTransactionRef tx = MakeTransactionRef(std::move(signal_tx));
     {
@@ -1209,6 +1496,7 @@ int MaybeAutoShadowSignal(CWallet& wallet)
         const MempoolAcceptResult accept = chainman.ProcessTransaction(tx, /*test_accept=*/true);
         if (accept.m_result_type != MempoolAcceptResult::ResultType::VALID) {
             wallet.WalletLogPrintf("Gold Rush PoS signal rejected: %s\n", accept.m_state.ToString());
+            ScheduleAutoShadowSignalRetry(wallet, candidate.scan_height, accept.m_state.ToString());
             return 0;
         }
     }
@@ -1222,10 +1510,13 @@ int MaybeAutoShadowSignal(CWallet& wallet)
             if (!wallet.AbandonTransaction(tx->GetHash())) {
                 wallet.WalletLogPrintf("Gold Rush PoS signal could not be abandoned after broadcast failure: txid=%s\n", tx->GetHash().ToString());
             }
+            ScheduleAutoShadowSignalRetry(wallet, candidate.scan_height,
+                                          broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error);
             return 0;
         }
     } catch (const std::exception& e) {
         wallet.WalletLogPrintf("Broadcasting Gold Rush PoS signal failed: %s\n", e.what());
+        ScheduleAutoShadowSignalRetry(wallet, candidate.scan_height, e.what());
         return 0;
     }
 
@@ -1238,6 +1529,7 @@ int MaybeAutoShadowSignal(CWallet& wallet)
     }
     wallet.WalletLogPrintf("Gold Rush PoS signal submitted: txid=%s address=%s solve_height=%u payout=%s fee=%s\n",
                            tx->GetHash().ToString(), signal_address, candidate.solve_height, payout_address, FormatMoney(fee));
+    ResetAutoShadowSignalBackoff(wallet);
     return 1;
 }
 

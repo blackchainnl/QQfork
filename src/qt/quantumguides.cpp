@@ -99,8 +99,8 @@ QString PowGuide()
 <h3>Why the payout must be a quantum address</h3>
 <p>PoW Gold Rush is intended to pull users onto quantum-resistant keys. Paying the reward to a legacy address would defeat the transition goal. The wallet therefore uses a quantum payout address and asks users to back up the wallet after that address exists.</p>
 
-<h3>Moving PoW rewards once</h3>
-<p>A Gold Rush reward should be moved to a fresh quantum address before it is used for ordinary sends, cold-stake delegation, or node bonding. The wallet can perform that move as part of certain staking/delegation workflows so the user does not have to manually understand every intermediate transaction.</p>
+<h3>When PoW rewards become spendable</h3>
+<p>A Gold Rush reward remains locked until Gold Rush ends and must satisfy normal maturity. It then becomes an ordinary direct quantum output at the original payout address. Moving it to a fresh address is optional consolidation or key rotation, not a prerequisite for sends, cold-stake delegation, or node bonding.</p>
 )HTML");
 }
 
@@ -110,7 +110,7 @@ QString UnlockGuide()
 <h2>Unlock modes in practical terms</h2>
 <p><b>Locked</b> means the wallet cannot sign transactions. It can display balances and receive funds, but it cannot stake or create claim/migration transactions.</p>
 <p><b>Legacy staking-only unlock</b> is the conservative mode for ordinary PoS staking. It is useful when the user wants this node to stake without leaving the wallet able to spend. It does not sign quantum migration, PoW claim, PoS signal, cold-stake setup, or RGB/EUTXO transactions.</p>
-<p><b>Quantum and Legacy Staking unlock</b> is a normal unlock. Use it when the wallet needs to sign active transition transactions. This includes Gold Rush PoS signal publication, PoW claim submission, quantum reward movement, migration, cold-stake delegation, node bonding, and demurrage attestations.</p>
+<p><b>Quantum and Legacy Staking unlock</b> is a normal unlock. Use it when the wallet needs to sign active transition transactions. This includes Gold Rush PoS signal publication, PoW claim submission, optional reward consolidation, migration, cold-stake delegation, node bonding, and demurrage attestations.</p>
 <p><b>Rule:</b> if the action changes where coins are spendable, creates a new quantum state, or anchors a claim, it needs normal unlock.</p>
 )HTML");
 }
@@ -138,7 +138,7 @@ QString ColdStakeGuide()
 <p>If the user stops a delegation, the wallet owner-spends the delegation back to a fresh wallet-backed quantum address when the selected output is spendable. If a bonded output is still in its unbonding period, the wallet explains the unlock height instead of silently failing.</p>
 
 <h3>Gold Rush reward handling inside cold staking</h3>
-<p>If the user tries to delegate Gold Rush reward coins that still need the required first move, the wallet should move those rewards to a fresh quantum address first, then continue with the delegation when possible. The user should see both steps in the status text so the process is understandable rather than looking like a failure.</p>
+<p>Gold Rush reward outputs remain locked until Gold Rush ends. After normal maturity and the Gold Rush boundary, they are ordinary direct quantum funds and may be delegated without a required preliminary move. Optional consolidation into a fresh wallet-backed address remains available for organization or key rotation.</p>
 )HTML");
 }
 
@@ -147,7 +147,7 @@ QString MigrationGuide()
     return QObject::tr(R"HTML(
 <h2>Migration and final lockout</h2>
 <p>Migration is the process of moving control from legacy spend paths to quantum-resistant witness programs. During the transition, upgraded wallets track both legacy ledger activity and quantum state so users can prepare without abruptly breaking ordinary chain use.</p>
-<p><b>Legacy left</b> means value is still controlled by old signatures. <b>Quantum held</b> means value is already controlled by quantum keys. <b>Gold Rush to move</b> means reward outputs were credited but still need the required first movement to a fresh quantum address before normal use.</p>
+<p><b>Legacy left</b> means value is still controlled by old signatures. <b>Quantum held</b> means value is already controlled by quantum keys. <b>Gold Rush locked</b> means reward outputs are recorded but cannot be spent until Gold Rush has ended and normal maturity is satisfied.</p>
 
 <h3>Simple migration example</h3>
 <ol>
@@ -162,8 +162,8 @@ QString MigrationGuide()
 <ol>
 <li>The wallet receives a PoW or PoS Gold Rush quantum reward.</li>
 <li>The transaction list labels it as <b>PoW - Quantum Claim</b> or <b>PoS - Quantum Stake</b>.</li>
-<li>The reward must be moved once to a fresh quantum address before ordinary use.</li>
-<li>After the move, the wallet can use it for a send, local staking, node bond, or delegation.</li>
+<li>The reward remains locked throughout Gold Rush and must also satisfy normal maturity.</li>
+<li>After Gold Rush, the same output is an ordinary direct quantum UTXO. No remigration or fresh-address move is required before a send, local stake, node bond, or delegation.</li>
 </ol>
 )HTML");
 }
@@ -208,7 +208,7 @@ QString AccountSpecificGuide()
 </ul>
 <h3>Practical examples</h3>
 <p><b>Finding spendable legacy BLK:</b> choose the Legacy filter. These are the coins the wallet can use for ordinary legacy sends, control transaction fees, and legacy staking.</p>
-<p><b>Finding quantum reward coins:</b> choose the Quantum filter and look for notes about Gold Rush rewards needing a first move. Move those rewards before using them for delegation, node bonds, or ordinary sends.</p>
+<p><b>Finding quantum reward coins:</b> choose the Quantum filter. During Gold Rush, reward outputs are phase-locked. After Gold Rush and maturity, the original outputs are ordinary direct quantum funds; optional consolidation is not a spendability requirement.</p>
 <p><b>Checking cold-stake deposits:</b> choose Cold stake. Those rows represent funds in cold-staking contracts. They may be owner-spendable by this wallet, stakable by a selected node, or both, depending on the contract.</p>
 <p><b>Auditing advanced assets:</b> use the RGB/EUTXO summary cards and filters to see whether this wallet has contract state attached to specific outputs. Avoid spending protected asset/state outputs as ordinary BLK unless the wallet's guided workflow says that is intended.</p>
 )HTML");

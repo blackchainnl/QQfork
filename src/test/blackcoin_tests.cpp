@@ -39,7 +39,8 @@
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
-                       std::vector<CScriptCheck>* pvChecks) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+                       std::vector<CScriptCheck>* pvChecks,
+                       std::atomic_bool* mldsa_internal_error) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 BOOST_FIXTURE_TEST_SUITE(blackcoin_tests, BasicTestingSetup)
 
@@ -81,7 +82,9 @@ BOOST_AUTO_TEST_CASE(phase_schedule_boundaries)
     BOOST_CHECK(IsShadowGoldRushRewardActive(consensus, consensus.nProtocolV4Time + 1, SHADOW_REWARD_START_HEIGHT));
     BOOST_CHECK(!IsShadowGoldRushRewardActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT));
     BOOST_CHECK(!IsShadowGoldRushRewardActive(consensus, consensus.nQuantumMigrationDeadlineTime + 1, SHADOW_REWARD_START_HEIGHT));
-    BOOST_CHECK(IsQuantumWitnessSpendActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT));
+    // A time-only phase transition cannot unlock a payout on the final
+    // height-authoritative Gold Rush reward block.
+    BOOST_CHECK(!IsQuantumWitnessSpendActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT));
     BOOST_CHECK(IsQuantumWitnessSpendActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT + 1));
     consensus.nStakeTierActivationHeight = SHADOW_REWARD_START_HEIGHT;
     BOOST_CHECK(!IsQuantumStakeTiersActive(consensus, consensus.nGoldRushEndTime + 1, SHADOW_REWARD_END_HEIGHT));
@@ -128,16 +131,33 @@ BOOST_AUTO_TEST_CASE(mainnet_lifecycle_is_height_coherent_and_demurrage_is_autom
                           MAINNET_SHADOW_GOLD_RUSH_BLOCKS);
     const Consensus::Params& consensus = main_params->GetConsensus();
     const int gold_rush_end = MAINNET_SHADOW_REWARD_END_HEIGHT;
-    const int migration_blocks = static_cast<int>((Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS + consensus.nTargetSpacing - 1) / consensus.nTargetSpacing);
-    const int migration_end = gold_rush_end + migration_blocks;
+    const int migration_end = MAINNET_QUANTUM_MIGRATION_END_HEIGHT;
     const int64_t active_mtp = consensus.nQuantumMigrationDeadlineTime + 1;
 
+    BOOST_CHECK_EQUAL(consensus.nQuantumLifecycleStartHeight, 5950000);
     BOOST_CHECK_EQUAL(consensus.nGoldRushEndHeight, gold_rush_end);
-    BOOST_CHECK_EQUAL(consensus.nQuantumMigrationEndHeight, migration_end);
-    BOOST_CHECK_EQUAL(consensus.EffectiveDemurrageActivationHeight(), migration_end + 1);
+    BOOST_CHECK_EQUAL(consensus.nGoldRushEndHeight, 6192999);
+    BOOST_CHECK_EQUAL(consensus.nQuantumMigrationEndHeight, 6921999);
+    BOOST_CHECK_EQUAL(consensus.EffectiveDemurrageActivationHeight(), 6922000);
     BOOST_CHECK_EQUAL(consensus.nStakeTierActivationHeight, gold_rush_end + 1);
     BOOST_CHECK_EQUAL(consensus.nStakeRewardSplitActivationHeight, migration_end + 1);
+    BOOST_CHECK_EQUAL(consensus.nShadowCompetingClaimsActivationHeight,
+                      MAINNET_SHADOW_REWARD_START_HEIGHT);
+    BOOST_CHECK(consensus.m_demurrage_exempt_scripts.empty());
+    BOOST_CHECK(consensus.IsShadowCompetingClaimsActive(MAINNET_SHADOW_REWARD_START_HEIGHT));
+    BOOST_CHECK(!consensus.IsShadowCompetingClaimsActive(MAINNET_SHADOW_REWARD_START_HEIGHT - 1));
     BOOST_CHECK_EQUAL(SHADOW_HALVING_INTERVAL_BLOCKS, MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS);
+
+    // Mainnet phase transitions are height-exact and ignore both fast and
+    // slow MTP drift once the authoritative schedule is configured.
+    for (const int64_t drifted_mtp : {int64_t{0}, active_mtp}) {
+        BOOST_CHECK(consensus.GetQuantumQuasarPhase(drifted_mtp, 5949999) == Consensus::QuantumQuasarPhase::LEGACY);
+        BOOST_CHECK(consensus.GetQuantumQuasarPhase(drifted_mtp, 5950000) == Consensus::QuantumQuasarPhase::GOLD_RUSH);
+        BOOST_CHECK(consensus.GetQuantumQuasarPhase(drifted_mtp, 6192999) == Consensus::QuantumQuasarPhase::GOLD_RUSH);
+        BOOST_CHECK(consensus.GetQuantumQuasarPhase(drifted_mtp, 6193000) == Consensus::QuantumQuasarPhase::MIGRATION);
+        BOOST_CHECK(consensus.GetQuantumQuasarPhase(drifted_mtp, 6921999) == Consensus::QuantumQuasarPhase::MIGRATION);
+        BOOST_CHECK(consensus.GetQuantumQuasarPhase(drifted_mtp, 6922000) == Consensus::QuantumQuasarPhase::FINAL_LOCKOUT);
+    }
 
     BOOST_CHECK(IsShadowGoldRushRewardActive(consensus, active_mtp, gold_rush_end));
     BOOST_CHECK(consensus.GetQuantumQuasarPhase(active_mtp, gold_rush_end) == Consensus::QuantumQuasarPhase::GOLD_RUSH);
@@ -167,6 +187,7 @@ BOOST_AUTO_TEST_CASE(phase_schedule_height_overrides)
     consensus.nProtocolV4Time = 1000;
     consensus.nGoldRushEndTime = 2000;
     consensus.nQuantumMigrationDeadlineTime = 3000;
+    consensus.nQuantumLifecycleStartHeight = 0;
     consensus.nGoldRushEndHeight = 100;
     consensus.nQuantumMigrationEndHeight = 200;
 
@@ -187,8 +208,8 @@ BOOST_AUTO_TEST_CASE(phase_schedule_height_overrides)
     BOOST_CHECK(consensus.IsQuantumFinalLockout(t, 201));
     BOOST_CHECK(consensus.IsNewNetworkStakeOnly(t, 201));
     BOOST_CHECK(!consensus.IsBaseNetworkStakeCompatible(t, 201));
-    // Pre-V4 time still reports LEGACY regardless of heights.
-    BOOST_CHECK(consensus.GetQuantumQuasarPhase(consensus.nProtocolV4Time, 500) == Consensus::QuantumQuasarPhase::LEGACY);
+    // MTP is deliberately ignored by a complete height-authoritative schedule.
+    BOOST_CHECK(consensus.GetQuantumQuasarPhase(consensus.nProtocolV4Time, 500) == Consensus::QuantumQuasarPhase::FINAL_LOCKOUT);
 
     // Height-only migration end: gold rush end by height, final lockout by height, no times set.
     consensus.nGoldRushEndTime = 0;
@@ -204,14 +225,15 @@ BOOST_AUTO_TEST_CASE(phase_schedule_height_overrides)
     BOOST_CHECK(consensus.IsDemurrageActive(201, t));
 
     // A one-sided height configuration is never treated as a hybrid schedule.
-    // Startup rejects it; direct Params consumers fall back coherently to the
-    // paired time schedule instead of mixing height and time boundaries.
+    // Startup rejects it; direct Params consumers fail closed as LEGACY
+    // instead of silently falling back to a different time schedule.
     consensus.nQuantumMigrationEndHeight = 0;
     BOOST_CHECK(consensus.HasAnyHeightLifecycleBoundary());
     BOOST_CHECK(!consensus.UsesHeightLifecycle());
     BOOST_CHECK(!consensus.IsMigrationEndScheduled());
     BOOST_CHECK(!consensus.IsGoldRushEndScheduled());
-    BOOST_CHECK(consensus.GetQuantumQuasarPhase(t, 5000) == Consensus::QuantumQuasarPhase::GOLD_RUSH);
+    BOOST_CHECK(!consensus.GetQuantumLifecycleState(t, 5000).schedule_valid);
+    BOOST_CHECK(consensus.GetQuantumQuasarPhase(t, 5000) == Consensus::QuantumQuasarPhase::LEGACY);
     BOOST_CHECK(!consensus.IsQuantumFinalLockout(t, 5000));
 
     Consensus::Params one_sided;
@@ -222,9 +244,9 @@ BOOST_AUTO_TEST_CASE(phase_schedule_height_overrides)
     BOOST_CHECK(one_sided.HasAnyHeightLifecycleBoundary());
     BOOST_CHECK(!one_sided.UsesHeightLifecycle());
     BOOST_CHECK(one_sided.GetQuantumQuasarPhase(/*nTime=*/2500, /*nHeight=*/50) ==
-                Consensus::QuantumQuasarPhase::MIGRATION);
+                Consensus::QuantumQuasarPhase::LEGACY);
     BOOST_CHECK(one_sided.GetQuantumQuasarPhase(/*nTime=*/3500, /*nHeight=*/50) ==
-                Consensus::QuantumQuasarPhase::FINAL_LOCKOUT);
+                Consensus::QuantumQuasarPhase::LEGACY);
 }
 
 BOOST_AUTO_TEST_CASE(quantum_migration_witness_v16_address_roundtrip)

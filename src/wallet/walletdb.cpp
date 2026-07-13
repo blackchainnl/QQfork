@@ -62,6 +62,7 @@ const std::string RGB_GENESIS_PROOF{"rgbgenesisproof"};
 const std::string RGB_TRANSITION{"rgbtransition"};
 const std::string RGB_TRANSITION_PROOF{"rgbtransitionproof"};
 const std::string QUANTUM_COLDSTAKE{"quantumcoldstake"};
+const std::string QUANTUM_KEY_BACKUP_STATE{"quantumkeybackup"};
 const std::string QUANTUM_KEY{"quantumkey"};
 const std::string QUANTUM_REDELEGATION_AUTO_SCAN{"quantumredelegationautoscan"};
 const std::string QUANTUM_REDELEGATION_LAST_ATTEMPT{"quantumredelegationlastattempt"};
@@ -187,6 +188,11 @@ bool WalletBatch::WriteCryptedQuantumKey(const std::vector<unsigned char>& publi
         return false;
     }
     return EraseIC(std::make_pair(DBKeys::QUANTUM_KEY, public_key));
+}
+
+bool WalletBatch::WriteQuantumKeyBackupState(const std::vector<unsigned char>& witness_program, bool verified)
+{
+    return WriteIC(std::make_pair(DBKeys::QUANTUM_KEY_BACKUP_STATE, witness_program), static_cast<uint8_t>(verified ? 1 : 0));
 }
 
 bool WalletBatch::WriteQuantumColdStakeDelegation(const std::vector<unsigned char>& witness_program, const QuantumColdStakeDelegationRecord& record)
@@ -1332,6 +1338,30 @@ static DBErrors LoadQuantumWalletRecords(CWallet* pwallet, DatabaseBatch& batch)
     });
     result = std::max(result, key_res.m_result);
 
+    // This record was introduced after v30.1.0. Its absence deliberately
+    // means "unverified" so every pre-existing or imported non-HD key fails
+    // closed until a new backup has been reopened and cryptographically
+    // checked. Malformed/stale status metadata must not make the private key
+    // itself unloadable; it is ignored with a noncritical warning.
+    LoadResult backup_state_res = LoadRecords(pwallet, batch, DBKeys::QUANTUM_KEY_BACKUP_STATE,
+        [] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) {
+        std::vector<unsigned char> witness_program;
+        uint8_t verified{0};
+        try {
+            key >> witness_program;
+            value >> verified;
+        } catch (const std::exception&) {
+            err = "Error reading wallet database: malformed quantum key backup state; treating key as unverified";
+            return DBErrors::NONCRITICAL_ERROR;
+        }
+        if (verified > 1 || !pwallet->LoadQuantumKeyBackupState(witness_program, verified == 1)) {
+            err = "Error reading wallet database: invalid quantum key backup state; treating key as unverified";
+            return DBErrors::NONCRITICAL_ERROR;
+        }
+        return DBErrors::LOAD_OK;
+    });
+    result = std::max(result, backup_state_res.m_result);
+
     LoadResult coldstake_res = LoadRecords(pwallet, batch, DBKeys::QUANTUM_COLDSTAKE,
         [] (CWallet* pwallet, DataStream& key, CDataStream& value, std::string& err) {
         return LoadQuantumColdStakeDelegation(pwallet, key, value, err) ? DBErrors::LOAD_OK : DBErrors::CORRUPT;
@@ -1445,8 +1475,9 @@ static DBErrors LoadQuantumWalletRecords(CWallet* pwallet, DatabaseBatch& batch)
     }
 
     if (result <= DBErrors::NONCRITICAL_ERROR) {
-        pwallet->WalletLogPrintf("Quantum Wallet Keys: %u plaintext, %u encrypted, %u total; QCS delegations: %u; redelegation attempts: %u; redelegation successes: %u; redelegation win-history: %u; RGB contracts: %u; RGB assignments: %u; RGB genesis proofs: %u; RGB transitions: %u; RGB transition proofs: %u; EUTXO states: %u.\n",
+        pwallet->WalletLogPrintf("Quantum Wallet Keys: %u plaintext, %u encrypted, %u total; backup states: %u; QCS delegations: %u; redelegation attempts: %u; redelegation successes: %u; redelegation win-history: %u; RGB contracts: %u; RGB assignments: %u; RGB genesis proofs: %u; RGB transitions: %u; RGB transition proofs: %u; EUTXO states: %u.\n",
                key_res.m_records, ckey_res.m_records, key_res.m_records + ckey_res.m_records,
+               backup_state_res.m_records,
                coldstake_res.m_records, redelegation_attempt_res.m_records, redelegation_success_res.m_records, redelegation_win_res.m_records,
                rgb_contract_res.m_records, rgb_assignment_res.m_records,
                rgb_genesis_proof_res.m_records, rgb_transition_res.m_records, rgb_transition_proof_res.m_records,
@@ -1939,9 +1970,9 @@ bool WalletBatch::EraseRecords(const std::unordered_set<std::string>& types)
     return m_batch->TxnCommit();
 }
 
-bool WalletBatch::TxnBegin()
+bool WalletBatch::TxnBegin(bool durable)
 {
-    return m_batch->TxnBegin();
+    return m_batch->TxnBegin(durable);
 }
 
 bool WalletBatch::TxnCommit()

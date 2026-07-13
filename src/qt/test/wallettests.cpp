@@ -12,7 +12,6 @@
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
-#include <qt/bitcoinamountfield.h>
 #include <qt/bitcoinunits.h>
 #include <qt/bitcoinamountfield.h>
 #include <qt/clientmodel.h>

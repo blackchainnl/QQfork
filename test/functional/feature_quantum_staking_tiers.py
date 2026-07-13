@@ -42,6 +42,7 @@ class QuantumStakingTiersTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.num_nodes = 2
         args = [
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
             # Regression: a legacy dev-fund output must be suppressed when a

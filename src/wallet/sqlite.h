@@ -49,6 +49,7 @@ private:
     sqlite3_stmt* m_overwrite_stmt{nullptr};
     sqlite3_stmt* m_delete_stmt{nullptr};
     sqlite3_stmt* m_delete_prefix_stmt{nullptr};
+    bool m_durable_txn{false};
 
     void SetupSQLStatements();
     bool ExecStatement(sqlite3_stmt* stmt, Span<const std::byte> blob);
@@ -70,7 +71,7 @@ public:
 
     std::unique_ptr<DatabaseCursor> GetNewCursor() override;
     std::unique_ptr<DatabaseCursor> GetNewPrefixCursor(Span<const std::byte> prefix) override;
-    bool TxnBegin() override;
+    bool TxnBegin(bool durable = false) override;
     bool TxnCommit() override;
     bool TxnAbort() override;
 };

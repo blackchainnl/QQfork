@@ -834,6 +834,7 @@ RPCHelpMan getnewaddress();
 RPCHelpMan getnewquantumcoldstakingaddress();
 RPCHelpMan getnewquantumaddress();
 RPCHelpMan getnewquantumstakeaddress();
+RPCHelpMan getquantumkeyinventory();
 RPCHelpMan getrawchangeaddress();
 RPCHelpMan setlabel();
 RPCHelpMan deladdressbook();
@@ -946,6 +947,7 @@ Span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &getnewquantumcoldstakingaddress},
         {"wallet", &getnewquantumaddress},
         {"wallet", &getnewquantumstakeaddress},
+        {"wallet", &getquantumkeyinventory},
         {"wallet", &getrawchangeaddress},
         {"wallet", &getreceivedbyaddress},
         {"wallet", &getreceivedbylabel},

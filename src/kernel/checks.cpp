@@ -6,6 +6,7 @@
 
 #include <kernel/checks.h>
 
+#include <crypto/argon2_selftest.h>
 #include <crypto/mldsa.h>
 #include <key.h>
 #include <random.h>
@@ -24,6 +25,10 @@ util::Result<void> SanityChecks(const Context&)
 
     if (!Random_SanityCheck()) {
         return util::Error{Untranslated("OS cryptographic RNG sanity check failure. Aborting.")};
+    }
+
+    if (!Argon2idSelfTest()) {
+        return util::Error{Untranslated("Argon2id cryptography sanity check failure. Aborting.")};
     }
 
     if (!ML_DSA::SelfTest()) {

@@ -100,6 +100,9 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-powmining=<true/false>", "Auto-start the built-in (in-process) Gold Rush Proof-of-Work miner at startup. Requires an unlocked wallet with private keys (default: false)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingthreads=<n>", "Worker threads (CPU cores) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingcpu=<n>", "Per-core CPU utilization target (1-100) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqshadowsignalmaxretryfailures=<n>", "Regtest/testnet-only Gold Rush PoS signal retry ceiling (default: 6)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqshadowsignalretrybasemillis=<n>", "Regtest/testnet-only Gold Rush PoS signal retry base delay in milliseconds (default: 1000)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqshadowsignalcleanupdelaymillis=<n>", "Regtest/testnet-only cleanup race-test barrier delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
 
     argsman.AddArg("-minstakingamount=<amt>", strprintf("Minimum input value to be used for staking (default: %u)", wallet::DEFAULT_MIN_STAKING_AMOUNT), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-reservebalance=<amt>", strprintf("Reserved balance not used for staking (default: %u)", wallet::DEFAULT_RESERVE_BALANCE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);

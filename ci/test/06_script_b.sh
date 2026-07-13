@@ -15,6 +15,12 @@ export LSAN_OPTIONS="suppressions=${BASE_ROOT_DIR}/test/sanitizer_suppressions/l
 export TSAN_OPTIONS="suppressions=${BASE_ROOT_DIR}/test/sanitizer_suppressions/tsan:halt_on_error=1:log_path=${BASE_SCRATCH_DIR}/sanitizer-output/tsan"
 export UBSAN_OPTIONS="suppressions=${BASE_ROOT_DIR}/test/sanitizer_suppressions/ubsan:print_stacktrace=1:halt_on_error=1:report_error_type=1"
 
+# The release gate must not silently follow a moving fuzz corpus or unit-test
+# vector.  Update this commit and the checksum together after explicit review.
+QA_ASSETS_COMMIT="${QA_ASSETS_COMMIT:-0772287676fdf3fcf87631b383b12442ab48ce75}"
+SCRIPT_ASSETS_SHA256="${SCRIPT_ASSETS_SHA256:-cd789a58ec45916e1721cdd14e82ca4c93100959f1cef4e229b22e3bf539f095}"
+export QA_ASSETS_COMMIT SCRIPT_ASSETS_SHA256
+
 if [ "$CI_OS_NAME" == "macos" ]; then
   top -l 1 -s 0 | awk ' /PhysMem/ {print}'
   echo "Number of CPUs: $(sysctl -n hw.logicalcpu)"
@@ -58,18 +64,31 @@ index 65e31724bc..f61b471953 100644
 if [ "$RUN_FUZZ_TESTS" = "true" ]; then
   export DIR_FUZZ_IN=${DIR_QA_ASSETS}/fuzz_seed_corpus/
   if [ ! -d "$DIR_FUZZ_IN" ]; then
-    ${CI_RETRY_EXE} git clone --depth=1 https://github.com/bitcoin-core/qa-assets "${DIR_QA_ASSETS}"
+    rm -rf "${DIR_QA_ASSETS}"
+    ${CI_RETRY_EXE} git clone --filter=blob:none --no-checkout https://github.com/bitcoin-core/qa-assets "${DIR_QA_ASSETS}"
   fi
+  if ! git -C "${DIR_QA_ASSETS}" cat-file -e "${QA_ASSETS_COMMIT}^{commit}" 2>/dev/null; then
+    ${CI_RETRY_EXE} git -C "${DIR_QA_ASSETS}" fetch --depth=1 origin "${QA_ASSETS_COMMIT}"
+  fi
+  git -C "${DIR_QA_ASSETS}" checkout --detach --force "${QA_ASSETS_COMMIT}"
+  test "$(git -C "${DIR_QA_ASSETS}" rev-parse HEAD)" = "${QA_ASSETS_COMMIT}"
   (
     cd "${DIR_QA_ASSETS}"
-    echo "Using qa-assets repo from commit ..."
+    echo "Using pinned qa-assets commit"
     git log -1
   )
 elif [ "$RUN_UNIT_TESTS" = "true" ] || [ "$RUN_UNIT_TESTS_SEQUENTIAL" = "true" ]; then
   export DIR_UNIT_TEST_DATA=${DIR_QA_ASSETS}/unit_test_data/
   if [ ! -d "$DIR_UNIT_TEST_DATA" ]; then
     mkdir -p "$DIR_UNIT_TEST_DATA"
-    ${CI_RETRY_EXE} curl --location --fail https://github.com/bitcoin-core/qa-assets/raw/main/unit_test_data/script_assets_test.json -o "${DIR_UNIT_TEST_DATA}/script_assets_test.json"
+    ${CI_RETRY_EXE} curl --location --fail \
+      "https://raw.githubusercontent.com/bitcoin-core/qa-assets/${QA_ASSETS_COMMIT}/unit_test_data/script_assets_test.json" \
+      -o "${DIR_UNIT_TEST_DATA}/script_assets_test.json"
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    echo "${SCRIPT_ASSETS_SHA256}  ${DIR_UNIT_TEST_DATA}/script_assets_test.json" | sha256sum --check --strict
+  else
+    echo "${SCRIPT_ASSETS_SHA256}  ${DIR_UNIT_TEST_DATA}/script_assets_test.json" | shasum -a 256 --check
   fi
 fi
 

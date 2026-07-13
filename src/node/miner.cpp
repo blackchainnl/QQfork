@@ -295,9 +295,12 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         coinbaseTx.vout[0].scriptPubKey = scriptPubKeyIn;
         coinbaseTx.vout[0].nValue = nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus());
         const int64_t transition_mtp = pindexPrev->GetMedianTimePast();
+        const auto transition = chainparams.GetConsensus().GetQuantumLifecycleState(
+            transition_mtp, nHeight);
         const bool notice_window = nHeight >= SHADOW_REWARD_START_HEIGHT &&
-                                   chainparams.GetConsensus().IsProtocolV4(transition_mtp) &&
-                                   !chainparams.GetConsensus().IsQuantumFinalLockout(transition_mtp, nHeight);
+                                   transition.schedule_valid &&
+                                   transition.phase != Consensus::QuantumQuasarPhase::LEGACY &&
+                                   transition.phase != Consensus::QuantumQuasarPhase::FINAL_LOCKOUT;
         if (notice_window) {
             coinbaseTx.vout.push_back(CTxOut(0, BuildQuantumQuasarBlockNoticeScript()));
         }
@@ -314,14 +317,22 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         txCoinStake.nTime = pblock->nTime;
 
         int64_t nSearchTime = txCoinStake.nTime; // search to current time
-        if (pwallet->m_last_coin_stake_search_time == 0) {
-            pwallet->m_last_coin_stake_search_time = nSearchTime - 1;
-        }
+        int64_t last_search_time{0};
+        uint256 last_search_tip;
+        // cs_main is already held by BlockAssembler. Never wait on the wallet
+        // here: an RPC may have a wallet snapshot in progress and must be
+        // allowed to finish without stalling block processing. Keep the
+        // successful try-lock through kernel selection so telemetry cannot be
+        // published for a search that lost a wallet-lock race and never ran.
+        TRY_LOCK(pwallet->cs_wallet, wallet_lock);
+        if (!wallet_lock) return nullptr;
+        last_search_time = pwallet->m_last_coin_stake_search_time;
+        last_search_tip = pwallet->m_last_coin_stake_search_tip;
+        if (last_search_time == 0) last_search_time = nSearchTime - 1;
 
         const uint256 current_tip_hash = pindexPrev->GetBlockHash();
-        if (nSearchTime > pwallet->m_last_coin_stake_search_time ||
-            (nSearchTime == pwallet->m_last_coin_stake_search_time &&
-             current_tip_hash != pwallet->m_last_coin_stake_search_tip)) {
+        if (nSearchTime > last_search_time ||
+            (nSearchTime == last_search_time && current_tip_hash != last_search_tip)) {
             std::vector<CTransactionRef> selected_txs;
             selected_txs.reserve(pblock->vtx.size() > 0 ? pblock->vtx.size() - 1 : 0);
             for (size_t i = 1; i < pblock->vtx.size(); ++i) {
@@ -336,7 +347,7 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
                     *pfPoSCancel = false;
                 }
             }
-            pwallet->m_last_coin_stake_search_interval = nSearchTime - pwallet->m_last_coin_stake_search_time;
+            pwallet->m_last_coin_stake_search_interval = nSearchTime - last_search_time;
             pwallet->m_last_coin_stake_search_time = nSearchTime;
             pwallet->m_last_coin_stake_search_tip = current_tip_hash;
         }
@@ -934,19 +945,25 @@ void PoSMiner(CWallet *pwallet)
 
     CTxDestination dest;
 
-    // Compute timeout for pos as sqrt(numUTXO)
+    // Compute the timeout from a wallet-only output snapshot. The old path
+    // held cs_wallet and then acquired cs_main while scanning stakeable coins,
+    // which inverted the global cs_main -> cs_wallet order used by wallet RPCs.
+    // The timeout is only a scheduling heuristic, so an output-count estimate
+    // is sufficient and avoids a chain/wallet lock pair before every miner run.
     unsigned int pos_timio;
     {
-        LOCK2(pwallet->cs_wallet, cs_main);
         CBlockIndex* tip = pwallet->chain().getTip();
         const bool final_quantum_lockout = tip && Params().GetConsensus().IsQuantumFinalLockout(tip->GetMedianTimePast(), tip->nHeight + 1);
         if (!final_quantum_lockout) {
             const std::string label = "Staking Legacy Address";
-            pwallet->ForEachAddrBookEntry([&](const CTxDestination& _dest, const std::string& _label, bool _is_change, const std::optional<wallet::AddressPurpose>& _purpose) {
-                if (_is_change) return;
-                if (_label == label)
-                    dest = _dest;
-            });
+            {
+                LOCK(pwallet->cs_wallet);
+                pwallet->ForEachAddrBookEntry([&](const CTxDestination& _dest, const std::string& _label, bool _is_change, const std::optional<wallet::AddressPurpose>& _purpose) {
+                    if (_is_change) return;
+                    if (_label == label)
+                        dest = _dest;
+                });
+            }
 
             if (std::get_if<CNoDestination>(&dest)) {
                 // create mintkey address
@@ -957,18 +974,28 @@ void PoSMiner(CWallet *pwallet)
             }
         }
 
-        std::vector<std::pair<const CWalletTx*, unsigned int> > vCoins;
-        CCoinControl coincontrol;
-        AvailableCoinsForStaking(*pwallet, vCoins, &coincontrol);
-        pos_timio = gArgs.GetIntArg("-staketimio", DEFAULT_STAKETIMIO) + 30 * sqrt(vCoins.size());
-        pwallet->WalletLogPrintf("Set proof-of-stake timeout: %ums for %u UTXOs\n", pos_timio, vCoins.size());
+        size_t wallet_output_count{0};
+        {
+            LOCK(pwallet->cs_wallet);
+            // This is only a timeout heuristic. mapWallet::size() is O(1),
+            // unlike walking every historical output while GUI wallet RPCs
+            // wait on cs_wallet.
+            wallet_output_count = pwallet->mapWallet.size();
+        }
+        // Historical wallet entries include spent outputs. Cap their effect so
+        // a long-lived wallet never turns the shutdown-aware loop into a
+        // multi-minute polling interval.
+        const size_t timeout_output_count = std::min<size_t>(wallet_output_count, 1'000'000);
+        pos_timio = gArgs.GetIntArg("-staketimio", DEFAULT_STAKETIMIO) + 30 * sqrt(timeout_output_count);
+        pwallet->WalletLogPrintf("Set proof-of-stake timeout: %ums for approximately %u wallet outputs\n", pos_timio, wallet_output_count);
     }
 
+    unsigned int assembly_failures{0};
     try {
         while (true)
         {
             while (pwallet->IsLocked() || !pwallet->m_enabled_staking || fReindex || pwallet->chain().chainman().m_blockman.m_importing) {
-                pwallet->m_last_coin_stake_search_interval = 0;
+                WITH_LOCK(pwallet->cs_wallet, pwallet->m_last_coin_stake_search_interval = 0);
                 if (!SleepStaker(pwallet, 5000))
                     return;
             }
@@ -982,14 +1009,14 @@ void PoSMiner(CWallet *pwallet)
                 (Params().IsTestChain() && gArgs.GetBoolArg("-solostaking", node::DEFAULT_SOLO_STAKING));
             if (!solo_staking) {
                 while (pwallet->chain().getNodeCount(ConnectionDirection::Both) == 0 || pwallet->chain().isInitialBlockDownload()) {
-                    pwallet->m_last_coin_stake_search_interval = 0;
+                    WITH_LOCK(pwallet->cs_wallet, pwallet->m_last_coin_stake_search_interval = 0);
                     if (!SleepStaker(pwallet, 10000))
                         return;
                 }
             }
 
             while (!solo_staking && GuessVerificationProgress(Params().TxData(), pwallet->chain().getTip()) < 0.996) {
-                pwallet->m_last_coin_stake_search_interval = 0;
+                WITH_LOCK(pwallet->cs_wallet, pwallet->m_last_coin_stake_search_interval = 0);
                 pwallet->WalletLogPrintf("Staker thread sleeps while sync at %f\n", GuessVerificationProgress(Params().TxData(), pwallet->chain().getTip()));
                 if (!SleepStaker(pwallet, 10000))
                     return;
@@ -1001,22 +1028,24 @@ void PoSMiner(CWallet *pwallet)
             //
             // Create new block
             //
-            CBlockIndex* pindexPrev = pwallet->chain().getTip();
             bool fPoSCancel{false};
             int64_t pFees{0};
             CBlock *pblock;
             std::unique_ptr<CBlockTemplate> pblocktemplate;
 
+            try {
+                // BlockAssembler owns its chainstate locking and CreateCoinStake
+                // acquires cs_main before trying cs_wallet. Do not wrap it in a
+                // wallet-first lock pair.
+                pblocktemplate = BlockAssembler{pwallet->chain().chainman().ActiveChainstate(), &pwallet->chain().mempool()}.CreateNewBlock(GetScriptForDestination(dest), pwallet, &fPoSCancel, &pFees, dest);
+            }
+            catch (const std::runtime_error &e)
             {
-                LOCK2(pwallet->cs_wallet, cs_main);
-                try {
-                    pblocktemplate = BlockAssembler{pwallet->chain().chainman().ActiveChainstate(), &pwallet->chain().mempool()}.CreateNewBlock(GetScriptForDestination(dest), pwallet, &fPoSCancel, &pFees, dest);
-                }
-                catch (const std::runtime_error &e)
-                {
-                    pwallet->WalletLogPrintf("PoSMiner runtime error: %s\n", e.what());
-                    continue;
-                }
+                pwallet->WalletLogPrintf("PoSMiner runtime error: %s\n", e.what());
+                assembly_failures = std::min(assembly_failures + 1, 6U);
+                const uint64_t backoff_ms = std::min<uint64_t>(250ULL << (assembly_failures - 1), 5000ULL);
+                if (!SleepStaker(pwallet, backoff_ms)) return;
+                continue;
             }
 
             if (!pblocktemplate.get())
@@ -1035,19 +1064,51 @@ void PoSMiner(CWallet *pwallet)
                 return;
             }
             pblock = &pblocktemplate->block;
-            IncrementExtraNonce(pblock, pindexPrev, nExtraNonce);
+
+            const CBlockIndex* pindexPrev{nullptr};
+            int64_t prev_mtp{0};
+            int next_height{0};
+            bool stale_template{false};
+            {
+                LOCK(cs_main);
+                pindexPrev = pwallet->chain().chainman().m_blockman.LookupBlockIndex(pblock->hashPrevBlock);
+                const CBlockIndex* active_tip = pwallet->chain().chainman().ActiveChain().Tip();
+                if (!pindexPrev || !active_tip || active_tip != pindexPrev) {
+                    stale_template = true;
+                } else {
+                    prev_mtp = pindexPrev->GetMedianTimePast();
+                    next_height = pindexPrev->nHeight + 1;
+                    // IncrementExtraNonce keeps process-global previous-tip
+                    // state. Serialize it with the same chain lock used by all
+                    // template builders so concurrent wallet stakers cannot
+                    // race that static state after the old outer lock removal.
+                    IncrementExtraNonce(pblock, pindexPrev, nExtraNonce);
+                }
+            }
+            if (stale_template) {
+                if (!SleepStaker(pwallet, pos_timio)) return;
+                continue;
+            }
 
             // peercoin: if proof-of-stake block found then process block
             if (pblock->IsProofOfStake())
             {
+                bool signed_block{false};
                 {
-                    LOCK2(pwallet->cs_wallet, cs_main);
-                    if (!SignBlock(*pblock, *pwallet, Params().GetConsensus(), pindexPrev->GetMedianTimePast(), pindexPrev->nHeight + 1))
-                    {
-                        pwallet->WalletLogPrintf("PoSMiner: failed to sign PoS block\n");
-                        continue;
-                    }
+                    // Block signing uses wallet keys only. The phase context was
+                    // snapshotted above under cs_main; never hold the wallet lock
+                    // while entering chainstate here.
+                    LOCK(pwallet->cs_wallet);
+                    signed_block = SignBlock(*pblock, *pwallet, Params().GetConsensus(), prev_mtp, next_height);
                 }
+                if (!signed_block) {
+                    pwallet->WalletLogPrintf("PoSMiner: failed to sign PoS block\n");
+                    assembly_failures = std::min(assembly_failures + 1, 6U);
+                    const uint64_t backoff_ms = std::min<uint64_t>(250ULL << (assembly_failures - 1), 5000ULL);
+                    if (!SleepStaker(pwallet, backoff_ms)) return;
+                    continue;
+                }
+                assembly_failures = 0;
                 pwallet->WalletLogPrintf("PoSMiner: proof-of-stake block found %s\n", pblock->GetHash().ToString());
                 ProcessBlockFound(pblock, pwallet->chain().chainman());
                 // Rest for ~16 seconds after successful block to preserve close quick
@@ -1072,16 +1133,21 @@ void PoSMiner(CWallet *pwallet)
 void static ThreadStakeMiner(CWallet *pwallet)
 {
     pwallet->WalletLogPrintf("ThreadStakeMiner started\n");
-    while (true) {
+    unsigned int restart_failures{0};
+    while (!pwallet->IsStakeClosing()) {
         try {
             PoSMiner(pwallet);
-            break;
         }
         catch (std::exception& e) {
             PrintExceptionContinue(&e, "ThreadStakeMiner()");
         } catch (...) {
             PrintExceptionContinue(nullptr, "ThreadStakeMiner()");
         }
+        if (pwallet->IsStakeClosing()) break;
+        restart_failures = std::min(restart_failures + 1, 6U);
+        const uint64_t backoff_ms = std::min<uint64_t>(1000ULL << (restart_failures - 1), 30000ULL);
+        pwallet->WalletLogPrintf("ThreadStakeMiner restarting after unexpected exit in %ums\n", backoff_ms);
+        if (!SleepStaker(pwallet, backoff_ms)) break;
     }
     pwallet->WalletLogPrintf("ThreadStakeMiner stopped\n");
 }

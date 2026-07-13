@@ -135,6 +135,8 @@ WalletQuantumAddressInfo MakeWalletQuantumAddressInfo(const CWallet& wallet, con
     result.public_key = HexStr(info.public_key);
     result.creation_time = info.creation_time;
     result.encrypted = info.encrypted;
+    result.durably_stored = info.durably_stored;
+    result.backup_verified = info.backup_verified;
     QuantumStakeTierProgram tier;
     if (DecodeQuantumStakeTierProgram(QUANTUM_MIGRATION_WITNESS_VERSION, info.witness_program, tier) && tier.tiered) {
         result.tiered = true;
@@ -1398,7 +1400,7 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
 {
     const std::string label = !destination_label.empty()
         ? destination_label
-        : (goldrush_rewards_only ? "goldrush-remigration-gui" : "migration-gui");
+        : (goldrush_rewards_only ? "goldrush-consolidation-gui" : "migration-gui");
     auto destination_result = wallet.GetNewQuantumDestination(label);
     if (!destination_result) return util::Error{util::ErrorString(destination_result)};
     const CTxDestination destination = *destination_result;
@@ -1484,7 +1486,7 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         }
         if (eligible_inputs == 0) {
             return util::Error{goldrush_rewards_only
-                ? _("No wallet-owned Gold Rush reward outputs need migration.")
+                ? _("No spendable wallet-owned Gold Rush reward outputs are available to consolidate.")
                 : _("No spendable legacy coins to migrate.")};
         }
         if (!goldrush_rewards_only && IsQuantumWitnessSpendActive(consensus, mtp, next_height) &&
@@ -1500,19 +1502,19 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         fee = res->fee;
         if (tx->vout.size() != 1 || IsDust(tx->vout[0], wallet.chain().relayDustFee())) {
             return util::Error{goldrush_rewards_only
-                ? _("Gold Rush reward migration would strand funds: selected value is below the dust threshold after fees.")
+                ? _("Gold Rush reward consolidation would strand funds: selected value is below the dust threshold after fees.")
                 : _("Migration would strand funds: swept value is below the dust threshold after fees.")};
         }
         comment = !comment_override.empty()
             ? comment_override
             : goldrush_rewards_only
-            ? "Blackcoin Gold Rush reward remigration"
+            ? "Blackcoin Gold Rush reward consolidation"
             : "Blackcoin quantum migration";
     }
 
     mapValue_t map_value;
     map_value["comment"] = std::move(comment);
-    if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), goldrush_rewards_only ? "Gold Rush reward migration" : "quantum migration"); !committed) {
+    if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), goldrush_rewards_only ? "Gold Rush reward consolidation" : "quantum migration"); !committed) {
         return util::Error{util::ErrorString(committed)};
     }
 
@@ -2223,6 +2225,7 @@ public:
     }
     int64_t getLastCoinStakeSearchInterval() override
     {
+        LOCK(m_wallet->cs_wallet);
         return m_wallet->m_last_coin_stake_search_interval;
     }
     bool getWalletUnlockStakingOnly() override
@@ -2253,6 +2256,7 @@ public:
     }
     WalletPowMiningInfo getPowMiningInfo() override
     {
+        ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
         WalletPowMiningInfo info;
         info.enabled = m_wallet->m_pow_mining_enabled;
         info.threads = m_wallet->m_pow_threads;
@@ -2263,6 +2267,7 @@ public:
         info.shadow_reward_start_height = SHADOW_REWARD_START_HEIGHT;
         info.shadow_reward_end_height = SHADOW_REWARD_END_HEIGHT;
         std::set<CScript> wallet_scripts;
+        std::vector<WalletShadowSolveReference> wallet_solves;
         TRY_LOCK(::cs_main, main_lock);
         if (!main_lock) {
             info.payout_address_available = false;
@@ -2273,13 +2278,12 @@ public:
             TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
             if (wallet_lock) {
                 info.payout_address = m_wallet->m_pow_payout_quantum;
-                CCoinControl coin_control;
-                coin_control.m_avoid_address_reuse = false;
-                for (const COutput& output : AvailableCoins(*m_wallet, &coin_control).All()) {
-                    if (output.txout.nValue > 0 && !output.txout.scriptPubKey.empty() && !output.txout.scriptPubKey.IsUnspendable()) {
-                        wallet_scripts.insert(CanonicalizeLegacyStakeScript(output.txout.scriptPubKey));
-                    }
-                }
+                const std::vector<CScript> known_scripts =
+                    m_wallet->GetOwnedLegacyShadowScripts(MAX_WALLET_SHADOW_SOLVE_REFERENCES);
+                wallet_scripts.insert(known_scripts.begin(), known_scripts.end());
+                const CBlockIndex* tip = m_wallet->chain().chainman().ActiveChain().Tip();
+                if (tip) wallet_solves = GetWalletShadowSolveReferences(*m_wallet, tip->nHeight);
+                for (const WalletShadowSolveReference& solve : wallet_solves) wallet_scripts.insert(solve.target);
             } else {
                 info.payout_address_available = false;
                 info.wallet_goldrush_status_available = false;
@@ -2315,13 +2319,18 @@ public:
                     if (active_signals.count(script)) {
                         info.wallet_active_signal = true;
                     }
-                    const std::optional<ShadowSolverActivity> activity = GetRecentShadowSolverActivityForScript(active.CoinsTip(), tip, script);
-                    if (activity) {
-                        info.wallet_recent_solve_qualified = true;
-                        info.wallet_blocks_until_solver_expiry = std::max(
-                            info.wallet_blocks_until_solver_expiry,
-                            std::max(0, SHADOW_SOLVER_ACTIVITY_WINDOW - (tip->nHeight - static_cast<int>(activity->height))));
+                }
+                for (const WalletShadowSolveReference& solve : wallet_solves) {
+                    if (!wallet_scripts.count(solve.target) || !IsWhitelisted(active.CoinsTip(), solve.target)) continue;
+                    const CBlockIndex* solved = active.m_chain[solve.solve_height];
+                    if (!solved || solved->GetBlockHash() != solve.solve_hash ||
+                        !HasRecentShadowSolverActivity(active.CoinsTip(), tip, solve.target, solve.solve_height, solve.solve_hash)) {
+                        continue;
                     }
+                    info.wallet_recent_solve_qualified = true;
+                    info.wallet_blocks_until_solver_expiry = std::max(
+                        info.wallet_blocks_until_solver_expiry,
+                        std::max(0, SHADOW_SOLVER_ACTIVITY_WINDOW - (tip->nHeight - static_cast<int>(solve.solve_height))));
                 }
             }
         }

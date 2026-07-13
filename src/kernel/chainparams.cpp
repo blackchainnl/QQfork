@@ -156,9 +156,9 @@ public:
         consensus.nProtocolV4Time = Consensus::QUANTUM_QUASAR_MAINNET_V4_TIME; // Future date for mainnet
         consensus.nGoldRushEndTime = consensus.nProtocolV4Time + Consensus::QUANTUM_QUASAR_GOLD_RUSH_SECONDS;
         consensus.nQuantumMigrationDeadlineTime = consensus.nGoldRushEndTime + Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS;
+        consensus.nQuantumLifecycleStartHeight = MAINNET_SHADOW_REWARD_START_HEIGHT;
         consensus.nGoldRushEndHeight = MAINNET_SHADOW_REWARD_END_HEIGHT;
-        consensus.nQuantumMigrationEndHeight = consensus.nGoldRushEndHeight +
-            (Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS + consensus.nTargetSpacing - 1) / consensus.nTargetSpacing;
+        consensus.nQuantumMigrationEndHeight = MAINNET_QUANTUM_MIGRATION_END_HEIGHT;
         consensus.nQuantumSighashChainId = 0x424c4b00; // "BLK\0": mainnet ML-DSA replay domain
         // The first Final-Lockout block also starts demurrage with zero
         // inactivity. This is automatic, height-exact, and non-retroactive.
@@ -166,6 +166,7 @@ public:
         consensus.nDemurrageMinActivationHeight = consensus.nDemurrageActivationHeight;
         consensus.nStakeTierActivationHeight = consensus.nGoldRushEndHeight + 1;
         consensus.nStakeRewardSplitActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
+        consensus.nShadowCompetingClaimsActivationHeight = MAINNET_SHADOW_REWARD_START_HEIGHT;
         consensus.nLastPOWBlock = 10000;
         consensus.nStakeTimestampMask = 0xf; // 15
         consensus.nCoinbaseMaturity = 500;
@@ -308,6 +309,7 @@ public:
         consensus.nProtocolV4Time = 0; // Instantly active on testnet
         consensus.nGoldRushEndTime = Consensus::QUANTUM_QUASAR_MAINNET_V4_TIME + Consensus::QUANTUM_QUASAR_GOLD_RUSH_SECONDS;
         consensus.nQuantumMigrationDeadlineTime = consensus.nGoldRushEndTime + Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS;
+        consensus.nQuantumLifecycleStartHeight = 0;
         consensus.nGoldRushEndHeight = MAINNET_SHADOW_REWARD_END_HEIGHT;
         consensus.nQuantumMigrationEndHeight = consensus.nGoldRushEndHeight +
             (Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS + consensus.nTargetSpacing - 1) / consensus.nTargetSpacing;
@@ -344,6 +346,7 @@ public:
         consensus.nStakeRewardSplitActivationHeight = consensus.nQuantumMigrationEndHeight > 0
             ? consensus.nQuantumMigrationEndHeight + 1
             : std::numeric_limits<int>::max();
+        consensus.nShadowCompetingClaimsActivationHeight = SHADOW_REWARD_START_HEIGHT;
         if (consensus.UsesHeightLifecycle() && consensus.IsQuantumLifecycleScheduleOrdered()) {
             consensus.nDemurrageActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
             consensus.nDemurrageMinActivationHeight = consensus.nDemurrageActivationHeight;
@@ -532,11 +535,13 @@ public:
         consensus.nProtocolV4Time = 0; // Instantly active on signet
         consensus.nGoldRushEndTime = Consensus::QUANTUM_QUASAR_MAINNET_V4_TIME + Consensus::QUANTUM_QUASAR_GOLD_RUSH_SECONDS;
         consensus.nQuantumMigrationDeadlineTime = consensus.nGoldRushEndTime + Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS;
+        consensus.nQuantumLifecycleStartHeight = 0;
         consensus.nGoldRushEndHeight = MAINNET_SHADOW_REWARD_END_HEIGHT;
         consensus.nQuantumMigrationEndHeight = consensus.nGoldRushEndHeight +
             (Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS + consensus.nTargetSpacing - 1) / consensus.nTargetSpacing;
         consensus.nStakeTierActivationHeight = consensus.nGoldRushEndHeight + 1;
         consensus.nStakeRewardSplitActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
+        consensus.nShadowCompetingClaimsActivationHeight = MAINNET_SHADOW_REWARD_START_HEIGHT;
         consensus.nDemurrageActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
         consensus.nQuantumSighashChainId = 0x424c4b02; // "BLK\2": signet ML-DSA replay domain
         consensus.nDemurrageMinActivationHeight = consensus.nDemurrageActivationHeight;
@@ -660,12 +665,19 @@ public:
         if (opts.quantum_v4_time) consensus.nProtocolV4Time = *opts.quantum_v4_time;
         if (opts.quantum_gold_rush_end_time) consensus.nGoldRushEndTime = *opts.quantum_gold_rush_end_time;
         if (opts.quantum_migration_deadline_time) consensus.nQuantumMigrationDeadlineTime = *opts.quantum_migration_deadline_time;
-        if (opts.quantum_gold_rush_end_height) consensus.nGoldRushEndHeight = *opts.quantum_gold_rush_end_height;
-        if (opts.quantum_migration_end_height) consensus.nQuantumMigrationEndHeight = *opts.quantum_migration_end_height;
+        if (opts.quantum_gold_rush_end_height && opts.quantum_migration_end_height) {
+            // Test-chain height schedules retain the historical behavior in
+            // which Protocol V4 is active from genesis; only their compressed
+            // Gold Rush/Migration end heights are overridden.
+            consensus.nQuantumLifecycleStartHeight = 0;
+            consensus.nGoldRushEndHeight = *opts.quantum_gold_rush_end_height;
+            consensus.nQuantumMigrationEndHeight = *opts.quantum_migration_end_height;
+        }
         if (opts.quantum_stake_tiers_activation_height) consensus.nStakeTierActivationHeight = *opts.quantum_stake_tiers_activation_height;
         if (opts.quantum_stake_reward_split_activation_height) consensus.nStakeRewardSplitActivationHeight = *opts.quantum_stake_reward_split_activation_height;
         if (opts.quantum_demurrage_activation_height) consensus.nDemurrageActivationHeight = *opts.quantum_demurrage_activation_height;
         if (opts.quantum_demurrage_blocks_per_month) consensus.nDemurrageBlocksPerMonth = *opts.quantum_demurrage_blocks_per_month;
+        consensus.nShadowCompetingClaimsActivationHeight = SHADOW_REWARD_START_HEIGHT;
         if (consensus.UsesHeightLifecycle() && consensus.IsQuantumLifecycleScheduleOrdered()) {
             const int automatic_demurrage_height = consensus.nQuantumMigrationEndHeight + 1;
             if (opts.quantum_demurrage_activation_height &&

@@ -67,6 +67,17 @@ struct QuantumColdStakeRedelegationResult
     CTransactionRef tx;
 };
 
+/** Fixed cap on exact chainstate marker reads in latency-sensitive wallet paths. */
+static constexpr size_t MAX_WALLET_SHADOW_SOLVE_REFERENCES{256};
+
+/**
+ * Return the newest confirmed wallet-owned coinstake solve per canonical
+ * script. The wallet scan is in-memory; callers validate at most the fixed cap
+ * above through HasRecentShadowSolverActivity while holding cs_main.
+ */
+std::vector<WalletShadowSolveReference> GetWalletShadowSolveReferences(
+    const CWallet& wallet, int tip_height) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
 bool CreateDemurrageAttestationTransaction(
     CWallet& wallet,
     const std::vector<unsigned char>& witness_program,

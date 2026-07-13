@@ -3,27 +3,133 @@ name: pull-request safety gate
 on:
   pull_request:
   workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Full commit SHA to test (defaults to the selected branch)
+        required: false
+        type: string
+      release_mode:
+        description: Also run the complete extended functional suite
+        required: true
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      target_sha:
+        description: Immutable commit SHA to test
+        required: true
+        type: string
+      release_mode:
+        description: Run release-only exhaustive tests
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 concurrency:
-  group: pr-gate-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: safety-gate-${{ inputs.target_sha || github.event.pull_request.head.sha || github.sha }}
+  cancel-in-progress: ${{ inputs.release_mode != true }}
+
+env:
+  TARGET_SHA: ${{ inputs.target_sha || github.event.pull_request.head.sha || github.sha }}
+  HOST: x86_64-pc-linux-gnu
+  MAKEJOBS: 4
 
 jobs:
-  consensus-and-wallet:
-    name: consensus, wallet, and activation boundaries
+  policy-and-lint:
+    name: source identity, workflow syntax, and lint
     runs-on: ubuntu-22.04
-    timeout-minutes: 90
-    env:
-      HOST: x86_64-pc-linux-gnu
-      MAKEJOBS: 4
+    timeout-minutes: 30
     steps:
-      - name: Checkout
+      - name: Checkout immutable candidate
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
         with:
+          ref: ${{ env.TARGET_SHA }}
           fetch-depth: 0
+
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+
+      - name: Verify repository and source identity
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || 'f647dc75c9479c03e81414f145a8d233b60959c7' }}
+        run: |
+          set -euo pipefail
+          args=(
+            --base "$BASE_SHA"
+            --head "$TARGET_SHA"
+            --repository "$GITHUB_REPOSITORY"
+          )
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            args+=(--require-actor --actor "$GITHUB_ACTOR")
+          fi
+          python3 ci/release/verify_source_identity.py "${args[@]}"
+
+      - name: Reject malformed patch whitespace
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || 'f647dc75c9479c03e81414f145a8d233b60959c7' }}
+        run: git diff --check "$BASE_SHA...$TARGET_SHA"
+
+      - name: Install lint dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends python3-pip shellcheck
+          python3 -m pip install --user \
+            codespell==2.2.5 \
+            flake8==6.1.0 \
+            lief==0.13.2 \
+            mypy==1.4.1 \
+            pyzmq==25.1.0 \
+            vulture==2.6
+
+      - name: Parse workflow YAML
+        run: ruby -e 'require "yaml"; Dir[".github/workflows/*.yml"].each { |path| YAML.parse_file(path) }'
+
+      - name: Validate workflow semantics with pinned actionlint
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/actionlint_1.7.9_linux_amd64.tar.gz"
+          curl --location --fail --silent --show-error \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.9/actionlint_1.7.9_linux_amd64.tar.gz \
+            --output "$archive"
+          echo '233b280d05e100837f4af1433c7b40a5dcb306e3aa68fb4f17f8a7f45a7df7b4  '"$archive" |
+            sha256sum --check --strict
+          tar -C "$RUNNER_TEMP" -xzf "$archive" actionlint
+          "$RUNNER_TEMP/actionlint" -color
+
+      - name: Test fail-closed release tooling
+        run: python3 ci/release/test_release_tools.py
+
+      - name: Run repository linters
+        shell: bash
+        env:
+          COMMIT_RANGE: ${{ github.event.pull_request.base.sha || 'f647dc75c9479c03e81414f145a8d233b60959c7' }}..${{ env.TARGET_SHA }}
+        run: |
+          set -euo pipefail
+          test/lint/check-doc.py
+          test/lint/all-lint.py
+
+  native-build-and-unit:
+    name: pinned native build and unit tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
 
       - name: Install build tools
         run: |
@@ -32,33 +138,119 @@ jobs:
             automake bison build-essential cmake gettext gperf libtool \
             pkg-config python3 python3-zmq
 
-      - name: Reject malformed patch whitespace
-        if: github.event_name == 'pull_request'
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: git diff --check "origin/$BASE_REF...HEAD"
-
       - name: Build pinned dependencies
         run: |
           make -j "$MAKEJOBS" -C depends \
             HOST="$HOST" NO_QT=1 NO_UPNP=1 NO_NATPMP=1
 
-      - name: Configure
+      - name: Configure debug and lock-order build
         run: |
           ./autogen.sh
           ./configure \
             --prefix="$PWD/depends/$HOST" \
             --with-gui=no \
+            --enable-debug \
             --disable-bench \
             --disable-zmq
 
-      - name: Compile and run unit tests
+      - name: Compile candidate
+        run: make -j "$MAKEJOBS"
+
+      - name: Run unit and utility tests
         run: make -j "$MAKEJOBS" check
 
-      - name: Run consensus and wallet functional gates
+      - name: Upload exact test binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: safety-gate-native-${{ env.TARGET_SHA }}
+          path: |
+            src/blackcoind
+            src/blackcoin-cli
+            src/blackcoin-tx
+            src/blackcoin-util
+            src/blackcoin-wallet
+            test/config.ini
+          if-no-files-found: error
+          retention-days: 3
+
+  native-macos-crypto:
+    name: ${{ matrix.name }} native cryptographic vectors
+    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS Intel
+            runner: macos-15-intel
+            host: x86_64-apple-darwin
+            expected_arch: x86_64
+          - name: macOS Apple Silicon
+            runner: macos-15
+            host: aarch64-apple-darwin
+            expected_arch: arm64
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout and native architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(uname -m)" = "${{ matrix.expected_arch }}"
+
+      - name: Install native build tools
+        run: brew install automake libtool pkg-config
+
+      - name: Build pinned native dependencies
+        run: |
+          make -j 2 -C depends HOST=${{ matrix.host }} \
+            NO_WALLET=1 NO_QT=1 NO_UPNP=1 NO_NATPMP=1
+
+      - name: Configure walletless native test build
+        run: |
+          ./autogen.sh
+          ./configure \
+            --prefix="$PWD/depends/${{ matrix.host }}" \
+            --disable-wallet --with-gui=no --disable-bench --disable-zmq
+
+      - name: Compile and run cryptographic and monetary vectors
+        run: |
+          make -C src -j 2 test/test_blackcoin
+          for suite in crypto_hardening_tests demurrage_tests shadow_tests; do
+            src/test/test_blackcoin --run_test="$suite" --log_level=test_suite
+          done
+
+  critical-protocol:
+    name: critical Gold Rush, lifecycle, wallet, and recovery tests
+    needs: native-build-and-unit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Download exact test binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: safety-gate-native-${{ env.TARGET_SHA }}
+          path: .
+
+      - name: Restore executable permissions
+        run: chmod +x src/blackcoind src/blackcoin-cli src/blackcoin-tx src/blackcoin-util src/blackcoin-wallet
+
+      - name: Run critical protocol and wallet gates
         run: |
           python3 test/functional/test_runner.py \
-            --ci --jobs=1 --failfast --combinedlogslen=999999 \
+            --ci --jobs=2 --failfast --combinedlogslen=999999 \
             feature_quantum_activation_boundary.py \
             feature_blackcoin_phase.py \
             feature_goldrush_migration_rpc.py \
@@ -66,10 +258,180 @@ jobs:
             feature_goldrush_shadow_replay.py \
             feature_goldrush_reorg.py \
             feature_goldrush_pow_miner_e2e.py \
+            feature_goldrush_pos_signal.py \
+            feature_goldrush_pos_single_utxo.py \
             feature_goldrush_pos_unrestricted.py \
-            feature_quantum_staking_tiers.py \
-            feature_quantum_coldstaking.py \
+            feature_goldrush_value_path.py \
+            feature_goldrush_height_schedule_multinode.py \
+            feature_goldrush_schedule_controls.py \
             feature_goldrush_coldstake_auto_migration.py \
-            wallet_basic.py \
-            wallet_resendwallettransactions.py \
-            feature_goldrush_height_schedule_multinode.py
+            feature_goldrush_coinstatsindex.py \
+            feature_quantum_lifecycle.py \
+            feature_quantum_demurrage.py \
+            feature_quantum_demurrage_height_boundary.py \
+            feature_quantum_final_lockout_sighash.py \
+            feature_quantum_staking_tiers.py \
+            feature_quantum_stake_reward_split.py \
+            feature_quantum_pool_cap.py \
+            feature_quantum_redelegation.py \
+            feature_quantum_redelegation_auto.py \
+            feature_quantum_coldstaking.py \
+            wallet_quantum_coin_selection.py \
+            wallet_pos_multiwallet_staking.py \
+            wallet_backup.py \
+            wallet_encryption.py \
+            feature_reindex.py \
+            feature_shutdown.py
+
+  mixed-version:
+    name: real v26.2, v28.4, v30.1, and candidate interoperability
+    needs: native-build-and-unit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Download exact candidate binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: safety-gate-native-${{ env.TARGET_SHA }}
+          path: .
+
+      - name: Restore candidate executable permissions
+        run: chmod +x src/blackcoind src/blackcoin-cli src/blackcoin-tx src/blackcoin-util src/blackcoin-wallet
+
+      - name: Install historical build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            automake bison build-essential cmake gettext gperf libtool \
+            pkg-config python3 python3-zmq
+
+      - name: Restore pull-request historical-binary cache
+        if: ${{ inputs.release_mode != true }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: .ci/previous-releases
+          key: mixed-version-${{ runner.os }}-${{ hashFiles('ci/mixed-version/sources.json', 'ci/mixed-version/build_previous_releases.py') }}
+
+      - name: Build and verify historical binaries
+        run: |
+          python3 ci/mixed-version/build_previous_releases.py \
+            --output "$PWD/.ci/previous-releases" \
+            --build-root "$RUNNER_TEMP/blackcoin-previous-builds" \
+            --host "$HOST" \
+            --jobs "$MAKEJOBS"
+
+      - name: Run mixed-version relay and reorg test
+        env:
+          PREVIOUS_RELEASES_DIR: ${{ github.workspace }}/.ci/previous-releases
+        run: |
+          python3 test/functional/test_runner.py \
+            --ci --jobs=1 --failfast --combinedlogslen=999999 \
+            feature_goldrush_mixed_version.py --previous-releases
+
+      - name: Upload historical binary provenance
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mixed-version-provenance-${{ env.TARGET_SHA }}
+          path: .ci/previous-releases/provenance.json
+          if-no-files-found: error
+          retention-days: 30
+
+  exhaustive-functional:
+    name: complete functional and soak suite
+    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    needs: native-build-and-unit
+    runs-on: ubuntu-22.04
+    timeout-minutes: 480
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Download exact test binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: safety-gate-native-${{ env.TARGET_SHA }}
+          path: .
+
+      - name: Restore executable permissions
+        run: chmod +x src/blackcoind src/blackcoin-cli src/blackcoin-tx src/blackcoin-util src/blackcoin-wallet
+
+      - name: Run all default and extended functional tests
+        run: |
+          python3 test/functional/test_runner.py \
+            --ci --extended --jobs=4 --combinedlogslen=999999 \
+            --exclude=feature_goldrush_mixed_version.py
+
+  sanitizer-gates:
+    name: ${{ matrix.name }} consensus and liveness gate
+    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 480
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: address-undefined-sanitizer
+            environment: ci/test/00_setup_env_native_asan.sh
+            functional_tests: >-
+              feature_goldrush_shadow_replay.py
+              feature_goldrush_pos_signal.py
+              feature_goldrush_pos_signal_recovery.py
+              wallet_pos_multiwallet_staking.py
+              feature_quantum_lifecycle.py
+              feature_quantum_demurrage_height_boundary.py
+              feature_shutdown.py
+          - name: thread-sanitizer
+            environment: ci/test/00_setup_env_native_tsan.sh
+            functional_tests: >-
+              feature_goldrush_pos_signal.py
+              feature_goldrush_pos_signal_recovery.py
+              wallet_pos_multiwallet_staking.py
+              feature_shutdown.py
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+
+      - name: Run sanitizer gate with pinned consensus dependencies
+        env:
+          CI_OS_NAME: linux
+          FILE_ENV: ${{ matrix.environment }}
+          MAKEJOBS: -j2
+          TEST_RUNNER_EXTRA: ${{ matrix.functional_tests }}
+        run: ./ci/test_run_all.sh
+
+  fuzz-smoke:
+    name: pinned-corpus sanitizer fuzz smoke
+    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 480
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+
+      - name: Build and run the pinned fuzz corpus
+        env:
+          CI_OS_NAME: linux
+          FILE_ENV: ci/test/00_setup_env_native_fuzz.sh
+          MAKEJOBS: -j2
+        run: ./ci/test_run_all.sh

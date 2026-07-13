@@ -91,6 +91,7 @@ class GoldRushScheduleControlsTest(BitcoinTestFramework):
                 "-shadowgoldrushstartheight=110",
                 "-shadowgoldrushendheight=119",
                 "-qqgoldrushendheight=115",
+                "-qqmigrationendheight=215",
             ],
             expected_msg="must not be below the shadow reward end height",
             match=ErrorMatch.PARTIAL_REGEX,
@@ -108,8 +109,11 @@ class GoldRushScheduleControlsTest(BitcoinTestFramework):
         assert_equal(info["shadow_reward_end_height"], 119)
         assert_equal(info["shadow_reward_next_height"], 1)
         assert_equal(info["shadow_reward_height_active"], False)
-        assert_equal(info["gold_rush_end_height"], 0)
-        assert_equal(info["quantum_migration_end_height"], 0)
+        # A shadow-window override without separate phase controls derives a
+        # complete height-authoritative lifecycle from that reward window.
+        assert_equal(info["gold_rush_end_height"], 119)
+        assert info["quantum_migration_end_height"] > info["gold_rush_end_height"]
+        assert_equal(info["height_boundaries_authoritative"], True)
         self.stop_node(0)
 
         self.log.info("Starting testnet with the height-based phase boundaries")

@@ -75,12 +75,13 @@ pillars below all serve that goal.
   their node online and staking earns their full share.
 
 - **Liveness demurrage instead of dead weight.** After the migration era, quantum
-  holdings that are *never touched and never attested for more than six months* begin a
-  slow, capped decay, and the reclaimed value flows to the stakers who are actively
-  producing blocks. The point is not to tax holders, it is to ensure that keys are alive
+  holdings that remain inactive for more than six months begin a slow, capped decay.
+  Decayed principal is burned when spent; it is never added to transaction fees or paid
+  to a miner or staker. The point is to ensure that keys are alive
   and that the security weight of the supply reflects who is actually present. A single
   automatic, near-free liveness attestation every few months (the wallet does it for you)
-  keeps a holding at 100% forever. Delegating to a cold-staking pool exempts it entirely.
+  keeps a direct quantum holding current. A cold-stake output is also subject to the
+  activity clock; a successful coinstake spends and recreates it, resetting that clock.
 
 - **A bounded, well-signposted quantum migration.** Legacy elliptic-curve outputs are the
   network's quantum attack surface. Rather than leaving that surface open indefinitely,
@@ -177,7 +178,7 @@ human-readable prefix **`blk`** (`src/kernel/chainparams.cpp`).
 |:---:|:---:|---------|
 | **v16** | 32-byte commitment | **Quantum migration** output: the ML-DSA-protected home for migrated coins. Subject to demurrage. |
 | **v15** | 32-byte commitment | **EUTXO**: Extended UTXO smart-contract output (datum + validator). |
-| **v14** | 32-byte commitment | **Quantum cold-stake**: owner/staker-separated delegation output. **Demurrage-exempt.** |
+| **v14** | 32-byte commitment | **Quantum cold-stake**: owner/staker-separated delegation output, subject to inactivity demurrage. |
 
 Because the on-chain address is only a 32-byte commitment, the bulky ML-DSA public key
 and signature are supplied in the witness at spend time and are never stored in the UTXO
@@ -295,7 +296,13 @@ transactions carried in OP_RETURN outputs:
 - **QQSPROOF (Proof-of-Work side).** A miner grinds an Argon2id proof (magic
   `QQSPROOF`, `src/shadow.cpp`) against the target difficulty, a 12-bit base, ASERT-
   retargeted every 64 blocks within a [10-bit, 18-bit] band, and submits it in a claim
-  transaction that is validated before mempool acceptance.
+  transaction that is validated before mempool acceptance. Custom blocks can carry
+  competing claims, so v30.1.1 canonically ranks candidates independently of transaction
+  order and evaluates at most 64 Argon2 proofs. The lowest-ranked valid claim receives
+  the fixed PoW pool after each other evaluated valid claimant is reimbursed its actual
+  base fee, capped at 0.01 BLK. At most 0.63 BLK can be reimbursed in one block. Invalid,
+  malformed, and excess claims receive nothing, and all credits still sum exactly to the
+  pre-existing pool.
 
 The wallet automates both. See §9 for the exact RPCs (`sendshadowsignal`,
 `sendshadowpowclaim`, `setpowmining`, `getgoldrushinfo`).
@@ -362,31 +369,27 @@ dragging on forever with a permanently vulnerable dormant tail.
 Demurrage is the most misunderstood, and most important, participation mechanic in V4.
 This section states plainly what it is and what it is not.
 
-**It is a liveness check on quantum holdings, not a tax on holders.** A holding that shows
-any sign of life (an automatic attestation, a move, or delegation to a staking pool)
-never loses a single satoshi. Demurrage only ever touches coins that are provably
-abandoned: quantum outputs left completely untended for **more than six months**.
+**It is a liveness rule for quantum holdings.** A timely direct-key attestation or an
+activity spend refreshes the clock. Delegation alone does not. Demurrage applies to
+eligible quantum outputs left inactive for **more than six months**.
 
 ### 6.1 Exactly which coins are subject
 
-Evaluated per output at spend time by `DemurrageEvaluateOutput` (`src/consensus/demurrage.cpp`).
+Evaluated per output by `EvaluateDemurrage` (`src/consensus/demurrage.cpp`).
 The classification, in order:
 
 1. **Demurrage not yet active** → exempt. Demurrage cannot begin before the migration era
-   (earliest possible mainnet activation is the block after Gold Rush ends,
-   `SHADOW_REWARD_END_HEIGHT + 1 = 6,193,000`, and it additionally requires the migration
-   deadline to have passed).
-2. **Cold-stake (v14) outputs** → **exempt** (`"coldstake"`). *Delegating your coins to a
-   cold-staking pool shields them from demurrage completely*, participation is the
-   shield.
-3. **Treasury-exempt scripts** → exempt.
-4. **Non-quantum (legacy and everything else) outputs** → exempt (`"non_quantum"`). Legacy
+   (mainnet's height-authoritative schedule ends Migration at block 6,921,999 and activates
+   Final Lockout and demurrage at block 6,922,000).
+2. **Explicitly configured exempt scripts** → exempt. Mainnet currently configures none.
+3. **Non-quantum (legacy and everything else) outputs** → exempt (`"non_quantum"`). Legacy
    coins are governed by the lockout, not demurrage.
-5. **Quantum migration (v16) outputs** → **subject**, but only if inactive beyond the grace
-   period.
+4. **Quantum migration/tiered (v16), EUTXO (v15), and cold-stake (v14) outputs** →
+   **subject**, but only if inactive beyond the grace period. Direct and tiered v16 keys can
+   use attestations. EUTXO and cold-stake state refreshes through a spend/recreation.
 
-So the *only* coins that can ever decay are directly-held quantum migration outputs that
-have not been touched or attested in over six months.
+Thus cold delegation is not a permanent-value shelter. A cold-stake output that never
+successfully stakes or moves follows the same inactivity curve.
 
 ### 6.2 The inactivity clock and the grace period
 
@@ -419,10 +422,11 @@ t            = (elapsed / 729,000) × 1,000,000        (parts per million)
 remaining    = 1,000,000 − (t² / 1,000,000)           (ppm of value retained)
 ```
 
-The value burned when such a coin is finally spent is `nominal − effective`, and it is
-added directly to the transaction's fee, which means **the reclaimed value flows to the
-active staker who mints the block containing that spend.** Abandoned weight is returned to
-the people doing the work.
+The value burned when such a coin is spent is `nominal − effective`. Consensus recognizes
+only the effective value as input principal. The transaction fee is then
+`effective inputs − outputs`, so the burned remainder is not a fee and is never paid to the
+block producer. A coinstake is governed by the same rule: only effective principal is
+returned, and its reward remains limited to the ordinary PoS subsidy plus explicit fees.
 
 **Decay table (a quantum coin that is never attested, never moved, never delegated):**
 
@@ -452,27 +456,30 @@ for you:
   243,000`), and the wallet auto-attests at the **3-month** mark
   (`DEMURRAGE_AUTO_ATTEST_BLOCKS = 121,500`) while it is running and unlocked for
   quantum/legacy staking. A holder who simply keeps their wallet online never decays.
-- **Delegating to cold staking.** Cold-stake (v14) outputs are demurrage-exempt outright,
-  and they *earn staking rewards* at the same time. This is the recommended path for
-  long-term holders who do not want to run a hot node.
+- **Active cold staking.** Cold-stake (v14) outputs remain subject to demurrage. Each
+  successful coinstake realizes any accrued burn, returns only effective principal plus
+  the ordinary reward, recreates the output, and resets its activity clock. Delegation by
+  itself is not an exemption.
 - **Any ordinary use.** Moving, consolidating, or spending resets the clock as a side
   effect.
 
 The `getdemurragewalletinfo` RPC reports, per output, the nominal amount, the current
 effective (post-decay) amount, the value that would be burned if spent now, whether an
-attestation is due, and whether the output is locked. `sweepdemurragedecay` gathers any
-outputs that have fully decayed (24-month) so they can be cleared. The GUI surfaces the
-same information and can send attestations with one click.
+attestation is due, and whether the output is locked. `sweepdemurragedecay` spends outputs
+that are decaying but still have positive effective value, realizes the burn, and moves the
+remainder minus the explicit fee to a fresh quantum address. Outputs at zero effective
+value are permanently locked and are skipped. The GUI surfaces the same information and
+can send attestations with one click.
 
-In short, you keep every coin you are willing to keep alive, and the only value the
-network ever reclaims is value nobody was using to secure it.
+In short, timely participation preserves principal. Any decay realized by a spend is
+destroyed, not redistributed.
 
 ---
 
 ## 7. Quantum Staking: Tiered, Cold, and Pooled
 
-V4 gives quantum coins a rich set of ways to *participate*, each of which both earns
-rewards and (for cold-stake) shields against demurrage.
+V4 gives quantum coins a rich set of ways to participate and earn rewards. Participation
+also refreshes activity when it spends and recreates the relevant output.
 
 ### 7.1 Tiered self-staking
 
@@ -500,8 +507,9 @@ This lets a holder keep their principal in cold storage while a hot node, their 
 trusted operator's, stakes on their behalf.
 
 - The delegated principal is always **owner-controlled**; the operator can never move it.
-- Cold-stake outputs are **demurrage-exempt** (§6.1), so this is the cleanest way for a
-  long-term holder to both earn and stay at 100%.
+- Cold-stake outputs are subject to the same inactivity schedule. A successful coinstake
+  returns effective principal plus reward and creates a fresh output, but delegation alone
+  does not freeze the clock.
 - **RPCs:** `fundquantumcoldstakeaddress`, `withdrawquantumcoldstakeaddress`,
   `getquantumcoldstakebalance`.
 
@@ -633,7 +641,7 @@ RPC set.
 |-----|---------|
 | `senddemurrageattestation` | Send a liveness attestation to reset a quantum output's clock |
 | `getdemurragewalletinfo` | Per-output decay state, effective value, attestation-due flag |
-| `sweepdemurragedecay` | Gather fully-decayed outputs for cleanup |
+| `sweepdemurragedecay` | Realize decay on still-spendable outputs and move the effective remainder |
 
 ### 9.6 EUTXO and RGB
 
@@ -680,12 +688,12 @@ Alice holds 250,000 BLK and wants zero maintenance.
 1. **Before V4:** nothing to do. Keep the coins.
 2. **At V4 (2026-07-12):** she runs `migratetoquantum` once. Her coins move to a quantum
    (v16) address. **She backs up her wallet** (ML-DSA keys are not in the seed).
-3. **Optional but ideal:** she runs `fundquantumcoldstakeaddress` to delegate to a
-   cold-staking operator (or her own hot node). Her principal stays owner-controlled, her
-   coins are **demurrage-exempt**, and she **earns staking rewards**.
-4. **Forever after:** she does nothing. If she delegated, she is exempt. If she instead
-   left the coins in a plain quantum address, her wallet auto-attests every 3 months while
-   online and she stays at 100%.
+3. **Optional:** she runs `fundquantumcoldstakeaddress` to delegate to a cold-staking
+   operator (or her own hot node). Her principal stays owner-controlled and can earn
+   staking rewards. Successful coinstakes refresh the output's activity clock.
+4. **Afterward:** if she leaves coins in a direct quantum address, her wallet auto-attests
+   every 3 months while online. If she delegates, she monitors successful staking or moves
+   the output before prolonged inactivity; delegation alone is not an exemption.
 
 Alice never loses value, earns rewards, and is quantum-safe. Total effort: two clicks.
 
@@ -710,15 +718,15 @@ Carol migrated to a quantum address in 2026 and then lost interest, wallet offli
 
 - For **six months** after demurrage activates: no effect. 100% retained.
 - At **12 months** of total inactivity: 88.9% retained, still barely touched.
-- If she returns any time before **24 months** and simply opens her wallet (which attests)
-  or moves the coins, the clock resets and she keeps whatever the table shows at that
-  moment. A single attestation restores the full 6-month grace.
-- Only if she abandons the coins for a **full 24 months**, never opening the wallet, never
-  delegating, never attesting, do they fully decay, with the reclaimed value flowing to
-  the stakers who kept the network alive in her absence.
+- If she returns before the terminal **24-month** boundary and submits a valid liveness
+  attestation, the clock resets before decay is realized. If she spends first, the spend
+  burns the accrued difference and moves only the effective remainder.
+- If she reaches a full **24 months** without qualifying activity, the output reaches zero
+  effective value and becomes permanently unspendable. No miner or staker receives it,
+  and Carol is not charged a transaction fee to clean up a zero-value output.
 
-The design gives Carol every reasonable chance, and only reclaims value that was truly
-abandoned.
+The design gives Carol a long recovery window while permanently removing terminally
+inactive value from effective supply.
 
 ### Example D, Running a staking pool
 
@@ -745,31 +753,27 @@ distributed set of participants.
   participation. Holding qualifies; participating pays.
 
 - **Demurrage** removes the free-rider equilibrium of classic PoS. In a passive-holding
-  chain, dormant coins retain full influence forever and dilute the reward and security
-  contribution of active stakers. Under V4, dormant *quantum* weight that is genuinely
-  abandoned is slowly recycled to active stakers, while any holder who participates even
-  minimally (one automatic attestation, or a single delegation) keeps 100%. The mechanic
-  therefore **raises the expected reward of active stakers** and **nudges passive holders
-  into the active set**, without ever penalizing a holder who is willing to press one
-  button.
+  chain, dormant coins retain full influence forever. Under V4, inactive quantum principal
+  loses effective value and realized decay is burned. Active stakers receive only the
+  ordinary subsidy and explicit transaction fees; their benefit is liveness participation
+  and the deflationary reduction of effective supply, not a transfer from inactive holders.
 
 - **The legacy lockout** guarantees the migration completes, so the network's security
   actually improves rather than carrying a permanent vulnerable tail. A fully-migrated
   supply is a stronger, more valuable supply for everyone who stayed.
 
 - **Tiered, cold, and pooled staking** lower the barrier to participation: cold delegation
-  lets a holder participate (and become demurrage-exempt) without running a hot node, and
+  lets a holder participate without exposing the owner key on a hot node, and
   autonomous redelegation keeps the pool landscape healthy and decentralized on its own.
 
 Across all of these mechanics, the V4 equilibrium points every holder toward the same
 choice. Whether large or small, technical or not, the sensible move is to participate,
-because participation is where the rewards are, where the demurrage exemption is, and
+because participation is where the rewards are and where the activity clock is refreshed, and
 where the network's future lies. The "do-nothing" strategy carries the weakest returns,
 yet it remains trivially easy to leave behind.
 
 In summary, Quantum Quasar rewards HODLers in full for helping secure the network, makes
-that help nearly effortless, and reclaims only the influence of coins that no one is
-willing to keep alive.
+that help nearly effortless, and burns realized decay rather than redistributing it.
 
 ---
 
@@ -836,7 +840,7 @@ All values from version 30.1.0 source.
 | ML-DSA signature | 2,420 bytes | Quantum signature size | `crypto/mldsa.h` |
 | Quantum migration witness | v16, 32-byte program | Migrated-coin output | `consensus/quantum_witness.h` |
 | EUTXO witness | v15, 32-byte program | Smart-contract output | `addresstype.h` |
-| Cold-stake witness | v14, 32-byte program | Delegation output (demurrage-exempt) | `consensus/quantum_witness.h` |
+| Cold-stake witness | v14, 32-byte program | Delegation output (subject to inactivity demurrage) | `consensus/quantum_witness.h` |
 | `QUANTUM_POOL_CAP_BPS` | 2000 (20%) | Per-pool delegation cap (policy) | `node/quantum_pool.h` |
 | Operator bond period | 40,500 blocks (30 days) | Verified operator commitment | `wallet/rpc/staking.cpp` |
 | Block time | 64 seconds | Mainnet target spacing | `kernel/chainparams.cpp` |
@@ -855,13 +859,13 @@ All values from version 30.1.0 source.
 - **Migration**, moving legacy ECDSA coins into quantum (v16) outputs via `migratetoquantum`.
 - **Final Lockout**, the point (V4 + 24 months) after which legacy ECDSA spends are
   permanently rejected.
-- **Demurrage**, the liveness mechanism by which abandoned quantum outputs slowly decay,
-  with reclaimed value flowing to active stakers; avoided entirely by attestation, cold
-  delegation, or any use.
+- **Demurrage**, the liveness mechanism by which inactive quantum outputs slowly lose
+  effective value. Realized decay is burned, never paid to a miner or staker. Timely
+  attestation or a spend/recreation refreshes activity; cold delegation alone does not.
 - **Attestation**, a zero-value ML-DSA-signed transaction that resets a quantum output's
   demurrage clock; auto-sent by the wallet.
 - **Cold staking**, owner/staker key separation (witness v14) letting a holder delegate
-  staking while retaining principal control; demurrage-exempt.
+  staking while retaining principal control; subject to the inactivity schedule.
 - **Tiered staking**, self-staking with a consensus-visible bonding/unbonding lock schedule.
 - **Operator bond**, a 30-day verified commitment posted by a staking-pool operator.
 - **EUTXO**, Extended-UTXO smart-contract output (witness v15): datum + validator.

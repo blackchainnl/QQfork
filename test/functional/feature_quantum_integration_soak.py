@@ -78,6 +78,7 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         self.num_nodes = 2
         self.setup_clean_chain = True
         args = [
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
             "-donatetodevfund=0",

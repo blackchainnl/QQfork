@@ -4,15 +4,19 @@
 Requires: pip install reportlab
 Usage: python3 contrib/devtools/gen-whitepaper-pdf.py
 """
-import re, sys, os
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch
-from reportlab.lib import colors
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER, TA_LEFT
-from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame, Paragraph, Spacer,
-                                Table, TableStyle, PageBreak, HRFlowable, KeepTogether)
-from reportlab.platypus.tableofcontents import TableOfContents
+import os
+import re
+import sys
+
+from reportlab.lib import colors  # type: ignore[import-not-found]
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT  # type: ignore[import-not-found]
+from reportlab.lib.pagesizes import letter  # type: ignore[import-not-found]
+from reportlab.lib.styles import ParagraphStyle  # type: ignore[import-not-found]
+from reportlab.lib.units import inch  # type: ignore[import-not-found]
+from reportlab.platypus import (BaseDocTemplate, Frame, HRFlowable, KeepTogether,  # type: ignore[import-not-found]
+                                PageBreak, PageTemplate, Paragraph, Spacer, Table,
+                                TableStyle)
+from reportlab.platypus.tableofcontents import TableOfContents  # type: ignore[import-not-found]
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SRC = os.path.join(ROOT, "doc", "whitepaper-quantum-quasar.md")
@@ -309,8 +313,8 @@ def _xmp_packet(doc_id, inst_id):
 def stamp_metadata(path):
     """Rewrite DocInfo + XMP so the file presents as Acrobat-authored output."""
     import uuid
-    from pypdf import PdfReader, PdfWriter
-    from pypdf.generic import NameObject, create_string_object, DecodedStreamObject
+    from pypdf import PdfReader, PdfWriter  # type: ignore[import-not-found]
+    from pypdf.generic import DecodedStreamObject, NameObject, create_string_object  # type: ignore[import-not-found]
     reader = PdfReader(path)
     writer = PdfWriter()
     writer.append(reader)
@@ -336,7 +340,8 @@ def stamp_metadata(path):
         writer.write(fh)
 
 def main():
-    md = open(SRC).read().splitlines()
+    with open(SRC, encoding="utf8") as source:
+        md = source.read().splitlines()
     doc = WPDoc(OUT, pagesize=letter,
                 leftMargin=0.9*inch, rightMargin=0.9*inch,
                 topMargin=0.95*inch, bottomMargin=0.95*inch,

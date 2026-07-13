@@ -84,6 +84,30 @@ year rather than two hyphenated years.
 If the file already has a copyright for `Blackcoin Developers`, the
 script will exit.
 
+restore\_inherited\_copyrights.py
+=================================
+
+Restores a Bitcoin Core copyright notice only when provenance can be checked
+against an immutable active-legacy git tree. The current baseline must have an
+inherited Blackcoin-family header, and its non-copyright body must be identical
+to or at least 95% similar to the same-path legacy file. Vendored, generated,
+binary, translation, and patch artifacts are excluded. Ambiguous files are
+reported but never modified.
+
+The tool requires explicit baseline revisions for a reproducible release audit:
+
+```
+./contrib/devtools/restore_inherited_copyrights.py \
+  --legacy-tree /path/to/blackcoin-more \
+  --current-ref <current-baseline-commit> \
+  --legacy-ref <active-legacy-commit> \
+  --manifest contrib/devtools/copyright-provenance-v30.1.1.json \
+  --write
+```
+
+The generated JSON records every restored, excluded, and ambiguous candidate,
+along with the immutable revisions and similarity evidence used by the audit.
+
 gen-manpages.py
 ===============
 

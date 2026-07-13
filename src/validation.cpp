@@ -393,11 +393,16 @@ void Chainstate::MaybeUpdateMempoolForReorg(
             const CTransaction& tx = entry.get().GetTx();
             std::string reject_reason;
             size_t tx_attestation_count{0};
-            if (!Consensus::CheckDemurrageAttestations(tx, attestation_view, m_chainman.GetConsensus(),
-                                                       next_block_height, next_block_mtp,
-                                                       attested_keys, tx_attestation_count,
-                                                       reject_reason)) {
+            const Consensus::DemurrageAttestationValidationResult attestation_result =
+                Consensus::CheckDemurrageAttestationsDetailed(
+                    tx, attestation_view, m_chainman.GetConsensus(),
+                    next_block_height, next_block_mtp,
+                    attested_keys, tx_attestation_count, reject_reason);
+            if (attestation_result == Consensus::DemurrageAttestationValidationResult::INVALID) {
                 invalid_lifecycle_transactions.insert(tx.GetHash());
+            } else if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
+                LogPrintf("Local demurrage verification failed while rechecking mempool transaction %s; retaining it for retry: %s\n",
+                          tx.GetHash().ToString(), reject_reason);
             }
             for (const Consensus::DemurrageAttestation& attestation :
                  Consensus::ExtractDemurrageAttestations(tx)) {
@@ -492,6 +497,11 @@ void Chainstate::MaybeUpdateMempoolForReorg(
                                next_block_script_flags,
                                /*cacheSigStore=*/true,
                                /*cacheFullScriptStore=*/true, txdata)) {
+            if (tx_state.IsError()) {
+                LogPrintf("Local script verification failed while rechecking mempool transaction %s; retaining it for retry: %s\n",
+                          tx.GetHash().ToString(), tx_state.ToString());
+                return false;
+            }
             return true;
         }
         // Transaction is still valid and cached LockPoints are updated.
@@ -957,7 +967,12 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     std::string shadow_reject_reason;
     const bool gold_rush_active = tip &&
                                   IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), next_height);
-    if (!CheckShadowPowClaimForMempool(tx, tip, m_view, gold_rush_active, shadow_reject_reason)) {
+    const ShadowProofValidationResult shadow_proof_result =
+        CheckShadowPowClaimForMempoolDetailed(tx, tip, m_view, gold_rush_active, shadow_reject_reason);
+    if (shadow_proof_result == ShadowProofValidationResult::LOCAL_INTERNAL_ERROR) {
+        return state.Error(shadow_reject_reason);
+    }
+    if (shadow_proof_result == ShadowProofValidationResult::INVALID) {
         return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, shadow_reject_reason);
     }
     if (!CheckShadowSignalForMempool(tx, tip, m_view, gold_rush_active, shadow_reject_reason)) {
@@ -1014,13 +1029,15 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
             }
         }
         std::string demurrage_reject_reason;
-        if (!Consensus::CheckDemurrageAttestations(tx, m_view, consensus, next_height, next_block_mtp,
-                                                   attested_keys, transaction_attestation_count,
-                                                   demurrage_reject_reason)) {
-            return state.Invalid(demurrage_reject_reason.rfind("local-demurrage-", 0) == 0
-                                     ? TxValidationResult::TX_MEMPOOL_POLICY
-                                     : TxValidationResult::TX_CONSENSUS,
-                                 demurrage_reject_reason);
+        const Consensus::DemurrageAttestationValidationResult attestation_result =
+            Consensus::CheckDemurrageAttestationsDetailed(
+                tx, m_view, consensus, next_height, next_block_mtp,
+                attested_keys, transaction_attestation_count, demurrage_reject_reason);
+        if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
+            return state.Error(demurrage_reject_reason);
+        }
+        if (attestation_result == Consensus::DemurrageAttestationValidationResult::INVALID) {
+            return state.Invalid(TxValidationResult::TX_CONSENSUS, demurrage_reject_reason);
         }
     }
 
@@ -1313,6 +1330,11 @@ bool MemPoolAccept::ConsensusScriptChecks(const ATMPArgs& args, Workspace& ws)
     const unsigned int nextBlockScriptVerifyFlags{GetNextBlockScriptFlags(m_active_chainstate.m_chain.Tip(), m_active_chainstate.m_chainman)};
     if (!CheckInputsFromMempoolAndCache(tx, state, m_view, m_pool, nextBlockScriptVerifyFlags,
                                         ws.m_precomputed_txdata, m_active_chainstate.CoinsTip())) {
+        if (state.IsError()) {
+            LogPrintf("Local script verification failed while caching transaction %s: %s\n",
+                      hash.ToString(), state.ToString());
+            return false;
+        }
         LogPrintf("BUG! PLEASE REPORT THIS! CheckInputScripts failed against latest-block but not STANDARD flags %s, %s\n", hash.ToString(), state.ToString());
         return Assume(false);
     }
@@ -1404,6 +1426,10 @@ bool MemPoolAccept::SubmitPackage(const ATMPArgs& args, std::vector<Workspace>& 
     for (Workspace& ws : workspaces) {
         if (!ConsensusScriptChecks(args, ws)) {
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
+            if (ws.m_state.IsError()) {
+                package_state.Error(ws.m_state.GetRejectReason());
+                return false;
+            }
             // Since PolicyScriptChecks() passed, this should never fail.
             Assume(false);
             all_submitted = false;
@@ -1511,7 +1537,11 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
     // Do all PreChecks first and fail fast to avoid running expensive script checks when unnecessary.
     for (Workspace& ws : workspaces) {
         if (!PreChecks(args, ws)) {
-            package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+            if (ws.m_state.IsError()) {
+                package_state.Error(ws.m_state.GetRejectReason());
+            } else {
+                package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+            }
             // Exit early to avoid doing pointless work. Update the failed tx result; the rest are unfinished.
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
             return PackageMempoolAcceptResult(package_state, std::move(results));
@@ -1539,15 +1569,20 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
             size_t package_attestation_count{0};
             for (Workspace& ws : workspaces) {
                 std::string demurrage_reject_reason;
-                if (!Consensus::CheckDemurrageAttestations(*ws.m_ptx, m_view, consensus, next_height,
-                                                           next_block_mtp, attested_keys,
-                                                           package_attestation_count,
-                                                           demurrage_reject_reason)) {
-                    ws.m_state.Invalid(demurrage_reject_reason.rfind("local-demurrage-", 0) == 0
-                                           ? TxValidationResult::TX_MEMPOOL_POLICY
-                                           : TxValidationResult::TX_CONSENSUS,
-                                       demurrage_reject_reason);
-                    package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+                const Consensus::DemurrageAttestationValidationResult attestation_result =
+                    Consensus::CheckDemurrageAttestationsDetailed(
+                        *ws.m_ptx, m_view, consensus, next_height, next_block_mtp,
+                        attested_keys, package_attestation_count, demurrage_reject_reason);
+                if (attestation_result != Consensus::DemurrageAttestationValidationResult::VALID) {
+                    if (attestation_result == Consensus::DemurrageAttestationValidationResult::LOCAL_INTERNAL_ERROR) {
+                        ws.m_state.Error(demurrage_reject_reason);
+                        package_state.Error(demurrage_reject_reason);
+                    } else {
+                        ws.m_state.Invalid(TxValidationResult::TX_CONSENSUS,
+                                           demurrage_reject_reason);
+                        package_state.Invalid(PackageValidationResult::PCKG_TX,
+                                              "transaction failed");
+                    }
                     results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
                     return PackageMempoolAcceptResult(package_state, std::move(results));
                 }
@@ -1614,7 +1649,11 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
         ws.m_package_feerate = package_feerate;
         if (!PolicyScriptChecks(args, ws)) {
             // Exit early to avoid doing pointless work. Update the failed tx result; the rest are unfinished.
-            package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+            if (ws.m_state.IsError()) {
+                package_state.Error(ws.m_state.GetRejectReason());
+            } else {
+                package_state.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+            }
             results.emplace(ws.m_ptx->GetWitnessHash(), MempoolAcceptResult::Failure(ws.m_state));
             return PackageMempoolAcceptResult(package_state, std::move(results));
         }
@@ -1653,7 +1692,11 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptSubPackage(const std::vector<CTr
         const auto single_res = AcceptSingleTransaction(tx, single_args);
         PackageValidationState package_state_wrapped;
         if (single_res.m_result_type != MempoolAcceptResult::ResultType::VALID) {
-            package_state_wrapped.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+            if (single_res.m_state.IsError()) {
+                package_state_wrapped.Error(single_res.m_state.GetRejectReason());
+            } else {
+                package_state_wrapped.Invalid(PackageValidationResult::PCKG_TX, "transaction failed");
+            }
         }
         return PackageMempoolAcceptResult(package_state_wrapped, {{tx->GetWitnessHash(), single_res}});
     }();
@@ -1794,6 +1837,13 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptPackage(const Package& package, 
                 // in package validation, because its fees should only be "used" once.
                 assert(m_pool.exists(GenTxid::Wtxid(wtxid)));
                 results_final.emplace(wtxid, single_res);
+            } else if (single_res.m_state.IsError()) {
+                // A local cryptographic/library failure is retryable. Preserve
+                // that classification at package scope instead of relabeling
+                // the transaction as a package-rule failure.
+                quit_early = true;
+                package_state_quit_early.Error(single_res.m_state.GetRejectReason());
+                individual_results_nonfinal.emplace(wtxid, single_res);
             } else if (single_res.m_state.GetResult() != TxValidationResult::TX_MEMPOOL_POLICY &&
                        single_res.m_state.GetResult() != TxValidationResult::TX_MISSING_INPUTS) {
                 // Package validation policy only differs from individual policy in its evaluation
@@ -2117,7 +2167,11 @@ void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txund
 bool CScriptCheck::operator()() {
     const CScript &scriptSig = ptxTo->vin[nIn].scriptSig;
     const CScriptWitness *witness = &ptxTo->vin[nIn].scriptWitness;
-    return VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *txdata), &error);
+    const bool valid = VerifyScript(scriptSig, m_tx_out.scriptPubKey, witness, nFlags, CachingTransactionSignatureChecker(ptxTo, nIn, m_tx_out.nValue, cacheStore, *txdata), &error);
+    if (!valid && error == SCRIPT_ERR_ML_DSA_INTERNAL && mldsa_internal_error != nullptr) {
+        mldsa_internal_error->store(true, std::memory_order_release);
+    }
+    return valid;
 }
 
 static CuckooCache::cache<uint256, SignatureCacheHasher> g_scriptExecutionCache;
@@ -2166,7 +2220,8 @@ static std::optional<int> GetP2SHRedeemWitnessVersion(const CScript& script, con
 bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                        const CCoinsViewCache& inputs, unsigned int flags, bool cacheSigStore,
                        bool cacheFullScriptStore, PrecomputedTransactionData& txdata,
-                       std::vector<CScriptCheck>* pvChecks)
+                       std::vector<CScriptCheck>* pvChecks,
+                       std::atomic_bool* mldsa_internal_error)
 {
     if (tx.IsCoinBase()) return true;
 
@@ -2290,10 +2345,13 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
         // spent being checked as a part of CScriptCheck.
 
         // Verify signature
-        CScriptCheck check(txdata.m_spent_outputs[i], tx, i, flags, cacheSigStore, &txdata);
+        CScriptCheck check(txdata.m_spent_outputs[i], tx, i, flags, cacheSigStore, &txdata, mldsa_internal_error);
         if (pvChecks) {
             pvChecks->emplace_back(std::move(check));
         } else if (!check()) {
+            if (check.GetScriptError() == SCRIPT_ERR_ML_DSA_INTERNAL) {
+                return state.Error("local-mldsa-verification-error");
+            }
             if (flags & STANDARD_NOT_MANDATORY_VERIFY_FLAGS) {
                 // Check whether the failure was caused by a
                 // non-mandatory script verification check, such as
@@ -2304,8 +2362,13 @@ bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
                 // non-upgraded nodes by banning CONSENSUS-failing
                 // data providers.
                 CScriptCheck check2(txdata.m_spent_outputs[i], tx, i,
-                        flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheSigStore, &txdata);
-                if (check2())
+                        flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, cacheSigStore, &txdata,
+                        mldsa_internal_error);
+                const bool mandatory_valid = check2();
+                if (!mandatory_valid && check2.GetScriptError() == SCRIPT_ERR_ML_DSA_INTERNAL) {
+                    return state.Error("local-mldsa-verification-error");
+                }
+                if (mandatory_valid)
                     return state.Invalid(TxValidationResult::TX_NOT_STANDARD, strprintf("non-mandatory-script-verify-flag (%s)", ScriptErrorString(check.GetScriptError())));
             }
             // MANDATORY flag failures correspond to
@@ -2714,8 +2777,11 @@ static bool CheckQuantumMigrationSpendIsolation(const CTransaction& tx, const CC
         if (quantum_rules_active && IsTxidCommittedForkIdAnchor(coin.out.scriptPubKey, txin)) {
             has_protected_lineage = true;
         }
-        if (!coin.IsCoinBase() && consensus_params.UsesHeightLifecycle() &&
-            coin.nHeight > static_cast<uint32_t>(consensus_params.nGoldRushEndHeight)) {
+        const auto origin_lifecycle = consensus_params.GetQuantumLifecycleState(
+            /*nTime=*/0, static_cast<int>(coin.nHeight));
+        if (!coin.IsCoinBase() && origin_lifecycle.height_authoritative &&
+            (origin_lifecycle.phase == Consensus::QuantumQuasarPhase::MIGRATION ||
+             origin_lifecycle.phase == Consensus::QuantumQuasarPhase::FINAL_LOCKOUT)) {
             // Induction anchor: every non-coinbase transaction after G is
             // required below to descend from protected lineage, so every
             // output it creates has an outpoint absent from the legacy fork.
@@ -3756,6 +3822,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // preallocate the vector size so a new allocation doesn't invalidate
     // pointers into the vector.
     std::vector<PrecomputedTransactionData> txsdata(block.vtx.size());
+    std::atomic_bool mldsa_internal_error{false};
     CCheckQueueControl<CScriptCheck> control(fScriptChecks && parallel_script_checks ? &scriptcheckqueue : nullptr);
 
     std::vector<int> prevheights;
@@ -3864,7 +3931,12 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
             std::vector<CScriptCheck> vChecks;
             bool fCacheResults = fJustCheck; /* Don't cache results if we're actually connecting blocks (still consult the cache, though) */
             TxValidationState tx_state;
-            if (fScriptChecks && !CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], parallel_script_checks ? &vChecks : nullptr)) {
+            if (fScriptChecks && !CheckInputScripts(tx, tx_state, view, flags, fCacheResults, fCacheResults, txsdata[i], parallel_script_checks ? &vChecks : nullptr, &mldsa_internal_error)) {
+                if (tx_state.IsError() || mldsa_internal_error.load(std::memory_order_acquire)) {
+                    return FatalError(m_chainman.GetNotifications(), state,
+                        strprintf("Local ML-DSA verification failed while checking transaction %s at height %d; the block was not marked invalid", tx.GetHash().ToString(), pindex->nHeight),
+                        _("A local ML-DSA verification failed. Blackcoin stopped without rejecting the block; restart after checking system memory and the linked liboqs installation."));
+                }
                 // Any transaction validation failure in ConnectBlock is a block consensus failure
                 state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                               tx_state.GetRejectReason(), tx_state.GetDebugMessage());
@@ -3978,6 +4050,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     }
 
     if (!control.Wait()) {
+        if (mldsa_internal_error.load(std::memory_order_acquire)) {
+            return FatalError(m_chainman.GetNotifications(), state,
+                strprintf("Local ML-DSA verification failed in the script-check queue at height %d; the block was not marked invalid", pindex->nHeight),
+                _("A local ML-DSA verification failed. Blackcoin stopped without rejecting the block; restart after checking system memory and the linked liboqs installation."));
+        }
         LogPrintf("ERROR: %s: CheckQueue failed\n", __func__);
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "block-validation-failed");
     }
@@ -5167,21 +5244,35 @@ static bool ExtractQuantumBlockSigningPubKey(const CBlock& block, std::vector<un
     return ExtractQuantumBlockSigningPubKey(block.vtx[1]->vout[1].scriptPubKey, pubkey);
 }
 
-static bool CheckBlockSignature(const CBlock& block)
+enum class BlockSignatureCheckResult {
+    VALID,
+    INVALID,
+    INTERNAL_ERROR,
+};
+
+static BlockSignatureCheckResult CheckBlockSignature(const CBlock& block)
 {
     if (block.IsProofOfWork())
-        return block.vchBlockSig.empty();
+        return block.vchBlockSig.empty() ? BlockSignatureCheckResult::VALID : BlockSignatureCheckResult::INVALID;
 
     if (block.vchBlockSig.empty())
-        return false;
+        return BlockSignatureCheckResult::INVALID;
 
     std::vector<unsigned char> quantum_pubkey;
     if (ExtractQuantumBlockSigningPubKey(block, quantum_pubkey)) {
         if (block.vchBlockSig.size() != ML_DSA::SIGNATURE_BYTES) {
-            return false;
+            return BlockSignatureCheckResult::INVALID;
         }
         const uint256 hash = block.GetHash();
-        return ML_DSA::Verify(quantum_pubkey, hash.begin(), uint256::size(), block.vchBlockSig);
+        switch (ML_DSA::VerifyDetailed(quantum_pubkey, hash.begin(), uint256::size(), block.vchBlockSig)) {
+        case MLDSAVerifyResult::VALID:
+            return BlockSignatureCheckResult::VALID;
+        case MLDSAVerifyResult::INVALID:
+            return BlockSignatureCheckResult::INVALID;
+        case MLDSAVerifyResult::INTERNAL_ERROR:
+            return BlockSignatureCheckResult::INTERNAL_ERROR;
+        }
+        return BlockSignatureCheckResult::INTERNAL_ERROR;
     }
 
     std::vector<valtype> vSolutions;
@@ -5190,7 +5281,8 @@ static bool CheckBlockSignature(const CBlock& block)
 
     if (whichType == TxoutType::PUBKEY) {
         std::vector<unsigned char>& vchPubKey = vSolutions[0];
-        return CPubKey(vchPubKey).Verify(block.GetHash(), block.vchBlockSig);
+        return CPubKey(vchPubKey).Verify(block.GetHash(), block.vchBlockSig)
+            ? BlockSignatureCheckResult::VALID : BlockSignatureCheckResult::INVALID;
     }
     else {
         // Block signing key also can be encoded in the nonspendable output
@@ -5203,17 +5295,18 @@ static bool CheckBlockSignature(const CBlock& block)
         uint256 hash = block.GetHash();
 
         if (!script.GetOp(pc, opcode, vchPushValue))
-            return false;
+            return BlockSignatureCheckResult::INVALID;
         if (opcode != OP_RETURN)
-            return false;
+            return BlockSignatureCheckResult::INVALID;
         if (!script.GetOp(pc, opcode, vchPushValue))
-            return false;
+            return BlockSignatureCheckResult::INVALID;
         if (!IsCompressedOrUncompressedPubKey(vchPushValue))
-            return false;
-        return CPubKey(vchPushValue).Verify(hash, block.vchBlockSig);
+            return BlockSignatureCheckResult::INVALID;
+        return CPubKey(vchPushValue).Verify(hash, block.vchBlockSig)
+            ? BlockSignatureCheckResult::VALID : BlockSignatureCheckResult::INVALID;
     }
 
-    return false;
+    return BlockSignatureCheckResult::INVALID;
 }
 
 static bool CheckBlockHeader(const CBlockHeader& block, BlockValidationState& state, const Consensus::Params& consensusParams, Chainstate& chainstate, bool fCheckPOW = true, bool fOldClient = false)
@@ -5389,8 +5482,15 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
     }
 
     // Check proof-of-stake block signature
-    if (fCheckSig && !CheckBlockSignature(block))
-        return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-signature", "bad proof-of-stake block signature");
+    if (fCheckSig) {
+        const BlockSignatureCheckResult signature_result = CheckBlockSignature(block);
+        if (signature_result == BlockSignatureCheckResult::INTERNAL_ERROR) {
+            return state.Error("local-mldsa-block-signature-verification-error");
+        }
+        if (signature_result == BlockSignatureCheckResult::INVALID) {
+            return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-blk-signature", "bad proof-of-stake block signature");
+        }
+    }
 
     // Check transactions
     // Must check for duplicate inputs (see CVE-2018-17144)
@@ -6394,17 +6494,18 @@ bool Chainstate::ReplayBlocks()
         assert(pindexFork != nullptr);
     }
 
-    // A partially flushed reorganization can leave positive synthetic payout
-    // coins from the old branch even when their provenance marker was in a
-    // different write batch. Those coins are not base-block outputs, so a
-    // generic UTXO rollback cannot authenticate and remove every possible
-    // PRE/POST mixture. Fail closed instead of risking cross-branch inflation;
-    // a chainstate rebuild deterministically reconstructs only the active
-    // branch. Straight-line interrupted flushes continue only when the exact
-    // new-tip auxiliary commitment survives and authenticates below.
-    if (pindexOld && pindexFork && pindexOld != pindexFork &&
-        pindexOld->nHeight >= SHADOW_REWARD_START_HEIGHT) {
-        return error("ReplayBlocks(): interrupted reorganization crossed Quantum Quasar shadow state; restart with -reindex-chainstate");
+    // CCoinsViewDB may split one cache flush into multiple LevelDB batches.
+    // DB_HEAD_BLOCKS proves that at least one such partial batch was committed,
+    // but it cannot prove which base or auxiliary leaves reached disk. QQRSTATE
+    // commits rolling summaries, not the presence of every leaf, so accepting a
+    // marker that happened to sort into an earlier batch could silently trust a
+    // missing QQALIVE/provenance record. Once the authenticated auxiliary
+    // namespace exists, fail closed and rebuild the chainstate from blocks.
+    // A single-batch flush never exposes DB_HEAD_BLOCKS: its transition marker,
+    // coins, and final best-block marker commit atomically.
+    if (pindexNew->nHeight >= SHADOW_WHITELIST_HEIGHT ||
+        (pindexOld && pindexOld->nHeight >= SHADOW_WHITELIST_HEIGHT)) {
+        return error("ReplayBlocks(): interrupted multi-batch flush crossed authenticated Quantum Quasar state; restart with -reindex-chainstate");
     }
 
     // Rollback along the old branch.
@@ -6440,29 +6541,8 @@ bool Chainstate::ReplayBlocks()
 
     cache.SetBestBlock(pindexNew->GetBlockHash());
 
-    // A straight-line two-head recovery is produced after the atomic CoinsDB
-    // batch (including auxiliary markers) was written but before the head
-    // marker was finalized. Preserve that state only if its full v8 replay
-    // commitment and both rolling inventories authenticate at the recovered
-    // new tip. Deleting an already-current QQRSTATE here would turn every
-    // otherwise recoverable interrupted flush at/after Gold Rush into a forced
-    // reindex on the next line of startup.
-    const ShadowBlockReader replay_block_reader = [&](const CBlockIndex& index, CBlock& block) {
-        return m_blockman.ReadBlockFromDisk(block, index);
-    };
-    const bool auxiliary_state_current =
-        pindexNew->nHeight < SHADOW_WHITELIST_HEIGHT ||
-        (HasCurrentShadowReplayState(cache, m_chainman.GetConsensus(), pindexNew,
-                                     &replay_block_reader) &&
-         Consensus::DeepAuditDemurrageInventory(
-             cache, pindexNew, m_chainman.GetConsensus()));
-    if (pindexNew->nHeight >= SHADOW_WHITELIST_HEIGHT && !auxiliary_state_current) {
-        return error("ReplayBlocks(): interrupted flush left Quantum Quasar auxiliary state inconsistent at recovered height %d; restart with -reindex-chainstate",
-                     pindexNew->nHeight);
-    }
-
     if (!cache.Flush()) return error("ReplayBlocks(): failed to flush recovered base chainstate");
-    if (pindexNew->nHeight < SHADOW_WHITELIST_HEIGHT && !ReplayShadowBlocks()) {
+    if (!ReplayShadowBlocks()) {
         return error("ReplayBlocks(): failed to rebuild pre-whitelist Quantum Quasar auxiliary state");
     }
     m_chainman.GetNotifications().progress(bilingual_str{}, 100, false);
@@ -6541,17 +6621,27 @@ bool Chainstate::ReplayShadowBlocks()
     const ShadowBlockReader replay_block_reader = [&](const CBlockIndex& index, CBlock& block) {
         return m_blockman.ReadBlockFromDisk(block, index);
     };
-    // The v8 replay marker commits the exact tip, schedule, pool, signal,
+    // The v9 replay marker commits the exact tip, schedule, pool, signal,
     // whitelist, Gold Rush inventory, and demurrage inventory. Check it before
-    // any historical obligation calculation so a normal pre-Final restart is
-    // bounded and performs no reward-height walk or block read. After Final,
-    // QQALIVE is reconciled in one constant-memory UTXO cursor pass.
+    // any historical obligation calculation so every normal restart, including
+    // Final, is bounded and performs no reward-height walk, block read, or UTXO
+    // cursor scan. DeepAuditDemurrageInventory remains available for explicit
+    // maintenance and migration QA.
     if (!whitelist_missing && HasCurrentShadowReplayState(
-            cache, m_chainman.GetConsensus(), pindexTip, &replay_block_reader) &&
-        Consensus::DeepAuditDemurrageInventory(
-            cache, pindexTip, m_chainman.GetConsensus())) {
+            cache, m_chainman.GetConsensus(), pindexTip, &replay_block_reader)) {
         return true;
     }
+
+    // At/after the whitelist boundary there is no safe in-place repair path:
+    // the exact v9 checkpoint must authenticate or chainstate must be rebuilt.
+    // Return before the historical reward-obligation walk so a corrupt or old
+    // checkpoint also fails in bounded time rather than delaying the recovery
+    // instruction by up to the entire Gold Rush window.
+    if (pindexTip->nHeight >= SHADOW_WHITELIST_HEIGHT) {
+        return error("ReplayShadowBlocks(): Quantum Quasar v30.1.1 auxiliary checkpoint is missing or inconsistent at height %d. Restart with -reindex-chainstate; if required block data was pruned, redownload the chainstate first",
+                     pindexTip->nHeight);
+    }
+
     int first_active_height{0};
     const auto expected = GetExpectedShadowObligation(m_chainman.GetConsensus(), pindexTip, &first_active_height);
     if (!expected) return error("ReplayShadowBlocks(): failed to compute expected Quantum Quasar shadow obligation");
@@ -6589,15 +6679,8 @@ bool Chainstate::ReplayShadowBlocks()
         return true;
     }
 
-    // v30.1.1 builds QQRSTATE v8 and its rolling inventory commitments while
-    // chainstate is connected. If any authenticated checkpoint is absent or
-    // mismatched, do not enter the legacy O(all claims + full UTXO cursor)
-    // purge/replay path: at mainnet scale that recovery can exhaust memory and
-    // make every restart fail. Rebuild from an empty chainstate instead. A
-    // pruned node that no longer has the pinned history must redownload it.
-    return error("ReplayShadowBlocks(): Quantum Quasar v30.1.1 auxiliary checkpoint is missing or inconsistent at height %d. Restart with -reindex-chainstate; if required block data was pruned, redownload the chainstate first",
+    return error("ReplayShadowBlocks(): unexpected pre-whitelist Quantum Quasar obligation at height %d",
                  pindexTip->nHeight);
-
 }
 
 bool Chainstate::NeedsRedownload() const

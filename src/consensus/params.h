@@ -136,16 +136,20 @@ struct Params {
     int64_t nProtocolV4Time;
     int64_t nGoldRushEndTime;
     int64_t nQuantumMigrationDeadlineTime;
-    /** Optional height-based phase boundaries (0 = disabled). When set, the block
-     *  AT the boundary height is the last block of its phase. Mainnet uses these
-     *  as the authoritative lifecycle so the reward window, migration, final
-     *  lockout, and demurrage cannot disagree when block production drifts from
-     *  wall-clock estimates. Test chains may override them. */
+    /** Optional height-authoritative lifecycle (start < 0 = disabled). The
+     *  boundary blocks are inclusive: nGoldRushEndHeight is the last Gold Rush
+     *  block and nQuantumMigrationEndHeight is the last Migration block. A
+     *  partial or unordered height schedule is invalid and fails closed in
+     *  GetQuantumLifecycleState instead of falling back to wall-clock time. */
+    int nQuantumLifecycleStartHeight{-1};
     int nGoldRushEndHeight{0};
     int nQuantumMigrationEndHeight{0};
     uint32_t nQuantumSighashChainId{0};
     int nStakeTierActivationHeight{std::numeric_limits<int>::max()};
     int nStakeRewardSplitActivationHeight{std::numeric_limits<int>::max()};
+    /** Height at which competing Gold Rush proof claims use the canonical,
+     *  order-independent winner and bounded loser-fee reimbursement rule. */
+    int nShadowCompetingClaimsActivationHeight{std::numeric_limits<int>::max()};
     int nDemurrageActivationHeight{std::numeric_limits<int>::max()};
     int nDemurrageMinActivationHeight{0};
     int nDemurrageBlocksPerMonth{40500};
@@ -155,47 +159,114 @@ struct Params {
     bool IsProtocolV3(int64_t nTime) const { return nTime > nProtocolV3Time && nTime != 1444028400; }
     bool IsProtocolV3_1(int64_t nTime) const { return nTime > nProtocolV3_1Time && nTime != 1713938400; }
     bool IsProtocolV4(int64_t nTime) const { return nTime > nProtocolV4Time; }
-    /** Phase boundary primitives. nTime is the median-time-past context the caller already
-     *  uses for phase decisions; nHeight is the height of the block being evaluated (for
-     *  next-block/mempool contexts: tip height + 1; for tip-status contexts: tip height).
-     *  When a height override is set (testnet/regtest schedule branch) the height is
-     *  authoritative and the paired time is ignored for that boundary. */
-    bool HasAnyHeightLifecycleBoundary() const { return nGoldRushEndHeight > 0 || nQuantumMigrationEndHeight > 0; }
-    bool UsesHeightLifecycle() const { return nGoldRushEndHeight > 0 && nQuantumMigrationEndHeight > 0; }
-    bool IsGoldRushEndScheduled() const { return UsesHeightLifecycle() ? nGoldRushEndHeight > 0 : nGoldRushEndTime != 0; }
-    bool IsMigrationEndScheduled() const { return UsesHeightLifecycle() ? nQuantumMigrationEndHeight > 0 : nQuantumMigrationDeadlineTime != 0; }
+    struct QuantumLifecycleState {
+        QuantumQuasarPhase phase{QuantumQuasarPhase::LEGACY};
+        bool schedule_valid{true};
+        bool height_authoritative{false};
+    };
+
+    /**
+     * Return the single authoritative lifecycle decision for a block context.
+     *
+     * nTime is the parent median-time-past used by consensus for the block and
+     * nHeight is the height of that block. For mempool/template decisions pass
+     * tip MTP and tip height + 1. For active-tip status pass tip MTP and tip
+     * height. Mainnet uses the complete height schedule, so MTP drift cannot
+     * skip, delay, or reverse a production transition. Time-only schedules are
+     * retained solely for isolated compatibility tests.
+     */
+    QuantumLifecycleState GetQuantumLifecycleState(int64_t nTime, int nHeight) const
+    {
+        const bool any_height = HasAnyHeightLifecycleBoundary();
+        if (any_height) {
+            if (!UsesHeightLifecycle() || !IsQuantumLifecycleScheduleOrdered()) {
+                return {QuantumQuasarPhase::LEGACY, /*schedule_valid=*/false,
+                        /*height_authoritative=*/true};
+            }
+            if (nHeight < nQuantumLifecycleStartHeight) {
+                return {QuantumQuasarPhase::LEGACY, true, true};
+            }
+            if (nHeight <= nGoldRushEndHeight) {
+                return {QuantumQuasarPhase::GOLD_RUSH, true, true};
+            }
+            if (nHeight <= nQuantumMigrationEndHeight) {
+                return {QuantumQuasarPhase::MIGRATION, true, true};
+            }
+            return {QuantumQuasarPhase::FINAL_LOCKOUT, true, true};
+        }
+
+        if (!IsProtocolV4(nTime)) {
+            return {QuantumQuasarPhase::LEGACY, true, false};
+        }
+        if (nGoldRushEndTime == 0 || nTime <= nGoldRushEndTime) {
+            return {QuantumQuasarPhase::GOLD_RUSH, true, false};
+        }
+        if (nQuantumMigrationDeadlineTime != 0 &&
+            nQuantumMigrationDeadlineTime > nGoldRushEndTime &&
+            nTime > nQuantumMigrationDeadlineTime) {
+            return {QuantumQuasarPhase::FINAL_LOCKOUT, true, false};
+        }
+        return {QuantumQuasarPhase::MIGRATION, true, false};
+    }
+
+    bool HasAnyHeightLifecycleBoundary() const
+    {
+        return nQuantumLifecycleStartHeight >= 0 ||
+               nGoldRushEndHeight > 0 ||
+               nQuantumMigrationEndHeight > 0;
+    }
+    bool UsesHeightLifecycle() const
+    {
+        return nQuantumLifecycleStartHeight >= 0 &&
+               nGoldRushEndHeight > 0 &&
+               nQuantumMigrationEndHeight > 0;
+    }
+    bool IsGoldRushEndScheduled() const
+    {
+        if (HasAnyHeightLifecycleBoundary()) return UsesHeightLifecycle() && IsQuantumLifecycleScheduleOrdered();
+        return nGoldRushEndTime != 0;
+    }
+    bool IsMigrationEndScheduled() const
+    {
+        if (HasAnyHeightLifecycleBoundary()) return UsesHeightLifecycle() && IsQuantumLifecycleScheduleOrdered();
+        return nGoldRushEndTime != 0 &&
+               nQuantumMigrationDeadlineTime > nGoldRushEndTime;
+    }
     bool IsQuantumLifecycleScheduleOrdered() const
     {
         if (UsesHeightLifecycle()) {
-            return nGoldRushEndHeight > 0 && nQuantumMigrationEndHeight > nGoldRushEndHeight;
+            return nQuantumLifecycleStartHeight <= nGoldRushEndHeight &&
+                   nQuantumMigrationEndHeight > nGoldRushEndHeight;
         }
+        if (HasAnyHeightLifecycleBoundary()) return false;
         return nGoldRushEndTime != 0 &&
                nQuantumMigrationDeadlineTime > nGoldRushEndTime;
     }
     bool GoldRushEndPassed(int64_t nTime, int nHeight) const
     {
-        if (UsesHeightLifecycle()) return nHeight > nGoldRushEndHeight;
-        return nGoldRushEndTime != 0 && nTime > nGoldRushEndTime;
+        const QuantumQuasarPhase phase = GetQuantumLifecycleState(nTime, nHeight).phase;
+        return phase == QuantumQuasarPhase::MIGRATION ||
+               phase == QuantumQuasarPhase::FINAL_LOCKOUT;
     }
     bool MigrationDeadlinePassed(int64_t nTime, int nHeight) const
     {
-        if (UsesHeightLifecycle()) return nHeight > nQuantumMigrationEndHeight;
-        return nQuantumMigrationDeadlineTime != 0 && nTime > nQuantumMigrationDeadlineTime;
+        return GetQuantumLifecycleState(nTime, nHeight).phase ==
+               QuantumQuasarPhase::FINAL_LOCKOUT;
     }
     bool IsQuantumFinalLockout(int64_t nTime, int nHeight) const
     {
-        return IsProtocolV4(nTime) && IsGoldRushEndScheduled() && GoldRushEndPassed(nTime, nHeight) &&
-               IsMigrationEndScheduled() && IsQuantumLifecycleScheduleOrdered() &&
-               MigrationDeadlinePassed(nTime, nHeight);
+        return GetQuantumLifecycleState(nTime, nHeight).phase ==
+               QuantumQuasarPhase::FINAL_LOCKOUT;
     }
     bool IsGoldRushEpoch(int64_t nTime, int nHeight) const
     {
-        return IsProtocolV4(nTime) && (!IsGoldRushEndScheduled() || !GoldRushEndPassed(nTime, nHeight));
+        return GetQuantumLifecycleState(nTime, nHeight).phase ==
+               QuantumQuasarPhase::GOLD_RUSH;
     }
     bool IsQuantumMigrationWindow(int64_t nTime, int nHeight) const
     {
-        return IsProtocolV4(nTime) && IsGoldRushEndScheduled() && GoldRushEndPassed(nTime, nHeight) &&
-               !IsQuantumFinalLockout(nTime, nHeight);
+        return GetQuantumLifecycleState(nTime, nHeight).phase ==
+               QuantumQuasarPhase::MIGRATION;
     }
     bool IsQuantumSpendEnforcementActive(int64_t nTime, int nHeight) const { return IsQuantumMigrationWindow(nTime, nHeight) || IsQuantumFinalLockout(nTime, nHeight); }
     bool IsQuantumStakeRulesActive(int64_t nTime, int nHeight) const { return IsQuantumSpendEnforcementActive(nTime, nHeight); }
@@ -203,6 +274,7 @@ struct Params {
     bool IsBaseNetworkStakeCompatible(int64_t nTime, int nHeight) const { return !IsNewNetworkStakeOnly(nTime, nHeight); }
     bool IsStakeTiersActive(int nHeight) const { return nHeight >= nStakeTierActivationHeight; }
     bool IsStakeRewardSplitActive(int nHeight) const { return nHeight >= nStakeRewardSplitActivationHeight; }
+    bool IsShadowCompetingClaimsActive(int nHeight) const { return nHeight >= nShadowCompetingClaimsActivationHeight; }
     int EffectiveDemurrageActivationHeight() const { return std::max(nDemurrageActivationHeight, nDemurrageMinActivationHeight); }
     int DemurrageBlocksPerMonth() const { return std::max(1, nDemurrageBlocksPerMonth); }
     int DemurrageGraceBlocks() const { return 6 * DemurrageBlocksPerMonth(); }
@@ -216,10 +288,7 @@ struct Params {
     }
     QuantumQuasarPhase GetQuantumQuasarPhase(int64_t nTime, int nHeight) const
     {
-        if (!IsProtocolV4(nTime)) return QuantumQuasarPhase::LEGACY;
-        if (IsGoldRushEpoch(nTime, nHeight)) return QuantumQuasarPhase::GOLD_RUSH;
-        if (IsQuantumFinalLockout(nTime, nHeight)) return QuantumQuasarPhase::FINAL_LOCKOUT;
-        return QuantumQuasarPhase::MIGRATION;
+        return GetQuantumLifecycleState(nTime, nHeight).phase;
     }
     int nLastPOWBlock;
     int nStakeTimestampMask;

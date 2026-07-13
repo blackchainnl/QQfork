@@ -12,8 +12,8 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
-GOLD_RUSH_END_TIME = 2_000_000_000
-MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 40_000
+GOLD_RUSH_END_HEIGHT = 501
+MIGRATION_END_HEIGHT = 700
 QUANTUM_SPEND_FEE = Decimal("0.01")
 WALLET_NAME = "goldrush_migration_rpc"
 
@@ -26,12 +26,13 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.extra_args = [[
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=500",
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
-            f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
         ]]
 
     def skip_test_if_missing_module(self):
@@ -88,9 +89,8 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
             self._bump_mocktime(16)
         raise last_error or AssertionError("failed to mine deterministic PoS block")
 
-    def _mine_until_phase(self, phase, target_time, address):
+    def _mine_until_phase(self, phase, address):
         node = self.nodes[0]
-        self._set_mocktime(target_time)
         for _ in range(1000):
             self.generatetoaddress(node, 1, address, sync_fun=self.no_op)
             self._bump_mocktime(16)
@@ -212,7 +212,7 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         # The bridge blocks are still validated under the preceding Gold Rush
         # MTP context, so mine them to a legacy script until G+1 is active.
         mining_address = wallet.getnewaddress("", "legacy")
-        self._mine_until_phase("migration", GOLD_RUSH_END_TIME + 16, mining_address)
+        self._mine_until_phase("migration", mining_address)
         status = wallet.getmigrationstatus()
         assert_equal(status["phase"], "migration")
         assert_equal(status["goldrush_remigration_active"], True)

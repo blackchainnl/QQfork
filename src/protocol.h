@@ -296,6 +296,12 @@ enum ServiceFlags : uint64_t {
     // NODE_P2P_V2 means the node supports BIP324 transport
     NODE_P2P_V2 = (1 << 11),
 
+    // NODE_QUANTUM_QUASAR advertises that a node understands the Quantum
+    // Quasar shadow ledger and its associated RPC surface. This is an
+    // unauthenticated capability advertisement, not a consensus-readiness
+    // vote, and must not be required for mixed-version peer connectivity.
+    NODE_QUANTUM_QUASAR = (1ULL << 24),
+
     // Bits 24-31 are reserved for temporary experiments. Just pick a bit that
     // isn't getting used, or one not being used much, and notify the
     // bitcoin-development mailing list. Remember that service bits are just

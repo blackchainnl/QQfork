@@ -209,6 +209,8 @@ class NetTest(BitcoinTestFramework):
         network_info = [node.getnetworkinfo() for node in self.nodes]
         for info in network_info:
             assert_net_servicesnames(int(info["localservices"], 0x10), info["localservicesnames"])
+            assert int(info["localservices"], 16) & test_framework.messages.NODE_QUANTUM_QUASAR
+            assert "QUANTUM_QUASAR" in info["localservicesnames"]
 
         # Check dynamically generated networks list in getnetworkinfo help output.
         assert "(ipv4, ipv6, onion, i2p, cjdns)" in self.nodes[0].help("getnetworkinfo")

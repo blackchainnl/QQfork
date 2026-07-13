@@ -86,6 +86,15 @@ struct DemurrageAttestation {
     uint256 pubkey_hash;
 };
 
+/** Typed attestation result. Local cryptographic or chainstate failures are
+ * retryable node errors and must not be converted to transaction/block
+ * invalidity. */
+enum class DemurrageAttestationValidationResult {
+    VALID,
+    INVALID,
+    LOCAL_INTERNAL_ERROR,
+};
+
 static constexpr size_t MAX_DEMURRAGE_ATTESTATIONS_PER_TX = 1;
 static constexpr size_t MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK = 16;
 
@@ -121,6 +130,15 @@ CScript BuildDemurrageAttestationScript(const COutPoint& replay_anchor,
 bool IsDemurrageAttestationScript(const CScript& script_pub_key);
 bool DecodeDemurrageAttestationPayload(const std::vector<unsigned char>& payload, DemurrageAttestation& attestation);
 std::vector<DemurrageAttestation> ExtractDemurrageAttestations(const CTransaction& tx);
+DemurrageAttestationValidationResult CheckDemurrageAttestationsDetailed(
+                                const CTransaction& tx,
+                                const CCoinsViewCache& view,
+                                const Params& params,
+                                int spend_height,
+                                int64_t spend_time,
+                                std::set<uint256>& attested_keys,
+                                size_t& attestation_count,
+                                std::string& reject_reason);
 bool CheckDemurrageAttestations(const CTransaction& tx,
                                 const CCoinsViewCache& view,
                                 const Params& params,
@@ -143,6 +161,9 @@ bool DecodeAuthenticatedDemurrageLatestState(const COutPoint& outpoint, const Co
                                              const CBlockIndex* pindex_tip, uint256& pubkey_hash,
                                              DemurrageAttestationState& state);
 bool IsAuthenticatedDemurrageStateOutpoint(const COutPoint& outpoint, const Coin& coin, const CBlockIndex* pindex_tip);
+/** Purge only current or obsolete auxiliary records authenticated by their
+ * reserved outpoint, zero-value metadata, and active-chain source. Marker-like
+ * transaction outputs at ordinary outpoints are never eligible. */
 bool PurgeAuthenticatedDemurrageState(CCoinsViewCache& view, const CBlockIndex* pindex_tip, uint64_t& removed);
 /** O(1) commitment used by the Quantum Quasar replay-state fingerprint. */
 uint256 DemurrageInventoryCoinCommitment(const CCoinsViewCache& view);
@@ -154,13 +175,14 @@ bool CanApplyDemurrageInventory(const CCoinsViewCache& view,
                                 const CBlockIndex* pindex,
                                 const Params& params);
 /** Constant-memory reconciliation of every authenticated QQALIVE leaf against
- * QQAINV. Intended for startup/explicit verification after Final, not per
- * block. */
+ * QQAINV. Intended for explicit maintenance verification after Final, not
+ * normal startup or per block. */
 bool DeepAuditDemurrageInventory(const CCoinsViewCache& view,
                                  const CBlockIndex* pindex_tip,
                                  const Params& params);
-/** On an actually connected A-1 block, prove the old marker families empty
- * once and persist an authenticated empty inventory sentinel for A. */
+/** On an actually connected A-1 block, persist the versioned authenticated
+ * empty inventory sentinel for A in O(1). Pre-activation attestations cannot
+ * create records in its namespace. */
 bool PrepareDemurrageActivationInventory(CCoinsViewCache& view,
                                          const CBlockIndex* pindex,
                                          const Params& params);

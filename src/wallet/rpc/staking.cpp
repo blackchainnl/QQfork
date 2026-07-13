@@ -75,14 +75,16 @@ static void CommitWalletTransactionOrThrow(CWallet& wallet, const CTransactionRe
 
 static bool HasUnconfirmedWalletShadowSignal(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
-    for (const auto& [txid, wtx] : wallet.mapWallet) {
+    for (const uint256& txid : wallet.GetPendingShadowSignalTxids()) {
+        const auto it = wallet.mapWallet.find(txid);
+        if (it == wallet.mapWallet.end()) continue;
+        const CWalletTx& wtx = it->second;
         const auto comment = wtx.mapValue.find("comment");
         if (comment == wtx.mapValue.end() ||
             (comment->second != "PoS Claim" && comment->second != "Quantum PoS Claim")) {
             continue;
         }
-        if (wtx.isAbandoned() || wtx.isConflicted()) continue;
-        if (wallet.GetTxDepthInMainChain(wtx) == 0) return true;
+        if (wtx.isUnconfirmed()) return true;
     }
     return false;
 }
@@ -331,12 +333,12 @@ static std::vector<RPCResult> QuantumStakeTxResult()
         {RPCResult::Type::NUM, "unlock_height", "Unlock height for newly unbonding funds, or 0"},
         {RPCResult::Type::BOOL, "started_unbonding", "true if the transaction started an unbonding period"},
         {RPCResult::Type::BOOL, "completed_withdrawal", "true if the transaction withdrew matured funds"},
-        {RPCResult::Type::BOOL, "created_goldrush_migration", "true if Gold Rush rewards were first moved to a fresh quantum address"},
+        {RPCResult::Type::BOOL, "created_goldrush_migration", "deprecated compatibility field; mature Gold Rush rewards do not require a preliminary move"},
         {RPCResult::Type::BOOL, "completed_delegation", "true if the requested delegation/funding transaction completed"},
-        {RPCResult::Type::STR_HEX, "migration_txid", /*optional=*/true, "Gold Rush reward migration transaction id"},
+        {RPCResult::Type::STR_HEX, "migration_txid", /*optional=*/true, "deprecated optional Gold Rush consolidation transaction id"},
         {RPCResult::Type::STR, "migration_address", /*optional=*/true, "Fresh quantum migration address"},
-        {RPCResult::Type::STR_AMOUNT, "migration_amount", /*optional=*/true, "Amount moved by the Gold Rush migration"},
-        {RPCResult::Type::STR_AMOUNT, "migration_fee", /*optional=*/true, "Fee paid by the Gold Rush migration"},
+        {RPCResult::Type::STR_AMOUNT, "migration_amount", /*optional=*/true, "Amount moved by deprecated optional Gold Rush consolidation"},
+        {RPCResult::Type::STR_AMOUNT, "migration_fee", /*optional=*/true, "Fee paid by deprecated optional Gold Rush consolidation"},
         {RPCResult::Type::STR, "warning", /*optional=*/true, "Follow-up warning"},
     };
 }
@@ -380,6 +382,7 @@ static RPCHelpMan getstakinginfo()
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
+    ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
 
     uint64_t nWeight = 0;
     uint64_t lastCoinStakeSearchInterval = 0;
@@ -1049,6 +1052,7 @@ static RPCHelpMan sendshadowsignal()
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
+    ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
 
     pwallet->BlockUntilSyncedToCurrentChain();
     EnsureWalletIsUnlocked(*pwallet);
@@ -1115,13 +1119,7 @@ static RPCHelpMan sendshadowsignal()
             if (!IsWhitelisted(chainman.ActiveChainstate().CoinsTip(), target)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "address is not in the deterministic Gold Rush whitelist");
             }
-            bool has_solver_activity = HasRecentShadowSolverActivity(chainman.ActiveChainstate().CoinsTip(), tip, target, solve_height, solve_hash);
-            if (!has_solver_activity && solve_height == static_cast<uint32_t>(tip->nHeight)) {
-                const auto recent_solvers = GetRecentShadowSolverActivity(chainman.ActiveChainstate().CoinsTip(), tip);
-                const auto it = recent_solvers.find(target);
-                has_solver_activity = it != recent_solvers.end() && it->second.height == solve_height;
-            }
-            if (!has_solver_activity) {
+            if (!HasRecentShadowSolverActivity(chainman.ActiveChainstate().CoinsTip(), tip, target, solve_height, solve_hash)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "referenced solve is not an active Gold Rush solver marker for this address");
             }
             if (GetActiveShadowSignalPayouts(chainman.ActiveChainstate().CoinsTip(), tip).count(target)) {
@@ -1516,10 +1514,10 @@ static RPCHelpMan getgoldrushinfo()
                         {RPCResult::Type::STR_AMOUNT, "pow_pool_jackpot", "PoW-side jackpot currently accrued in the pool before the next block reward is added."},
                         {RPCResult::Type::NUM, "pow_pool_amount", "PoW-side jackpot currently accrued in the pool before the next block reward is added, in satoshis."},
                         {RPCResult::Type::NUM, "claimed_amount", "Total Gold Rush amount already materialized to wallet-spendable quantum payout coins in satoshis."},
-                        {RPCResult::Type::NUM, "recent_solver_participants", "Unique whitelisted solver scripts with a solve marker still inside the 14-day window."},
+                        {RPCResult::Type::NUM, "recent_solver_participants", "Bounded authenticated active-signal count used as the participant proxy. Global recent-solver enumeration is intentionally not performed by this wallet RPC."},
                         {RPCResult::Type::NUM, "active_signalers", "Whitelisted recent solvers that have an unexpired QQSIGNAL marker and can receive the next qualified PoS split."},
                         {RPCResult::Type::NUM, "recent_count", "Recent solver/claim accounting count from the consensus pool."},
-                        {RPCResult::Type::STR_AMOUNT, "estimated_pos_payout_per_recent_solver", "Estimated PoS payout if every recent solver signals in the next qualified payout block."},
+                        {RPCResult::Type::STR_AMOUNT, "estimated_pos_payout_per_recent_solver", "Deprecated bounded estimate using active signalers; identical to estimated_pos_payout_per_active_signaler."},
                         {RPCResult::Type::STR_AMOUNT, "next_pos_payout_pool", "PoS-side jackpot plus the next block's PoS-side Gold Rush reward, if the next height is inside the reward window."},
                         {RPCResult::Type::NUM, "next_pos_payout_amount", "PoS-side jackpot plus the next block's PoS-side Gold Rush reward in satoshis."},
                         {RPCResult::Type::STR_AMOUNT, "estimated_pos_payout_per_active_signaler", "Estimated next qualified PoS payout per active signaler."},
@@ -1530,8 +1528,8 @@ static RPCHelpMan getgoldrushinfo()
                         {RPCResult::Type::NUM, "pow_count", "Alias for pow_claim_count."},
                         {RPCResult::Type::NUM, "last_pos_height", "Most recent accepted PoS-side Shadow payout height, or 0 if none."},
                         {RPCResult::Type::NUM, "last_pow_height", "Most recent accepted PoW-side Shadow claim height, or 0 if none."},
-                        {RPCResult::Type::BOOL, "wallet_recent_solve_qualified", "Whether this wallet has at least one spendable whitelisted script with a recent solver marker."},
-                        {RPCResult::Type::ARR, "wallet_scripts", "Spendable wallet scripts relevant to Gold Rush signaling.",
+                        {RPCResult::Type::BOOL, "wallet_recent_solve_qualified", "Whether this wallet has at least one known whitelisted script with a recent solver marker."},
+                        {RPCResult::Type::ARR, "wallet_scripts", "Bounded wallet-known scripts relevant to Gold Rush signaling; transaction construction performs the final spendability check.",
                         {
                             {RPCResult::Type::OBJ, "", "",
                             {
@@ -1555,19 +1553,20 @@ static RPCHelpMan getgoldrushinfo()
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
+    ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
 
     pwallet->BlockUntilSyncedToCurrentChain();
 
     std::set<CScript> wallet_scripts;
+    std::vector<WalletShadowSolveReference> wallet_solves;
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
-        CCoinControl coin_control;
-        coin_control.m_avoid_address_reuse = false;
-        for (const COutput& output : AvailableCoins(*pwallet, &coin_control).All()) {
-            if (output.txout.nValue > 0 && !output.txout.scriptPubKey.empty() && !output.txout.scriptPubKey.IsUnspendable()) {
-                wallet_scripts.insert(CanonicalizeLegacyStakeScript(output.txout.scriptPubKey));
-            }
-        }
+        const std::vector<CScript> known_scripts =
+            pwallet->GetOwnedLegacyShadowScripts(MAX_WALLET_SHADOW_SOLVE_REFERENCES);
+        wallet_scripts.insert(known_scripts.begin(), known_scripts.end());
+        const CBlockIndex* tip = pwallet->chain().chainman().ActiveChain().Tip();
+        if (tip) wallet_solves = GetWalletShadowSolveReferences(*pwallet, tip->nHeight);
+        for (const WalletShadowSolveReference& solve : wallet_solves) wallet_scripts.insert(solve.target);
     }
 
     UniValue wallet_entries(UniValue::VARR);
@@ -1594,8 +1593,17 @@ static RPCHelpMan getgoldrushinfo()
         mtp = tip->GetMedianTimePast();
         active = IsShadowGoldRushRewardActive(consensus, mtp, tip->nHeight + 1);
         shadow_info = GetShadowGoldRushInfo(active_chainstate.CoinsTip(), tip);
-        recent_solvers = GetRecentShadowSolverActivity(active_chainstate.CoinsTip(), tip);
         active_signalers = GetActiveShadowSignalCount(active_chainstate.CoinsTip(), tip);
+
+        for (const WalletShadowSolveReference& solve : wallet_solves) {
+            if (!wallet_scripts.count(solve.target) || !IsWhitelisted(active_chainstate.CoinsTip(), solve.target)) continue;
+            const CBlockIndex* solved = active_chainstate.m_chain[solve.solve_height];
+            if (!solved || solved->GetBlockHash() != solve.solve_hash ||
+                !HasRecentShadowSolverActivity(active_chainstate.CoinsTip(), tip, solve.target, solve.solve_height, solve.solve_hash)) {
+                continue;
+            }
+            recent_solvers.emplace(solve.target, ShadowSolverActivity{solve.solve_height, solved->GetBlockTime()});
+        }
 
         for (const CScript& script : wallet_scripts) {
             const bool whitelisted = IsWhitelisted(active_chainstate.CoinsTip(), script);
@@ -1632,8 +1640,12 @@ static RPCHelpMan getgoldrushinfo()
     const CAmount next_pos_reward = next_reward - next_pow_reward;
     const CAmount next_pow_payout = next_reward_height_active ? shadow_info.pow_amount + next_pow_reward : shadow_info.pow_amount;
     const CAmount next_pos_payout_pool = next_reward_height_active ? shadow_info.pos_amount + next_pos_reward : shadow_info.pos_amount;
-    const size_t participants = recent_solvers.size();
-    const CAmount estimated_pos_payout = participants > 0 ? shadow_info.pos_amount / static_cast<CAmount>(participants) : 0;
+    // The former participant estimate scanned every UTXO while cs_main was
+    // held. Active signals are authenticated bounded state and are also the
+    // actual recipients of the next PoS split, so retain the legacy fields as
+    // documented aliases without reintroducing a GUI/RPC chainstate stall.
+    const uint64_t participants = active_signalers;
+    const CAmount estimated_pos_payout = participants > 0 ? next_pos_payout_pool / static_cast<CAmount>(participants) : 0;
     const CAmount estimated_active_pos_payout = active_signalers > 0 ? next_pos_payout_pool / static_cast<CAmount>(active_signalers) : 0;
 
     UniValue result(UniValue::VOBJ);
@@ -1647,7 +1659,7 @@ static RPCHelpMan getgoldrushinfo()
     result.pushKV("pow_pool_jackpot", ValueFromAmount(shadow_info.pow_amount));
     result.pushKV("pow_pool_amount", shadow_info.pow_amount);
     result.pushKV("claimed_amount", shadow_info.claimed_amount);
-    result.pushKV("recent_solver_participants", static_cast<uint64_t>(participants));
+    result.pushKV("recent_solver_participants", participants);
     result.pushKV("active_signalers", active_signalers);
     result.pushKV("recent_count", shadow_info.recent_count);
     result.pushKV("estimated_pos_payout_per_recent_solver", ValueFromAmount(estimated_pos_payout));

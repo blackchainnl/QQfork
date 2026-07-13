@@ -267,7 +267,7 @@ void WalletView::backupWallet()
             CClientUIInterface::MSG_ERROR);
         }
     else {
-        Q_EMIT message(tr("Backup Successful"), tr("The wallet data was successfully saved to %1.").arg(filename),
+        Q_EMIT message(tr("Backup Successful"), tr("The wallet data was atomically saved to %1. Any wallet-backed quantum keys were reopened and passed an independent cryptographic signing check before the backup was installed.").arg(filename),
             CClientUIInterface::MSG_INFORMATION);
     }
 }

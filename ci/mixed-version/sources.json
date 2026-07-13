@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "sources": [
+    {
+      "version": "v26.2.0",
+      "install_dir": "v26.2",
+      "repository": "https://github.com/CoinBlack/blackcoin-more.git",
+      "source_ref": "refs/tags/v26.2.0",
+      "ref_object": "b54edb619b0d42df4b3a73a29b02d9eb885516d5",
+      "commit": "b54edb619b0d42df4b3a73a29b02d9eb885516d5",
+      "tag_kind": "lightweight",
+      "source_daemon": "blackmored",
+      "source_cli": "blackmore-cli",
+      "release_asset": {
+        "host": "x86_64-pc-linux-gnu",
+        "url": "https://github.com/CoinBlack/blackcoin-more/releases/download/v26.2.0/blackcoin-more-26.2.0-x86_64-pc-linux-gnu.tar.gz",
+        "sha256": "27ab715af906e0a6f78b282c17bca51f0359b0f875c2f2c2ffeaa83708af114a",
+        "daemon_member": "blackcoin-more-26.2.0/blackmored",
+        "daemon_sha256": "c6148b5e53a091fe27dffadd607f62fc84489968ee4ac2e751ab9d591bfb4542",
+        "cli_member": "blackcoin-more-26.2.0/blackmore-cli",
+        "cli_sha256": "b9568a49f384f5b87ed48d577f64e7f8d44aef57a0140c25ecee84f93318eb58"
+      }
+    },
+    {
+      "version": "v28.4.0",
+      "install_dir": "v28.4",
+      "repository": "https://github.com/CoinBlack/blackcoin-more.git",
+      "source_ref": "refs/heads/28.x",
+      "ref_object": "5c1a4a5efc3886a69f01d50109c251d153ed092e",
+      "commit": "5c1a4a5efc3886a69f01d50109c251d153ed092e",
+      "tag_kind": "untagged-release-branch",
+      "source_daemon": "blackmored",
+      "source_cli": "blackmore-cli"
+    },
+    {
+      "version": "v30.1.0",
+      "install_dir": "v30.1",
+      "repository": "https://github.com/Blackcoin-Dev/Blackcoin.git",
+      "source_ref": "refs/tags/v30.1.0",
+      "ref_object": "1d16eba95983fb2bf41246de6250d7762a450c50",
+      "commit": "f647dc75c9479c03e81414f145a8d233b60959c7",
+      "tag_kind": "annotated",
+      "source_daemon": "blackcoind",
+      "source_cli": "blackcoin-cli"
+    }
+  ]
+}

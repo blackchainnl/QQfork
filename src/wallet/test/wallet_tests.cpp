@@ -6,9 +6,13 @@
 
 #include <wallet/wallet.h>
 
+#include <algorithm>
+#include <array>
 #include <future>
+#include <iterator>
 #include <memory>
 #include <stdint.h>
+#include <string_view>
 #include <vector>
 
 #include <addresstype.h>
@@ -23,11 +27,13 @@
 #include <rpc/server.h>
 #include <script/solver.h>
 #include <shadow.h>
+#include <support/cleanse.h>
 #include <streams.h>
 #include <test/util/logging.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <undo.h>
+#include <util/readwritefile.h>
 #include <util/translation.h>
 #include <validation.h>
 #include <validationinterface.h>
@@ -184,6 +190,98 @@ class MockTimeScope
 public:
     ~MockTimeScope() { SetMockTime(0); }
 };
+
+BOOST_AUTO_TEST_CASE(shadow_solve_index_is_bounded_ordered_and_disconnect_safe)
+{
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    {
+        LOCK(wallet.cs_wallet);
+        wallet.SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet.SetupDescriptorScriptPubKeyMans();
+    }
+
+    CKey key_a;
+    CKey key_b;
+    CKey key_c;
+    key_a.MakeNewKey(true);
+    key_b.MakeNewKey(true);
+    key_c.MakeNewKey(true);
+    AddKey(wallet, key_a);
+    AddKey(wallet, key_b);
+    AddKey(wallet, key_c);
+
+    const CScript target_a = GetScriptForDestination(PKHash(key_a.GetPubKey()));
+    const CScript target_b = GetScriptForDestination(PKHash(key_b.GetPubKey()));
+    const CScript target_c = GetScriptForDestination(PKHash(key_c.GetPubKey()));
+
+    auto add_funding = [&](const CScript& target, int height, uint64_t block_tag) {
+        CMutableTransaction tx;
+        tx.vin.resize(1);
+        tx.vin[0].prevout.SetNull();
+        tx.vout.emplace_back(10 * COIN, target);
+        CTransactionRef ref = MakeTransactionRef(std::move(tx));
+        BOOST_REQUIRE(wallet.AddToWallet(ref, TxStateConfirmed{uint256{static_cast<uint8_t>(block_tag)}, height, 0}));
+        return ref;
+    };
+    auto add_solve = [&](const CTransactionRef& previous, uint32_t output_index, const CScript& target,
+                         int height, uint64_t block_tag) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(COutPoint{previous->GetHash(), output_index});
+        tx.vout.emplace_back(0, CScript{});
+        tx.vout.emplace_back(10 * COIN, target);
+        CTransactionRef ref = MakeTransactionRef(std::move(tx));
+        BOOST_REQUIRE(wallet.AddToWallet(ref, TxStateConfirmed{uint256{static_cast<uint8_t>(block_tag)}, height, 1}));
+        return ref;
+    };
+
+    const CTransactionRef funding_a = add_funding(target_a, 1, 1);
+    const CTransactionRef funding_b = add_funding(target_b, 1, 2);
+    const CTransactionRef funding_c = add_funding(target_c, 1, 3);
+    const CTransactionRef solve_a_old = add_solve(funding_a, 0, target_a, 100, 100);
+    const CTransactionRef solve_b = add_solve(funding_b, 0, target_b, 101, 101);
+    const CTransactionRef solve_c = add_solve(funding_c, 0, target_c, 101, 102);
+    const CTransactionRef solve_a_new = add_solve(solve_a_old, 1, target_a, 102, 103);
+
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.GetOwnedLegacyShadowScripts(0).empty());
+        BOOST_CHECK(wallet.GetRecentShadowSolveReferences(102, 0).empty());
+
+        const auto newest = wallet.GetRecentShadowSolveReferences(102, 2);
+        BOOST_REQUIRE_EQUAL(newest.size(), 2U);
+        BOOST_CHECK_EQUAL(newest[0].solve_txid, solve_a_new->GetHash());
+        BOOST_CHECK_EQUAL(newest[0].solve_height, 102U);
+        BOOST_CHECK_EQUAL(newest[1].solve_height, 101U);
+
+        const auto capped = wallet.GetRecentShadowSolveReferences(102, 1);
+        BOOST_REQUIRE_EQUAL(capped.size(), 1U);
+        BOOST_CHECK_EQUAL(capped[0].solve_txid, solve_a_new->GetHash());
+
+        const auto at_101 = wallet.GetRecentShadowSolveReferences(101, 3);
+        BOOST_REQUIRE_EQUAL(at_101.size(), 2U);
+        BOOST_CHECK_EQUAL(at_101[0].solve_height, 101U);
+        BOOST_CHECK_EQUAL(at_101[1].solve_height, 101U);
+        BOOST_CHECK(at_101[1].target < at_101[0].target);
+    }
+
+    BOOST_REQUIRE(wallet.AddToWallet(solve_a_new, TxStateInactive{}));
+    {
+        LOCK(wallet.cs_wallet);
+        const auto after_disconnect = wallet.GetRecentShadowSolveReferences(102, 3);
+        BOOST_REQUIRE_EQUAL(after_disconnect.size(), 3U);
+        BOOST_CHECK_EQUAL(after_disconnect[0].solve_height, 101U);
+        BOOST_CHECK_EQUAL(after_disconnect[1].solve_height, 101U);
+        BOOST_CHECK_EQUAL(after_disconnect[2].solve_txid, solve_a_old->GetHash());
+    }
+
+    BOOST_REQUIRE(wallet.AddToWallet(solve_a_new, TxStateConfirmed{uint256{103}, 102, 1}));
+    {
+        LOCK(wallet.cs_wallet);
+        const auto after_reconnect = wallet.GetRecentShadowSolveReferences(102, 1);
+        BOOST_REQUIRE_EQUAL(after_reconnect.size(), 1U);
+        BOOST_CHECK_EQUAL(after_reconnect[0].solve_txid, solve_a_new->GetHash());
+    }
+}
 
 BOOST_AUTO_TEST_CASE(goldrush_pow_miner_lifecycle_creates_quantum_payout)
 {
@@ -784,6 +882,23 @@ static void CheckQuantumWalletSigning(CWallet& wallet, const CTxDestination& des
     BOOST_CHECK(spend.vin[0].scriptSig.empty());
 }
 
+static void CheckQuantumKeyChallenge(CWallet& wallet, const CTxDestination& dest) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+{
+    const auto info = wallet.GetQuantumKeyInfo(dest);
+    BOOST_REQUIRE(info.has_value());
+    std::vector<unsigned char> public_key;
+    CKeyingMaterial private_key;
+    bilingual_str error;
+    BOOST_REQUIRE_MESSAGE(wallet.GetQuantumKey(info->witness_program, public_key, private_key, error), error.original);
+
+    const uint256 challenge = GetRandHash();
+    std::vector<unsigned char> private_key_bytes(private_key.begin(), private_key.end());
+    std::vector<unsigned char> signature;
+    BOOST_REQUIRE(ML_DSA::Sign(private_key_bytes, challenge.begin(), uint256::size(), signature));
+    memory_cleanse(private_key_bytes.data(), private_key_bytes.size());
+    BOOST_CHECK(ML_DSA::Verify(public_key, challenge.begin(), uint256::size(), signature));
+}
+
 static std::shared_ptr<CWallet> TestLoadQuantumWallet(const std::string& name, DatabaseFormat format)
 {
     DatabaseOptions options;
@@ -793,6 +908,20 @@ static std::shared_ptr<CWallet> TestLoadQuantumWallet(const std::string& name, D
     auto database{MakeWalletDatabase(name, options, status, error)};
     auto wallet{std::make_shared<CWallet>(/*chain=*/nullptr, "", std::move(database))};
     BOOST_CHECK_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
+    return wallet;
+}
+
+static std::shared_ptr<CWallet> TestLoadQuantumWalletBackup(const fs::path& path)
+{
+    DatabaseOptions options;
+    options.require_existing = true;
+    options.verify = true;
+    DatabaseStatus status;
+    bilingual_str error;
+    auto database{MakeDatabase(path, options, status, error)};
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    auto wallet{std::make_shared<CWallet>(/*chain=*/nullptr, "restored-quantum-backup", std::move(database))};
+    BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
     return wallet;
 }
 
@@ -812,6 +941,8 @@ BOOST_AUTO_TEST_CASE(QuantumWalletKeysPersistAndSign)
             const auto info = wallet->GetQuantumKeyInfo(dest);
             BOOST_REQUIRE(info.has_value());
             BOOST_CHECK(!info->encrypted);
+            BOOST_CHECK(info->durably_stored);
+            BOOST_CHECK(!info->backup_verified);
             CheckQuantumWalletSigning(*wallet, dest);
         }
         {
@@ -822,7 +953,311 @@ BOOST_AUTO_TEST_CASE(QuantumWalletKeysPersistAndSign)
             const auto info = wallet->GetQuantumKeyInfo(dest);
             BOOST_REQUIRE(info.has_value());
             BOOST_CHECK(!info->encrypted);
+            BOOST_CHECK(info->durably_stored);
+            BOOST_CHECK(!info->backup_verified);
             CheckQuantumWalletSigning(*wallet, dest);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)
+{
+    std::vector<uint8_t> public_key;
+    std::vector<uint8_t> generated_private_key;
+    BOOST_REQUIRE(ML_DSA::KeyGen(public_key, generated_private_key));
+    const CKeyingMaterial private_key(generated_private_key.begin(), generated_private_key.end());
+
+    // A receive key is one transaction containing the private key, initial
+    // unverified-backup marker, wallet flags, address purpose, and label.
+    // Fail each write in turn and prove neither memory nor a crash-style
+    // reload can observe a partial key.
+    for (size_t fail_write = 0; fail_write < 5; ++fail_write) {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        const MockableData initial_records = database.m_records;
+        database.m_fail_write_at = fail_write;
+
+        auto result = wallet.AddQuantumKey(public_key, private_key, "atomic-quantum", GetTime(), /*record_as_receive=*/true);
+        BOOST_CHECK(!result);
+        BOOST_CHECK(database.m_last_txn_durable);
+        BOOST_CHECK(database.m_records == initial_records);
+        {
+            LOCK(wallet.cs_wallet);
+            BOOST_CHECK(wallet.ListQuantumKeyInfos().empty());
+            BOOST_CHECK(!wallet.IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
+        }
+
+        CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        LOCK(reloaded.cs_wallet);
+        BOOST_CHECK(reloaded.ListQuantumKeyInfos().empty());
+    }
+
+    // A failed durable commit has the same all-or-nothing result.
+    {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        const MockableData initial_records = database.m_records;
+        database.m_fail_commit = true;
+        auto result = wallet.AddQuantumKey(public_key, private_key, "atomic-quantum", GetTime(), /*record_as_receive=*/true);
+        BOOST_CHECK(!result);
+        BOOST_CHECK(database.m_last_txn_durable);
+        BOOST_CHECK(database.m_records == initial_records);
+
+        CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        LOCK(reloaded.cs_wallet);
+        BOOST_CHECK(reloaded.ListQuantumKeyInfos().empty());
+    }
+
+    // Once the durable commit reports success, a fresh process view recovers
+    // the complete key and can sign. It remains conservatively unverified
+    // until backupwallet reopens and challenges a produced backup.
+    {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        auto result = wallet.AddQuantumKey(public_key, private_key, "atomic-quantum", GetTime(), /*record_as_receive=*/true);
+        BOOST_REQUIRE(result);
+        const CTxDestination destination = *result;
+        BOOST_CHECK(database.m_last_txn_durable);
+
+        CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        LOCK(reloaded.cs_wallet);
+        const auto info = reloaded.GetQuantumKeyInfo(destination);
+        BOOST_REQUIRE(info.has_value());
+        BOOST_CHECK(info->durably_stored);
+        BOOST_CHECK(!info->backup_verified);
+        CheckQuantumKeyChallenge(reloaded, destination);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(QuantumWalletVerifiedBackupsAreCompleteAndRestorable)
+{
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        const std::string name{strprintf("quantum-wallet-backup-%i", format)};
+        const fs::path first_backup_dir = m_path_root / fs::PathFromString(strprintf("quantum-first-backup-%i", format));
+        const fs::path current_backup_dir = m_path_root / fs::PathFromString(strprintf("quantum-current-backup-%i", format));
+        BOOST_REQUIRE(fs::create_directory(first_backup_dir));
+        BOOST_REQUIRE(fs::create_directory(current_backup_dir));
+
+        CTxDestination first_destination;
+        CTxDestination second_destination;
+        std::string wallet_filename;
+        {
+            auto wallet{TestLoadQuantumWallet(name, format)};
+            wallet_filename = fs::PathToString(fs::PathFromString(wallet->GetDatabase().Filename()).filename());
+
+            auto first = wallet->GetNewQuantumDestination("first-quantum");
+            BOOST_REQUIRE(first);
+            first_destination = *first;
+            {
+                LOCK(wallet->cs_wallet);
+                const auto info = wallet->GetQuantumKeyInfo(first_destination);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(info->durably_stored);
+                BOOST_CHECK(!info->backup_verified);
+            }
+
+            bilingual_str error;
+            BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(first_backup_dir), &error), error.original);
+            {
+                LOCK(wallet->cs_wallet);
+                const auto info = wallet->GetQuantumKeyInfo(first_destination);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(info->backup_verified);
+            }
+
+            // A later non-HD key is not covered by the earlier backup. The
+            // older key stays verified; the new one fails closed until the
+            // next complete backup is reopened and challenged.
+            auto second = wallet->GetNewQuantumDestination("second-quantum");
+            BOOST_REQUIRE(second);
+            second_destination = *second;
+            {
+                LOCK(wallet->cs_wallet);
+                const auto infos = wallet->ListQuantumKeyInfos();
+                BOOST_REQUIRE_EQUAL(infos.size(), 2U);
+                BOOST_CHECK_EQUAL(std::count_if(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) { return info.backup_verified; }), 1);
+            }
+
+            error.clear();
+            BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(current_backup_dir), &error), error.original);
+            {
+                LOCK(wallet->cs_wallet);
+                const auto infos = wallet->ListQuantumKeyInfos();
+                BOOST_REQUIRE_EQUAL(infos.size(), 2U);
+                BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) {
+                    return info.durably_stored && info.backup_verified;
+                }));
+            }
+
+            // Every staged-copy boundary is fail-closed. In particular, no
+            // injected failure may modify a pre-existing good destination;
+            // only the final verified stage is ever atomically promoted.
+            const fs::path current_backup_path = current_backup_dir / fs::PathFromString(wallet_filename);
+            const std::array<std::string_view, 9> failpoints{{
+                "before_first_copy",
+                "after_first_copy",
+                "before_stage_directory_commit",
+                "before_marker_prepare",
+                "after_marker_prepare",
+                "after_marker_commit",
+                "before_final_verify",
+                "after_final_verify",
+                "before_promote",
+            }};
+            for (const std::string_view injected : failpoints) {
+                error.clear();
+                BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(current_backup_dir), &error), error.original);
+                const auto [before_ok, before] = ReadBinaryFile(current_backup_path);
+                BOOST_REQUIRE(before_ok);
+
+                wallet->m_quantum_backup_failpoint = [injected](std::string_view point) { return point == injected; };
+                error.clear();
+                BOOST_CHECK(!wallet->BackupWallet(fs::PathToString(current_backup_dir), &error));
+                wallet->m_quantum_backup_failpoint = {};
+                BOOST_CHECK(!error.empty());
+
+                const auto [after_ok, after] = ReadBinaryFile(current_backup_path);
+                BOOST_REQUIRE(after_ok);
+                BOOST_CHECK_EQUAL_COLLECTIONS(before.begin(), before.end(), after.begin(), after.end());
+                BOOST_CHECK_EQUAL(static_cast<size_t>(std::distance(fs::directory_iterator(current_backup_dir), fs::directory_iterator{})), 1U);
+            }
+
+            // Once the verified stage has been atomically installed, a
+            // directory-sync failure cannot safely be rolled back. Report the
+            // failure without deleting the complete destination or claiming
+            // that a newly added source key was covered. The independently
+            // verified destination must remain usable.
+            error.clear();
+            wallet->m_quantum_backup_failpoint = [](std::string_view point) { return point == "before_final_directory_commit"; };
+            BOOST_CHECK(!wallet->BackupWallet(fs::PathToString(current_backup_dir), &error));
+            wallet->m_quantum_backup_failpoint = {};
+            BOOST_CHECK(!error.empty());
+            BOOST_CHECK(fs::is_regular_file(current_backup_path));
+            BOOST_CHECK_EQUAL(static_cast<size_t>(std::distance(fs::directory_iterator(current_backup_dir), fs::directory_iterator{})), 1U);
+            {
+                auto restored{TestLoadQuantumWalletBackup(current_backup_path)};
+                LOCK(restored->cs_wallet);
+                const auto infos = restored->ListQuantumKeyInfos();
+                BOOST_REQUIRE_EQUAL(infos.size(), 2U);
+                BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) {
+                    return info.durably_stored && info.backup_verified;
+                }));
+            }
+            error.clear();
+            BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(current_backup_dir), &error), error.original);
+        }
+
+        const fs::path first_backup_path = first_backup_dir / fs::PathFromString(wallet_filename);
+        const fs::path current_backup_path = current_backup_dir / fs::PathFromString(wallet_filename);
+        BOOST_REQUIRE(fs::is_regular_file(first_backup_path));
+        BOOST_REQUIRE(fs::is_regular_file(current_backup_path));
+
+        {
+            auto restored{TestLoadQuantumWalletBackup(first_backup_path)};
+            LOCK(restored->cs_wallet);
+            const auto infos = restored->ListQuantumKeyInfos();
+            BOOST_REQUIRE_EQUAL(infos.size(), 1U);
+            BOOST_CHECK(infos.front().durably_stored);
+            BOOST_CHECK(infos.front().backup_verified);
+            BOOST_CHECK(restored->GetQuantumKeyInfo(first_destination).has_value());
+            BOOST_CHECK(!restored->GetQuantumKeyInfo(second_destination).has_value());
+            CheckQuantumKeyChallenge(*restored, first_destination);
+        }
+        {
+            auto restored{TestLoadQuantumWalletBackup(current_backup_path)};
+            LOCK(restored->cs_wallet);
+            const auto infos = restored->ListQuantumKeyInfos();
+            BOOST_REQUIRE_EQUAL(infos.size(), 2U);
+            BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) {
+                return info.durably_stored && info.backup_verified;
+            }));
+            CheckQuantumKeyChallenge(*restored, first_destination);
+            CheckQuantumKeyChallenge(*restored, second_destination);
+        }
+    }
+}
+
+BOOST_AUTO_TEST_CASE(QuantumWalletEncryptedBackupAndOldWalletCompatibility)
+{
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        const std::string encrypted_name{strprintf("quantum-wallet-encrypted-backup-%i", format)};
+        const fs::path backup_path = m_path_root / fs::PathFromString(strprintf("quantum-encrypted-backup-%i.dat", format));
+        CTxDestination destination;
+
+        {
+            auto wallet{TestLoadQuantumWallet(encrypted_name, format)};
+            auto created = wallet->GetNewQuantumDestination("encrypted-backup");
+            BOOST_REQUIRE(created);
+            destination = *created;
+            BOOST_REQUIRE(wallet->EncryptWallet("pass"));
+            BOOST_REQUIRE(wallet->Unlock("pass"));
+
+            bilingual_str error;
+            BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(backup_path), &error), error.original);
+            const auto [read_ok, known_good_backup] = ReadBinaryFile(backup_path);
+            BOOST_REQUIRE(read_ok);
+
+            BOOST_REQUIRE(wallet->Lock());
+            error.clear();
+            BOOST_CHECK(!wallet->BackupWallet(fs::PathToString(backup_path), &error));
+            BOOST_CHECK_EQUAL(error.original, "Unlock this wallet before creating a verified quantum-key backup");
+            const auto [failed_read_ok, after_failed_backup] = ReadBinaryFile(backup_path);
+            BOOST_REQUIRE(failed_read_ok);
+            BOOST_CHECK_EQUAL_COLLECTIONS(known_good_backup.begin(), known_good_backup.end(), after_failed_backup.begin(), after_failed_backup.end());
+
+            BOOST_REQUIRE(wallet->Unlock("pass"));
+            wallet->m_wallet_unlock_staking_only = true;
+            auto blocked_creation = wallet->GetNewQuantumDestination("staking-only-must-not-create");
+            BOOST_CHECK(!blocked_creation);
+            error.clear();
+            BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(backup_path), &error), error.original);
+            wallet->m_wallet_unlock_staking_only = false;
+            BOOST_REQUIRE(wallet->Lock());
+        }
+
+        {
+            auto restored{TestLoadQuantumWalletBackup(backup_path)};
+            LOCK(restored->cs_wallet);
+            const auto info = restored->GetQuantumKeyInfo(destination);
+            BOOST_REQUIRE(info.has_value());
+            BOOST_CHECK(info->encrypted);
+            BOOST_CHECK(info->durably_stored);
+            BOOST_CHECK(info->backup_verified);
+            BOOST_CHECK(restored->IsLocked());
+            BOOST_REQUIRE(restored->Unlock("pass"));
+            CheckQuantumKeyChallenge(*restored, destination);
+        }
+
+        // A pre-v30.1.1 database has the key record but no per-key backup
+        // marker. It must remain usable while loading conservatively as
+        // unverified on both supported backends.
+        const std::string old_name{strprintf("quantum-wallet-old-key-%i", format)};
+        std::vector<uint8_t> public_key;
+        std::vector<uint8_t> generated_private_key;
+        BOOST_REQUIRE(ML_DSA::KeyGen(public_key, generated_private_key));
+        const CKeyingMaterial private_key(generated_private_key.begin(), generated_private_key.end());
+        const CTxDestination old_destination = WitnessUnknown{
+            QUANTUM_MIGRATION_WITNESS_VERSION,
+            QuantumMigrationProgramForPubkey(public_key)};
+        {
+            auto wallet{TestLoadQuantumWallet(old_name, format)};
+            WalletBatch batch{wallet->GetDatabase()};
+            BOOST_REQUIRE(batch.WriteQuantumKey(public_key, private_key, CKeyMetadata{GetTime()}));
+        }
+        {
+            auto wallet{TestLoadQuantumWallet(old_name, format)};
+            LOCK(wallet->cs_wallet);
+            const auto info = wallet->GetQuantumKeyInfo(old_destination);
+            BOOST_REQUIRE(info.has_value());
+            BOOST_CHECK(info->durably_stored);
+            BOOST_CHECK(!info->backup_verified);
+            CheckQuantumKeyChallenge(*wallet, old_destination);
         }
     }
 }

@@ -1,3 +1,4 @@
+// Copyright (c) 2022 The Bitcoin Core developers
 // Copyright (c) 2022 Blackcoin Core Developers
 // Copyright (c) 2022 Blackcoin More Developers
 // Copyright (c) 2022 Quantum Quasar Developers
@@ -12,7 +13,6 @@
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <kernel/chainparams.h>
-#include <logging.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <tinyformat.h>
@@ -47,18 +47,6 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, const CChainP
 
     if (auto hours = argsman.GetIntArg("-mempoolexpiry")) mempool_opts.expiry = std::chrono::hours{*hours};
 
-    /*
-    // incremental relay fee sets the minimum feerate increase necessary for replacement in the mempool
-    // and the amount the mempool min fee increases above the feerate of txs evicted due to mempool limiting.
-    if (argsman.IsArgSet("-incrementalrelayfee")) {
-        if (std::optional<CAmount> inc_relay_fee = ParseMoney(argsman.GetArg("-incrementalrelayfee", ""))) {
-            mempool_opts.incremental_relay_feerate = CFeeRate{inc_relay_fee.value()};
-        } else {
-            return util::Error{AmountErrMsg("incrementalrelayfee", argsman.GetArg("-incrementalrelayfee", ""))};
-        }
-    }
-    */
-
     if (argsman.IsArgSet("-minrelaytxfee")) {
         if (std::optional<CAmount> min_relay_feerate = ParseMoney(argsman.GetArg("-minrelaytxfee", ""))) {
             // High fee check is done afterward in CWallet::Create()
@@ -67,14 +55,6 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& argsman, const CChainP
             return util::Error{AmountErrMsg("minrelaytxfee", argsman.GetArg("-minrelaytxfee", ""))};
         }
     }
-    /*
-    else if (mempool_opts.incremental_relay_feerate > mempool_opts.min_relay_feerate) {
-        // Allow only setting incremental fee to control both
-        mempool_opts.min_relay_feerate = mempool_opts.incremental_relay_feerate;
-        LogPrintf("Increasing minrelaytxfee to %s to match incrementalrelayfee\n", mempool_opts.min_relay_feerate.ToString());
-    }
-    */
-
     // Feerate used to define dust.  Shouldn't be changed lightly as old
     // implementations may inadvertently create non-standard transactions
     if (argsman.IsArgSet("-dustrelayfee")) {

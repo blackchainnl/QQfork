@@ -25,10 +25,10 @@ helping secure the chain**.
 - **The Gold Rush.** A 180-day bonus-emission epoch (up to 51,437,700 BLK) paid to holders
   **through staking and mining**, split 50/50 between native PoS and a light, CPU-friendly
   Argon2id PoW lane.
-- **Liveness demurrage.** Directly-held quantum coins that are abandoned for more than six
-  months slowly decay, with the reclaimed value flowing to active stakers, while any holder
-  who participates even minimally (one automatic attestation, or a single cold-stake
-  delegation) keeps **100%** forever.
+- **Liveness demurrage.** Quantum coins that remain inactive for more than six months
+  slowly decay. Decayed principal is burned when spent and is never paid to a miner or
+  staker. A timely liveness attestation, ordinary spend, or successful cold-stake refresh
+  keeps the activity clock current.
 - **Rich quantum staking.** Tiered self-staking, cold staking with owner/staker key
   separation, operator bonds, a per-pool decentralization cap, and autonomous redelegation.
 - **Advanced primitives.** EUTXO smart-contract outputs and RGB client-side asset commitments.

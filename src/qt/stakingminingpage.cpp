@@ -26,6 +26,7 @@
 #include <array>
 #include <limits>
 #include <optional>
+#include <set>
 #include <thread>
 
 #include <QApplication>
@@ -408,7 +409,7 @@ void StakingMiningPage::setupUi()
            "<ol>"
            "<li><b>Keep legacy staking online</b> while Gold Rush runs. Legacy staking secures the base chain and can also produce PoS Gold Rush eligibility.</li>"
            "<li><b>Use normal wallet unlock for quantum actions.</b> Legacy staking-only unlock is intentionally limited and will not create Gold Rush signal or quantum transactions.</li>"
-           "<li><b>Move Gold Rush rewards once.</b> Newly mined Gold Rush quantum rewards must move to a fresh wallet-backed quantum address before being used for sends, staking, node bonds, or delegation.</li>"
+           "<li><b>Wait for Gold Rush rewards to unlock.</b> Newly mined Gold Rush quantum rewards remain locked until Gold Rush ends. After maturity and that boundary, the original outputs are ordinary direct quantum funds; no preliminary move is required.</li>"
            "<li><b>Choose a staking mode.</b> Stake locally if you want this machine to secure the network with your coins, run a node if you want to stake delegated cold deposits, or delegate to a verified node if you want owner keys offline.</li>"
            "</ol>"
            "<h3>Where transactions appear</h3>"
@@ -422,11 +423,11 @@ void StakingMiningPage::setupUi()
            "<li>Back up the wallet after creating any new quantum address, node key, or delegation address.</li>"
            "<li>Use <b>Unlock wallet for LEGACY staking only</b> only when you want ordinary legacy staking and no spending or quantum operations.</li>"
            "<li>Use <b>Unlock wallet for Quantum and Legacy Staking</b> when you want Gold Rush PoS signals, PoW claim transactions, migration, cold-staking setup, or quantum spends.</li>"
-           "<li>Do not delegate or stake unmoved Gold Rush reward outputs directly. The wallet will move them to a fresh quantum address first when possible.</li>"
+           "<li>Gold Rush reward outputs cannot be spent during Gold Rush. After Gold Rush and maturity, they can be sent, staked, bonded, or delegated directly; consolidation is optional.</li>"
            "<li>Node bonds use a fixed 30-day unbonding period. Delegated funds remain owner-controlled by the delegator wallet.</li>"
            "</ul>"
            "<h3>What the dashboard is telling you</h3>"
-           "<p>The recommended action panel is conservative. It calls out the next action most likely to prevent confusion or blocked transactions, such as moving Gold Rush rewards, unlocking normally for signals, or choosing a cold-staking path.</p>"),
+           "<p>The recommended action panel is conservative. It calls out the next action most likely to prevent confusion or blocked transactions, such as waiting for Gold Rush rewards to unlock, unlocking normally for signals, or choosing a cold-staking path.</p>"),
         dashboardBox);
     dashboard->addWidget(m_dashboard_action, 0, 0, 1, 2);
     dashboard->addLayout(makeGuideRow({systemHelp, safetyHelp}), 1, 0, 1, 2);
@@ -625,8 +626,8 @@ void StakingMiningPage::setupUi()
     m_pow_warning->setWordWrap(true);
     m_pow_warning->setTextFormat(Qt::RichText);
     m_pow_warning->setText(tr("<b>Important:</b> Gold Rush PoW rewards are paid to the quantum address above. "
-                              "Back up this wallet after the address is created, then move Gold Rush rewards "
-                              "to a fresh quantum address before final lockout."));
+                              "Back up this wallet after the address is created. Rewards remain locked until Gold Rush ends, "
+                              "then become ordinary direct quantum funds after normal maturity."));
     m_pow_warning->setStyleSheet(QStringLiteral("QLabel { color: #8a6d00; background: #fff6d6; padding: 6px; border-radius: 4px; }"));
     auto* powHelp = makeHelpButton(
         tr("PoW"),
@@ -651,7 +652,7 @@ void StakingMiningPage::setupUi()
         tr("<h3>Payout address</h3>"
            "<p>The payout address is a wallet-backed quantum address. Back up the wallet after it is created.</p>"
            "<h3>Using mined rewards</h3>"
-           "<p>Gold Rush rewards must be moved once to a fresh wallet-backed quantum address before normal use. The wallet can perform that move automatically before staking, node bonding, or delegation when quantum spending is active.</p>"
+           "<p>Gold Rush rewards remain phase-locked until Gold Rush ends. After maturity and the boundary, the original wallet-backed quantum outputs are ordinary direct quantum funds. A fresh-address consolidation is optional, not a spendability requirement.</p>"
            "<h3>Why the control transaction has a fee</h3>"
            "<p>The QQSPROOF itself is anchored on the legacy chain through a normal transaction. That transaction pays the standard network fee. The quantum reward is not a legacy output.</p>"),
         powBox);
@@ -701,7 +702,7 @@ void StakingMiningPage::setupUi()
            "<h3>Confirmations and availability</h3>"
            "<p>New node bonds and delegations are visible immediately as pending, then become active after normal confirmations. There is no extra waiting period beyond confirmation and the fixed unbonding rules.</p>"
            "<h3>Gold Rush reward handling</h3>"
-           "<p>If the wallet uses unmoved Gold Rush reward outputs, the wallet first moves those rewards to a fresh quantum address and then completes the staking or delegation step when possible.</p>"),
+           "<p>Gold Rush reward outputs remain unavailable during Gold Rush. After Gold Rush and maturity, they can fund staking or delegation directly without a required first move.</p>"),
         coldstakeBox);
     auto* coldstakeSummaryRow = new QHBoxLayout();
     coldstakeSummaryRow->addWidget(m_coldstake_summary, 1);
@@ -863,7 +864,7 @@ void StakingMiningPage::setupUi()
            "<li>Use Stop delegation to owner-spend back to a fresh quantum address.</li>"
            "</ol>"
            "<h3>Gold Rush rewards</h3>"
-           "<p>If your selected amount depends on unmoved Gold Rush rewards, the wallet first creates the required fresh quantum move and then completes delegation when possible.</p>"),
+           "<p>Gold Rush reward outputs cannot fund delegation during Gold Rush. After Gold Rush and maturity, they are ordinary direct quantum funds and do not require a preliminary move.</p>"),
         coldstakeBox);
     m_coldstake_quantum_available = new QLabel(QStringLiteral("-"), coldstakeBox);
     m_coldstake_quantum_available->setObjectName(QStringLiteral("coldstakeQuantumAvailable"));
@@ -1034,9 +1035,9 @@ void StakingMiningPage::setupUi()
     m_migration_legacy_sweep = new QPushButton(tr("Move legacy to quantum"), migrationBox);
     m_migration_legacy_sweep->setObjectName(QStringLiteral("migrationLegacySweep"));
     m_migration_legacy_sweep->setToolTip(tr("Create, sign, and broadcast a transaction moving all spendable legacy wallet funds to a fresh wallet-backed quantum address."));
-    m_migration_goldrush_sweep = new QPushButton(tr("Move Gold Rush rewards"), migrationBox);
+    m_migration_goldrush_sweep = new QPushButton(tr("Consolidate Gold Rush rewards"), migrationBox);
     m_migration_goldrush_sweep->setObjectName(QStringLiteral("migrationGoldrushSweep"));
-    m_migration_goldrush_sweep->setToolTip(tr("Move wallet-owned Gold Rush reward outputs to a fresh quantum address before using them for sends, staking, or delegation."));
+    m_migration_goldrush_sweep->setToolTip(tr("Optionally consolidate mature, unlocked Gold Rush reward outputs into a fresh wallet-backed quantum address. This is not required for normal use."));
     m_migration_action_status = new QLabel(QStringLiteral("-"), migrationBox);
     m_migration_action_status->setObjectName(QStringLiteral("migrationActionStatus"));
     m_migration_action_status->setWordWrap(true);
@@ -1102,12 +1103,12 @@ void StakingMiningPage::setupUi()
            "<h3>Legacy to quantum</h3>"
            "<p>Use Move legacy to quantum to sweep spendable legacy wallet funds to a fresh wallet-backed quantum address. Back up the wallet after creating new quantum addresses.</p>"
            "<h3>Gold Rush rewards</h3>"
-           "<p>Gold Rush reward outputs need one fresh move before normal use. This proves the owner is aware of the received quantum reward and establishes a fresh wallet-backed destination.</p>"
+           "<p>Gold Rush reward outputs remain locked throughout Gold Rush. After normal maturity and the Gold Rush boundary, the original outputs become ordinary direct quantum funds. Optional consolidation can organize outputs or rotate keys, but it is not required.</p>"
            "<h3>What to watch</h3>"
            "<ul>"
            "<li><b>Legacy left:</b> value still controlled by legacy spend paths.</li>"
            "<li><b>Quantum held:</b> value already visible to the quantum wallet.</li>"
-           "<li><b>Gold Rush to move:</b> reward value that must be moved once before use.</li>"
+           "<li><b>Gold Rush locked:</b> reward value that remains phase-locked until Gold Rush ends.</li>"
            "</ul>"),
         migrationBox);
     auto* demurrageHelp = makeHelpButton(
@@ -1143,7 +1144,7 @@ void StakingMiningPage::setupUi()
     mgrid->addWidget(m_migration_legacy_amount, r++, 1, 1, 2);
     mgrid->addWidget(new QLabel(tr("Quantum held:"), migrationBox), r, 0);
     mgrid->addWidget(m_migration_quantum_amount, r++, 1, 1, 2);
-    mgrid->addWidget(new QLabel(tr("Gold Rush to move:"), migrationBox), r, 0);
+    mgrid->addWidget(new QLabel(tr("Gold Rush locked:"), migrationBox), r, 0);
     mgrid->addWidget(m_migration_goldrush_amount, r++, 1, 1, 2);
     mgrid->addWidget(new QLabel(tr("Quantum addresses:"), migrationBox), r, 0);
     mgrid->addWidget(m_quantum_address_count, r++, 1);
@@ -1518,8 +1519,8 @@ void StakingMiningPage::onMigrateGoldRushRewards()
     if (!m_wallet_model) return;
     const int rc = QMessageBox::question(
         this,
-        tr("Move Gold Rush rewards"),
-        tr("This will create a fresh wallet-backed quantum address and move wallet-owned Gold Rush reward outputs into it. After confirmation, those funds can be used for sends, staking, node bonds, or cold-stake delegation. Continue?"));
+        tr("Consolidate Gold Rush rewards"),
+        tr("This optional action creates a fresh wallet-backed quantum address and consolidates mature, unlocked Gold Rush reward outputs into it. The original outputs are already ordinary quantum funds after Gold Rush; consolidation is not required for use. Continue?"));
     if (rc != QMessageBox::Yes) return;
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
@@ -1529,12 +1530,12 @@ void StakingMiningPage::onMigrateGoldRushRewards()
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_migration_action_status->setText(msg);
-        QMessageBox::warning(this, tr("Move Gold Rush rewards"), msg);
+        QMessageBox::warning(this, tr("Consolidate Gold Rush rewards"), msg);
         return;
     }
 
     m_quantum_address->setText(QString::fromStdString(result->address));
-    m_migration_action_status->setText(tr("Gold Rush reward move broadcast: %1. Fresh quantum address: %2. Moved %3 from %4 output(s); fee %5. Back up this wallet now.")
+    m_migration_action_status->setText(tr("Gold Rush reward consolidation broadcast: %1. Fresh quantum address: %2. Consolidated %3 from %4 output(s); fee %5. Back up this wallet now.")
         .arg(QString::fromStdString(result->txid))
         .arg(QString::fromStdString(result->address))
         .arg(formatBLK(result->amount))
@@ -1988,7 +1989,7 @@ void StakingMiningPage::onFundColdStakeAddress()
             this,
             tr("Delegate coins"),
             tr("This will broadcast a wallet transaction delegating coins to cold-staking address:\n%1\n\nAmount: %2\nSelected node: %3\n\n"
-               "If unmoved Gold Rush reward outputs must be used, the wallet will first move them to a fresh quantum address when quantum spending is active. Continue?")
+               "Gold Rush reward outputs are unavailable during Gold Rush and become ordinary direct quantum funds after Gold Rush and maturity. Continue?")
                 .arg(m_coldstake_address->text())
                 .arg(formatBLK(amount))
                 .arg(shortenHex(selected_operator_pubkey.toStdString())))) {
@@ -2007,7 +2008,7 @@ void StakingMiningPage::onFundColdStakeAddress()
     }
 
     if (result->created_migration && result->completed_delegation) {
-        m_coldstake_last_action_status = tr("Gold Rush rewards were first moved to fresh quantum address %1 (%2, fee %3), then delegation funding was broadcast: %4. Delegated %5; delegation fee %6.")
+        m_coldstake_last_action_status = tr("Gold Rush rewards were optionally consolidated to fresh quantum address %1 (%2, fee %3), then delegation funding was broadcast: %4. Delegated %5; delegation fee %6.")
             .arg(QString::fromStdString(result->migration_address))
             .arg(QString::fromStdString(result->migration_txid))
             .arg(formatBLK(result->migration_fee))
@@ -2015,12 +2016,12 @@ void StakingMiningPage::onFundColdStakeAddress()
             .arg(formatBLK(result->amount))
             .arg(formatBLK(result->fee));
     } else if (result->created_migration) {
-        m_coldstake_last_action_status = tr("Gold Rush rewards were moved to fresh quantum address %1 (%2, fee %3). Delegation was not broadcast yet: %4")
+        m_coldstake_last_action_status = tr("Gold Rush rewards were optionally consolidated to fresh quantum address %1 (%2, fee %3). Delegation was not broadcast yet: %4")
             .arg(QString::fromStdString(result->migration_address))
             .arg(QString::fromStdString(result->migration_txid))
             .arg(formatBLK(result->migration_fee))
             .arg(QString::fromStdString(result->warning));
-        QMessageBox::information(this, tr("Gold Rush rewards moved"), m_coldstake_last_action_status);
+        QMessageBox::information(this, tr("Gold Rush rewards consolidated"), m_coldstake_last_action_status);
     } else {
         m_coldstake_last_action_status = tr("Cold-stake delegation funding broadcast: %1. Amount: %2. Fee: %3.")
             .arg(QString::fromStdString(result->txid))
@@ -2559,19 +2560,16 @@ void StakingMiningPage::updateStatus()
         goldrush_reward_amount_needing_move = migration.goldrush_reward_amount_needing_move;
         goldrush_reward_outputs_needing_move = migration.goldrush_reward_outputs_needing_move;
         staked_quantum_amount = migration.staked_quantum_amount;
-        const bool wallet_migration_complete = migration.eligible_legacy_inputs == 0 &&
-                                               migration.goldrush_reward_outputs_needing_move == 0;
+        const bool wallet_migration_complete = migration.eligible_legacy_inputs == 0;
         applyDonationDefaults(wallet_migration_complete);
         refreshDonationControls();
-        m_coldstake_fund_available = direct_delegation_balance > 0 ||
-                                     (migration.goldrush_remigration_active &&
-                                      migration.goldrush_reward_amount_needing_move > 0);
+        m_coldstake_fund_available = direct_delegation_balance > 0;
         const QString staked_note = migration.staked_quantum_amount > 0
             ? tr(" %1 is already bonded or delegated for staking.")
                   .arg(formatBLK(migration.staked_quantum_amount))
             : QString();
         if (migration.goldrush_reward_amount_needing_move > 0) {
-            m_coldstake_quantum_available->setText(tr("%1 total quantum wallet balance. %2 direct quantum available for delegation. %3 Gold Rush rewards need a fresh quantum migration before cold staking; Delegate coins will move them first when quantum spending is active.%4")
+            m_coldstake_quantum_available->setText(tr("%1 total quantum wallet balance. %2 direct quantum available for delegation. %3 Gold Rush rewards remain locked until Gold Rush ends; after maturity they become direct quantum funds without a required move.%4")
                 .arg(formatBLK(balances.quantum_balance))
                 .arg(formatBLK(direct_delegation_balance))
                 .arg(formatBLK(migration.goldrush_reward_amount_needing_move))
@@ -2665,6 +2663,10 @@ void StakingMiningPage::updateStatus()
 
     const std::vector<interfaces::WalletQuantumAddressInfo> quantum_addresses = w.listQuantumAddresses();
     const std::vector<interfaces::WalletQuantumColdStakeInfo> coldstake_delegations = w.listQuantumColdStakeDelegations();
+    std::set<std::string> unverified_quantum_keys;
+    for (const interfaces::WalletQuantumAddressInfo& info : quantum_addresses) {
+        if (!info.backup_verified) unverified_quantum_keys.insert(info.public_key);
+    }
     m_quantum_address_count->setText(QString::number(static_cast<int>(quantum_addresses.size())));
     m_coldstake_count->setText(QString::number(static_cast<int>(coldstake_delegations.size())));
 
@@ -2919,10 +2921,10 @@ void StakingMiningPage::updateStatus()
             ? tr("no local node selected")
             : tr("node key selected; fund or wait for confirmations"));
     const QString goldrush_move_note = goldrush_reward_outputs_needing_move > 0
-        ? tr("%1 Gold Rush reward output(s), %2, must first move to a fresh quantum address.")
+        ? tr("%1 Gold Rush reward output(s), %2, remain locked until Gold Rush ends.")
               .arg(goldrush_reward_outputs_needing_move)
               .arg(formatBLK(goldrush_reward_amount_needing_move))
-        : tr("no unmoved Gold Rush reward outputs");
+        : tr("no phase-locked Gold Rush reward outputs");
     m_coldstake_summary->setText(tr(
         "<b>Cold-staking snapshot</b><br>"
         "Available for delegation: %1 direct quantum &nbsp;|&nbsp; Already bonded/delegated: %2<br>"
@@ -2946,8 +2948,11 @@ void StakingMiningPage::updateStatus()
         .arg(formatBLK(staked_quantum_amount + wallet_delegated_amount))
         .arg(formatBLK(wallet_pending_delegated_amount)));
 
-    if (goldrush_reward_outputs_needing_move > 0) {
-        m_dashboard_action->setText(tr("<b>Recommended next step</b><br>Move %1 in Gold Rush rewards to a fresh quantum address before using those rewards for sends, staking, node bonds, or delegation.")
+    if (!unverified_quantum_keys.empty()) {
+        m_dashboard_action->setText(tr("<b>Backup required</b><br>%1 non-HD quantum key(s) are not in a reopened, cryptographically verified backup. Unlock this wallet and use Backup Wallet before mining, staking, or creating another quantum address.")
+            .arg(static_cast<int>(unverified_quantum_keys.size())));
+    } else if (goldrush_reward_outputs_needing_move > 0) {
+        m_dashboard_action->setText(tr("<b>Recommended next step</b><br>Keep the wallet backed up and wait for %1 in Gold Rush rewards to unlock. After Gold Rush and normal maturity, no preliminary move is required.")
             .arg(formatBLK(goldrush_reward_amount_needing_move)));
     } else if (migration.available && migration.eligible_legacy_amount > 0 && migration.quantum_spends_active) {
         m_dashboard_action->setText(tr("<b>Recommended next step</b><br>Move remaining legacy funds to a quantum address before the final migration deadline."));

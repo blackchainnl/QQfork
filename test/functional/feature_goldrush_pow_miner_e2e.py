@@ -33,6 +33,7 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.extra_args = [[
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
             "-mempoolexpiry=1",

@@ -55,7 +55,11 @@ current work parameters and broadcasts a `QQSPROOF` transaction. The transaction
 authenticates the claimant with a legacy spend and specifies a quantum payout
 address. If a staker includes a valid claim, the upgraded rules credit the
 claim's reward to that quantum address. Claim transactions pay ordinary network
-fees.
+fees. From Gold Rush height 5,950,000, if a custom block contains multiple
+valid claims, v30.1.1 chooses the winner by a transaction-order-independent
+rank. Each evaluated valid loser receives its actual fee capped at 0.01 BLK,
+and the winner receives the fixed pool remainder. Malformed and over-limit
+claims receive nothing; the total credit never exceeds the existing pool.
 
 The wallet exposes helper RPCs for both paths, including `getgoldrushstate`,
 `getgoldrushinfo`, `sendshadowsignal`, `getshadowpowwork`,
@@ -102,8 +106,9 @@ principal safety while improving operator distribution.
 - The per-pool cap is wallet and policy guidance. It steers new delegations away
   from oversized operators when alternatives exist, but it is not a consensus
   defense and does not prevent solo staking or operator sub-pools.
-- Cold-stake outputs are exempt from demurrage while they remain in the
-  cold-stake covenant.
+- Cold-stake outputs remain subject to demurrage. A successful coinstake or
+  authenticated liveness attestation refreshes activity; delegation by itself
+  is not an exemption.
 
 ## Demurrage And Liveness
 
@@ -115,9 +120,10 @@ periodic attestations while staking.
 
 ## Existing-node upgrade and chainstate rebuild
 
-v30.1.1 changes the persisted shadow and demurrage state schema and normalizes
+v30.1.1 changes the persisted shadow and demurrage state schema, recomputes the
+canonical competing-claim result from Gold Rush height 5,950,000, and normalizes
 legacy-compatible pre-Gold-Rush coin timestamps. Operators upgrading from
-v30.1.0 must back up wallets, stop the daemon, and run one bounded
+v30.1.0 must back up wallets, stop the daemon, and run one full
 `-reindex-chainstate` before relying on the node for staking or mining:
 
 ```bash
@@ -129,6 +135,19 @@ wallet or block files; if the rebuild cannot authenticate the local state, the
 daemon stops and prints the exact recovery action. Allow sufficient disk space
 and keep the pre-upgrade backup until the rebuilt node has synchronized and
 produced a matching UTXO-state hash.
+
+After the authenticated Quantum Quasar namespace begins, a process or power
+failure during a multi-batch chainstate flush also fails closed on restart and
+requires `-reindex-chainstate`. A partial database flush cannot prove that every
+auxiliary leaf reached disk merely because its rolling summary did. This trades
+automatic crash recovery for deterministic reconstruction from block files.
+
+`-reindex-chainstate` opens a newly wiped chainstate database and derives the
+entire UTXO and auxiliary state from block files. Removal of obsolete v30.1.0
+or prerelease demurrage records therefore does not depend on recognizing them
+in place. The defensive pre-whitelist cleanup also recognizes authenticated
+obsolete reserved records, but never deletes marker-shaped transaction outputs
+at ordinary outpoints.
 
 Wallet RPCs include `getdemurragewalletinfo`, `senddemurrageattestation`,
 `sweepdemurragedecay`, and `getcirculatingsupply`.

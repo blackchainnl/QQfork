@@ -1,187 +1,287 @@
 #include <crypto/mldsa.h>
 
-#include <crypto/sha256.h>
+#include <crypto/mldsa_kat.h>
+#include <support/cleanse.h>
 
 #include <oqs/oqs.h>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <cstring>
+#include <memory>
+#include <new>
+#include <string_view>
 
 namespace {
 
-uint64_t g_kat_rng_state_0;
-uint64_t g_kat_rng_state_1;
+constexpr size_t MESSAGE_HASH_BYTES{32};
+constexpr std::string_view REQUIRED_LIBOQS_VERSION{"0.15.0"};
 
-uint64_t KatNextRandom()
+std::atomic<MLDSATestFailure> g_test_failure{MLDSATestFailure::NONE};
+std::atomic<uint64_t> g_test_failure_remaining{0};
+
+struct OQSSigDeleter {
+    void operator()(OQS_SIG* sig) const { OQS_SIG_free(sig); }
+};
+
+const OQS_SIG* GetMLDSA44()
 {
-    uint64_t x = g_kat_rng_state_0;
-    const uint64_t y = g_kat_rng_state_1;
-    g_kat_rng_state_0 = y;
-    x ^= x << 23;
-    g_kat_rng_state_1 = x ^ y ^ (x >> 17) ^ (y >> 26);
-    return g_kat_rng_state_1 + y;
+    // OQS_SIG is immutable after construction. Sharing one instance eliminates
+    // per-verification allocation and is safe for concurrent callers because
+    // all algorithm state is held in each liboqs call's local buffers.
+    static const std::unique_ptr<OQS_SIG, OQSSigDeleter> sig{OQS_SIG_new(OQS_SIG_alg_ml_dsa_44)};
+    return sig.get();
 }
 
-void KatRandomBytes(uint8_t* out, size_t len)
+bool HasExpectedMetadata(const OQS_SIG* sig)
 {
-    size_t pos{0};
-    while (pos < len) {
-        uint64_t v = KatNextRandom();
-        for (int i = 0; i < 8 && pos < len; ++i) {
-            out[pos++] = static_cast<uint8_t>(v & 0xff);
-            v >>= 8;
+    return sig != nullptr &&
+           sig->method_name != nullptr &&
+           std::strcmp(sig->method_name, OQS_SIG_alg_ml_dsa_44) == 0 &&
+           sig->alg_version != nullptr &&
+           std::strcmp(sig->alg_version, "FIPS204") == 0 &&
+           sig->length_public_key == ML_DSA::PUBLICKEY_BYTES &&
+           sig->length_secret_key == ML_DSA::SECRETKEY_BYTES &&
+           sig->length_signature == ML_DSA::SIGNATURE_BYTES;
+}
+
+bool ConsumeTestFailure(MLDSATestFailure failure)
+{
+    if (g_test_failure.load(std::memory_order_acquire) != failure) return false;
+    uint64_t remaining = g_test_failure_remaining.load(std::memory_order_relaxed);
+    while (remaining != 0) {
+        if (g_test_failure_remaining.compare_exchange_weak(
+                remaining, remaining - 1,
+                std::memory_order_acq_rel, std::memory_order_relaxed)) {
+            return true;
         }
     }
+    return false;
 }
 
-bool RunKnownAnswerTest()
+int HexDigit(char c)
 {
-    static constexpr std::array<uint8_t, 32> MSG{
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-    };
-    static constexpr std::array<uint8_t, CSHA256::OUTPUT_SIZE> EXPECTED_PUBKEY_SIG_HASH{
-        0xa7, 0x20, 0xc2, 0xa4, 0xa4, 0xbb, 0xc4, 0xb3,
-        0x43, 0xb8, 0xa9, 0xeb, 0x1e, 0xf3, 0xd9, 0x4d,
-        0x34, 0xb2, 0x47, 0x47, 0x0d, 0xc3, 0x31, 0x0c,
-        0x90, 0x5c, 0x4e, 0x2a, 0x87, 0x3d, 0x33, 0x0c,
-    };
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
 
-    g_kat_rng_state_0 = 0x9e3779b97f4a7c15ULL;
-    g_kat_rng_state_1 = 0xd1b54a32d192ed03ULL;
-    OQS_randombytes_custom_algorithm(&KatRandomBytes);
+bool DecodeHex(std::string_view hex, std::vector<uint8_t>& out)
+{
+    if ((hex.size() & 1U) != 0) return false;
+    try {
+        std::vector<uint8_t> decoded(hex.size() / 2);
+        for (size_t i = 0; i < decoded.size(); ++i) {
+            const int high = HexDigit(hex[2 * i]);
+            const int low = HexDigit(hex[2 * i + 1]);
+            if (high < 0 || low < 0) return false;
+            decoded[i] = static_cast<uint8_t>((high << 4) | low);
+        }
+        out.swap(decoded);
+        return true;
+    } catch (const std::bad_alloc&) {
+        out.clear();
+        return false;
+    }
+}
 
+bool RunIndependentKnownAnswerTest()
+{
+    // C2SP/Wycheproof ML-DSA-44 vectors, independently generated from the
+    // implementation linked here. See mldsa_kat.h for the pinned source,
+    // commit, and digest. tcId 20 is valid; tcId 15 has a noncanonical reverse-
+    // ordered hint encoding and must be rejected.
     std::vector<uint8_t> pubkey;
-    std::vector<uint8_t> privkey;
-    std::vector<uint8_t> signature;
-    bool ok = ML_DSA::KeyGen(pubkey, privkey) &&
-              pubkey.size() == ML_DSA::PUBLICKEY_BYTES &&
-              privkey.size() == ML_DSA::SECRETKEY_BYTES &&
-              ML_DSA::Sign(privkey, MSG.data(), MSG.size(), signature) &&
-              signature.size() == ML_DSA::SIGNATURE_BYTES;
-    std::fill(privkey.begin(), privkey.end(), 0);
-
-    if (ok) {
-        std::array<uint8_t, CSHA256::OUTPUT_SIZE> actual_hash{};
-        CSHA256()
-            .Write(pubkey.data(), pubkey.size())
-            .Write(signature.data(), signature.size())
-            .Finalize(actual_hash.data());
-        ok = actual_hash == EXPECTED_PUBKEY_SIG_HASH;
+    std::vector<uint8_t> valid_message;
+    std::vector<uint8_t> valid_signature;
+    std::vector<uint8_t> noncanonical_message;
+    std::vector<uint8_t> noncanonical_signature;
+    if (!DecodeHex(mldsa_kat::PUBLIC_KEY_HEX, pubkey) ||
+        !DecodeHex(mldsa_kat::VALID_MESSAGE_HEX, valid_message) ||
+        !DecodeHex(mldsa_kat::VALID_SIGNATURE_HEX, valid_signature) ||
+        !DecodeHex(mldsa_kat::NONCANONICAL_MESSAGE_HEX, noncanonical_message) ||
+        !DecodeHex(mldsa_kat::NONCANONICAL_SIGNATURE_HEX, noncanonical_signature)) {
+        return false;
     }
-    if (ok) {
-        ok = ML_DSA::Verify(pubkey, MSG.data(), MSG.size(), signature);
+    if (pubkey.size() != ML_DSA::PUBLICKEY_BYTES ||
+        valid_message.size() != MESSAGE_HASH_BYTES ||
+        valid_signature.size() != ML_DSA::SIGNATURE_BYTES ||
+        noncanonical_message.size() != MESSAGE_HASH_BYTES ||
+        noncanonical_signature.size() != ML_DSA::SIGNATURE_BYTES) {
+        return false;
     }
-    if (ok) {
-        std::vector<uint8_t> tampered_signature{signature};
-        tampered_signature[0] ^= 0x01;
-        ok = !ML_DSA::Verify(pubkey, MSG.data(), MSG.size(), tampered_signature);
+    if (ML_DSA::VerifyDetailed(pubkey, valid_message.data(), valid_message.size(), valid_signature) !=
+        MLDSAVerifyResult::VALID) {
+        return false;
     }
-    if (ok) {
-        std::array<uint8_t, MSG.size()> tampered_message{MSG};
-        tampered_message[0] ^= 0x01;
-        ok = !ML_DSA::Verify(pubkey, tampered_message.data(), tampered_message.size(), signature);
+    if (ML_DSA::VerifyDetailed(pubkey, noncanonical_message.data(), noncanonical_message.size(), noncanonical_signature) !=
+        MLDSAVerifyResult::INVALID) {
+        return false;
     }
 
-    const bool restored = OQS_randombytes_switch_algorithm(OQS_RAND_alg_system) == OQS_SUCCESS;
-    return ok && restored;
+    std::vector<uint8_t> short_signature{valid_signature.begin(), valid_signature.end() - 1};
+    std::vector<uint8_t> long_signature{valid_signature};
+    long_signature.push_back(0);
+    return ML_DSA::VerifyDetailed(pubkey, valid_message.data(), valid_message.size(), short_signature) == MLDSAVerifyResult::INVALID &&
+           ML_DSA::VerifyDetailed(pubkey, valid_message.data(), valid_message.size(), long_signature) == MLDSAVerifyResult::INVALID;
 }
 
 } // namespace
 
-bool ML_DSA::KeyGen(std::vector<uint8_t>& pubkey, std::vector<uint8_t>& privkey) {
-    OQS_SIG* sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_44);
-    if (sig == nullptr) {
-        pubkey.clear();
-        privkey.clear();
-        return false;
-    }
-    if (sig->length_public_key != PUBLICKEY_BYTES || sig->length_secret_key != SECRETKEY_BYTES || sig->length_signature != SIGNATURE_BYTES) {
-        OQS_SIG_free(sig);
-        pubkey.clear();
-        privkey.clear();
-        return false;
-    }
+MLDSAOperationResult ML_DSA::KeyGenDetailed(std::vector<uint8_t>& pubkey, std::vector<uint8_t>& privkey)
+{
+    pubkey.clear();
+    if (!privkey.empty()) memory_cleanse(privkey.data(), privkey.size());
+    privkey.clear();
+    if (ConsumeTestFailure(MLDSATestFailure::KEYGEN)) return MLDSAOperationResult::INTERNAL_ERROR;
 
-    pubkey.assign(PUBLICKEY_BYTES, 0);
-    privkey.assign(SECRETKEY_BYTES, 0);
-    const bool ok = OQS_SIG_keypair(sig, pubkey.data(), privkey.data()) == OQS_SUCCESS;
-    OQS_SIG_free(sig);
-    if (!ok) {
-        std::fill(pubkey.begin(), pubkey.end(), 0);
-        std::fill(privkey.begin(), privkey.end(), 0);
+    const OQS_SIG* sig = GetMLDSA44();
+    if (!HasExpectedMetadata(sig)) return MLDSAOperationResult::INTERNAL_ERROR;
+
+    try {
+        std::vector<uint8_t> generated_pubkey(PUBLICKEY_BYTES);
+        std::vector<uint8_t> generated_privkey(SECRETKEY_BYTES);
+        if (OQS_SIG_keypair(sig, generated_pubkey.data(), generated_privkey.data()) != OQS_SUCCESS) {
+            memory_cleanse(generated_privkey.data(), generated_privkey.size());
+            return MLDSAOperationResult::INTERNAL_ERROR;
+        }
+        pubkey.swap(generated_pubkey);
+        privkey.swap(generated_privkey);
+        return MLDSAOperationResult::SUCCESS;
+    } catch (const std::bad_alloc&) {
         pubkey.clear();
+        if (!privkey.empty()) memory_cleanse(privkey.data(), privkey.size());
         privkey.clear();
+        return MLDSAOperationResult::INTERNAL_ERROR;
     }
-    return ok;
 }
 
-bool ML_DSA::Sign(const std::vector<uint8_t>& privkey, const uint8_t* hash, size_t hash_len, std::vector<uint8_t>& signature) {
+bool ML_DSA::KeyGen(std::vector<uint8_t>& pubkey, std::vector<uint8_t>& privkey)
+{
+    return KeyGenDetailed(pubkey, privkey) == MLDSAOperationResult::SUCCESS;
+}
+
+MLDSAOperationResult ML_DSA::SignDetailed(const std::vector<uint8_t>& privkey,
+                                          const uint8_t* hash,
+                                          size_t hash_len,
+                                          std::vector<uint8_t>& signature)
+{
     signature.clear();
-    if (privkey.size() != SECRETKEY_BYTES || hash == nullptr || hash_len == 0) return false;
-
-    OQS_SIG* sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_44);
-    if (sig == nullptr) return false;
-    if (sig->length_secret_key != SECRETKEY_BYTES || sig->length_signature != SIGNATURE_BYTES) {
-        OQS_SIG_free(sig);
-        return false;
+    if (privkey.size() != SECRETKEY_BYTES || hash == nullptr || hash_len != MESSAGE_HASH_BYTES) {
+        return MLDSAOperationResult::INVALID_INPUT;
     }
+    if (ConsumeTestFailure(MLDSATestFailure::SIGN)) return MLDSAOperationResult::INTERNAL_ERROR;
 
-    signature.assign(SIGNATURE_BYTES, 0);
-    size_t signature_len = 0;
-    const bool ok = OQS_SIG_sign(sig, signature.data(), &signature_len, hash, hash_len, privkey.data()) == OQS_SUCCESS;
-    OQS_SIG_free(sig);
-    if (!ok || signature_len != SIGNATURE_BYTES) {
-        std::fill(signature.begin(), signature.end(), 0);
+    const OQS_SIG* sig = GetMLDSA44();
+    if (!HasExpectedMetadata(sig)) return MLDSAOperationResult::INTERNAL_ERROR;
+
+    try {
+        std::vector<uint8_t> generated_signature(SIGNATURE_BYTES);
+        size_t signature_len{0};
+        if (OQS_SIG_sign(sig, generated_signature.data(), &signature_len, hash, hash_len, privkey.data()) != OQS_SUCCESS ||
+            signature_len != SIGNATURE_BYTES) {
+            std::fill(generated_signature.begin(), generated_signature.end(), 0);
+            return MLDSAOperationResult::INTERNAL_ERROR;
+        }
+        signature.swap(generated_signature);
+        return MLDSAOperationResult::SUCCESS;
+    } catch (const std::bad_alloc&) {
         signature.clear();
-        return false;
+        return MLDSAOperationResult::INTERNAL_ERROR;
     }
-    return true;
 }
 
-bool ML_DSA::Verify(const std::vector<uint8_t>& pubkey, const uint8_t* hash, size_t hash_len, const std::vector<uint8_t>& signature) {
-    if (pubkey.size() != PUBLICKEY_BYTES || signature.size() != SIGNATURE_BYTES || hash == nullptr || hash_len == 0) return false;
+bool ML_DSA::Sign(const std::vector<uint8_t>& privkey,
+                  const uint8_t* hash,
+                  size_t hash_len,
+                  std::vector<uint8_t>& signature)
+{
+    return SignDetailed(privkey, hash, hash_len, signature) == MLDSAOperationResult::SUCCESS;
+}
 
-    OQS_SIG* sig = OQS_SIG_new(OQS_SIG_alg_ml_dsa_44);
-    if (sig == nullptr) return false;
-    if (sig->length_public_key != PUBLICKEY_BYTES || sig->length_signature != SIGNATURE_BYTES) {
-        OQS_SIG_free(sig);
-        return false;
+MLDSAVerifyResult ML_DSA::VerifyDetailed(const uint8_t* pubkey,
+                                         size_t pubkey_len,
+                                         const uint8_t* hash,
+                                         size_t hash_len,
+                                         const uint8_t* signature,
+                                         size_t signature_len)
+{
+    if (pubkey == nullptr || pubkey_len != PUBLICKEY_BYTES ||
+        hash == nullptr || hash_len != MESSAGE_HASH_BYTES ||
+        signature == nullptr || signature_len != SIGNATURE_BYTES) {
+        return MLDSAVerifyResult::INVALID;
     }
+    if (ConsumeTestFailure(MLDSATestFailure::VERIFY)) return MLDSAVerifyResult::INTERNAL_ERROR;
 
-    const bool ok = OQS_SIG_verify(sig, hash, hash_len, signature.data(), signature.size(), pubkey.data()) == OQS_SUCCESS;
-    OQS_SIG_free(sig);
-    return ok;
+    const OQS_SIG* sig = GetMLDSA44();
+    if (!HasExpectedMetadata(sig)) return MLDSAVerifyResult::INTERNAL_ERROR;
+
+    // In pinned liboqs 0.15.0, ML-DSA-44 verification performs no recoverable
+    // allocation: malformed/noncanonical signatures return OQS_ERROR, while
+    // SHAKE allocation failure is process-fatal inside liboqs. Therefore an
+    // OQS_ERROR here is a deterministic invalid-signature result.
+    return OQS_SIG_verify(sig, hash, hash_len, signature, signature_len, pubkey) == OQS_SUCCESS
+        ? MLDSAVerifyResult::VALID
+        : MLDSAVerifyResult::INVALID;
+}
+
+MLDSAVerifyResult ML_DSA::VerifyDetailed(const std::vector<uint8_t>& pubkey,
+                                         const uint8_t* hash,
+                                         size_t hash_len,
+                                         const std::vector<uint8_t>& signature)
+{
+    return VerifyDetailed(pubkey.data(), pubkey.size(), hash, hash_len,
+                          signature.data(), signature.size());
+}
+
+bool ML_DSA::Verify(const std::vector<uint8_t>& pubkey,
+                    const uint8_t* hash,
+                    size_t hash_len,
+                    const std::vector<uint8_t>& signature)
+{
+    return VerifyDetailed(pubkey, hash, hash_len, signature) == MLDSAVerifyResult::VALID;
 }
 
 bool ML_DSA::SelfTest()
 {
-    if (!RunKnownAnswerTest()) return false;
+    const char* linked_version = OQS_version();
+    if (linked_version == nullptr || linked_version != REQUIRED_LIBOQS_VERSION) return false;
+    if (!HasExpectedMetadata(GetMLDSA44())) return false;
+    if (!RunIndependentKnownAnswerTest()) return false;
 
     std::vector<uint8_t> pubkey;
     std::vector<uint8_t> privkey;
-    if (!KeyGen(pubkey, privkey)) return false;
-    if (pubkey.size() != PUBLICKEY_BYTES || privkey.size() != SECRETKEY_BYTES) return false;
+    if (KeyGenDetailed(pubkey, privkey) != MLDSAOperationResult::SUCCESS) return false;
 
-    std::array<uint8_t, 32> message{};
-    for (size_t i = 0; i < message.size(); ++i) {
-        message[i] = static_cast<uint8_t>(i);
-    }
+    std::array<uint8_t, MESSAGE_HASH_BYTES> message{};
+    for (size_t i = 0; i < message.size(); ++i) message[i] = static_cast<uint8_t>(i);
 
     std::vector<uint8_t> signature;
-    const bool signed_ok = Sign(privkey, message.data(), message.size(), signature);
-    std::fill(privkey.begin(), privkey.end(), 0);
-    if (!signed_ok || signature.size() != SIGNATURE_BYTES) return false;
-    if (!Verify(pubkey, message.data(), message.size(), signature)) return false;
+    const MLDSAOperationResult signed_result = SignDetailed(privkey, message.data(), message.size(), signature);
+    memory_cleanse(privkey.data(), privkey.size());
+    privkey.clear();
+    if (signed_result != MLDSAOperationResult::SUCCESS) return false;
+    if (VerifyDetailed(pubkey, message.data(), message.size(), signature) != MLDSAVerifyResult::VALID) return false;
 
-    std::vector<uint8_t> tampered_signature{signature};
-    tampered_signature[0] ^= 0x01;
-    if (Verify(pubkey, message.data(), message.size(), tampered_signature)) return false;
-
-    message[0] ^= 0x01;
-    if (Verify(pubkey, message.data(), message.size(), signature)) return false;
-
+    signature[0] ^= 0x01;
+    if (VerifyDetailed(pubkey, message.data(), message.size(), signature) != MLDSAVerifyResult::INVALID) return false;
     return true;
+}
+
+void ML_DSA::SetFailureForTesting(MLDSATestFailure failure, uint64_t count)
+{
+    if (failure == MLDSATestFailure::NONE || count == 0) {
+        ClearFailureForTesting();
+        return;
+    }
+    g_test_failure_remaining.store(count, std::memory_order_relaxed);
+    g_test_failure.store(failure, std::memory_order_release);
+}
+
+void ML_DSA::ClearFailureForTesting()
+{
+    g_test_failure.store(MLDSATestFailure::NONE, std::memory_order_release);
+    g_test_failure_remaining.store(0, std::memory_order_relaxed);
 }

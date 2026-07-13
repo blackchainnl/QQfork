@@ -21,6 +21,7 @@ HEADER_ID_SUFFIX = '_H'
 
 EXCLUDE_FILES_WITH_PREFIX = ['contrib/devtools/bitcoin-tidy',
                              'src/crypto/ctaes',
+                             'src/crypto/argon2',
                              'src/leveldb',
                              'src/crc32c',
                              'src/secp256k1',

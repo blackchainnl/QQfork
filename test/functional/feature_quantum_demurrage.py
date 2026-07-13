@@ -58,6 +58,7 @@ class QuantumDemurrageTest(BitcoinTestFramework):
         self.num_nodes = 2
         self.setup_clean_chain = True
         self.active_args = [
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
             "-donatetodevfund=0",
@@ -372,22 +373,29 @@ class QuantumDemurrageTest(BitcoinTestFramework):
         self._generate(1, funder_address)
         assert_equal(self._one_output(kernel_staker, kernel_fee_address)["txid"], kernel_fee_txid)
 
-        txid = wallet.sendtoaddress(quantum_address, QUANTUM_AMOUNT)
-        attest_txid = wallet.sendtoaddress(attest_address, ATTEST_AMOUNT)
-        lock_txid = wallet.sendtoaddress(lock_address, LOCK_AMOUNT)
-        fee_txid = wallet.sendtoaddress(fee_address, FEE_AMOUNT)
-        auto_txid = wallet.sendtoaddress(auto_address, AUTO_AMOUNT)
-        auto_fee_source_txid = wallet.sendtoaddress(auto_fee_source_address, AUTO_FEE_SOURCE_AMOUNT)
-        unsafe_fee_txid = wallet.sendtoaddress(unsafe_fee_address, FEE_AMOUNT)
+        # Fund every test output in one transaction. Sequential self-payments
+        # during Migration may legitimately select a preceding quantum output,
+        # turning this fixture into a chain and consuming the exact output the
+        # test intends to age. One multi-output transaction fixes the inputs to
+        # legacy funds and keeps all seven targets independently unspent.
+        funding_txid = wallet.sendmany("", {
+            quantum_address: QUANTUM_AMOUNT,
+            attest_address: ATTEST_AMOUNT,
+            lock_address: LOCK_AMOUNT,
+            fee_address: FEE_AMOUNT,
+            auto_address: AUTO_AMOUNT,
+            auto_fee_source_address: AUTO_FEE_SOURCE_AMOUNT,
+            unsafe_fee_address: FEE_AMOUNT,
+        })
         self._generate(1, funder_address)
         utxo = self._one_output(wallet, quantum_address)
-        assert_equal(utxo["txid"], txid)
-        assert_equal(self._one_output(wallet, attest_address)["txid"], attest_txid)
-        assert_equal(self._one_output(wallet, lock_address)["txid"], lock_txid)
-        assert_equal(self._one_output(wallet, fee_address)["txid"], fee_txid)
-        assert_equal(self._one_output(auto_wallet, auto_address)["txid"], auto_txid)
-        assert_equal(self._one_output(wallet, auto_fee_source_address)["txid"], auto_fee_source_txid)
-        assert_equal(self._one_output(unsafe_wallet, unsafe_fee_address)["txid"], unsafe_fee_txid)
+        assert_equal(utxo["txid"], funding_txid)
+        assert_equal(self._one_output(wallet, attest_address)["txid"], funding_txid)
+        assert_equal(self._one_output(wallet, lock_address)["txid"], funding_txid)
+        assert_equal(self._one_output(wallet, fee_address)["txid"], funding_txid)
+        assert_equal(self._one_output(auto_wallet, auto_address)["txid"], funding_txid)
+        assert_equal(self._one_output(wallet, auto_fee_source_address)["txid"], funding_txid)
+        assert_equal(self._one_output(unsafe_wallet, unsafe_fee_address)["txid"], funding_txid)
 
         self.log.info("Demurrage stays inert through the height-authoritative migration window")
         supply = node.getcirculatingsupply()
@@ -395,36 +403,20 @@ class QuantumDemurrageTest(BitcoinTestFramework):
         assert_equal(supply["demurrage_active"], False)
         assert_equal(supply["demurrage_activation_height"], DEMURRAGE_ACTIVATION_HEIGHT)
         assert_equal(supply["demurrage_effective_activation_height"], DEMURRAGE_ACTIVATION_HEIGHT)
-        assert_equal(supply["quantum_migration_deadline_height"], MIGRATION_END_HEIGHT)
-        assert_equal(supply["demurrage_height_guard_satisfied"], True)
+        assert_equal(supply["quantum_migration_end_height"], MIGRATION_END_HEIGHT)
+        assert_equal(supply["demurrage_height_guard_satisfied"], False)
         assert_equal(supply["demurrage_post_migration_guard_satisfied"], False)
 
         wallet_info, output = self._wallet_output(wallet, quantum_address)
         assert_equal(wallet_info["demurrage_active"], False)
-        assert_equal(wallet_info["quantum_migration_deadline_height"], MIGRATION_END_HEIGHT)
-        assert_equal(wallet_info["demurrage_height_guard_satisfied"], True)
+        assert_equal(wallet_info["demurrage_height_guard_satisfied"], False)
         assert_equal(wallet_info["demurrage_post_migration_guard_satisfied"], False)
         assert_equal(output["exemption"], "inactive")
         assert_equal(Decimal(output["effective_amount"]), Decimal(output["nominal_amount"]))
         assert_equal(Decimal(output["burned_if_spent_amount"]), Decimal("0E-8"))
         assert_raises_rpc_error(-4, "demurrage is not active for the next block", wallet.sweepdemurragedecay)
 
-        self.log.info("Demurrage is still inert on the last Migration block")
-        self._set_mocktime(MIGRATION_DEADLINE_TIME)
-        self._generate(1, funder_address)
-        supply = self._assert_lockout_demurrage_atomic()
-        self._assert_supply_matches_txoutset(supply)
-        assert_equal(supply["demurrage_active"], False)
-        assert_equal(supply["demurrage_post_migration_guard_satisfied"], False)
-        wallet_info, output = self._wallet_output(wallet, quantum_address)
-        assert_equal(wallet_info["demurrage_active"], False)
-        assert_equal(wallet_info["demurrage_post_migration_guard_satisfied"], False)
-        assert_equal(output["exemption"], "inactive")
-        assert_equal(Decimal(output["effective_amount"]), Decimal(output["nominal_amount"]))
-        assert_equal(Decimal(output["burned_if_spent_amount"]), Decimal("0E-8"))
-
-        self.log.info("Cross the migration boundary; demurrage activates atomically with Final lockout")
-        self._set_mocktime(MIGRATION_DEADLINE_TIME + 16)
+        self.log.info("Connect the last Migration block; next-block state activates demurrage atomically with Final lockout")
         supply = self._mine_until_demurrage_active(mining_quantum_address)
         self._assert_supply_matches_txoutset(supply)
         assert_equal(supply["demurrage_active"], True)

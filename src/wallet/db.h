@@ -116,7 +116,16 @@ public:
 
     virtual std::unique_ptr<DatabaseCursor> GetNewCursor() = 0;
     virtual std::unique_ptr<DatabaseCursor> GetNewPrefixCursor(Span<const std::byte> prefix) = 0;
-    virtual bool TxnBegin() = 0;
+    /**
+     * Begin a database transaction.
+     *
+     * A durable transaction must not report a successful commit until the
+     * backend has requested stable-storage synchronization. This is reserved
+     * for non-derivable key material and the metadata that proves its backup
+     * state; ordinary wallet batching keeps the historical asynchronous
+     * behavior.
+     */
+    virtual bool TxnBegin(bool durable = false) = 0;
     virtual bool TxnCommit() = 0;
     virtual bool TxnAbort() = 0;
 };

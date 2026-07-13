@@ -100,7 +100,7 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
     m_spend_source_combo->setMinimumContentsLength(22);
     m_spend_source_balance_label = new QLabel(this);
     m_spend_source_balance_label->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-    m_spend_source_warning_label = new QLabel(tr("Quantum sends require quantum addresses; unmoved Gold Rush rewards are excluded."), this);
+    m_spend_source_warning_label = new QLabel(tr("Quantum sends require quantum addresses; Gold Rush rewards remain excluded until Gold Rush ends and normal maturity is satisfied."), this);
     m_spend_source_warning_label->setStyleSheet(QStringLiteral("QLabel{color:#aa0000;}"));
     spend_source_layout->addWidget(spend_source_label);
     spend_source_layout->addWidget(m_spend_source_combo);

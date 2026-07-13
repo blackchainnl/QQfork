@@ -49,7 +49,11 @@ bool IsShadowGoldRushRewardActive(const Consensus::Params& consensus, int64_t nM
 
 bool IsQuantumWitnessSpendActive(const Consensus::Params& consensus, int64_t nMedianTimePast, int nSpendHeight)
 {
-    if (consensus.UsesHeightLifecycle() && nSpendHeight <= SHADOW_REWARD_END_HEIGHT) return false;
+    // The spend lock is coupled to the complete height-authoritative reward
+    // window even on test schedules that still use time-only phase controls.
+    // Otherwise an early MTP transition can make a Gold Rush payout spendable
+    // while reward heights remain, violating the bridge's core invariant.
+    if (nSpendHeight <= SHADOW_REWARD_END_HEIGHT) return false;
     if (consensus.IsQuantumSpendEnforcementActive(nMedianTimePast, nSpendHeight)) return true;
     return false;
 }

@@ -55,6 +55,10 @@ Notable changes
 - Gold Rush staking and PoW claim paths credit the upgraded shadow ledger to
   quantum addresses while preserving legacy-compatible base block rewards during
   the bridge period.
+- From Gold Rush height 5,950,000, competing valid PoW claims are ranked
+  independently of transaction order. Evaluated valid losers recover their actual
+  base fee up to 0.01 BLK from the fixed pool, the canonical winner receives the
+  remainder, and the authenticated shadow state is replayed under schema 10.
 - ML-DSA quantum spends, EUTXO spends, larger post-quantum script elements, and
   expanded block limits are deferred until after the Gold Rush reward-height
   window, during the migration/final-lockout phases.
@@ -73,3 +77,6 @@ Notable changes
 - The legacy daemon/config names have been replaced by Blackcoin
   names.
 - Blackcoin remains the coin and network name.
+- The v30.1.1 dependency, inherited-code provenance, P2P capability, and
+  active-legacy delta review is recorded in the
+  [dependency and security audit](v30.1.1-dependency-security-audit.md).

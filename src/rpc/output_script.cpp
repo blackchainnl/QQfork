@@ -9,6 +9,8 @@
 #include <addresstype.h>
 #include <chain.h>
 #include <chainparams.h>
+#include <common/args.h>
+#include <common/system.h>
 #include <crypto/mldsa.h>
 #include <crypto/sha256.h>
 #include <kernel/cs_main.h>
@@ -179,7 +181,8 @@ static RPCHelpMan createquantumkey()
     return RPCHelpMan{
         "createquantumkey",
         "\nGenerates an ML-DSA-44 keypair and its Blackcoin witness-v16 migration address.\n"
-        "The returned private key is raw hex and is not stored in the wallet.\n",
+        "The returned private key is raw hex and is not stored in the wallet.\n"
+        "Disabled by default; start with -allowunsafequantumkeyrpc only for an explicit offline export workflow.\n",
         {},
         RPCResult{
             RPCResult::Type::OBJ, "", "", {
@@ -197,6 +200,11 @@ static RPCHelpMan createquantumkey()
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
+    if (!gArgs.GetBoolArg("-allowunsafequantumkeyrpc", false)) {
+        throw JSONRPCError(RPC_FORBIDDEN_BY_SAFE_MODE,
+            "createquantumkey is disabled by default because it returns unstored private material. "
+            "Use wallet-scoped getnewquantumaddress, or restart with -allowunsafequantumkeyrpc for an explicit offline workflow.");
+    }
     std::vector<uint8_t> pubkey;
     std::vector<uint8_t> privkey;
     if (!ML_DSA::KeyGen(pubkey, privkey)) {

@@ -1,0 +1,89 @@
+{
+  "schema": 1,
+  "liboqs": {
+    "version": "0.15.0",
+    "tag_commit": "97f6b86b1b6d109cfd43cf276ae39c2e776aed80",
+    "archive_url": "https://codeload.github.com/open-quantum-safe/liboqs/tar.gz/refs/tags/0.15.0",
+    "archive_sha256": "3983f7cd1247f37fb76a040e6fd684894d44a84cecdcfbdb90559b3216684b5c",
+    "upstream_files": {
+      "src/sig/ml_dsa/CMakeLists.txt": "2e3f06e6b4fabf496f36547211c4d6d4f0ff33e53b3dd035ca1e406bbf4833bc",
+      "src/sig/ml_dsa/sig_ml_dsa.h": "4c66c0d190b93dff9a5f430f2ade016e6dd11f2b7b8dade1761493c86a06d936",
+      "src/sig/ml_dsa/sig_ml_dsa_44.c": "726f33d7d0743276df64fef13815ecd1888371890ec71752e3b1a71cc95270c7",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/LICENSE": "25cca8af82a865bb979a9c61c6fd1746f6f6376b1d4a58dd498591a77b1ae8ab",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/api.h": "eff2fe4cca86cb72543628656a40af6720bb66f1781a5fadd55454c695472598",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/config.h": "c9517983f48eb5ef226ba67e12afedbc1af0cdd8f0a1cb1e48ff311a36ca64f9",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/ntt.c": "921b76ae7a183305893800e69c0b9ea561bffd2a6e85621767eb789c02a0f8d0",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/ntt.h": "32345efead2c237177f3c0e050c26caf6c9d1772a629664632d9ff32f2693a3e",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/packing.c": "af51fe6b63164c17a765fcca14afa1ad2bfa11a1389a1964781951cdaf0f6016",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/packing.h": "73b2a0840e23e53edaf9a3509120864ec7ee82b1a2329f35816642a788c96509",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/params.h": "1d6c116396e3d20f40d72c35a093af2be9f03177282762bdbdb282bb4c4b64af",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/poly.c": "dbab3b40c796a5fe756decb96365d240d788b3db1ad1f7eaecf4ef480e4348e8",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/poly.h": "2b63cc2ec62c027dd16cf92bd120a4bc4f3a41a94a4a51b2005d366fc30a0330",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/polyvec.c": "2fa664c380a5bef7e2e9868e0b8f02f8353c4bd81afe0d6328b498baf6864eac",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/polyvec.h": "6523a95d74add7e36129831fd5a72370c6275703fafd1529b6af59ef9645368e",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/reduce.c": "3088cac3d23355a3f9adaac9fd4ee864be9caf5fb0ad30bcb4a4da17dba0e4f4",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/reduce.h": "9abe0b725e0608948eaa74fabd01c4701de5480ce9494a5f6bfa35140eee0399",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/rounding.c": "7223dbbe56b1fba226d536d64eaf05b1ad3f249d33ec767ee655eee471478816",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/rounding.h": "7459644c21e7cbfe48361a1f6b6fda687ff8792f8e0577a0862b3de620558d25",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/sign.c": "c88001605f1b81fa220b93c514aac77a702d4be4bb25f0ece7ccfc3b31dafb6f",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/sign.h": "5e3f5a6b0f64a2fd5563c7267800ee086d5a983415703e4d623aa94ff4f67716",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/symmetric-shake.c": "12271937b92f15af3046af3f27fd6cc5730a13c27f51d5067ab134d7ab1e0e17",
+      "src/sig/ml_dsa/pqcrystals-dilithium-standard_ml-dsa-44_ref/symmetric.h": "cdb23dc3448add71444e0982ebd2152f18144a8328a9dae00207ac7b9eabeb1b"
+    }
+  },
+  "argon2": {
+    "version": "20190702",
+    "tag_commit": "62358ba2123abd17fccf2a108a301d4b52c01a7c",
+    "archive_url": "https://codeload.github.com/P-H-C/phc-winner-argon2/tar.gz/refs/tags/20190702",
+    "archive_sha256": "daf972a89577f8772602bf2eb38b6a3dd3d922bf5724d45e7f9589b5e830442c",
+    "upstream_files": {
+      "LICENSE": "220f8736a89ff51c92ef3d497f413b48e6cf1df3d6278bc909c6308c78e1718e",
+      "src/argon2.c": "72a93deebc5fd76bec0c6d300a2d92b500fb354b26babbddbc6d8b88681e663d",
+      "include/argon2.h": "df20cb726a2fe6bccc736b81ea0d86219766a0d17f1794c19e048a34830ca1cc",
+      "src/core.c": "0f53eb2370f8971f04fcf043b8083bf81d1530c48b2ead71c0b6c4e22a01aeec",
+      "src/core.h": "c9665623cb3d306f63b6a3effd87bcfab971c28253c77e111445e42c1523235e",
+      "src/encoding.c": "e20124ec0f780f88527e79cf00825e839624ed1f469c7e231596bf070f8c7b14",
+      "src/encoding.h": "42f283d12ec445cfb423ac2f1f5a5d1a7f152ce2b9363f6ec3e1d5b61cd4ee6d",
+      "src/ref.c": "4ec47b080c22f4ee416b9dbcfae70ee6007fcfba427f870d7b84395846fa1bc7",
+      "src/thread.c": "1402085e2f54b021ea31b0d301f4b689a8b300832e2d11901502e62835185e3e",
+      "src/thread.h": "9eab7f9ff356862a00a3075478dd0059344953ed79daab8b29185be2010efe78",
+      "src/blake2/blake2.h": "3c2de197dd23179f78c57deac7b73a6049778bf651c5db57e508b2cfce5e7559",
+      "src/blake2/blake2-impl.h": "8ac91f1f57d94235f8de0069b7809be1deb365c3b37adb8e30423cd364aff09a",
+      "src/blake2/blake2b.c": "52519ccbc1e48f489ff444091f630d05dadcc8f1ee61c5b7361e3a9618299c9a",
+      "src/blake2/blamka-round-opt.h": "ba5a9c1fef492cc6ce8d5b5217d6e7cd7983de10f16762f84e284d0ed9972e3b",
+      "src/blake2/blamka-round-ref.h": "bcfdcf785218cf897f05b144e80b659e611188fee3887d533bdcb7a6aa4c336b"
+    },
+    "local_files": {
+      "src/crypto/argon2/LICENSE": "ac36638bcfcedb75441a5daeeaf4ef75b565911712583c272830e9fa7fddb590",
+      "src/crypto/argon2/argon2.c": "b1289ec7134e8502e9113396fdac89402bf2575ee1b35e33fb7410f2fb63bb6d",
+      "src/crypto/argon2/argon2.h": "25ed629feca91ca9d361441160c6fbc10318bb0fb3757555b418ed47b705b35b",
+      "src/crypto/argon2/core.c": "d6ddc9e28c51d2c3b0d542c0c4678c4d9d788da048e4f557166030d0ef62618b",
+      "src/crypto/argon2/core.h": "32f6ab8c0c313d9336d2731a001426b68d246bba5b362fabeaf593c333da7d37",
+      "src/crypto/argon2/encoding.c": "7b9a0c019abc6fca7e6e0a9abd2f7b22a885f8831827cfbd4bfd4502dd9f7806",
+      "src/crypto/argon2/encoding.h": "a4e0681ef4b0eb229a35760b603b7a32e9019cfe98c31732f747f087e5e39828",
+      "src/crypto/argon2/ref.c": "9ac347fd8dc737af69bbb93d56ac8b4ab5488152f606880c8d7fc4592e207647",
+      "src/crypto/argon2/thread.c": "af2ab481fcf5ef00f1b2deb346bda3642797b417fc0ed98bfb7ae80e716f90d1",
+      "src/crypto/argon2/thread.h": "650e713fb584de2e6aeb307e64228f95cef733ea667faa0bb111960aaace30ef",
+      "src/crypto/argon2/blake2/blake2.h": "196cd9adf0660474ea04cb686c122f3ca8c758445c5ff0806f438e6412ac8423",
+      "src/crypto/argon2/blake2/blake2-impl.h": "ec9884fe834c30eb362f0cef3432a43a5c496b0d6d1d637a5a590a45bec4d79c",
+      "src/crypto/argon2/blake2/blake2b.c": "7eb2f3faac14c532fb75f645f518686f3ef0db4c7b9849a1ffc73d262b596281",
+      "src/crypto/argon2/blake2/blamka-round-opt.h": "38772a3fc29db218a1833b8fa326cb95f98fdc2cda1cbcbaede928a2d8d32b41",
+      "src/crypto/argon2/blake2/blamka-round-ref.h": "8d5fc886bbc0b55af10ac6f1e9a5995a4e8d4abace46642fb1832c84d38c3007"
+    },
+    "documented_local_deltas": [
+      "license hyperlinks changed from http to https",
+      "argon2.h uses defined(_MSC_VER) instead of an undefined-macro expression",
+      "core.c recognizes MinGW SecureZeroMemory",
+      "blake2-impl.h recognizes all _WIN32 compilers"
+    ]
+  },
+  "wycheproof": {
+    "commit": "6d7cccd0fcb1917368579adeeac10fe802f1b521",
+    "path": "testvectors_v1/mldsa_44_verify_test.json",
+    "source_sha256": "5ec04790c240c443ca8b662b8fc871834602c7cce87fcd36a193110745b2b9ea",
+    "local_files": {
+      "contrib/devtools/gen-mldsa44-kat.py": "0402f9b5c5e99ceee324ca8de63df1923ffeb57f35b50c622e3fa0fbaf2f424b",
+      "src/crypto/mldsa_kat.h": "ef0dd3f89f2e97bc37b9a2272e0d29f3a370cd41234035ddec0b07ba09ff4b15"
+    }
+  }
+}

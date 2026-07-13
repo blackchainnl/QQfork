@@ -968,13 +968,16 @@ static RPCHelpMan getblocktemplate()
     const bool shadow_merge_mining_active = IsShadowGoldRushRewardActive(consensusParams, template_mtp, template_height);
     const bool final_lockout_active = consensusParams.IsQuantumFinalLockout(template_mtp, template_height);
     const bool shadow_reward_height_active = IsShadowGoldRushRewardHeight(template_height);
+    const auto lifecycle = consensusParams.GetQuantumLifecycleState(template_mtp, template_height);
     quantumquasar.pushKV("phase", gbt_blackcoin_phase_name(consensusParams.GetQuantumQuasarPhase(template_mtp, template_height)));
+    quantumquasar.pushKV("lifecycle_schedule_valid", lifecycle.schedule_valid);
     quantumquasar.pushKV("v4_activation_time", consensusParams.nProtocolV4Time);
+    quantumquasar.pushKV("v4_activation_height", consensusParams.nQuantumLifecycleStartHeight);
     quantumquasar.pushKV("gold_rush_end_time", consensusParams.nGoldRushEndTime);
     quantumquasar.pushKV("quantum_migration_deadline_time", consensusParams.nQuantumMigrationDeadlineTime);
     quantumquasar.pushKV("gold_rush_end_height", consensusParams.nGoldRushEndHeight);
     quantumquasar.pushKV("quantum_migration_end_height", consensusParams.nQuantumMigrationEndHeight);
-    quantumquasar.pushKV("height_boundaries_authoritative", consensusParams.nGoldRushEndHeight > 0 && consensusParams.nQuantumMigrationEndHeight > 0);
+    quantumquasar.pushKV("height_boundaries_authoritative", lifecycle.height_authoritative);
     quantumquasar.pushKV("time_boundaries_are_estimates", consensusParams.UsesHeightLifecycle());
     quantumquasar.pushKV("blocks_until_gold_rush_end", consensusParams.nGoldRushEndHeight > 0 && template_height <= consensusParams.nGoldRushEndHeight
         ? consensusParams.nGoldRushEndHeight - template_height + 1 : 0);

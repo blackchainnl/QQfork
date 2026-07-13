@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 // Copyright (c) 2009-2022 Blackcoin Core Developers
 // Copyright (c) 2009-2022 Blackcoin More Developers
 // Copyright (c) 2009-2022 Quantum Quasar Developers
@@ -780,14 +781,15 @@ std::unique_ptr<DatabaseCursor> BerkeleyBatch::GetNewPrefixCursor(Span<const std
     return std::make_unique<BerkeleyCursor>(m_database, *this, prefix);
 }
 
-bool BerkeleyBatch::TxnBegin()
+bool BerkeleyBatch::TxnBegin(bool durable)
 {
     if (!pdb || activeTxn)
         return false;
-    DbTxn* ptxn = env->TxnBegin(DB_TXN_WRITE_NOSYNC);
+    DbTxn* ptxn = env->TxnBegin(durable ? 0 : DB_TXN_WRITE_NOSYNC);
     if (!ptxn)
         return false;
     activeTxn = ptxn;
+    m_durable_txn = durable;
     return true;
 }
 
@@ -795,8 +797,13 @@ bool BerkeleyBatch::TxnCommit()
 {
     if (!pdb || !activeTxn)
         return false;
-    int ret = activeTxn->commit(0);
+    // The environment is configured for write-no-sync throughput by default.
+    // DB_TXN_SYNC is therefore required here for non-derivable quantum keys;
+    // beginning the transaction without WRITE_NOSYNC alone is not sufficient
+    // to override the environment default on every supported BDB release.
+    int ret = activeTxn->commit(m_durable_txn ? DB_TXN_SYNC : 0);
     activeTxn = nullptr;
+    m_durable_txn = false;
     return (ret == 0);
 }
 
@@ -806,6 +813,7 @@ bool BerkeleyBatch::TxnAbort()
         return false;
     int ret = activeTxn->abort();
     activeTxn = nullptr;
+    m_durable_txn = false;
     return (ret == 0);
 }
 

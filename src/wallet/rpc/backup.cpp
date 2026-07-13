@@ -234,6 +234,8 @@ RPCHelpMan importquantumkey()
                         {RPCResult::Type::STR_HEX, "public_key", "The imported ML-DSA-44 public key"},
                         {RPCResult::Type::NUM_TIME, "timestamp", "The stored key creation time"},
                         {RPCResult::Type::BOOL, "encrypted", "Whether the wallet stores this key encrypted"},
+                        {RPCResult::Type::BOOL, "stored_in_wallet", "Whether the key was durably committed to the wallet database"},
+                        {RPCResult::Type::BOOL, "backup_verified", "Whether this key is present in a completed, reopened, cryptographically verified backup"},
                         {RPCResult::Type::BOOL, "rescan", "Whether a rescan was requested"},
                         {RPCResult::Type::STR, "warning", "Backup warning"},
                     }},
@@ -314,6 +316,8 @@ RPCHelpMan importquantumkey()
         result.pushKV("public_key", HexStr(info->public_key));
         result.pushKV("timestamp", info->creation_time);
         result.pushKV("encrypted", info->encrypted);
+        result.pushKV("stored_in_wallet", info->durably_stored);
+        result.pushKV("backup_verified", info->backup_verified);
         result.pushKV("rescan", rescan);
         result.pushKV("warning", "Back up the wallet after importing quantum migration keys.");
         return result;
@@ -1951,7 +1955,9 @@ RPCHelpMan listdescriptors()
 RPCHelpMan backupwallet()
 {
     return RPCHelpMan{"backupwallet",
-                "\nSafely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n",
+                "\nSafely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n"
+                "Wallets with non-HD quantum keys are staged separately, reopened, and required to sign and verify a fresh challenge with every key before the verified copy is atomically installed.\n"
+                "An encrypted wallet must be unlocked so this private-material check can run.\n",
                 {
                     {"destination", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination directory or file"},
                 },
@@ -1962,18 +1968,17 @@ RPCHelpMan backupwallet()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+    const std::shared_ptr<CWallet> pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
     // Make sure the results are valid at least up to the most recent block
     // the user could have gotten from another RPC command prior to now
     pwallet->BlockUntilSyncedToCurrentChain();
 
-    LOCK(pwallet->cs_wallet);
-
     std::string strDest = request.params[0].get_str();
-    if (!pwallet->BackupWallet(strDest)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet backup failed!");
+    bilingual_str error;
+    if (!pwallet->BackupWallet(strDest, &error)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, error.empty() ? "Error: Wallet backup failed!" : error.original);
     }
 
     return UniValue::VNULL;

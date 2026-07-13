@@ -69,6 +69,7 @@
 #include <util/error.h>
 #include <util/fs.h>
 #include <util/fs_helpers.h>
+#include <util/getuniquepath.h>
 #include <util/message.h>
 #include <util/moneystr.h>
 #include <util/result.h>
@@ -95,6 +96,7 @@
 #include <array>
 #include <cassert>
 #include <condition_variable>
+#include <cstdio>
 #include <exception>
 #include <optional>
 #include <set>
@@ -373,6 +375,20 @@ static void CleanseVector(std::vector<Byte>& bytes)
         bytes.clear();
     }
 }
+
+template <typename Byte>
+class ScopedVectorCleanser
+{
+public:
+    explicit ScopedVectorCleanser(std::vector<Byte>& bytes) : m_bytes(bytes) {}
+    ~ScopedVectorCleanser() { CleanseVector(m_bytes); }
+
+    ScopedVectorCleanser(const ScopedVectorCleanser&) = delete;
+    ScopedVectorCleanser& operator=(const ScopedVectorCleanser&) = delete;
+
+private:
+    std::vector<Byte>& m_bytes;
+};
 
 static bool VerifyFinalizedPSBTInput(const PartiallySignedTransaction& psbtx, unsigned int input_index, const PrecomputedTransactionData& txdata, unsigned int verify_flags, ScriptError* serror)
 {
@@ -1441,6 +1457,8 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
             CWalletTx* desc_tx = txs.back();
             txs.pop_back();
             desc_tx->m_state = inactive_state;
+            RemoveIndexedShadowSolve(desc_tx->GetHash());
+            UpdatePendingShadowSignalIndex(*desc_tx);
             // Break caches since we have changed the state
             desc_tx->MarkDirty();
             batch.WriteTx(*desc_tx);
@@ -1457,6 +1475,14 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
             }
         }
     }
+
+    if (wtx.isConfirmed()) {
+        IndexConfirmedShadowSolve(wtx);
+    } else {
+        RemoveIndexedShadowSolve(hash);
+    }
+    UpdatePendingShadowSignalIndex(wtx);
+    IndexOwnedLegacyShadowScripts(wtx);
 
     //// debug print
     WalletLogPrintf("AddToWallet %s  %s%s %s\n", hash.ToString(), (fInsertedNew ? "new" : ""), (fUpdated ? "update" : ""), TxStateString(state));
@@ -1547,6 +1573,8 @@ bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx
 
     // Update birth time when tx time is older than it.
     MaybeUpdateBirthTime(wtx.GetTxTime());
+    UpdatePendingShadowSignalIndex(wtx);
+    IndexOwnedLegacyShadowScripts(wtx);
 
     return true;
 }
@@ -1698,7 +1726,7 @@ bool CWallet::AbandonTransaction(const uint256& hashTx, bool automatic_shadow_st
         WalletBatch(GetDatabase()).WriteTx(origtx);
     }
 
-    auto try_updating_state = [](CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
+    auto try_updating_state = [&](CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet) {
         // If the orig tx was not in block/mempool, none of its spends can be.
         assert(!wtx.isConfirmed());
         assert(!wtx.InMempool());
@@ -1771,6 +1799,12 @@ void CWallet::RecursiveUpdateTxState(const uint256& tx_hash, const TryUpdatingSt
 
         TxUpdate update_state = try_updating_state(wtx);
         if (update_state != TxUpdate::UNCHANGED) {
+            if (wtx.isConfirmed()) {
+                IndexConfirmedShadowSolve(wtx);
+            } else {
+                RemoveIndexedShadowSolve(wtx.GetHash());
+            }
+            UpdatePendingShadowSignalIndex(wtx);
             wtx.MarkDirty();
             batch.WriteTx(wtx);
             // Iterate over all its outputs, and update those tx states as well (if applicable)
@@ -1813,6 +1847,7 @@ void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
         RefreshMempoolStatus(it->second, chain());
+        UpdatePendingShadowSignalIndex(it->second);
         const bool manual_provenance_removed = it->second.mapValue.erase(MANUAL_SHADOW_ABANDON_KEY) != 0;
         const bool automatic_provenance_removed = it->second.mapValue.erase(AUTO_SHADOW_STALE_KEY) != 0;
         const bool reorg_resubmit_removed = it->second.mapValue.erase(REORG_SHADOW_RESUBMIT_KEY) != 0;
@@ -1828,6 +1863,7 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
         RefreshMempoolStatus(it->second, chain());
+        UpdatePendingShadowSignalIndex(it->second);
 
         // Gold Rush PoW claims commit to the current parent tip. Once a claim
         // expires on tip advancement it can never become valid again, so it
@@ -1848,6 +1884,7 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
                 auto current_it = mapWallet.find(current);
                 if (current_it == mapWallet.end()) continue;
                 RefreshMempoolStatus(current_it->second, chain());
+                UpdatePendingShadowSignalIndex(current_it->second);
                 for (unsigned int output_index = 0; output_index < current_it->second.tx->vout.size(); ++output_index) {
                     const auto range = mapTxSpends.equal_range(COutPoint{current, output_index});
                     for (auto spend_it = range.first; spend_it != range.second; ++spend_it) {
@@ -2055,6 +2092,7 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
                     auto replacement = mapWallet.find(spend->second);
                     if (replacement == mapWallet.end()) continue;
                     RefreshMempoolStatus(replacement->second, chain());
+                    UpdatePendingShadowSignalIndex(replacement->second);
                     const auto automatic = replacement->second.mapValue.find(AUTO_SHADOW_STALE_KEY);
                     const bool pending_tip_validation =
                         TransactionHasShadowProof(*replacement->second.tx) &&
@@ -2836,6 +2874,7 @@ void CWallet::RepairStaleShadowTransactions(bool force)
                             auto package_it = mapWallet.find(current);
                             if (package_it == mapWallet.end()) continue;
                             RefreshMempoolStatus(package_it->second, chain());
+                            UpdatePendingShadowSignalIndex(package_it->second);
                             for (unsigned int output_index = 0; output_index < package_it->second.tx->vout.size(); ++output_index) {
                                 const auto range = mapTxSpends.equal_range(COutPoint{current, output_index});
                                 for (auto spend_it = range.first; spend_it != range.second; ++spend_it) {
@@ -3858,6 +3897,7 @@ DBErrors CWallet::LoadWallet()
     LOCK2(::cs_main, cs_wallet);
 
     DBErrors nLoadWalletRet = WalletBatch(GetDatabase()).LoadWallet(this);
+    RecomputeShadowSolveIndex();
     if (nLoadWalletRet == DBErrors::NEED_REWRITE)
     {
         if (GetDatabase().Rewrite("\x04pool"))
@@ -3885,6 +3925,8 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
         wtxOrdered.erase(it->second.m_it_wtxOrdered);
         for (const auto& txin : it->second.tx->vin)
             mapTxSpends.erase(txin.prevout);
+        RemoveIndexedShadowSolve(hash);
+        m_pending_shadow_signal_txids.erase(hash);
         mapWallet.erase(it);
         NotifyTransactionChanged(hash, CT_DELETED);
     }
@@ -4058,6 +4100,7 @@ bool CWallet::LoadQuantumKey(const std::vector<unsigned char>& public_key, const
     record.public_key = public_key;
     record.private_key = private_key;
     record.creation_time = creation_time;
+    record.durably_stored = true;
     m_quantum_keys.emplace(witness_program, std::move(record));
     MaybeUpdateBirthTime(creation_time > 0 ? creation_time : 1);
     return true;
@@ -4085,6 +4128,7 @@ bool CWallet::LoadCryptedQuantumKey(const std::vector<unsigned char>& public_key
         }
         existing->second.crypted_private_key = crypted_private_key;
         existing->second.creation_time = creation_time;
+        existing->second.durably_stored = true;
         MaybeUpdateBirthTime(creation_time > 0 ? creation_time : 1);
         return true;
     }
@@ -4097,8 +4141,18 @@ bool CWallet::LoadCryptedQuantumKey(const std::vector<unsigned char>& public_key
     record.public_key = public_key;
     record.crypted_private_key = crypted_private_key;
     record.creation_time = creation_time;
+    record.durably_stored = true;
     m_quantum_keys.emplace(witness_program, std::move(record));
     MaybeUpdateBirthTime(creation_time > 0 ? creation_time : 1);
+    return true;
+}
+
+bool CWallet::LoadQuantumKeyBackupState(const std::vector<unsigned char>& witness_program, bool verified)
+{
+    AssertLockHeld(cs_wallet);
+    const auto it = m_quantum_keys.find(witness_program);
+    if (it == m_quantum_keys.end() || !it->second.durably_stored) return false;
+    it->second.backup_verified = verified;
     return true;
 }
 
@@ -4139,7 +4193,8 @@ bool CWallet::LoadQuantumColdStakeDelegation(const std::vector<unsigned char>& w
 bool CWallet::HaveQuantumKeyForProgram(const std::vector<unsigned char>& witness_program) const
 {
     AssertLockHeld(cs_wallet);
-    return m_quantum_keys.count(QuantumWalletKeyLookupProgram(witness_program)) > 0;
+    const auto it = m_quantum_keys.find(QuantumWalletKeyLookupProgram(witness_program));
+    return it != m_quantum_keys.end() && it->second.durably_stored;
 }
 
 bool CWallet::GetQuantumKey(const std::vector<unsigned char>& witness_program, std::vector<unsigned char>& public_key, CKeyingMaterial& private_key, bilingual_str& error) const
@@ -4149,6 +4204,10 @@ bool CWallet::GetQuantumKey(const std::vector<unsigned char>& witness_program, s
     const auto it = m_quantum_keys.find(lookup_program);
     if (it == m_quantum_keys.end()) {
         error = _("No wallet ML-DSA key matches this quantum witness program");
+        return false;
+    }
+    if (!it->second.durably_stored) {
+        error = _("Wallet ML-DSA key is not durably stored");
         return false;
     }
 
@@ -4192,6 +4251,8 @@ std::optional<QuantumKeyInfo> CWallet::GetQuantumKeyInfo(const CTxDestination& d
     info.public_key = it->second.public_key;
     info.creation_time = it->second.creation_time;
     info.encrypted = it->second.IsCrypted();
+    info.durably_stored = it->second.durably_stored;
+    info.backup_verified = it->second.backup_verified;
     return info;
 }
 
@@ -4224,6 +4285,8 @@ std::vector<QuantumKeyInfo> CWallet::ListQuantumKeyInfos() const
         info.public_key = record.public_key;
         info.creation_time = record.creation_time;
         info.encrypted = record.IsCrypted();
+        info.durably_stored = record.durably_stored;
+        info.backup_verified = record.backup_verified;
         infos.push_back(std::move(info));
     }
     return infos;
@@ -4292,6 +4355,173 @@ void CWallet::RecordQuantumRedelegationWins(const CTransaction& tx, int height, 
         m_redelegation_last_win_height[info->witness_program] = height;
         batch.WriteQuantumRedelegationLastWinHeight(info->witness_program, height);
     }
+}
+
+void CWallet::RefreshLatestShadowSolve(const CScript& target)
+{
+    AssertLockHeld(cs_wallet);
+    const auto old_latest = m_shadow_solve_latest.find(target);
+    if (old_latest != m_shadow_solve_latest.end()) {
+        const auto old_height = m_shadow_solve_latest_by_height.find(static_cast<int>(old_latest->second.solve_height));
+        if (old_height != m_shadow_solve_latest_by_height.end()) {
+            old_height->second.erase(target);
+            if (old_height->second.empty()) m_shadow_solve_latest_by_height.erase(old_height);
+        }
+        m_shadow_solve_latest.erase(old_latest);
+    }
+
+    const auto history = m_shadow_solve_history.find(target);
+    if (history == m_shadow_solve_history.end() || history->second.empty()) return;
+
+    const WalletShadowSolveReference& latest = history->second.rbegin()->second;
+    m_shadow_solve_latest.emplace(target, latest);
+    m_shadow_solve_latest_by_height[static_cast<int>(latest.solve_height)].insert(target);
+}
+
+void CWallet::RemoveIndexedShadowSolve(const uint256& txid)
+{
+    AssertLockHeld(cs_wallet);
+    const auto locator = m_shadow_solve_by_txid.find(txid);
+    if (locator == m_shadow_solve_by_txid.end()) return;
+
+    const CScript target = locator->second.first;
+    const ShadowSolveHistoryKey history_key = locator->second.second;
+    const auto history = m_shadow_solve_history.find(target);
+    if (history != m_shadow_solve_history.end()) {
+        history->second.erase(history_key);
+        if (history->second.empty()) m_shadow_solve_history.erase(history);
+    }
+    m_shadow_solve_by_txid.erase(locator);
+    RefreshLatestShadowSolve(target);
+}
+
+void CWallet::IndexConfirmedShadowSolve(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    const uint256 txid = wtx.GetHash();
+    if (!wtx.IsCoinStake() || wtx.tx->vin.empty()) {
+        RemoveIndexedShadowSolve(txid);
+        return;
+    }
+    const TxStateConfirmed* confirmed = wtx.state<TxStateConfirmed>();
+    if (!confirmed || confirmed->confirmed_block_height < 0) {
+        RemoveIndexedShadowSolve(txid);
+        return;
+    }
+
+    const COutPoint& kernel = wtx.tx->vin[0].prevout;
+    const auto prev_it = mapWallet.find(kernel.hash);
+    if (prev_it == mapWallet.end() || !prev_it->second.tx || kernel.n >= prev_it->second.tx->vout.size()) {
+        RemoveIndexedShadowSolve(txid);
+        return;
+    }
+    const CTxOut& kernel_output = prev_it->second.tx->vout[kernel.n];
+    if (kernel_output.nValue <= 0 || IsMine(kernel_output) == ISMINE_NO) {
+        RemoveIndexedShadowSolve(txid);
+        return;
+    }
+    const CScript target = CanonicalizeLegacyStakeScript(kernel_output.scriptPubKey);
+    CTxDestination target_dest;
+    if (target.empty() || target.IsUnspendable() || !ExtractDestination(target, target_dest) ||
+        !IsValidDestination(target_dest) || IsQuantumMigrationDestination(target_dest)) {
+        RemoveIndexedShadowSolve(txid);
+        return;
+    }
+
+    const ShadowSolveHistoryKey history_key{confirmed->confirmed_block_height, txid};
+    const auto existing = m_shadow_solve_by_txid.find(txid);
+    if (existing != m_shadow_solve_by_txid.end() &&
+        existing->second == std::make_pair(target, history_key)) {
+        const auto history = m_shadow_solve_history.find(target);
+        if (history != m_shadow_solve_history.end()) {
+            const auto solve = history->second.find(history_key);
+            if (solve != history->second.end() &&
+                solve->second.solve_hash == confirmed->confirmed_block_hash) {
+                return;
+            }
+        }
+    }
+    RemoveIndexedShadowSolve(txid);
+
+    WalletShadowSolveReference solve{target, static_cast<uint32_t>(confirmed->confirmed_block_height), confirmed->confirmed_block_hash, txid};
+    m_shadow_solve_history[target].emplace(history_key, solve);
+    m_shadow_solve_by_txid.emplace(txid, std::make_pair(target, history_key));
+    RefreshLatestShadowSolve(target);
+}
+
+void CWallet::RecomputeShadowSolveIndex()
+{
+    AssertLockHeld(cs_wallet);
+    m_shadow_solve_history.clear();
+    m_shadow_solve_by_txid.clear();
+    m_shadow_solve_latest.clear();
+    m_shadow_solve_latest_by_height.clear();
+    for (const auto& [txid, wtx] : mapWallet) IndexConfirmedShadowSolve(wtx);
+}
+
+void CWallet::UpdatePendingShadowSignalIndex(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    if (!TransactionHasShadowSignal(*wtx.tx)) return;
+    if (wtx.isUnconfirmed()) {
+        m_pending_shadow_signal_txids.insert(wtx.GetHash());
+    } else {
+        m_pending_shadow_signal_txids.erase(wtx.GetHash());
+    }
+}
+
+void CWallet::IndexOwnedLegacyShadowScripts(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    for (const CTxOut& output : wtx.tx->vout) {
+        if (output.nValue <= 0 || IsMine(output) == ISMINE_NO) continue;
+        const CScript target = CanonicalizeLegacyStakeScript(output.scriptPubKey);
+        CTxDestination dest;
+        if (target.empty() || target.IsUnspendable() || !ExtractDestination(target, dest) ||
+            !IsValidDestination(dest) || IsQuantumMigrationDestination(dest)) {
+            continue;
+        }
+        m_owned_legacy_shadow_scripts.insert(target);
+    }
+}
+
+std::vector<WalletShadowSolveReference> CWallet::GetRecentShadowSolveReferences(int tip_height, size_t limit) const
+{
+    AssertLockHeld(cs_wallet);
+    std::vector<WalletShadowSolveReference> solves;
+    if (tip_height < 0 || limit == 0) return solves;
+    solves.reserve(std::min(limit, m_shadow_solve_latest.size()));
+    for (auto height_it = m_shadow_solve_latest_by_height.lower_bound(tip_height);
+         height_it != m_shadow_solve_latest_by_height.end(); ++height_it) {
+        const int height = height_it->first;
+        if (tip_height - height > SHADOW_SOLVER_ACTIVITY_WINDOW) break;
+        for (const CScript& target : height_it->second) {
+            const auto solve = m_shadow_solve_latest.find(target);
+            if (solve == m_shadow_solve_latest.end() || solve->second.solve_height != static_cast<uint32_t>(height)) continue;
+            solves.push_back(solve->second);
+            if (solves.size() >= limit) return solves;
+        }
+    }
+    return solves;
+}
+
+std::vector<uint256> CWallet::GetPendingShadowSignalTxids() const
+{
+    AssertLockHeld(cs_wallet);
+    return {m_pending_shadow_signal_txids.begin(), m_pending_shadow_signal_txids.end()};
+}
+
+std::vector<CScript> CWallet::GetOwnedLegacyShadowScripts(size_t limit) const
+{
+    AssertLockHeld(cs_wallet);
+    std::vector<CScript> scripts;
+    if (limit == 0) return scripts;
+    scripts.reserve(std::min(limit, m_owned_legacy_shadow_scripts.size()));
+    for (const CScript& script : m_owned_legacy_shadow_scripts) {
+        scripts.push_back(script);
+        if (scripts.size() >= limit) break;
+    }
+    return scripts;
 }
 
 void CWallet::RecomputeQuantumRedelegationWinHistory(WalletBatch& batch)
@@ -4903,7 +5133,7 @@ util::Result<CTxDestination> CWallet::AddQuantumKey(const std::vector<unsigned c
         }
 
         WalletBatch batch(GetDatabase());
-        if (!batch.TxnBegin()) {
+        if (!batch.TxnBegin(/*durable=*/true)) {
             return util::Error{_("Error: Failed to begin wallet database transaction")};
         }
 
@@ -4929,6 +5159,11 @@ util::Result<CTxDestination> CWallet::AddQuantumKey(const std::vector<unsigned c
             }
         }
 
+        if (!batch.WriteQuantumKeyBackupState(witness_program, /*verified=*/false)) {
+            batch.TxnAbort();
+            return util::Error{_("Error: Failed to initialize ML-DSA key backup state")};
+        }
+
         const uint64_t new_flags = (m_wallet_flags | WALLET_FLAG_QUANTUM_KEYS) & ~WALLET_FLAG_BLANK_WALLET;
         if (!batch.WriteWalletFlags(new_flags)) {
             batch.TxnAbort();
@@ -4950,6 +5185,8 @@ util::Result<CTxDestination> CWallet::AddQuantumKey(const std::vector<unsigned c
             return util::Error{_("Error: Failed to commit wallet database transaction")};
         }
 
+        record.durably_stored = true;
+        record.backup_verified = false;
         m_wallet_flags = new_flags;
         m_quantum_keys.emplace(witness_program, std::move(record));
         MaybeUpdateBirthTime(key_time);
@@ -5963,9 +6200,376 @@ void CWallet::postInitProcess()
     }
 }
 
-bool CWallet::BackupWallet(const std::string& strDest) const
+bool CWallet::VerifyQuantumBackup(const fs::path& backup_path, const QuantumKeySnapshot& expected_keys,
+                                  const CKeyingMaterial& master_key, bool require_verified_markers,
+                                  bool write_verified_markers,
+                                  bilingual_str& error) const
 {
-    return GetDatabase().Backup(strDest);
+    class ScopedDirectoryRemoval
+    {
+    public:
+        explicit ScopedDirectoryRemoval(fs::path path) : m_path(std::move(path)) {}
+        ~ScopedDirectoryRemoval()
+        {
+            try {
+                fs::remove_all(m_path);
+            } catch (const std::exception&) {
+                // A verification scratch directory contains only a copy of
+                // the user-selected backup. Cleanup failure must never alter
+                // the verified backup or its result.
+            }
+        }
+    private:
+        fs::path m_path;
+    };
+
+    try {
+        if (!fs::is_regular_file(backup_path)) {
+            error = strprintf(_("Quantum-key backup verification could not find the produced wallet file: %s"), fs::PathToString(backup_path));
+            return false;
+        }
+
+        const fs::path scratch_random = GetUniquePath(backup_path.parent_path());
+        const fs::path scratch_dir = backup_path.parent_path() / fs::PathFromString(
+            ".blackcoin-quantum-backup-verify-" + fs::PathToString(scratch_random.filename()));
+        if (!TryCreateDirectories(scratch_dir)) {
+            error = _("Quantum-key backup verification could not create an isolated verification directory");
+            return false;
+        }
+        ScopedDirectoryRemoval remove_scratch{scratch_dir};
+        const fs::path scratch_wallet = scratch_dir / "wallet.dat";
+        fs::copy_file(backup_path, scratch_wallet, fs::copy_options::none);
+
+        DatabaseOptions options;
+        options.require_existing = true;
+        options.verify = true;
+        options.use_unsafe_sync = false;
+        DatabaseStatus status;
+        bilingual_str database_error;
+        std::unique_ptr<WalletDatabase> database = MakeDatabase(scratch_wallet, options, status, database_error);
+        if (!database) {
+            error = Untranslated("Quantum-key backup database verification failed. ") + database_error;
+            return false;
+        }
+
+        auto backup_wallet = std::make_unique<CWallet>(/*chain=*/nullptr, "quantum-backup-verification", std::move(database));
+        if (backup_wallet->LoadWallet() != DBErrors::LOAD_OK) {
+            error = _("Quantum-key backup could not be fully reloaded");
+            return false;
+        }
+
+        LOCK(backup_wallet->cs_wallet);
+        if (backup_wallet->IsCrypted()) {
+            if (master_key.empty() || !backup_wallet->Unlock(master_key, /*accept_no_keys=*/true)) {
+                error = _("Quantum-key backup could not be unlocked for cryptographic verification");
+                return false;
+            }
+        }
+
+        if (backup_wallet->m_quantum_keys.size() != expected_keys.size()) {
+            error = _("Quantum-key backup does not contain the complete current key inventory");
+            return false;
+        }
+
+        for (const auto& [witness_program, expected_public_key] : expected_keys) {
+            const auto record_it = backup_wallet->m_quantum_keys.find(witness_program);
+            if (record_it == backup_wallet->m_quantum_keys.end() ||
+                record_it->second.public_key != expected_public_key ||
+                !record_it->second.durably_stored) {
+                error = _("Quantum-key backup is missing a durably stored ML-DSA key");
+                return false;
+            }
+            if (require_verified_markers && !record_it->second.backup_verified) {
+                error = _("Quantum-key backup is missing verified-backup metadata");
+                return false;
+            }
+
+            std::vector<unsigned char> public_key;
+            CKeyingMaterial private_key;
+            bilingual_str key_error;
+            if (!backup_wallet->GetQuantumKey(witness_program, public_key, private_key, key_error)) {
+                error = Untranslated("Quantum-key backup private-key verification failed. ") + key_error;
+                return false;
+            }
+
+            // A fresh random challenge proves that the reopened file contains
+            // working private material rather than merely matching public
+            // metadata or a checksum copied from the source process.
+            const uint256 challenge = GetRandHash();
+            std::vector<unsigned char> private_key_bytes(private_key.begin(), private_key.end());
+            ScopedVectorCleanser<unsigned char> cleanse_private_key{private_key_bytes};
+            std::vector<unsigned char> signature;
+            const bool signed_challenge = ML_DSA::Sign(private_key_bytes, challenge.begin(), uint256::size(), signature);
+            if (!signed_challenge || !ML_DSA::Verify(public_key, challenge.begin(), uint256::size(), signature)) {
+                error = _("Quantum-key backup failed its independent ML-DSA sign/verify challenge");
+                return false;
+            }
+        }
+
+        if (write_verified_markers) {
+            if (!backup_wallet->SetQuantumKeyBackupState(expected_keys, /*verified=*/true, error)) {
+                return false;
+            }
+            // Copy the marked, isolated database back only to the temporary
+            // stage. The user-selected destination remains untouched until a
+            // second reopen/challenge confirms these markers and the stage is
+            // atomically promoted.
+            if (!backup_wallet->GetDatabase().Backup(fs::PathToString(backup_path))) {
+                error = _("Failed to prepare verified quantum-key backup metadata");
+                return false;
+            }
+        }
+        return true;
+    } catch (const std::exception& e) {
+        error = strprintf(_("Quantum-key backup verification failed: %s"), e.what());
+        return false;
+    }
+}
+
+bool CWallet::SetQuantumKeyBackupState(const QuantumKeySnapshot& expected_keys, bool verified, bilingual_str& error)
+{
+    LOCK(cs_wallet);
+    // Marking a backup complete requires an exact current inventory. The
+    // durable database transaction and in-memory update are all-or-nothing.
+    if (verified && m_quantum_keys.size() != expected_keys.size()) {
+        error = _("Quantum key inventory changed while creating the wallet backup");
+        return false;
+    }
+    for (const auto& [witness_program, expected_public_key] : expected_keys) {
+        const auto it = m_quantum_keys.find(witness_program);
+        if (it == m_quantum_keys.end() || it->second.public_key != expected_public_key || !it->second.durably_stored) {
+            error = _("Quantum key inventory changed while creating the wallet backup");
+            return false;
+        }
+    }
+
+    WalletBatch batch(GetDatabase());
+    if (!batch.TxnBegin(/*durable=*/true)) {
+        error = _("Failed to begin durable quantum backup-state transaction");
+        return false;
+    }
+    for (const auto& entry : expected_keys) {
+        if (!batch.WriteQuantumKeyBackupState(entry.first, verified)) {
+            batch.TxnAbort();
+            error = _("Failed to write quantum key backup state");
+            return false;
+        }
+    }
+    if (!batch.TxnCommit()) {
+        error = _("Failed to durably commit quantum key backup state");
+        return false;
+    }
+    for (const auto& entry : expected_keys) {
+        m_quantum_keys.at(entry.first).backup_verified = verified;
+    }
+    return true;
+}
+
+bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out, bool verify_quantum_keys)
+{
+    class ScopedPathRemoval
+    {
+    public:
+        explicit ScopedPathRemoval(fs::path path) : m_path(std::move(path)) {}
+        ~ScopedPathRemoval()
+        {
+            if (!m_active) return;
+            try {
+                fs::remove(m_path);
+            } catch (const std::exception&) {
+            }
+        }
+        void Release() { m_active = false; }
+
+    private:
+        fs::path m_path;
+        bool m_active{true};
+    };
+
+    bilingual_str local_error;
+    const auto failpoint = [&](std::string_view point) {
+        if (!m_quantum_backup_failpoint || !m_quantum_backup_failpoint(point)) return false;
+        local_error = Untranslated(strprintf("Injected quantum wallet backup failure at %s", point));
+        return true;
+    };
+    QuantumKeySnapshot expected_keys;
+    CKeyingMaterial master_key;
+    bool source_was_crypted{false};
+    {
+        LOCK(cs_wallet);
+        for (const auto& [witness_program, record] : m_quantum_keys) {
+            if (!record.durably_stored) {
+                local_error = _("Wallet contains an ML-DSA key that is not durably stored");
+                if (error_out) *error_out = local_error;
+                return false;
+            }
+            expected_keys.emplace(witness_program, record.public_key);
+        }
+        if (verify_quantum_keys && !expected_keys.empty() && IsCrypted()) {
+            if (vMasterKey.empty()) {
+                local_error = _("Unlock this wallet before creating a verified quantum-key backup");
+                if (error_out) *error_out = local_error;
+                return false;
+            }
+            master_key = vMasterKey;
+        }
+        source_was_crypted = IsCrypted();
+    }
+
+    fs::path backup_path = fs::PathFromString(strDest);
+    try {
+        if (fs::is_directory(backup_path)) {
+            backup_path /= fs::PathFromString(GetDatabase().Filename()).filename();
+        }
+        for (const fs::path& source_path : GetDatabase().Files()) {
+            if (fs::exists(source_path) && fs::exists(backup_path) && fs::equivalent(source_path, backup_path)) {
+                local_error = _("Cannot back up a wallet onto its active database file");
+                if (error_out) *error_out = local_error;
+                return false;
+            }
+        }
+    } catch (const fs::filesystem_error& e) {
+        local_error = strprintf(_("Unable to validate wallet backup destination: %s"), fsbridge::get_filesystem_error_message(e));
+        if (error_out) *error_out = local_error;
+        return false;
+    }
+
+    const fs::path backup_directory = backup_path.has_parent_path() ? backup_path.parent_path() : fs::path{"."};
+    fs::path staged_path;
+    try {
+        for (int attempt = 0; attempt < 10; ++attempt) {
+            const fs::path random_path = GetUniquePath(backup_directory);
+            const fs::path candidate = backup_directory / fs::PathFromString(
+                fs::PathToString(backup_path.filename()) + ".tmp-" + fs::PathToString(random_path.filename()));
+            if (!fs::exists(fs::symlink_status(candidate))) {
+                staged_path = candidate;
+                break;
+            }
+        }
+    } catch (const fs::filesystem_error& e) {
+        local_error = strprintf(_("Unable to prepare wallet backup destination: %s"), fsbridge::get_filesystem_error_message(e));
+        if (error_out) *error_out = local_error;
+        return false;
+    }
+    if (staged_path.empty()) {
+        local_error = _("Unable to reserve a unique temporary wallet backup path");
+        if (error_out) *error_out = local_error;
+        return false;
+    }
+    ScopedPathRemoval remove_staged{staged_path};
+
+    const auto commit_stage = [&]() {
+        FILE* staged_file = fsbridge::fopen(staged_path, "rb+");
+        if (staged_file == nullptr) {
+            local_error = _("Unable to open the temporary wallet backup for durable commit");
+            return false;
+        }
+        const bool committed = FileCommit(staged_file);
+        const bool closed = std::fclose(staged_file) == 0;
+        if (!committed || !closed) {
+            local_error = _("Unable to durably commit the temporary wallet backup");
+            return false;
+        }
+        if (failpoint("before_stage_directory_commit") || !DirectoryCommit(backup_directory)) {
+            if (local_error.empty()) local_error = _("Unable to durably commit the temporary wallet backup directory entry");
+            return false;
+        }
+        return true;
+    };
+
+    const auto copy_to_stage = [&]() {
+        try {
+            if (fs::exists(staged_path) && !fs::remove(staged_path)) {
+                local_error = _("Unable to replace the temporary wallet backup file");
+                return false;
+            }
+        } catch (const fs::filesystem_error& e) {
+            local_error = strprintf(_("Unable to prepare the temporary wallet backup file: %s"), fsbridge::get_filesystem_error_message(e));
+            return false;
+        }
+        if (!GetDatabase().Backup(fs::PathToString(staged_path))) {
+            local_error = _("Wallet database copy failed");
+            return false;
+        }
+        return commit_stage();
+    };
+
+    const auto promote_stage = [&](bool require_unchanged_quantum_snapshot = false) {
+        std::unique_lock<RecursiveMutex> wallet_lock;
+        if (require_unchanged_quantum_snapshot) {
+            wallet_lock = std::unique_lock<RecursiveMutex>{cs_wallet};
+            if (IsCrypted() != source_was_crypted || m_quantum_keys.size() != expected_keys.size()) {
+                local_error = _("Quantum key inventory changed while finalizing the wallet backup");
+                return false;
+            }
+            for (const auto& [witness_program, expected_public_key] : expected_keys) {
+                const auto it = m_quantum_keys.find(witness_program);
+                if (it == m_quantum_keys.end() || it->second.public_key != expected_public_key ||
+                    !it->second.durably_stored) {
+                    local_error = _("Quantum key inventory changed while finalizing the wallet backup");
+                    return false;
+                }
+            }
+        }
+        if (!RenameOver(staged_path, backup_path)) {
+            local_error = _("Unable to atomically install the verified wallet backup");
+            return false;
+        }
+        remove_staged.Release();
+        if (failpoint("before_final_directory_commit") || !DirectoryCommit(backup_directory)) {
+            if (local_error.empty()) local_error = _("Unable to durably commit the installed wallet backup directory entry");
+            return false;
+        }
+        if (require_unchanged_quantum_snapshot && !SetQuantumKeyBackupState(expected_keys, /*verified=*/true, local_error)) {
+            // The promoted file is complete and independently verified. A
+            // source-marker failure remains conservative and is reported so
+            // the caller can retry; it must never delete the good backup.
+            return false;
+        }
+        return true;
+    };
+
+    if (failpoint("before_first_copy") || !copy_to_stage() || failpoint("after_first_copy")) {
+        if (error_out) *error_out = local_error;
+        return false;
+    }
+    if (!verify_quantum_keys || expected_keys.empty()) {
+        const bool promoted = promote_stage();
+        if (!promoted && error_out) *error_out = local_error;
+        return promoted;
+    }
+
+    if (failpoint("before_marker_prepare") ||
+        !VerifyQuantumBackup(staged_path, expected_keys, master_key,
+                             /*require_verified_markers=*/false,
+                             /*write_verified_markers=*/true,
+                             local_error) ||
+        failpoint("after_marker_prepare")) {
+        if (error_out) *error_out = local_error;
+        return false;
+    }
+    if (!commit_stage() || failpoint("after_marker_commit")) {
+        if (error_out) *error_out = local_error;
+        return false;
+    }
+
+    // Reopen the marked stage and challenge every key again. Only then is it
+    // atomically promoted. Source markers are committed after promotion, so a
+    // crash at any earlier instruction can only leave a false-negative backup
+    // warning, never a false claim that a completed backup exists.
+    if (failpoint("before_final_verify") ||
+        !VerifyQuantumBackup(staged_path, expected_keys, master_key,
+                             /*require_verified_markers=*/true,
+                             /*write_verified_markers=*/false,
+                             local_error) ||
+        failpoint("after_final_verify") ||
+        failpoint("before_promote") ||
+        !promote_stage(/*require_unchanged_quantum_snapshot=*/true)) {
+        if (local_error.empty()) local_error = _("Final verified wallet database copy failed");
+        if (error_out) *error_out = local_error;
+        return false;
+    }
+    return true;
 }
 
 CKeyPool::CKeyPool()
@@ -6010,9 +6614,12 @@ int CWallet::GetTxBlocksToMaturity(const CWalletTx& wtx) const
     const bool synthetic_payout =
         (synthetic != wtx.mapValue.end() && synthetic->second == "1") ||
         IsSyntheticGoldRushPayoutEnvelope(wtx);
+    const auto next_lifecycle = consensus.GetQuantumLifecycleState(
+        /*nTime=*/0, GetLastBlockHeight() + 1);
     if (synthetic_payout &&
-        consensus.UsesHeightLifecycle() &&
-        GetLastBlockHeight() + 1 > consensus.nGoldRushEndHeight &&
+        next_lifecycle.height_authoritative &&
+        (next_lifecycle.phase == Consensus::QuantumQuasarPhase::MIGRATION ||
+         next_lifecycle.phase == Consensus::QuantumQuasarPhase::FINAL_LOCKOUT) &&
         chain_depth >= consensus.nCoinbaseMaturity) {
         // Wallet balances describe what can be spent in the candidate next
         // block. Synthetic Gold Rush payouts use ordinary coinbase maturity,
@@ -6947,7 +7554,7 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
 
     fs::path backup_filename = fs::PathFromString(strprintf("%s_%d.legacy.bak", backup_prefix, GetTime()));
     fs::path backup_path = fsbridge::AbsPathJoin(GetWalletDir(), backup_filename);
-    if (!local_wallet->BackupWallet(fs::PathToString(backup_path))) {
+    if (!local_wallet->BackupWallet(fs::PathToString(backup_path), /*error=*/nullptr, /*verify_quantum_keys=*/false)) {
         return util::Error{_("Error: Unable to make a backup of your wallet")};
     }
     res.backup_path = backup_path;
@@ -7279,8 +7886,9 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created)
         LOCK(cs_wallet);
         if (!m_pow_payout_quantum.empty()) {
             const CTxDestination existing = DecodeDestination(m_pow_payout_quantum);
-            if (IsValidDestination(existing) && IsQuantumMigrationDestination(existing)) return true;
-            error = _("Stored Gold Rush PoW payout address is not a valid quantum migration address.");
+            const auto key_info = GetQuantumKeyInfo(existing);
+            if (IsValidDestination(existing) && IsQuantumMigrationDestination(existing) && key_info && key_info->durably_stored) return true;
+            error = _("Stored Gold Rush PoW payout address is not backed by a durably stored wallet quantum key.");
             return false;
         }
 
@@ -7288,7 +7896,8 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created)
             const std::string label = entry.GetLabel();
             if (entry.IsChange() || (label != POW_PAYOUT_LABEL && label != OLD_POW_PAYOUT_LABEL && label != LEGACY_POW_PAYOUT_LABEL)) continue;
             if (!IsValidDestination(dest) || !IsQuantumMigrationDestination(dest)) continue;
-            if (IsMine(dest) == ISMINE_NO) continue;
+            const auto key_info = GetQuantumKeyInfo(dest);
+            if (!key_info || !key_info->durably_stored) continue;
             restored_payout = EncodeDestination(dest);
             m_pow_payout_quantum = restored_payout;
             if (label != POW_PAYOUT_LABEL) {

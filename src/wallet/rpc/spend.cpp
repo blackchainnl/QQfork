@@ -2023,7 +2023,7 @@ RPCHelpMan migrategoldrushrewards()
                 {
                     {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{false}, "Estimate only; do not sign, broadcast, or create a new quantum key. Requires existing_address."},
                     {"existing_address", RPCArg::Type::STR, RPCArg::Default{""}, "Move into this already-owned wallet-backed quantum address instead of generating a fresh one. Required for dry_run."},
-                    {"label", RPCArg::Type::STR, RPCArg::Default{"goldrush-remigration"}, "Label for a newly generated destination address."},
+                    {"label", RPCArg::Type::STR, RPCArg::Default{"goldrush-consolidation"}, "Label for a newly generated optional consolidation address."},
                     {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"wallet default"}, "Fee rate in " + CURRENCY_ATOM + "/vB."},
                     {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include unconfirmed/unsafe reward coins."},
                 },
@@ -2058,7 +2058,7 @@ RPCHelpMan migrategoldrushrewards()
         const UniValue options = request.params[0].isNull() ? UniValue(UniValue::VOBJ) : request.params[0].get_obj();
         const bool dry_run = options.exists("dry_run") && options["dry_run"].get_bool();
         const bool include_unsafe = options.exists("include_unsafe") && options["include_unsafe"].get_bool();
-        const std::string label = options.exists("label") ? options["label"].get_str() : "goldrush-remigration";
+        const std::string label = options.exists("label") ? options["label"].get_str() : "goldrush-consolidation";
         const std::string existing = options.exists("existing_address") ? options["existing_address"].get_str() : "";
         if (dry_run && existing.empty()) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "dry_run requires existing_address so the estimate does not create wallet metadata");
@@ -2166,7 +2166,7 @@ RPCHelpMan migrategoldrushrewards()
         const CTransactionRef& tx = res->tx;
         if (tx->vout.size() != 1 || IsDust(tx->vout[0], pwallet->chain().relayDustFee())) {
             throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS,
-                "Gold Rush reward migration would strand funds: selected value is below the dust threshold after fees.");
+                "Gold Rush reward consolidation would strand funds: selected value is below the dust threshold after fees.");
         }
 
         UniValue result(UniValue::VOBJ);
@@ -2183,7 +2183,7 @@ RPCHelpMan migrategoldrushrewards()
         result.pushKV("fee", ValueFromAmount(res->fee));
         result.pushKV("vsize", (int)GetVirtualTransactionSize(*tx, 0, 0));
         if (!dry_run) {
-            CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Blackcoin Gold Rush reward migration");
+            CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Blackcoin Gold Rush reward consolidation");
             result.pushKV("txid", tx->GetHash().GetHex());
         }
         if (newly_generated) {

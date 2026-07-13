@@ -591,7 +591,7 @@ struct WalletPowMiningInfo
     int shadow_reward_start_height{0};//!< Gold Rush reward start height
     int shadow_reward_end_height{0};  //!< Gold Rush reward end height
     bool wallet_goldrush_status_available{true}; //!< false when wallet status could not be read without blocking
-    int wallet_whitelisted_scripts{0}; //!< wallet-owned spendable scripts in the deterministic whitelist
+    int wallet_whitelisted_scripts{0}; //!< bounded wallet-known scripts in the deterministic whitelist
     bool wallet_recent_solve_qualified{false}; //!< wallet has a whitelisted script with a recent solver marker
     bool wallet_active_signal{false}; //!< wallet has an active QQSIGNAL entry
     int wallet_blocks_until_solver_expiry{0}; //!< max recent-solver expiry across wallet-owned whitelisted scripts
@@ -606,6 +606,8 @@ struct WalletQuantumAddressInfo
     std::string public_key;
     int64_t creation_time{0};
     bool encrypted{false};
+    bool durably_stored{false};
+    bool backup_verified{false};
     bool tiered{false};
     uint16_t unbonding_blocks{0};
     uint32_t unlock_height{0};

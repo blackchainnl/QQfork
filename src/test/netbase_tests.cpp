@@ -53,6 +53,17 @@ BOOST_AUTO_TEST_CASE(netbase_networks)
     BOOST_CHECK(CreateInternal("foo.com").GetNetwork() == NET_INTERNAL);
 }
 
+BOOST_AUTO_TEST_CASE(quantum_quasar_service_flag)
+{
+    const ServiceFlags services = ServiceFlags(NODE_NETWORK | NODE_QUANTUM_QUASAR);
+    BOOST_CHECK(serviceFlagsToStr(services) ==
+                std::vector<std::string>({"NETWORK", "QUANTUM_QUASAR"}));
+
+    // Capability discovery must not partition v30 from legacy peers.
+    BOOST_CHECK_EQUAL(GetDesirableServiceFlags(services), NODE_NETWORK);
+    BOOST_CHECK(HasAllDesirableServiceFlags(NODE_NETWORK));
+}
+
 BOOST_AUTO_TEST_CASE(netbase_properties)
 {
 

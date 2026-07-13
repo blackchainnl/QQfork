@@ -11,9 +11,9 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
 
-GOLD_RUSH_END_TIME = 2_000_000_000
-MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 400
-PRE_LOCKOUT_TIME = GOLD_RUSH_END_TIME - 10_000
+START_TIME = 2_000_000_000
+GOLD_RUSH_END_HEIGHT = 15
+MIGRATION_END_HEIGHT = 18
 LEGACY_SPEND_FEE = Decimal("0.001")
 SIGHASH_FORKID = 0x40
 
@@ -23,8 +23,11 @@ class QuantumFinalLockoutSighashTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.extra_args = [[
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
-            f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
+            "-allowunsafequantumkeyrpc=1",
+            "-shadowwhitelistheight=1",
+            "-shadowgoldrushblocks=14",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
         ]]
 
     def _set_mocktime(self, timestamp):
@@ -34,9 +37,8 @@ class QuantumFinalLockoutSighashTest(BitcoinTestFramework):
     def _bump_mocktime(self, seconds=16):
         self._set_mocktime(self.mock_time + seconds)
 
-    def _mine_until_phase(self, phase, target_time, address):
+    def _mine_until_phase(self, phase, address):
         node = self.nodes[0]
-        self._set_mocktime(target_time)
         for _ in range(20):
             self.generatetoaddress(node, 1, address, sync_fun=self.no_op)
             self._bump_mocktime()
@@ -56,7 +58,7 @@ class QuantumFinalLockoutSighashTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
         funding_key = node.get_deterministic_priv_key()
-        self._set_mocktime(PRE_LOCKOUT_TIME)
+        self._set_mocktime(START_TIME)
 
         self.log.info("Create a mature legacy UTXO before final lockout")
         assert_equal(node.getquantumquasarinfo()["phase"], "gold_rush")
@@ -74,7 +76,7 @@ class QuantumFinalLockoutSighashTest(BitcoinTestFramework):
 
         self.log.info("Cross the migration deadline into final lockout")
         quantum_address = node.createquantumkey()["address"]
-        self._mine_until_phase("final_lockout", MIGRATION_DEADLINE_TIME + 16, quantum_address)
+        self._mine_until_phase("final_lockout", quantum_address)
         info = node.getquantumquasarinfo()
         assert_equal(info["phase"], "final_lockout")
         assert_equal(info["replay_protection_active"], True)
@@ -90,9 +92,10 @@ class QuantumFinalLockoutSighashTest(BitcoinTestFramework):
         assert_equal(default_signed["complete"], True)
         assert_equal(self._legacy_signature_has_forkid(node, default_signed["hex"]), True)
 
-        self.log.info("Explicit ALL remains non-FORKID and is not broadcastable after final lockout")
+        self.log.info("Explicit ALL remains non-FORKID and fails next-block verification after final lockout")
         explicit_all_signed = node.signrawtransactionwithkey(raw_spend, [funding_key.key], [prevtx], "ALL")
-        assert_equal(explicit_all_signed["complete"], True)
+        assert_equal(explicit_all_signed["complete"], False)
+        assert explicit_all_signed["errors"]
         assert_equal(self._legacy_signature_has_forkid(node, explicit_all_signed["hex"]), False)
         explicit_all_accept = node.testmempoolaccept([explicit_all_signed["hex"]])[0]
         assert_equal(explicit_all_accept["allowed"], False)

@@ -363,6 +363,8 @@ struct QuantumKeyInfo
     std::vector<unsigned char> public_key;
     int64_t creation_time{0};
     bool encrypted{false};
+    bool durably_stored{false};
+    bool backup_verified{false};
 };
 
 struct QuantumColdStakeDelegationRecord
@@ -520,6 +522,14 @@ struct EUTXOStateRecord
     }
 };
 
+struct WalletShadowSolveReference
+{
+    CScript target;
+    uint32_t solve_height{0};
+    uint256 solve_hash;
+    uint256 solve_txid;
+};
+
 class WalletRescanReserver; //forward declarations for ScanForWalletTransactions/RescanFromTime
 /**
  * A CWallet maintains a set of transactions and balances, and provides the ability to create new transactions.
@@ -537,11 +547,20 @@ private:
         CKeyingMaterial private_key;
         std::vector<unsigned char> crypted_private_key;
         int64_t creation_time{0};
+        bool durably_stored{false};
+        bool backup_verified{false};
 
         bool IsCrypted() const { return !crypted_private_key.empty(); }
     };
 
     std::map<std::vector<unsigned char>, QuantumKeyRecord> m_quantum_keys GUARDED_BY(cs_wallet);
+    using QuantumKeySnapshot = std::map<std::vector<unsigned char>, std::vector<unsigned char>>;
+    bool VerifyQuantumBackup(const fs::path& backup_path, const QuantumKeySnapshot& expected_keys,
+                             const CKeyingMaterial& master_key, bool require_verified_markers,
+                             bool write_verified_markers,
+                             bilingual_str& error) const;
+    bool SetQuantumKeyBackupState(const QuantumKeySnapshot& expected_keys, bool verified,
+                                  bilingual_str& error);
     std::map<std::vector<unsigned char>, QuantumColdStakeDelegationRecord> m_quantum_coldstake_delegations GUARDED_BY(cs_wallet);
     std::map<uint256, RGBContractRecord> m_rgb_contracts GUARDED_BY(cs_wallet);
     std::map<std::pair<uint256, COutPoint>, RGBOwnedAssignmentRecord> m_rgb_assignments GUARDED_BY(cs_wallet);
@@ -571,6 +590,33 @@ private:
     std::atomic<int64_t> m_best_block_time {0};
 
     std::map<COutPoint, CStakeCache> stakeCache;
+
+    // Confirmed legacy PoS solves indexed by canonical wallet script. The
+    // complete wallet-known solve-only history is rebuilt once at load, then updated on
+    // wallet transaction state transitions. Retaining the history makes a
+    // disconnect restore the prior latest solve in logarithmic time instead
+    // of walking the complete wallet once per disconnected block.
+    using ShadowSolveHistoryKey = std::pair<int, uint256>;
+    struct ShadowSolveScriptDescending {
+        bool operator()(const CScript& a, const CScript& b) const
+        {
+            return b < a;
+        }
+    };
+    std::map<CScript, std::map<ShadowSolveHistoryKey, WalletShadowSolveReference>> m_shadow_solve_history GUARDED_BY(cs_wallet);
+    std::map<uint256, std::pair<CScript, ShadowSolveHistoryKey>> m_shadow_solve_by_txid GUARDED_BY(cs_wallet);
+    std::map<CScript, WalletShadowSolveReference> m_shadow_solve_latest GUARDED_BY(cs_wallet);
+    // Newest height first, with canonical script bytes as the deterministic
+    // tie-break. There is exactly one entry per script.
+    std::map<int, std::set<CScript, ShadowSolveScriptDescending>, std::greater<int>> m_shadow_solve_latest_by_height GUARDED_BY(cs_wallet);
+    std::set<uint256> m_pending_shadow_signal_txids GUARDED_BY(cs_wallet);
+    std::set<CScript> m_owned_legacy_shadow_scripts GUARDED_BY(cs_wallet);
+    void RefreshLatestShadowSolve(const CScript& target) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RemoveIndexedShadowSolve(const uint256& txid) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void IndexConfirmedShadowSolve(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RecomputeShadowSolveIndex() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void UpdatePendingShadowSignalIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void IndexOwnedLegacyShadowScripts(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     // First created key time. Used to skip blocks prior to this time.
     // 'std::numeric_limits<int64_t>::max()' if wallet is blank.
@@ -983,9 +1029,9 @@ public:
     // serves to disable the trivial sendmoney when OS account compromised
     // provides no real security
     std::atomic<bool> m_wallet_unlock_staking_only{false};
-    int64_t m_last_coin_stake_search_time{0};
-    int64_t m_last_coin_stake_search_interval{0};
-    uint256 m_last_coin_stake_search_tip{};
+    int64_t m_last_coin_stake_search_time GUARDED_BY(cs_wallet){0};
+    int64_t m_last_coin_stake_search_interval GUARDED_BY(cs_wallet){0};
+    uint256 m_last_coin_stake_search_tip GUARDED_BY(cs_wallet){};
     CAmount m_min_staking_amount{DEFAULT_MIN_STAKING_AMOUNT};
     CAmount m_reserve_balance{DEFAULT_RESERVE_BALANCE};
     unsigned int m_donation_percentage{DEFAULT_DONATION_PERCENTAGE};
@@ -994,6 +1040,13 @@ public:
     int m_demurrage_last_auto_attest_scan_height GUARDED_BY(cs_wallet){-1};
     std::map<uint256, int> m_demurrage_last_auto_attest_attempt_height GUARDED_BY(cs_wallet);
     int m_shadow_signal_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
+    // The staking thread and the periodic wallet scheduler can both request an
+    // automatic QQSIGNAL. Keep construction single-flight per wallet and use a
+    // non-blocking retry deadline so transient validation/signing failures do
+    // not become a tight loop or permanently suppress retries at the same tip.
+    std::atomic<bool> m_shadow_signal_inflight{false};
+    std::atomic<unsigned int> m_shadow_signal_retry_failures{0};
+    std::atomic<int64_t> m_shadow_signal_next_retry_ms{0};
     int m_redelegation_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_attempt_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_success_height GUARDED_BY(cs_wallet);
@@ -1071,9 +1124,13 @@ public:
 
     bool LoadQuantumKey(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, int64_t creation_time) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadCryptedQuantumKey(const std::vector<unsigned char>& public_key, const std::vector<unsigned char>& crypted_private_key, int64_t creation_time) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool LoadQuantumKeyBackupState(const std::vector<unsigned char>& witness_program, bool verified) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadQuantumColdStakeDelegation(const std::vector<unsigned char>& witness_program, const QuantumColdStakeDelegationRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RecordQuantumRedelegationWins(const CTransaction& tx, int height, WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RecomputeQuantumRedelegationWinHistory(WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::vector<WalletShadowSolveReference> GetRecentShadowSolveReferences(int tip_height, size_t limit) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::vector<uint256> GetPendingShadowSignalTxids() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::vector<CScript> GetOwnedLegacyShadowScripts(size_t limit) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadRGBContract(const uint256& contract_id, const RGBContractRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadRGBAssignment(const uint256& contract_id, const COutPoint& outpoint, const RGBOwnedAssignmentRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadRGBGenesisProof(const uint256& contract_id, const RGBGenesisProofRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1214,7 +1271,19 @@ public:
      */
     void postInitProcess();
 
-    bool BackupWallet(const std::string& strDest) const;
+    /**
+     * Copy the wallet database. By default, wallets containing non-HD quantum
+     * keys reopen the produced file, independently sign/verify every key, and
+     * only then persist the per-key verified-backup state.
+     *
+     * Internal pre-migration safety copies may opt out because they preserve
+     * the exact source database and are not represented to the user as a
+     * verified current-generation quantum-key backup.
+     */
+    bool BackupWallet(const std::string& strDest, bilingual_str* error = nullptr, bool verify_quantum_keys = true);
+
+    /** In-process fault injection for wallet backup tests. Never persisted or exposed through RPC. */
+    std::function<bool(std::string_view)> m_quantum_backup_failpoint;
 
     /* Returns true if HD is enabled */
     bool IsHDEnabled() const;
