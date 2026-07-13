@@ -12,6 +12,7 @@
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <shadow.h>
+#include <test/util/setup_common.h>
 #include <uint256.h>
 #include <undo.h>
 #include <util/strencodings.h>
@@ -26,7 +27,7 @@
 
 #include <boost/test/unit_test.hpp>
 
-BOOST_AUTO_TEST_SUITE(shadow_tests)
+BOOST_FIXTURE_TEST_SUITE(shadow_tests, BasicTestingSetup)
 
 namespace {
 
@@ -1259,14 +1260,11 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_winner_is_order_independent_and_replay
     InitIndex(prev_index, SHADOW_REWARD_START_HEIGHT, &whitelist_index, prev_hash);
     CBlock prev_block;
     prev_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_TRUE));
-    {
-        CCoinsViewCache seed_view{&base, true};
-        BOOST_REQUIRE(ApplyLegacyWhitelistSnapshot(seed_view, &whitelist_index));
-        BOOST_REQUIRE(ApplyShadowBlock(seed_view, prev_block, &prev_index));
-        BOOST_REQUIRE(seed_view.Flush());
-    }
+    CCoinsViewCache seed_view{&base, true};
+    BOOST_REQUIRE(ApplyLegacyWhitelistSnapshot(seed_view, &whitelist_index));
+    BOOST_REQUIRE(ApplyShadowBlock(seed_view, prev_block, &prev_index));
 
-    CCoinsViewCache view{&base, true};
+    CCoinsViewCache view{&seed_view, true};
     const CScript target_a = CScript{} << OP_2;
     const CScript target_b = CScript{} << OP_3;
     const CScript payout_a = QuantumScript(0x75);
@@ -1372,7 +1370,7 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_winner_is_order_independent_and_replay
     BOOST_CHECK_EQUAL(applied_total_b, applied_total_a);
     BOOST_REQUIRE(UndoShadowBlock(view, block_b, &claim_index_b, &undo_b));
 
-    CCoinsViewCache replay_view{&base, true};
+    CCoinsViewCache replay_view{&seed_view, true};
     BOOST_REQUIRE(ApplyShadowBlock(replay_view, block_a, &claim_index_a, &undo_a));
     std::map<CScript, CAmount> replayed;
     CAmount replayed_total{0};
