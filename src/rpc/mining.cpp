@@ -604,7 +604,9 @@ static RPCHelpMan getblocktemplate()
                 {RPCResult::Type::NUM, "weightlimit", /*optional=*/true, "limit of block weight"},
                 {RPCResult::Type::OBJ, "quantumquasar", "Blackcoin V4 roadmap data for miners", {
                     {RPCResult::Type::STR, "phase", "current Blackcoin roadmap phase for the template"},
+                    {RPCResult::Type::BOOL, "lifecycle_schedule_valid", "whether the configured lifecycle boundaries are complete and ordered"},
                     {RPCResult::Type::NUM_TIME, "v4_activation_time", "first V4 hard-fork activation boundary"},
+                    {RPCResult::Type::NUM, "v4_activation_height", "authoritative first Gold Rush lifecycle height, or 0 for a time-only test schedule"},
                     {RPCResult::Type::NUM_TIME, "gold_rush_end_time", "forecast Gold Rush end time; non-authoritative when height boundaries are enabled"},
                     {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "forecast final migration time; non-authoritative when height boundaries are enabled"},
                     {RPCResult::Type::NUM, "gold_rush_end_height", "authoritative last Gold Rush block height, or 0 for a time-only test schedule"},
