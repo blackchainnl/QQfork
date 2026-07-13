@@ -26,6 +26,34 @@ EXPECTED_CIRCULAR_DEPENDENCIES = (
     "kernel/coinstats -> validation -> kernel/coinstats",
     "kernel/mempool_persist -> validation -> kernel/mempool_persist",
 
+    # Inherited v30.1.0 integration baseline. Removing these safely is tracked
+    # by production issues #22 and #25.
+    "addresstype -> script/solver -> addresstype",
+    "addresstype -> script/solver -> script/interpreter -> addresstype",
+    "chain -> chainparams -> shadow -> chain",
+    "chainparams -> key_io -> chainparams",
+    "consensus/tx_verify -> validation -> consensus/tx_verify",
+    "consensus/tx_verify -> validation -> txmempool -> consensus/tx_verify",
+    "consensus/tx_verify -> validation -> wallet/wallet -> consensus/tx_verify",
+    "index/txindex -> node/blockstorage -> wallet/wallet -> index/txindex",
+    "node/blockstorage -> wallet/wallet -> node/transaction -> node/blockstorage",
+    "node/context -> validation -> wallet/wallet -> node/context",
+    "node/miner -> wallet/staking -> node/miner",
+    "node/miner -> wallet/wallet -> node/miner",
+    "node/transaction -> validation -> wallet/wallet -> node/transaction",
+    "node/transaction -> validation -> wallet/wallet -> psbt -> node/transaction",
+    "pos -> validation -> pos",
+    "pos -> validation -> wallet/wallet -> pos",
+    "validation -> wallet/wallet -> validation",
+    "wallet/fees -> wallet/wallet -> wallet/fees",
+    "wallet/spend -> wallet/wallet -> wallet/spend",
+    "wallet/staking -> wallet/wallet -> wallet/staking",
+
+    # Added by the v30.1.1 shadow/demurrage integration and explicitly deferred
+    # from alpha.1 under production issues #22 and #25.
+    "chain -> chainparams -> shadow -> consensus/demurrage -> chain",
+    "chainparams -> shadow -> chainparams",
+
     # Temporary, removed in followup https://github.com/bitcoin/bitcoin/pull/24230
     "index/base -> node/context -> net_processing -> index/blockfilterindex -> index/base",
 )

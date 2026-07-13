@@ -37,7 +37,6 @@ from test_framework.script import (
     LEAF_VERSION_TAPSCRIPT,
     LegacySignatureMsg,
     LOCKTIME_THRESHOLD,
-    MAX_SCRIPT_ELEMENT_SIZE,
     V4_MAX_SCRIPT_ELEMENT_SIZE,
     OP_0,
     OP_1,
@@ -50,8 +49,6 @@ from test_framework.script import (
     OP_8,
     OP_9,
     OP_10,
-    OP_11,
-    OP_12,
     OP_16,
     OP_2DROP,
     OP_2DUP,
@@ -87,7 +84,6 @@ from test_framework.script import (
     taproot_construct,
 )
 from test_framework.script_util import (
-    key_to_p2pk_script,
     key_to_p2pkh_script,
     key_to_p2wpkh_script,
     keyhash_to_p2pkh_script,
@@ -100,7 +96,6 @@ from test_framework.util import (
     assert_equal,
     random_bytes,
 )
-from test_framework.wallet_util import generate_keypair
 from test_framework.key import (
     generate_privkey,
     compute_xonly_pubkey,
@@ -838,6 +833,7 @@ def spenders_taproot_active():
                     QUANTUM_MIGRATION_WITNESS_VERSION,
                 ]:
                     continue
+
                 def mutate(spk):
                     prog = spk[2:]
                     assert len(prog) == 32

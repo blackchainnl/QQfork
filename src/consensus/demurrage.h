@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
-#ifndef BLACKCOIN_CONSENSUS_DEMURRAGE_H
-#define BLACKCOIN_CONSENSUS_DEMURRAGE_H
+#ifndef BITCOIN_CONSENSUS_DEMURRAGE_H
+#define BITCOIN_CONSENSUS_DEMURRAGE_H
 
 #include <consensus/amount.h>
 #include <primitives/transaction.h>
@@ -209,4 +209,4 @@ DemurrageEvaluation EvaluateDemurrage(
 
 } // namespace Consensus
 
-#endif // BLACKCOIN_CONSENSUS_DEMURRAGE_H
+#endif // BITCOIN_CONSENSUS_DEMURRAGE_H

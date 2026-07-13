@@ -193,7 +193,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert "last_pos_height" in info
         assert "recent_count" in info
         assert "pow_target_bits" in info
-        
+
         # Verify pow_target_bits is a valid positive integer
         assert isinstance(info["pow_target_bits"], int)
         assert info["pow_target_bits"] >= 0

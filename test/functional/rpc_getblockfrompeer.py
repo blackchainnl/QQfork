@@ -8,16 +8,6 @@
 """Test the getblockfrompeer RPC."""
 
 from test_framework.authproxy import JSONRPCException
-from test_framework.messages import (
-    CBlock,
-    from_hex,
-    msg_headers,
-    NODE_WITNESS,
-)
-from test_framework.p2p import (
-    P2P_SERVICES,
-    P2PInterface,
-)
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,

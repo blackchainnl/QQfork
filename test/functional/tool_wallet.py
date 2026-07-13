@@ -36,7 +36,6 @@ class ToolWalletTest(BitcoinTestFramework):
             raise SkipTest(f"blackcoin-wallet binary is missing at {self.options.bitcoinwallet}")
 
     def bitcoin_wallet_process(self, *args):
-        binary = self.config["environment"]["BUILDDIR"] + '/src/blackcoin-wallet' + self.config["environment"]["EXEEXT"]
         default_args = ['-datadir={}'.format(self.nodes[0].datadir_path), '-chain=%s' % self.chain]
         if not self.options.descriptors and 'create' in args:
             default_args.append('-legacy')

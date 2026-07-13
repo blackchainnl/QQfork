@@ -131,7 +131,6 @@ BITCOIN_TESTS =\
   test/raii_event_tests.cpp \
   test/random_tests.cpp \
   test/quantum_pool_tests.cpp \
-  test/quantum_redelegation_tests.cpp \
   test/blackcoin_tests.cpp \
   test/rgb_tests.cpp \
   test/rest_tests.cpp \
@@ -184,6 +183,7 @@ BITCOIN_TESTS =\
 
 if ENABLE_WALLET
 BITCOIN_TESTS += \
+  test/quantum_redelegation_tests.cpp \
   wallet/test/psbt_wallet_tests.cpp \
   wallet/test/spend_tests.cpp \
   wallet/test/wallet_tests.cpp \

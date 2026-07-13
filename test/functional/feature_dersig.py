@@ -60,7 +60,7 @@ class BIP66Test(BitcoinTestFramework):
 
     def test_dersig_info(self, *, is_active):
         # Blackcoin: assume that DERSIG is always active
-        pass
+        assert is_active
 
     def run_test(self):
         peer = self.nodes[0].add_p2p_connection(P2PInterface())

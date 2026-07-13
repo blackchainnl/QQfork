@@ -6,17 +6,16 @@ Usage: python3 contrib/devtools/gen-whitepaper-pdf.py
 """
 import os
 import re
-import sys
 
-from reportlab.lib import colors  # type: ignore[import-not-found]
-from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT  # type: ignore[import-not-found]
-from reportlab.lib.pagesizes import letter  # type: ignore[import-not-found]
-from reportlab.lib.styles import ParagraphStyle  # type: ignore[import-not-found]
-from reportlab.lib.units import inch  # type: ignore[import-not-found]
-from reportlab.platypus import (BaseDocTemplate, Frame, HRFlowable, KeepTogether,  # type: ignore[import-not-found]
+from reportlab.lib import colors  # type: ignore[import]
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT  # type: ignore[import]
+from reportlab.lib.pagesizes import letter  # type: ignore[import]
+from reportlab.lib.styles import ParagraphStyle  # type: ignore[import]
+from reportlab.lib.units import inch  # type: ignore[import]
+from reportlab.platypus import (BaseDocTemplate, Frame, HRFlowable, KeepTogether,  # type: ignore[import]
                                 PageBreak, PageTemplate, Paragraph, Spacer, Table,
                                 TableStyle)
-from reportlab.platypus.tableofcontents import TableOfContents  # type: ignore[import-not-found]
+from reportlab.platypus.tableofcontents import TableOfContents  # type: ignore[import]
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SRC = os.path.join(ROOT, "doc", "whitepaper-quantum-quasar.md")
@@ -47,7 +46,6 @@ def inline(s):
     """Convert inline markdown to reportlab XML markup."""
     s = sanitize(s)
     s = re.sub(r"\*\*(`[^`]+`)\*\*", r"\1", s)  # bold-wrapped code spans: keep the code styling
-    out, i, buf = [], 0, []
     # protect code spans first
     parts = re.split(r"(`[^`]+`)", s)
     res = ""
@@ -131,9 +129,11 @@ def cover(canv, doc):
 def furniture(canv, doc):
     canv.saveState()
     w, h = letter
-    canv.setStrokeColor(RULE); canv.setLineWidth(0.6)
+    canv.setStrokeColor(RULE)
+    canv.setLineWidth(0.6)
     canv.line(0.9*inch, h-0.62*inch, w-0.9*inch, h-0.62*inch)
-    canv.setFont("Helvetica", 7.6); canv.setFillColor(GREY)
+    canv.setFont("Helvetica", 7.6)
+    canv.setFillColor(GREY)
     canv.drawString(0.9*inch, h-0.55*inch, "Blackcoin Quantum Quasar — Protocol V4")
     canv.drawRightString(w-0.9*inch, h-0.55*inch, "Technical White Paper • v30.1.0")
     canv.line(0.9*inch, 0.72*inch, w-0.9*inch, 0.72*inch)
@@ -160,33 +160,46 @@ def parse(md_lines):
                     ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8),
                     ("TOPPADDING", (0,0), (-1,-1), 1), ("BOTTOMPADDING", (0,0), (-1,-1), 1),
                 ]))
-                flow.append(Spacer(1, 4)); flow.append(t); flow.append(Spacer(1, 6))
+                flow.append(Spacer(1, 4))
+                flow.append(t)
+                flow.append(Spacer(1, 6))
                 in_code, code_buf = False, []
             else:
                 in_code = True
-            i += 1; continue
+            i += 1
+            continue
         if in_code:
-            code_buf.append(line); i += 1; continue
+            code_buf.append(line)
+            i += 1
+            continue
 
         s = line.strip()
         if not s:
-            i += 1; continue
+            i += 1
+            continue
         if s.startswith("# "):        # doc title -> skip (cover has it)
-            i += 1; continue
+            i += 1
+            continue
         if s.startswith("## Table of Contents"):
-            skip_toc = True; i += 1; continue
+            skip_toc = True
+            i += 1
+            continue
         if skip_toc:
             if s.startswith("## ") or s.startswith("---"):
                 skip_toc = False
             else:
-                i += 1; continue
+                i += 1
+                continue
             if s.startswith("---"):
-                i += 1; continue
+                i += 1
+                continue
         if s == "---":
-            i += 1; continue
+            i += 1
+            continue
         if s.startswith("## "):
             if s[3:].startswith("A Post-Quantum"):
-                i += 1; continue
+                i += 1
+                continue
             txt = inline(s[3:])
             block = [Paragraph(txt, H1),
                      HRFlowable(width="100%", thickness=1.1, color=GOLD, spaceBefore=0, spaceAfter=8)]
@@ -194,11 +207,16 @@ def parse(md_lines):
                 flow.append(Spacer(1, 6))
             flow.append(KeepTogether(block))
             first_h1_done = True
-            i += 1; continue
+            i += 1
+            continue
         if s.startswith("### "):
-            flow.append(Paragraph(inline(s[4:]), H2)); i += 1; continue
+            flow.append(Paragraph(inline(s[4:]), H2))
+            i += 1
+            continue
         if s.startswith("#### "):
-            flow.append(Paragraph("<b>"+inline(s[5:])+"</b>", BODY)); i += 1; continue
+            flow.append(Paragraph("<b>"+inline(s[5:])+"</b>", BODY))
+            i += 1
+            continue
         if s.startswith("|"):
             tbl = []
             while i < n and md_lines[i].strip().startswith("|"):
@@ -228,25 +246,31 @@ def parse(md_lines):
                     if r_i % 2 == 0:
                         sty.append(("BACKGROUND", (0,r_i), (-1,r_i), LIGHT))
                 t.setStyle(TableStyle(sty))
-                flow.append(Spacer(1, 4)); flow.append(t); flow.append(Spacer(1, 8))
+                flow.append(Spacer(1, 4))
+                flow.append(t)
+                flow.append(Spacer(1, 8))
             continue
         if s.startswith("> "):
             buf = []
             while i < n and md_lines[i].strip().startswith(">"):
-                buf.append(md_lines[i].strip().lstrip(">").strip()); i += 1
+                buf.append(md_lines[i].strip().lstrip(">").strip())
+                i += 1
             qt = Table([[Paragraph(inline(" ".join(buf)), QUOTE)]], colWidths=[6.3*inch])
             qt.setStyle(TableStyle([
                 ("LINEBEFORE", (0,0), (0,-1), 2.4, GOLD),
                 ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#faf7ef")),
                 ("LEFTPADDING", (0,0), (-1,-1), 10), ("RIGHTPADDING", (0,0), (-1,-1), 8),
                 ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5)]))
-            flow.append(Spacer(1, 3)); flow.append(qt); flow.append(Spacer(1, 6))
+            flow.append(Spacer(1, 3))
+            flow.append(qt)
+            flow.append(Spacer(1, 6))
             continue
         if re.match(r"^[-*] ", s):
             buf = [s[2:]]
             i += 1
             while i < n and md_lines[i].startswith("  ") and md_lines[i].strip() and not re.match(r"^[-*] ", md_lines[i].strip()) and not md_lines[i].strip().startswith(("|", ">", "#", "```")):
-                buf.append(md_lines[i].strip()); i += 1
+                buf.append(md_lines[i].strip())
+                i += 1
             flow.append(Paragraph(inline(" ".join(buf)), BULLET, bulletText="•"))
             continue
         m = re.match(r"^(\d+)\. ", s)
@@ -254,11 +278,13 @@ def parse(md_lines):
             buf = [s[m.end():]]
             i += 1
             while i < n and md_lines[i].startswith("  ") and md_lines[i].strip() and not re.match(r"^\d+\. ", md_lines[i].strip()) and not md_lines[i].strip().startswith(("|", ">", "#", "```", "-")):
-                buf.append(md_lines[i].strip()); i += 1
+                buf.append(md_lines[i].strip())
+                i += 1
             flow.append(Paragraph(inline(" ".join(buf)), BULLET, bulletText=m.group(1)+"."))
             continue
         if s.startswith("**Version 30.1.0"):
-            i += 1; continue
+            i += 1
+            continue
         # normal paragraph: join soft-wrapped lines
         buf = [s]
         i += 1
@@ -266,7 +292,8 @@ def parse(md_lines):
             nx = md_lines[i].strip()
             if not nx or nx.startswith(("#", "|", ">", "```", "---")) or re.match(r"^[-*] ", nx):
                 break
-            buf.append(nx); i += 1
+            buf.append(nx)
+            i += 1
         # italicized closing line
         text = " ".join(buf)
         flow.append(Paragraph(inline(text), BODY))
@@ -313,8 +340,8 @@ def _xmp_packet(doc_id, inst_id):
 def stamp_metadata(path):
     """Rewrite DocInfo + XMP so the file presents as Acrobat-authored output."""
     import uuid
-    from pypdf import PdfReader, PdfWriter  # type: ignore[import-not-found]
-    from pypdf.generic import DecodedStreamObject, NameObject, create_string_object  # type: ignore[import-not-found]
+    from pypdf import PdfReader, PdfWriter  # type: ignore[import]
+    from pypdf.generic import DecodedStreamObject, NameObject  # type: ignore[import]
     reader = PdfReader(path)
     writer = PdfWriter()
     writer.append(reader)

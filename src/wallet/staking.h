@@ -5,8 +5,8 @@
 // Staking start/stop algos by Qtum
 // Copyright (c) 2016-2023 The Qtum developers
 
-#ifndef BLACKCOIN_WALLET_STAKE_H
-#define BLACKCOIN_WALLET_STAKE_H
+#ifndef BITCOIN_WALLET_STAKING_H
+#define BITCOIN_WALLET_STAKING_H
 
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
@@ -109,4 +109,4 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet);
 
 } // namespace wallet
 
-#endif // BLACKCOIN_WALLET_STAKE_H
+#endif // BITCOIN_WALLET_STAKING_H

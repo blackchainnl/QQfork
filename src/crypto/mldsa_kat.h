@@ -2,8 +2,8 @@
 // C2SP/Wycheproof commit: 6d7cccd0fcb1917368579adeeac10fe802f1b521
 // Source: testvectors_v1/mldsa_44_verify_test.json
 // Source SHA-256: 5ec04790c240c443ca8b662b8fc871834602c7cce87fcd36a193110745b2b9ea
-#ifndef BLACKCOIN_CRYPTO_MLDSA_KAT_H
-#define BLACKCOIN_CRYPTO_MLDSA_KAT_H
+#ifndef BITCOIN_CRYPTO_MLDSA_KAT_H
+#define BITCOIN_CRYPTO_MLDSA_KAT_H
 
 namespace mldsa_kat {
 
@@ -151,4 +151,4 @@ inline constexpr char NONCANONICAL_SIGNATURE_HEX[] =
 
 } // namespace mldsa_kat
 
-#endif // BLACKCOIN_CRYPTO_MLDSA_KAT_H
+#endif // BITCOIN_CRYPTO_MLDSA_KAT_H

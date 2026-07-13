@@ -66,8 +66,8 @@ def main() -> None:
         f"// C2SP/Wycheproof commit: {SOURCE_COMMIT}",
         f"// Source: {SOURCE_PATH}",
         f"// Source SHA-256: {SOURCE_SHA256}",
-        "#ifndef BLACKCOIN_CRYPTO_MLDSA_KAT_H",
-        "#define BLACKCOIN_CRYPTO_MLDSA_KAT_H",
+        "#ifndef BITCOIN_CRYPTO_MLDSA_KAT_H",
+        "#define BITCOIN_CRYPTO_MLDSA_KAT_H",
         "",
         "namespace mldsa_kat {",
         "",
@@ -78,7 +78,7 @@ def main() -> None:
     lines.extend([
         "} // namespace mldsa_kat",
         "",
-        "#endif // BLACKCOIN_CRYPTO_MLDSA_KAT_H",
+        "#endif // BITCOIN_CRYPTO_MLDSA_KAT_H",
         "",
     ])
     args.output.write_text("\n".join(lines), encoding="utf-8")

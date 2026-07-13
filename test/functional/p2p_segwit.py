@@ -31,7 +31,6 @@ from test_framework.messages import (
     MSG_BLOCK,
     MSG_TX,
     MSG_WITNESS_FLAG,
-    MSG_WITNESS_TX,
     MSG_WTX,
     NODE_NETWORK,
     NODE_WITNESS,
@@ -665,7 +664,7 @@ class SegWitTest(BitcoinTestFramework):
         tx3.vout = [CTxOut(tx.vout[0].nValue - 1000, CScript([OP_TRUE, OP_DROP] * 15 + [OP_TRUE]))]
         tx3.wit.vtxinwit.append(CTxInWitness())
         tx3.wit.vtxinwit[0].scriptWitness.stack = [witness_script]
-        tx3_fee = set_tx_fee(tx3, tx.vout[0].nValue)
+        set_tx_fee(tx3, tx.vout[0].nValue)
         if not self.segwit_active:
             # Witness spends are rejected before activation on this fork, so
             # assert that policy result before spending the same output without

@@ -1,5 +1,5 @@
-#ifndef BLACKCOIN_CRYPTO_MLDSA_H
-#define BLACKCOIN_CRYPTO_MLDSA_H
+#ifndef BITCOIN_CRYPTO_MLDSA_H
+#define BITCOIN_CRYPTO_MLDSA_H
 
 #include <vector>
 #include <stdint.h>
@@ -62,4 +62,4 @@ public:
     static void ClearFailureForTesting();
 };
 
-#endif // BLACKCOIN_CRYPTO_MLDSA_H
+#endif // BITCOIN_CRYPTO_MLDSA_H

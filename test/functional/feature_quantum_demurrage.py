@@ -240,7 +240,6 @@ class QuantumDemurrageTest(BitcoinTestFramework):
         effective_activation = supply["demurrage_effective_activation_height"]
         utxos = {}
         latest_attestation = {}
-        parent_mtp = node.getblockheader(node.getblockhash(0))["mediantime"]
         for block_height in range(1, height + 1):
             block_hash = node.getblockhash(block_height)
             block = node.getblock(block_hash, 2)
@@ -263,8 +262,6 @@ class QuantumDemurrageTest(BitcoinTestFramework):
                         key_hash = self._attestation_key_hash(vout["scriptPubKey"]["hex"])
                         if key_hash is not None:
                             latest_attestation[key_hash] = block_height
-            parent_mtp = block["mediantime"]
-
         nominal = 0
         circulating = 0
         decayed_txouts = 0

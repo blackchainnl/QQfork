@@ -24,7 +24,7 @@ export PACKAGES="cmake systemtap-sdt-dev clang-17 llvm-17 libclang-rt-17-dev pyt
 # liboqs is deliberately rejected, so sanitizer jobs must use depends too.
 export DEP_OPTS="CC=clang-17 CXX=clang++-17"
 export GOAL="install"
-export BITCOIN_CONFIG="--enable-c++20 --enable-usdt --enable-zmq --with-incompatible-bdb --with-gui=qt5 \
+export BITCOIN_CONFIG="--enable-usdt --enable-zmq --with-incompatible-bdb --with-gui=qt5 \
 CPPFLAGS='-DARENA_DEBUG -DDEBUG_LOCKORDER' \
 --with-sanitizers=address,float-divide-by-zero,integer,undefined \
 CC='clang-17 -ftrivial-auto-var-init=pattern' CXX='clang++-17 -ftrivial-auto-var-init=pattern'"

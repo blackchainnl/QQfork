@@ -224,13 +224,17 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
             if opcode <= 75:
                 size = opcode
             elif opcode == 0x4c:
-                size = script[cursor]; cursor += 1
+                size = script[cursor]
+                cursor += 1
             elif opcode == 0x4d:
-                size = int.from_bytes(script[cursor:cursor + 2], "little"); cursor += 2
+                size = int.from_bytes(script[cursor:cursor + 2], "little")
+                cursor += 2
             elif opcode == 0x4e:
-                size = int.from_bytes(script[cursor:cursor + 4], "little"); cursor += 4
+                size = int.from_bytes(script[cursor:cursor + 4], "little")
+                cursor += 4
             else:
-                pushes.append((opcode, None)); continue
+                pushes.append((opcode, None))
+                continue
             pushes.append((opcode, script[cursor:cursor + size]))
             cursor += size
         return pushes
@@ -268,7 +272,6 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         effective_activation = supply["demurrage_effective_activation_height"]
         utxos = {}
         latest_attestation = {}
-        parent_mtp = node.getblockheader(node.getblockhash(0))["mediantime"]
         for block_height in range(1, height + 1):
             block = node.getblock(node.getblockhash(block_height), 2)
             block_active = block_height >= effective_activation
@@ -288,8 +291,6 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
                         key_hash = self._attestation_key_hash(vout["scriptPubKey"]["hex"])
                         if key_hash is not None:
                             latest_attestation[key_hash] = block_height
-            parent_mtp = block["mediantime"]
-
         nominal = circulating = decayed_txouts = locked_txouts = 0
         for coin in utxos.values():
             nominal += coin["value"]

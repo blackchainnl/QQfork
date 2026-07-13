@@ -295,6 +295,7 @@ class RESTTest (BitcoinTestFramework):
         # See if we can get 5 headers in one response
         self.generate(self.nodes[1], 5)
         expected_filter_height = self.nodes[0].getblockcount()
+
         def basic_filter_index_synced():
             info = self.nodes[0].getindexinfo().get('basic block filter index', {})
             return info.get('synced') and info.get('best_block_height', -1) >= expected_filter_height

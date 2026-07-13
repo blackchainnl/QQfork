@@ -73,9 +73,9 @@ from test_framework.messages import (
     MSG_WTX,
     msg_wtxidrelay,
     NODE_NETWORK,
-    NODE_WITNESS,
     sha256,
 )
+from test_framework.messages import NODE_WITNESS  # noqa: F401 - intentional public re-export
 from test_framework.util import (
     MAX_NODES,
     p2p_port,

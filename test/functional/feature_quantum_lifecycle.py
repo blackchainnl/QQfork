@@ -263,7 +263,6 @@ class QuantumLifecycleTest(BitcoinTestFramework):
         # crosses the boundary; use a legacy coinbase destination for them.
         migration_mining_address = wallet.getnewaddress("", "legacy")
         self._mine_until_phase("migration", GOLD_RUSH_END_TIME + 16, migration_mining_address)
-        migration_tip = node.getbestblockhash()
         self._assert_phase_status(wallet, "migration", quantum_spends_active=True, deadline_passed=False)
 
         self.log.info("Gold Rush payouts are ordinary quantum UTXOs during migration")

@@ -1,5 +1,5 @@
-#ifndef BLACKCOIN_SHADOW_H
-#define BLACKCOIN_SHADOW_H
+#ifndef BITCOIN_SHADOW_H
+#define BITCOIN_SHADOW_H
 
 #include <consensus/amount.h>
 #include <primitives/block.h>
@@ -432,4 +432,4 @@ bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockInd
 
 
 
-#endif // BLACKCOIN_SHADOW_H
+#endif // BITCOIN_SHADOW_H

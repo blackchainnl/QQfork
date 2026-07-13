@@ -107,6 +107,8 @@ class WalletSendTest(BitcoinTestFramework):
             options["locktime"] = locktime
         if lock_unspents is not None:
             options["lock_unspents"] = lock_unspents
+        if replaceable is not None:
+            options["replaceable"] = replaceable
         if subtract_fee_from_outputs is not None:
             options["subtract_fee_from_outputs"] = subtract_fee_from_outputs
         if solving_data is not None:

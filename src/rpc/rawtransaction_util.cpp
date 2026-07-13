@@ -177,7 +177,7 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
 CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, const UniValue& rbf)
 {
     CMutableTransaction rawTx;
-    rawTx.nVersion = std::stoi(gArgs.GetArg("-txversion", std::to_string(CTransaction::CURRENT_VERSION)));
+    rawTx.nVersion = std::stoi(gArgs.GetArg("-txversion", strprintf("%d", int{CTransaction::CURRENT_VERSION})));
 
     std::optional<bool> replaceable;
     if (!rbf.isNull()) {

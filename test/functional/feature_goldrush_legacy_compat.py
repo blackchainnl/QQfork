@@ -17,7 +17,7 @@ from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.messages import CTransaction, from_hex
 from test_framework.script import CScript, OP_FALSE, OP_RETURN
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal, assert_raises_rpc_error
+from test_framework.util import assert_equal
 from test_framework.wallet_util import generate_keypair
 from test_framework.script_util import key_to_p2pkh_script
 

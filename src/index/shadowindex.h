@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or https://opensource.org/license/mit/.
 
-#ifndef BLACKCOIN_INDEX_SHADOWINDEX_H
-#define BLACKCOIN_INDEX_SHADOWINDEX_H
+#ifndef BITCOIN_INDEX_SHADOWINDEX_H
+#define BITCOIN_INDEX_SHADOWINDEX_H
 
 #include <consensus/amount.h>
 #include <index/base.h>
@@ -273,4 +273,4 @@ public:
 
 extern std::unique_ptr<ShadowIndex> g_shadow_index;
 
-#endif // BLACKCOIN_INDEX_SHADOWINDEX_H
+#endif // BITCOIN_INDEX_SHADOWINDEX_H

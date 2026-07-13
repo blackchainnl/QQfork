@@ -22,6 +22,7 @@
 #include <script/signingprovider.h>
 #include <script/solver.h>
 #include <shadow.h>
+#include <tinyformat.h>
 #include <util/check.h>
 #include <util/moneystr.h>
 #include <util/trace.h>
@@ -1268,7 +1269,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
 
     FastRandomContext rng_fast;
     CMutableTransaction txNew; // The resulting transaction that we make
-    txNew.nVersion = std::stoi(gArgs.GetArg("-txversion", std::to_string(CTransaction::CURRENT_VERSION)));
+    txNew.nVersion = std::stoi(gArgs.GetArg("-txversion", strprintf("%d", int{CTransaction::CURRENT_VERSION})));
 
     CoinSelectionParams coin_selection_params{rng_fast}; // Parameters for coin selection, init with dummy
     coin_selection_params.m_avoid_partial_spends = coin_control.m_avoid_partial_spends;

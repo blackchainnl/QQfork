@@ -216,7 +216,7 @@ class QuantumPoolCapTest(BitcoinTestFramework):
         assert_equal(len(minimal_tx["vin"]), 1)
 
         self.log.info("Cold-stake withdrawal refuses ambiguous multi-output sweeps unless all=true")
-        second_minimal_fund = owner_a.fundquantumcoldstakeaddress(minimal_delegation["address"], Decimal("1"))
+        owner_a.fundquantumcoldstakeaddress(minimal_delegation["address"], Decimal("1"))
         self._generate(1, funder_address)
         coldstake_utxos = owner_a.listunspent(1, 9999999, [minimal_delegation["address"]])
         assert_equal(len(coldstake_utxos), 2)

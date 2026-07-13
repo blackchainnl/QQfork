@@ -2,8 +2,8 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
-#ifndef BLACKCOIN_WALLET_RPC_STAKING_H
-#define BLACKCOIN_WALLET_RPC_STAKING_H
+#ifndef BITCOIN_WALLET_RPC_STAKING_H
+#define BITCOIN_WALLET_RPC_STAKING_H
 
 #include <span.h>
 
@@ -13,4 +13,4 @@ namespace wallet {
 Span<const CRPCCommand> GetStakingRPCCommands();
 } // namespace wallet
 
-#endif // BLACKCOIN_WALLET_RPC_STAKING_H
+#endif // BITCOIN_WALLET_RPC_STAKING_H

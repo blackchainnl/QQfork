@@ -51,7 +51,7 @@ class RGBRPCTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
         self.log.info("Testing decodergbcommitment...")
-        
+
         # Test empty transaction (has no outputs, so no RGB commitments)
         tx = CTransaction()
         tx_hex = tx.serialize().hex()
@@ -150,14 +150,14 @@ class RGBRPCTest(BitcoinTestFramework):
         inflated_validation = node.verifyrgbconsignment(inflated)
         assert_equal(inflated_validation["valid"], False)
         assert "transition input and output amounts do not balance" in inflated_validation["errors"]
-        
+
         # Test malformed hex
         assert_raises_rpc_error(-22, "TX decode failed", node.decodergbcommitment, "zzz")
 
         self.log.info("Testing decodeeutxospend...")
         # Test empty transaction (has no inputs, so no EUTXO spends)
         assert_equal(node.decodeeutxospend(tx_hex), [])
-        
+
         # Test malformed hex
         assert_raises_rpc_error(-22, "TX decode failed", node.decodeeutxospend, "zzz")
 

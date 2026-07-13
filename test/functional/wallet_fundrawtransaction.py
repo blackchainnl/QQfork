@@ -17,7 +17,6 @@ from test_framework.messages import (
 )
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
-    assert_approx,
     assert_equal,
     assert_fee_amount,
     assert_greater_than,
@@ -25,7 +24,6 @@ from test_framework.util import (
     assert_raises_rpc_error,
     count_bytes,
     find_vout_for_address,
-    get_fee,
 )
 from test_framework.wallet_util import generate_keypair, WalletUnlock
 
