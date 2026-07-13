@@ -6,11 +6,11 @@ $(package)_sha256_hash=c917d7db16648ec95f714974ace5e5dcf46b7dc70e26600a0a102a314
 
 define $(package)_set_vars
 $(package)_config_opts=--disable-shared --disable-readline --disable-load-extension
-$(package)_config_opts_linux=--with-pic
-$(package)_config_opts_freebsd=--with-pic
-$(package)_config_opts_netbsd=--with-pic
-$(package)_config_opts_openbsd=--with-pic
-$(package)_config_opts_debug=--enable-debug
+$(package)_config_opts_debug=--debug
+$(package)_cflags_linux+=-fPIC
+$(package)_cflags_freebsd+=-fPIC
+$(package)_cflags_netbsd+=-fPIC
+$(package)_cflags_openbsd+=-fPIC
 $(package)_cflags+=-DSQLITE_DQS=0 -DSQLITE_DEFAULT_MEMSTATUS=0 -DSQLITE_OMIT_DEPRECATED
 $(package)_cflags+=-DSQLITE_OMIT_SHARED_CACHE -DSQLITE_OMIT_JSON -DSQLITE_LIKE_DOESNT_MATCH_BLOBS
 $(package)_cflags+=-DSQLITE_OMIT_DECLTYPE -DSQLITE_OMIT_PROGRESS_CALLBACK -DSQLITE_OMIT_AUTOINIT
