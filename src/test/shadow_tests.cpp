@@ -7,6 +7,7 @@
 #include <consensus/amount.h>
 #include <crypto/common.h>
 #include <chain.h>
+#include <consensus/params.h>
 #include <hash.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
@@ -30,6 +31,31 @@
 BOOST_FIXTURE_TEST_SUITE(shadow_tests, BasicTestingSetup)
 
 namespace {
+
+class ShadowScheduleGuard
+{
+public:
+    ShadowScheduleGuard(int whitelist_height, int reward_start_height, int gold_rush_blocks)
+        : m_whitelist_height{SHADOW_WHITELIST_HEIGHT},
+          m_reward_start_height{SHADOW_REWARD_START_HEIGHT},
+          m_gold_rush_blocks{SHADOW_GOLD_RUSH_BLOCKS},
+          m_halving_interval{SHADOW_HALVING_INTERVAL_BLOCKS}
+    {
+        SetShadowTestSchedule(whitelist_height, reward_start_height, gold_rush_blocks);
+    }
+
+    ~ShadowScheduleGuard()
+    {
+        SetShadowTestSchedule(m_whitelist_height, m_reward_start_height, m_gold_rush_blocks);
+        SetShadowTestHalvingInterval(m_halving_interval);
+    }
+
+private:
+    const int m_whitelist_height;
+    const int m_reward_start_height;
+    const int m_gold_rush_blocks;
+    const int m_halving_interval;
+};
 
 void AddCoinForScript(CCoinsViewCache& view, const COutPoint& outpoint, CAmount amount, const CScript& script)
 {
@@ -790,6 +816,78 @@ BOOST_AUTO_TEST_CASE(active_signal_and_pool_state_are_atomic_and_fail_closed)
     BOOST_REQUIRE(UndoShadowBlock(view, first_block, &first_index));
     BOOST_CHECK(!view.HaveCoin(PoolOutpointForTest()));
     BOOST_CHECK(!view.HaveCoin(ActiveSignalSetOutpointForTest()));
+}
+
+BOOST_AUTO_TEST_CASE(active_signal_pool_pair_matches_exact_reward_history)
+{
+    // Use a short, contiguous history so the time-only compatibility path can
+    // locate the first V4 reward-height block without a synthetic gap.
+    ShadowScheduleGuard schedule{/*whitelist_height=*/1,
+                                 /*reward_start_height=*/2,
+                                 /*gold_rush_blocks=*/4};
+    std::vector<CBlockIndex> indexes(8);
+    std::vector<uint256> hashes(8);
+    for (int height = 0; height < static_cast<int>(indexes.size()); ++height) {
+        InitIndex(indexes[height], height, height == 0 ? nullptr : &indexes[height - 1], hashes[height]);
+    }
+
+    const auto pair_valid = [&](const Consensus::Params& consensus, int height,
+                                bool pool_present, bool signal_present) {
+        return ShadowActiveSignalPoolPairValidForTesting(
+            consensus, &indexes.at(height), pool_present, signal_present);
+    };
+
+    // A time-only schedule may jump directly from Legacy past Gold Rush. No
+    // reward transition occurs in that case, so even a symmetric present pair
+    // is invalid; only symmetric absence is authentic.
+    Consensus::Params skipped;
+    const int64_t reward_start_parent_mtp = indexes[1].GetMedianTimePast();
+    skipped.nProtocolV4Time = reward_start_parent_mtp - 1;
+    skipped.nGoldRushEndTime = reward_start_parent_mtp - 2;
+    skipped.nQuantumMigrationDeadlineTime = indexes[7].GetMedianTimePast() + 1;
+    BOOST_CHECK(pair_valid(skipped, 6, /*pool_present=*/false, /*signal_present=*/false));
+    BOOST_CHECK(!pair_valid(skipped, 6, /*pool_present=*/true, /*signal_present=*/false));
+    BOOST_CHECK(!pair_valid(skipped, 6, /*pool_present=*/false, /*signal_present=*/true));
+    BOOST_CHECK(!pair_valid(skipped, 6, /*pool_present=*/true, /*signal_present=*/true));
+
+    // In a genuine time-only Gold Rush, absence is required before the first
+    // active transition and presence is required from that transition onward,
+    // including after the lifecycle has advanced to Migration.
+    Consensus::Params time_only;
+    time_only.nProtocolV4Time = indexes[1].GetMedianTimePast();
+    time_only.nGoldRushEndTime = indexes[3].GetMedianTimePast();
+    time_only.nQuantumMigrationDeadlineTime = indexes[7].GetMedianTimePast() + 1;
+    BOOST_CHECK(pair_valid(time_only, 2, /*pool_present=*/false, /*signal_present=*/false));
+    BOOST_CHECK(!pair_valid(time_only, 2, /*pool_present=*/true, /*signal_present=*/true));
+    BOOST_CHECK(!pair_valid(time_only, 3, /*pool_present=*/false, /*signal_present=*/false));
+    BOOST_CHECK(pair_valid(time_only, 3, /*pool_present=*/true, /*signal_present=*/true));
+    BOOST_CHECK(pair_valid(time_only, 6, /*pool_present=*/true, /*signal_present=*/true));
+    BOOST_CHECK(!pair_valid(time_only, 6, /*pool_present=*/false, /*signal_present=*/false));
+
+    // A complete height schedule can deliberately begin after reward-start.
+    // The pair remains absent until the first overlapping lifecycle height.
+    Consensus::Params delayed_height;
+    delayed_height.nQuantumLifecycleStartHeight = 4;
+    delayed_height.nGoldRushEndHeight = 5;
+    delayed_height.nQuantumMigrationEndHeight = 7;
+    BOOST_CHECK(pair_valid(delayed_height, 3, /*pool_present=*/false, /*signal_present=*/false));
+    BOOST_CHECK(!pair_valid(delayed_height, 3, /*pool_present=*/true, /*signal_present=*/true));
+    BOOST_CHECK(!pair_valid(delayed_height, 4, /*pool_present=*/false, /*signal_present=*/false));
+    BOOST_CHECK(pair_valid(delayed_height, 4, /*pool_present=*/true, /*signal_present=*/true));
+
+    // Partial and unordered height schedules have no trustworthy provenance.
+    // Fail closed regardless of whether the two markers happen to be symmetric.
+    Consensus::Params partial_height;
+    partial_height.nQuantumLifecycleStartHeight = 2;
+    BOOST_CHECK(!pair_valid(partial_height, 6, /*pool_present=*/false, /*signal_present=*/false));
+    BOOST_CHECK(!pair_valid(partial_height, 6, /*pool_present=*/true, /*signal_present=*/true));
+
+    Consensus::Params unordered_height;
+    unordered_height.nQuantumLifecycleStartHeight = 5;
+    unordered_height.nGoldRushEndHeight = 4;
+    unordered_height.nQuantumMigrationEndHeight = 7;
+    BOOST_CHECK(!pair_valid(unordered_height, 6, /*pool_present=*/false, /*signal_present=*/false));
+    BOOST_CHECK(!pair_valid(unordered_height, 6, /*pool_present=*/true, /*signal_present=*/true));
 }
 
 BOOST_AUTO_TEST_CASE(shadow_undo_inactive_gold_rush_epoch_is_noop)

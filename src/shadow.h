@@ -276,6 +276,11 @@ bool ValidateShadowPowProofForWork(const ShadowPowWork& work, const std::vector<
  *  No configuration, RPC, or network path can arm this hook. */
 void SetShadowArgon2FailuresForTesting(uint64_t count = 1);
 void ClearShadowArgon2FailuresForTesting();
+/** Test-only oracle for the authenticated pool/active-signal pair invariant. */
+bool ShadowActiveSignalPoolPairValidForTesting(const Consensus::Params& consensus,
+                                               const CBlockIndex* pindex,
+                                               bool pool_present,
+                                               bool signal_present);
 
 /** Compute PoW Gold Rush shadow-ledger credits implied by a candidate block. */
 bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, std::map<CScript, CAmount>& payouts_out, CAmount& total_out);

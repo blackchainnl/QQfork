@@ -2269,11 +2269,11 @@ bool ActiveSignalPoolPairValid(const Consensus::Params& consensus,
     // an obsolete or interrupted auxiliary chainstate and must be replayed.
     const bool pool_present = pool_result == ShadowPoolReadResult::VALID;
     const bool signal_present = signal_result == ActiveSignalStateReadResult::VALID;
-    if (pool_present != signal_present) return false;
-    if (pool_present) return true;
     const std::optional<bool> transition_applied =
         HasAppliedShadowRewardTransition(consensus, pindex);
-    return transition_applied && !*transition_applied;
+    if (!transition_applied) return false;
+    return pool_present == signal_present &&
+           pool_present == *transition_applied;
 }
 
 std::optional<uint32_t> ReadAuthenticatedWhitelistCount(const CCoinsViewCache& view,
@@ -3439,6 +3439,17 @@ bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex,
 }
 
 } // namespace
+
+bool ShadowActiveSignalPoolPairValidForTesting(const Consensus::Params& consensus,
+                                               const CBlockIndex* pindex,
+                                               bool pool_present,
+                                               bool signal_present)
+{
+    return ActiveSignalPoolPairValid(
+        consensus, pindex,
+        pool_present ? ShadowPoolReadResult::VALID : ShadowPoolReadResult::MISSING,
+        signal_present ? ActiveSignalStateReadResult::VALID : ActiveSignalStateReadResult::MISSING);
+}
 
 bool AdvanceGoldRushInventoryTip(CCoinsViewCache& view, const CBlockIndex* pindex)
 {
