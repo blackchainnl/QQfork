@@ -459,6 +459,7 @@ libbitcoin_node_a_SOURCES = \
   policy/packages.cpp \
   policy/settings.cpp \
   pos.cpp \
+  test/data/staking_mr_table.h \
   pow.cpp \
   shadow.cpp \
   rest.cpp \
@@ -607,6 +608,7 @@ crypto_libbitcoin_crypto_base_la_SOURCES = \
   crypto/muhash.h \
   crypto/muhash.cpp \
   crypto/mldsa.cpp \
+  crypto/mldsa_kat.h \
   crypto/ripemd160.cpp \
   crypto/ripemd160.h \
   crypto/scrypt.cpp \
