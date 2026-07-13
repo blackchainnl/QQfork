@@ -3498,6 +3498,10 @@ bool CWallet::FinalizeAndExtractPSBT(PartiallySignedTransaction& psbtx, CMutable
 
 TransactionError CWallet::FillPSBT(PartiallySignedTransaction& psbtx, bool& complete, int sighash_type, bool sign, bool bip32derivs, size_t * n_signed, bool finalize) const
 {
+    // The active-chain snapshot must be taken before this method acquires the
+    // wallet lock. Callers holding cs_wallet would invert the global
+    // cs_main -> cs_wallet order in GetActiveScriptVerifyFlags().
+    AssertLockNotHeld(cs_wallet);
     if (n_signed) {
         *n_signed = 0;
     }

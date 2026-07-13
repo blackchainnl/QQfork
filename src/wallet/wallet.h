@@ -987,7 +987,7 @@ public:
                   bool sign = true,
                   bool bip32derivs = true,
                   size_t* n_signed = nullptr,
-                  bool finalize = true) const;
+                  bool finalize = true) const LOCKS_EXCLUDED(cs_wallet);
 
     //! Return wallet/script verification flags for the active chain tip.
     unsigned int GetActiveScriptVerifyFlags() const;
