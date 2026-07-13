@@ -3955,9 +3955,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 strprintf("Local Quantum Quasar spent-payout provenance failed at height %d", pindex->nHeight),
                 _("Failed to update authenticated Quantum Quasar payout provenance"));
         }
+        // Version-2 transactions do not serialize nTime. Persist the active
+        // block time exactly as v30.1.0 does so the block producer and peers
+        // derive the same stake-kernel timestamp from an identical UTXO.
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(),
-                    pindex->nHeight,
-                    quantum_spend_active ? pindex->GetBlockTime() : 0);
+                    pindex->nHeight, pindex->GetBlockTime());
     }
     const auto time_3{SteadyClock::now()};
     time_connect += time_3 - time_2;
@@ -6432,11 +6434,10 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
             }
         }
         // Pass check = true as every addition may be an overwrite.
-        const int64_t block_mtp = pindex->pprev ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
-        const bool quantum_spend_active = IsQuantumWitnessSpendActive(
-            m_chainman.GetConsensus(), block_mtp, pindex->nHeight);
-        AddCoins(inputs, *tx, pindex->nHeight, true,
-                 quantum_spend_active ? pindex->GetBlockTime() : 0);
+        // Replay must reproduce the same v30.1.0 coin-time provenance as the
+        // normal connection path. A local v2 transaction object can retain a
+        // nonserialized construction time that a peer never receives.
+        AddCoins(inputs, *tx, pindex->nHeight, true, pindex->GetBlockTime());
     }
     if (apply_auxiliary_state) {
         if (pindex->nHeight == SHADOW_WHITELIST_HEIGHT) {
