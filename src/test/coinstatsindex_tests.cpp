@@ -22,25 +22,28 @@ BOOST_FIXTURE_TEST_CASE(shadow_replay_preserves_pre_whitelist_snapshot_stats, Te
 {
     Chainstate& chainstate = Assert(m_node.chainman)->ActiveChainstate();
     chainstate.ForceFlushStateToDisk();
-    const auto before = kernel::ComputeUTXOStats(
+    const auto before = WITH_LOCK(cs_main, return kernel::ComputeUTXOStats(
         kernel::CoinStatsHashType::HASH_SERIALIZED,
         &chainstate.CoinsDB(),
-        chainstate.m_blockman);
+        chainstate.m_blockman));
     BOOST_REQUIRE(before);
 
     BOOST_REQUIRE(chainstate.ReplayShadowBlocks() == Chainstate::ReplayResult::SUCCESS);
 
-    const auto after = kernel::ComputeUTXOStats(
+    const auto after = WITH_LOCK(cs_main, return kernel::ComputeUTXOStats(
         kernel::CoinStatsHashType::HASH_SERIALIZED,
         &chainstate.CoinsDB(),
-        chainstate.m_blockman);
+        chainstate.m_blockman));
     BOOST_REQUIRE(after);
     BOOST_CHECK_EQUAL(after->hashSerialized, before->hashSerialized);
     BOOST_CHECK_EQUAL(after->coins_count, before->coins_count);
     BOOST_CHECK_EQUAL(after->nTransactionOutputs, before->nTransactionOutputs);
 
-    CCoinsViewCache view(&chainstate.CoinsDB());
-    BOOST_CHECK(!HasShadowReplayState(view));
+    {
+        LOCK(cs_main);
+        CCoinsViewCache view(&chainstate.CoinsDB());
+        BOOST_CHECK(!HasShadowReplayState(view));
+    }
 }
 
 BOOST_FIXTURE_TEST_CASE(shadow_replay_rejects_malformed_reserved_pre_whitelist_marker, TestChain100Setup)
