@@ -121,8 +121,8 @@ bool CheckNextBlockQuantumContext(const NodeContext& node, const CTransaction& t
                                   std::string& reject_reason,
                                   const std::map<COutPoint, Coin>* supplied_coins = nullptr)
 {
-    ChainstateManager& chainman = *Assert(node.chainman);
-    const CTxMemPool& mempool = *Assert(node.mempool);
+    ChainstateManager& chainman = *CHECK_NONFATAL(node.chainman);
+    const CTxMemPool& mempool = *CHECK_NONFATAL(node.mempool);
     LOCK2(::cs_main, mempool.cs);
     const CBlockIndex* tip = chainman.ActiveChain().Tip();
     const int next_height = tip ? tip->nHeight + 1 : 0;
