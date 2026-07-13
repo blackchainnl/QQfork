@@ -688,6 +688,7 @@ libbitcoin_consensus_a_SOURCES = \
   pubkey.cpp \
   pubkey.h \
   script/bitcoinconsensus.cpp \
+  script/bitcoinconsensus.h \
   script/interpreter.cpp \
   script/interpreter.h \
   script/script.cpp \
