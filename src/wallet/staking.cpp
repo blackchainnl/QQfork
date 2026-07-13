@@ -1932,6 +1932,127 @@ uint64_t GetStakeWeight(const CWallet& wallet)
     return nWeight;
 }
 
+struct StakeTransactionEligibility
+{
+    bool active{false};
+    bool immature{false};
+};
+
+struct StakeCandidateScanContext
+{
+    const CCoinControl* coin_control;
+    const CoinFilterParams& params;
+    const Consensus::Params& consensus;
+    const std::set<COutPoint>& protected_rgb_seals;
+    int min_depth;
+    int max_depth;
+    int spend_height;
+    int64_t spend_time;
+    bool allow_used_addresses;
+    bool lineage_active;
+    bool final_quantum_lockout;
+    std::set<uint256> trusted_parents;
+    std::map<uint256, StakeTransactionEligibility> transaction_eligibility;
+};
+
+/**
+ * Authoritative producer-side staking eligibility check. The wallet index is
+ * intentionally only a live-unspent prefilter; every mutable policy and phase
+ * rule is evaluated here for both stake weight and kernel selection.
+ *
+ * Gold Rush synthetic payout maturity remains output-specific, so that
+ * exception is evaluated below rather than cached as transaction eligibility.
+ */
+static bool EvaluateStakeCandidate(const CWallet& wallet, const COutPoint& outpoint,
+                                   const CWalletTx& wtx, StakeCandidateScanContext& context,
+                                   bool& spendable)
+{
+    spendable = false;
+    if (!wtx.tx || outpoint.n >= wtx.tx->vout.size()) return false;
+
+    auto [eligibility, inserted] = context.transaction_eligibility.emplace(
+        wtx.GetHash(), StakeTransactionEligibility{});
+    if (inserted) {
+        const int depth = wallet.GetTxDepthInMainChain(wtx);
+        const bool active = depth >= 0 &&
+            !(depth == 0 && !wtx.InMempool()) &&
+            depth >= context.min_depth && depth <= context.max_depth &&
+            CachedTxIsTrusted(wallet, wtx, context.trusted_parents);
+        eligibility->second = {active, wallet.IsTxImmature(wtx)};
+    }
+    if (!eligibility->second.active) return false;
+
+    const CTxOut& output = wtx.tx->vout[outpoint.n];
+    if (eligibility->second.immature &&
+        !IsNextBlockMatureGoldRushPayout(wallet, outpoint, context.spend_height, context.spend_time)) {
+        return false;
+    }
+
+    if (output.nValue < wallet.m_min_staking_amount ||
+        output.nValue < context.params.min_amount ||
+        output.nValue > context.params.max_amount) {
+        return false;
+    }
+    if (wallet.IsLockedCoin(outpoint) && context.params.skip_locked) return false;
+
+    // The exact live-unspent index should make this redundant. Keep the check
+    // as a fail-closed invariant guard if a future wallet mutation path is
+    // introduced without an index hook.
+    if (wallet.IsSpent(outpoint)) return false;
+
+    if (context.lineage_active) {
+        const Coin& coin = wallet.chain().getCoinsTip().AccessCoin(outpoint);
+        if (coin.IsSpent() || !IsWalletProtectedLineageInput(
+                wallet, outpoint, coin, context.consensus,
+                context.spend_time, context.spend_height)) {
+            return false;
+        }
+    }
+
+    const bool quantum_output = IsQuantumMigrationScript(output.scriptPubKey) ||
+                                IsQuantumColdStakeScript(output.scriptPubKey);
+    if ((quantum_output && !context.lineage_active) ||
+        (context.final_quantum_lockout && !quantum_output)) {
+        return false;
+    }
+
+    if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey) ||
+        IsDemurrageLockedStakeCandidate(wallet, outpoint, output.scriptPubKey,
+                                        context.spend_height, context.spend_time) ||
+        context.protected_rgb_seals.count(outpoint)) {
+        return false;
+    }
+
+    const isminetype mine = wallet.IsMine(output);
+    if (mine == ISMINE_NO) return false;
+    if (!context.allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) return false;
+
+    std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
+    bool solvable = quantum_output;
+    if (!solvable && provider) {
+        if (auto desc = InferDescriptor(output.scriptPubKey, *provider)) {
+            solvable = desc->IsSolvable();
+        }
+    }
+    spendable = ((mine & ISMINE_SPENDABLE) != ISMINE_NO) ||
+        (((mine & ISMINE_WATCH_ONLY) != ISMINE_NO) &&
+         (context.coin_control && context.coin_control->fAllowWatchOnly && solvable));
+    if (!spendable && context.params.only_spendable) return false;
+
+    // CreateCoinStake can only construct kernels for these legacy types. Keep
+    // status weight and actual kernel selection on the same candidate set.
+    if (!quantum_output) {
+        std::vector<std::vector<unsigned char>> solutions;
+        const TxoutType type = Solver(output.scriptPubKey, solutions);
+        if (type != TxoutType::PUBKEY && type != TxoutType::PUBKEYHASH &&
+            type != TxoutType::WITNESS_V0_KEYHASH && type != TxoutType::WITNESS_V1_TAPROOT) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 void AvailableCoinsForStaking(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl,
@@ -1947,7 +2068,6 @@ void AvailableCoinsForStaking(const CWallet& wallet,
     bool allow_used_addresses = !wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
     const int min_depth = std::max(DEFAULT_MIN_DEPTH, Params().GetConsensus().nCoinbaseMaturity);
     const int max_depth = DEFAULT_MAX_DEPTH;
-    const bool only_safe = true;
     const CBlockIndex* tip = wallet.chain().getTip();
     const int spend_height = tip ? tip->nHeight + 1 : 0;
     const int64_t spend_time = tip ? tip->GetMedianTimePast() : 0;
@@ -1957,128 +2077,35 @@ void AvailableCoinsForStaking(const CWallet& wallet,
     // Never stake UTXOs carrying live RGB single-use-seal or EUTXO state.
     const std::set<COutPoint> protected_rgb_seals = wallet.GetProtectedRGBSeals();
 
-    std::set<uint256> trusted_parents;
-    for (const auto& entry : wallet.mapWallet)
-    {
-        const uint256& wtxid = entry.first;
-        const CWalletTx& wtx = entry.second;
+    StakeCandidateScanContext context{
+        coinControl,
+        params,
+        consensus,
+        protected_rgb_seals,
+        min_depth,
+        max_depth,
+        spend_height,
+        spend_time,
+        allow_used_addresses,
+        lineage_active,
+        consensus.IsQuantumFinalLockout(spend_time, spend_height),
+        {},
+        {},
+    };
 
-        const bool tx_immature = wallet.IsTxImmature(wtx);
+    for (const COutPoint& outpoint : wallet.GetLiveUnspentStakeOutpoints()) {
+        const auto wallet_tx = wallet.mapWallet.find(outpoint.hash);
+        if (wallet_tx == wallet.mapWallet.end()) continue;
 
-        int nDepth = wallet.GetTxDepthInMainChain(wtx);
-        if (nDepth < 0)
-            continue;
+        bool spendable{false};
+        if (!EvaluateStakeCandidate(wallet, outpoint, wallet_tx->second, context, spendable)) continue;
 
-        // We should not consider coins which aren't at least in our mempool
-        // It's possible for these to be conflicted via ancestors which we may never be able to detect
-        if (nDepth == 0 && !wtx.InMempool())
-            continue;
+        const CTxOut& output = wallet_tx->second.tx->vout[outpoint.n];
+        if (spendable) vCoins.emplace_back(&wallet_tx->second, outpoint.n);
 
-        bool safeTx = CachedTxIsTrusted(wallet, wtx, trusted_parents);
-
-        if (only_safe && !safeTx) {
-            continue;
-        }
-
-        if (nDepth < min_depth || nDepth > max_depth) {
-            continue;
-        }
-
-        for (unsigned int i = 0; i < wtx.tx->vout.size(); i++) {
-            const CTxOut& output = wtx.tx->vout[i];
-            const COutPoint outpoint(wtxid, i);
-
-            if (tx_immature &&
-                !IsNextBlockMatureGoldRushPayout(wallet, outpoint, spend_height, spend_time)) {
-                continue;
-            }
-
-            if (output.nValue < wallet.m_min_staking_amount)
-                continue;
-
-            if (output.nValue < params.min_amount || output.nValue > params.max_amount)
-                continue;
-
-            if (wallet.IsLockedCoin(outpoint) && params.skip_locked)
-                continue;
-
-            if (wallet.IsSpent(outpoint))
-                continue;
-
-            if (lineage_active) {
-                const Coin& coin = wallet.chain().getCoinsTip().AccessCoin(outpoint);
-                if (coin.IsSpent() || !IsWalletProtectedLineageInput(
-                        wallet, outpoint, coin, consensus, spend_time, spend_height)) {
-                    continue;
-                }
-            }
-
-            if (IsGeneratedQuantumStakeCandidate(wallet, outpoint, output.scriptPubKey))
-                continue;
-
-            if (IsDemurrageLockedStakeCandidate(wallet, outpoint, output.scriptPubKey, spend_height, spend_time))
-                continue;
-
-            // Never stake an RGB seal / EUTXO-state UTXO; spending it would burn the asset.
-            if (protected_rgb_seals.count(outpoint))
-                continue;
-
-            isminetype mine = wallet.IsMine(output);
-
-            if (mine == ISMINE_NO) {
-                continue;
-            }
-
-            if (!allow_used_addresses && wallet.IsSpentKey(output.scriptPubKey)) {
-                continue;
-            }
-
-            std::unique_ptr<SigningProvider> provider = wallet.GetSolvingProvider(output.scriptPubKey);
-
-            bool solvable = IsQuantumMigrationScript(output.scriptPubKey) || IsQuantumColdStakeScript(output.scriptPubKey);
-            if (!solvable && provider) {
-                if (auto desc = InferDescriptor(output.scriptPubKey, *provider)) {
-                    solvable = desc->IsSolvable();
-                }
-            }
-            bool spendable = ((mine & ISMINE_SPENDABLE) != ISMINE_NO) || (((mine & ISMINE_WATCH_ONLY) != ISMINE_NO) && (coinControl && coinControl->fAllowWatchOnly && solvable));
-
-            // Filter by spendable outputs only
-            if (!spendable && params.only_spendable) continue;
-
-            // If the Output is P2SH and spendable, we want to know if it is
-            // a P2SH (legacy) or one of P2SH-P2WPKH, P2SH-P2WSH (P2SH-Segwit). We can determine
-            // this from the redeemScript. If the Output is not spendable, it will be classified
-            // as a P2SH (legacy), since we have no way of knowing otherwise without the redeemScript
-            CScript script;
-            if (output.scriptPubKey.IsPayToScriptHash() && solvable) {
-                CTxDestination destination;
-                if (!ExtractDestination(output.scriptPubKey, destination))
-                    continue;
-                const CScriptID& hash = ToScriptID(std::get<ScriptHash>(destination));
-                if (!provider->GetCScript(hash, script))
-                    continue;
-            } else {
-                script = output.scriptPubKey;
-            }
-
-            if (spendable)
-                vCoins.push_back(std::make_pair(&wtx, i));
-
-            // Cache total amount as we go
-            nTotal += output.nValue;
-            // Checks the sum amount of all UTXO's.
-            if (params.min_sum_amount != MAX_MONEY) {
-                if (nTotal >= params.min_sum_amount) {
-                    return;
-                }
-            }
-
-            // Checks the maximum number of UTXO's.
-            if (params.max_count > 0 && vCoins.size() >= params.max_count) {
-                return;
-            }
-        }
+        nTotal += output.nValue;
+        if (params.min_sum_amount != MAX_MONEY && nTotal >= params.min_sum_amount) return;
+        if (params.max_count > 0 && vCoins.size() >= params.max_count) return;
     }
 }
 

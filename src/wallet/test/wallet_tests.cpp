@@ -97,6 +97,134 @@ static void AddKey(CWallet& wallet, const CKey& key)
     if (!wallet.AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
 }
 
+static void CheckLiveUnspentStakeIndex(CWallet& wallet)
+{
+    std::set<COutPoint> expected;
+    std::set<COutPoint> indexed;
+    {
+        LOCK(wallet.cs_wallet);
+        for (const auto& [txid, wtx] : wallet.mapWallet) {
+            if (!wtx.tx) continue;
+            for (uint32_t output = 0; output < wtx.tx->vout.size(); ++output) {
+                const COutPoint outpoint{txid, output};
+                if (!wallet.IsSpent(outpoint)) expected.insert(outpoint);
+            }
+        }
+        indexed = wallet.GetLiveUnspentStakeOutpoints();
+    }
+    BOOST_CHECK(expected == indexed);
+    BOOST_CHECK_EQUAL(wallet.GetLiveUnspentStakeOutputCount(), expected.size());
+}
+
+BOOST_AUTO_TEST_CASE(live_unspent_stake_index_tracks_state_conflicts_zap_and_reload)
+{
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+
+    CMutableTransaction funding_mut;
+    funding_mut.vin.emplace_back(COutPoint{uint256{1}, 0});
+    funding_mut.vout.emplace_back(10 * COIN, CScript{} << OP_TRUE);
+    const CTransactionRef funding = MakeTransactionRef(std::move(funding_mut));
+    BOOST_REQUIRE(wallet.AddToWallet(funding, TxStateInMempool{}));
+    CheckLiveUnspentStakeIndex(wallet);
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.GetLiveUnspentStakeOutpoints().count(COutPoint{funding->GetHash(), 0}));
+    }
+
+    CMutableTransaction spend_a_mut;
+    spend_a_mut.vin.emplace_back(COutPoint{funding->GetHash(), 0});
+    spend_a_mut.vout.emplace_back(9 * COIN, CScript{} << OP_TRUE);
+    const CTransactionRef spend_a = MakeTransactionRef(std::move(spend_a_mut));
+    BOOST_REQUIRE(wallet.AddToWallet(spend_a, TxStateInMempool{}));
+    CheckLiveUnspentStakeIndex(wallet);
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(!wallet.GetLiveUnspentStakeOutpoints().count(COutPoint{funding->GetHash(), 0}));
+    }
+
+    // Abandoning and then reopening a spend models the input-availability
+    // transitions used by stale-claim cleanup and reorg recovery.
+    BOOST_REQUIRE(wallet.AddToWallet(
+        spend_a, TxStateInactive{/*abandoned=*/true},
+        [](CWalletTx& wtx, bool new_tx) {
+            BOOST_CHECK(!new_tx);
+            wtx.m_state = TxStateInactive{/*abandoned=*/true};
+            return true;
+        }));
+    CheckLiveUnspentStakeIndex(wallet);
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.GetLiveUnspentStakeOutpoints().count(COutPoint{funding->GetHash(), 0}));
+    }
+    BOOST_REQUIRE(wallet.AddToWallet(spend_a, TxStateInMempool{}));
+
+    CMutableTransaction spend_b_mut;
+    spend_b_mut.vin.emplace_back(COutPoint{funding->GetHash(), 0});
+    spend_b_mut.vout.emplace_back(8 * COIN, CScript{} << OP_TRUE);
+    const CTransactionRef spend_b = MakeTransactionRef(std::move(spend_b_mut));
+    BOOST_REQUIRE(wallet.AddToWallet(spend_b, TxStateInMempool{}));
+    CheckLiveUnspentStakeIndex(wallet);
+
+    // Removing one of two conflicting spends must not lose the other spend's
+    // mapTxSpends entry or prematurely reopen the shared input.
+    {
+        LOCK(wallet.cs_wallet);
+        std::vector<uint256> selected{spend_a->GetHash()};
+        std::vector<uint256> removed;
+        BOOST_REQUIRE_EQUAL(wallet.ZapSelectTx(selected, removed), DBErrors::LOAD_OK);
+        BOOST_REQUIRE_EQUAL(removed.size(), 1U);
+        BOOST_CHECK_EQUAL(removed.front(), spend_a->GetHash());
+        BOOST_CHECK(!wallet.GetLiveUnspentStakeOutpoints().count(COutPoint{funding->GetHash(), 0}));
+    }
+    CheckLiveUnspentStakeIndex(wallet);
+
+    {
+        LOCK(wallet.cs_wallet);
+        std::vector<uint256> selected{spend_b->GetHash()};
+        std::vector<uint256> removed;
+        BOOST_REQUIRE_EQUAL(wallet.ZapSelectTx(selected, removed), DBErrors::LOAD_OK);
+        BOOST_REQUIRE_EQUAL(removed.size(), 1U);
+        BOOST_CHECK(wallet.GetLiveUnspentStakeOutpoints().count(COutPoint{funding->GetHash(), 0}));
+    }
+    CheckLiveUnspentStakeIndex(wallet);
+
+    // The index is memory-only and must reconstruct exactly from persisted
+    // wallet transactions rather than becoming a second source of truth.
+    CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(wallet.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    CheckLiveUnspentStakeIndex(reloaded);
+    {
+        LOCK(reloaded.cs_wallet);
+        BOOST_CHECK(reloaded.GetLiveUnspentStakeOutpoints().count(COutPoint{funding->GetHash(), 0}));
+    }
+}
+
+BOOST_AUTO_TEST_CASE(live_unspent_stake_index_is_bounded_by_live_outputs_not_history)
+{
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+
+    COutPoint previous{uint256{2}, 0};
+    constexpr size_t HISTORY_LENGTH{512};
+    for (size_t i = 0; i < HISTORY_LENGTH; ++i) {
+        CMutableTransaction tx;
+        tx.vin.emplace_back(previous);
+        tx.vout.emplace_back((HISTORY_LENGTH - i + 1) * COIN, CScript{} << OP_TRUE);
+        const CTransactionRef ref = MakeTransactionRef(std::move(tx));
+        BOOST_REQUIRE(wallet.AddToWallet(ref, TxStateInMempool{}));
+        previous = COutPoint{ref->GetHash(), 0};
+    }
+
+    CheckLiveUnspentStakeIndex(wallet);
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK_EQUAL(wallet.mapWallet.size(), HISTORY_LENGTH);
+        BOOST_REQUIRE_EQUAL(wallet.GetLiveUnspentStakeOutpoints().size(), 1U);
+        BOOST_CHECK(*wallet.GetLiveUnspentStakeOutpoints().begin() == previous);
+    }
+}
+
 static void AddShadowWalletTestCoin(CCoinsViewCache& view, const COutPoint& outpoint, CAmount amount, const CScript& script)
 {
     Coin coin;

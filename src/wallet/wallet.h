@@ -595,6 +595,18 @@ private:
 
     std::map<COutPoint, CStakeCache> stakeCache;
 
+    // Ordered, broad producer-side prefilter for staking. This contains every
+    // wallet-known output that is not currently spent by a non-conflicted,
+    // non-abandoned wallet transaction. Ownership, maturity, phase, lock,
+    // lineage, RGB, demurrage, and solvability policy remains authoritative in
+    // AvailableCoinsForStaking and is deliberately not cached here.
+    std::set<COutPoint> m_live_unspent_stake_outpoints GUARDED_BY(cs_wallet);
+    bool IsSpentForStakeIndex(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RefreshLiveUnspentStakeOutpoint(const COutPoint& outpoint) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RefreshLiveUnspentStakeOutpoints(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RecomputeLiveUnspentStakeOutpoints() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RefreshMempoolStatus(CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
     // Confirmed legacy PoS solves indexed by canonical wallet script. The
     // complete wallet-known solve-only history is rebuilt once at load, then updated on
     // wallet transaction state transitions. Retaining the history makes a
@@ -1083,6 +1095,20 @@ public:
     std::set<uint256> m_inflight_wallet_broadcasts GUARDED_BY(cs_wallet);
 
     uint64_t GetStakeWeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+
+    /** Broad ordered staking prefilter. Caller must keep cs_wallet held while
+     *  using the returned reference. */
+    const std::set<COutPoint>& GetLiveUnspentStakeOutpoints() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_live_unspent_stake_outpoints;
+    }
+
+    /** O(1) scheduling/diagnostic count which does not expose wallet history. */
+    size_t GetLiveUnspentStakeOutputCount() const
+    {
+        LOCK(cs_wallet);
+        return m_live_unspent_stake_outpoints.size();
+    }
 
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */
     int64_t m_keypool_size{DEFAULT_KEYPOOL_SIZE};

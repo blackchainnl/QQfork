@@ -523,20 +523,6 @@ static void UpdateWalletSetting(interfaces::Chain& chain,
     }
 }
 
-/**
- * Refresh mempool status so the wallet is in an internally consistent state and
- * immediately knows the transaction's status: Whether it can be considered
- * trusted and is eligible to be abandoned ...
- */
-static void RefreshMempoolStatus(CWalletTx& tx, interfaces::Chain& chain)
-{
-    if (chain.isInMempool(tx.GetHash())) {
-        tx.m_state = TxStateInMempool();
-    } else if (tx.state<TxStateInMempool>()) {
-        tx.m_state = TxStateInactive();
-    }
-}
-
 bool AddWallet(WalletContext& context, const std::shared_ptr<CWallet>& wallet)
 {
     LOCK(context.wallets_mutex);
@@ -1191,9 +1177,88 @@ bool CWallet::IsSpent(const COutPoint& outpoint) const
     return false;
 }
 
+bool CWallet::IsSpentForStakeIndex(const COutPoint& outpoint) const
+{
+    AssertLockHeld(cs_wallet);
+    if (m_last_block_processed_height >= 0) return IsSpent(outpoint);
+
+    // Chainless wallet tools and early-load unit fixtures do not have a last
+    // processed height, so GetTxDepthInMainChain cannot be called. Mirror the
+    // state categories used by IsSpent: conflicted and abandoned spends do not
+    // reserve an input; confirmed, mempool, and ordinary inactive spends do.
+    const auto range = mapTxSpends.equal_range(outpoint);
+    for (auto spend = range.first; spend != range.second; ++spend) {
+        const auto wallet_tx = mapWallet.find(spend->second);
+        if (wallet_tx == mapWallet.end()) continue;
+        const CWalletTx& wtx = wallet_tx->second;
+        if (!wtx.isConflicted() && !wtx.isAbandoned()) return true;
+    }
+    return false;
+}
+
+void CWallet::RefreshLiveUnspentStakeOutpoint(const COutPoint& outpoint)
+{
+    AssertLockHeld(cs_wallet);
+    const auto wallet_tx = mapWallet.find(outpoint.hash);
+    const bool known_output = wallet_tx != mapWallet.end() && wallet_tx->second.tx &&
+        outpoint.n < wallet_tx->second.tx->vout.size();
+    if (known_output && !IsSpentForStakeIndex(outpoint)) {
+        m_live_unspent_stake_outpoints.insert(outpoint);
+    } else {
+        m_live_unspent_stake_outpoints.erase(outpoint);
+    }
+}
+
+void CWallet::RefreshLiveUnspentStakeOutpoints(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    if (!wtx.tx) return;
+
+    // A transaction state transition changes whether each of its inputs is
+    // considered spent. Its outputs are refreshed as well so insertion and
+    // removal paths share one invariant-preserving hook.
+    for (const CTxIn& input : wtx.tx->vin) {
+        if (!input.prevout.IsNull()) RefreshLiveUnspentStakeOutpoint(input.prevout);
+    }
+    for (uint32_t output = 0; output < wtx.tx->vout.size(); ++output) {
+        RefreshLiveUnspentStakeOutpoint(COutPoint{wtx.GetHash(), output});
+    }
+}
+
+void CWallet::RecomputeLiveUnspentStakeOutpoints()
+{
+    AssertLockHeld(cs_wallet);
+    m_live_unspent_stake_outpoints.clear();
+    for (const auto& [txid, wtx] : mapWallet) {
+        if (!wtx.tx) continue;
+        for (uint32_t output = 0; output < wtx.tx->vout.size(); ++output) {
+            const COutPoint outpoint{txid, output};
+            if (!IsSpentForStakeIndex(outpoint)) m_live_unspent_stake_outpoints.insert(outpoint);
+        }
+    }
+}
+
+/**
+ * Refresh mempool status so the wallet is in an internally consistent state and
+ * immediately knows the transaction's status: Whether it can be considered
+ * trusted and is eligible to be abandoned.
+ */
+void CWallet::RefreshMempoolStatus(CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    if (chain().isInMempool(wtx.GetHash())) {
+        wtx.m_state = TxStateInMempool();
+    } else if (wtx.state<TxStateInMempool>()) {
+        wtx.m_state = TxStateInactive();
+    }
+    RefreshLiveUnspentStakeOutpoints(wtx);
+}
+
 void CWallet::AddToSpends(const COutPoint& outpoint, const uint256& wtxid, WalletBatch* batch)
 {
     mapTxSpends.insert(std::make_pair(outpoint, wtxid));
+
+    RefreshLiveUnspentStakeOutpoint(outpoint);
 
     if (batch) {
         UnlockCoin(outpoint, batch);
@@ -1549,6 +1614,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
             CWalletTx* desc_tx = txs.back();
             txs.pop_back();
             desc_tx->m_state = inactive_state;
+            RefreshLiveUnspentStakeOutpoints(*desc_tx);
             RemoveIndexedShadowSolve(desc_tx->GetHash());
             UpdatePendingShadowSignalIndex(*desc_tx);
             // Break caches since we have changed the state
@@ -1575,6 +1641,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     }
     UpdatePendingShadowSignalIndex(wtx);
     IndexOwnedLegacyShadowScripts(wtx);
+    RefreshLiveUnspentStakeOutpoints(wtx);
 
     //// debug print
     WalletLogPrintf("AddToWallet %s  %s%s %s\n", hash.ToString(), (fInsertedNew ? "new" : ""), (fUpdated ? "update" : ""), TxStateString(state));
@@ -1667,6 +1734,7 @@ bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx
     MaybeUpdateBirthTime(wtx.GetTxTime());
     UpdatePendingShadowSignalIndex(wtx);
     IndexOwnedLegacyShadowScripts(wtx);
+    RefreshLiveUnspentStakeOutpoints(wtx);
 
     return true;
 }
@@ -1891,6 +1959,7 @@ void CWallet::RecursiveUpdateTxState(const uint256& tx_hash, const TryUpdatingSt
 
         TxUpdate update_state = try_updating_state(wtx);
         if (update_state != TxUpdate::UNCHANGED) {
+            RefreshLiveUnspentStakeOutpoints(wtx);
             if (wtx.isConfirmed()) {
                 IndexConfirmedShadowSolve(wtx);
             } else {
@@ -1938,7 +2007,7 @@ void CWallet::transactionAddedToMempool(const CTransactionRef& tx) {
 
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
-        RefreshMempoolStatus(it->second, chain());
+        RefreshMempoolStatus(it->second);
         UpdatePendingShadowSignalIndex(it->second);
         const bool manual_provenance_removed = it->second.mapValue.erase(MANUAL_SHADOW_ABANDON_KEY) != 0;
         const bool automatic_provenance_removed = it->second.mapValue.erase(AUTO_SHADOW_STALE_KEY) != 0;
@@ -1954,7 +2023,7 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
     LOCK(cs_wallet);
     auto it = mapWallet.find(tx->GetHash());
     if (it != mapWallet.end()) {
-        RefreshMempoolStatus(it->second, chain());
+        RefreshMempoolStatus(it->second);
         UpdatePendingShadowSignalIndex(it->second);
 
         // Gold Rush PoW claims commit to the current parent tip. Once a claim
@@ -1975,7 +2044,7 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
                 if (!done.insert(current).second) continue;
                 auto current_it = mapWallet.find(current);
                 if (current_it == mapWallet.end()) continue;
-                RefreshMempoolStatus(current_it->second, chain());
+                RefreshMempoolStatus(current_it->second);
                 UpdatePendingShadowSignalIndex(current_it->second);
                 for (unsigned int output_index = 0; output_index < current_it->second.tx->vout.size(); ++output_index) {
                     const auto range = mapTxSpends.equal_range(COutPoint{current, output_index});
@@ -2183,7 +2252,7 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
                     if (spend->second == txid) continue;
                     auto replacement = mapWallet.find(spend->second);
                     if (replacement == mapWallet.end()) continue;
-                    RefreshMempoolStatus(replacement->second, chain());
+                    RefreshMempoolStatus(replacement->second);
                     UpdatePendingShadowSignalIndex(replacement->second);
                     const auto automatic = replacement->second.mapValue.find(AUTO_SHADOW_STALE_KEY);
                     const bool pending_tip_validation =
@@ -2965,7 +3034,7 @@ void CWallet::RepairStaleShadowTransactions(bool force)
                             if (!done.insert(current).second) continue;
                             auto package_it = mapWallet.find(current);
                             if (package_it == mapWallet.end()) continue;
-                            RefreshMempoolStatus(package_it->second, chain());
+                            RefreshMempoolStatus(package_it->second);
                             UpdatePendingShadowSignalIndex(package_it->second);
                             for (unsigned int output_index = 0; output_index < package_it->second.tx->vout.size(); ++output_index) {
                                 const auto range = mapTxSpends.equal_range(COutPoint{current, output_index});
@@ -3934,6 +4003,7 @@ bool CWallet::CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std:
     committed_wtx.CopyFrom(wtx);
     committed_wtx.m_it_wtxOrdered = wtxOrdered.insert(std::make_pair(committed_wtx.nOrderPos, &committed_wtx));
     AddToSpends(committed_wtx);
+    RefreshLiveUnspentStakeOutpoints(committed_wtx);
     MaybeUpdateBirthTime(committed_wtx.GetTxTime());
     MarkDestinationsDirty(tx_destinations);
     committed_wtx.MarkDirty();
@@ -3990,6 +4060,7 @@ DBErrors CWallet::LoadWallet()
 
     DBErrors nLoadWalletRet = WalletBatch(GetDatabase()).LoadWallet(this);
     RecomputeShadowSolveIndex();
+    RecomputeLiveUnspentStakeOutpoints();
     if (nLoadWalletRet == DBErrors::NEED_REWRITE)
     {
         if (GetDatabase().Rewrite("\x04pool"))
@@ -4015,11 +4086,28 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
     for (const uint256& hash : vHashOut) {
         const auto& it = mapWallet.find(hash);
         wtxOrdered.erase(it->second.m_it_wtxOrdered);
-        for (const auto& txin : it->second.tx->vin)
-            mapTxSpends.erase(txin.prevout);
+        std::vector<COutPoint> spent_inputs;
+        spent_inputs.reserve(it->second.tx->vin.size());
+        for (const auto& txin : it->second.tx->vin) {
+            spent_inputs.push_back(txin.prevout);
+            const auto range = mapTxSpends.equal_range(txin.prevout);
+            for (auto spend = range.first; spend != range.second;) {
+                if (spend->second == hash) {
+                    spend = mapTxSpends.erase(spend);
+                } else {
+                    ++spend;
+                }
+            }
+        }
+        for (uint32_t output = 0; output < it->second.tx->vout.size(); ++output) {
+            m_live_unspent_stake_outpoints.erase(COutPoint{hash, output});
+        }
         RemoveIndexedShadowSolve(hash);
         m_pending_shadow_signal_txids.erase(hash);
         mapWallet.erase(it);
+        for (const COutPoint& input : spent_inputs) {
+            RefreshLiveUnspentStakeOutpoint(input);
+        }
         NotifyTransactionChanged(hash, CT_DELETED);
     }
 

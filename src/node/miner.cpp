@@ -945,12 +945,13 @@ void PoSMiner(CWallet *pwallet)
 
     CTxDestination dest;
 
-    // Compute the timeout from a wallet-only output snapshot. The old path
-    // held cs_wallet and then acquired cs_main while scanning stakeable coins,
-    // which inverted the global cs_main -> cs_wallet order used by wallet RPCs.
-    // The timeout is only a scheduling heuristic, so an output-count estimate
-    // is sufficient and avoids a chain/wallet lock pair before every miner run.
-    unsigned int pos_timio;
+    // The old timeout path held cs_wallet and then acquired cs_main while
+    // scanning stakeable coins. Keep scheduling independent of wallet size:
+    // -staketimio is the complete retry interval. Never inflate it from wallet
+    // history: a long-lived wallet must not silently turn a configured
+    // sub-second retry into a multi-second or multi-minute pause.
+    const unsigned int pos_timio = static_cast<unsigned int>(
+        std::max<int64_t>(1, gArgs.GetIntArg("-staketimio", DEFAULT_STAKETIMIO)));
     {
         CBlockIndex* tip = pwallet->chain().getTip();
         const bool final_quantum_lockout = tip && Params().GetConsensus().IsQuantumFinalLockout(tip->GetMedianTimePast(), tip->nHeight + 1);
@@ -974,20 +975,8 @@ void PoSMiner(CWallet *pwallet)
             }
         }
 
-        size_t wallet_output_count{0};
-        {
-            LOCK(pwallet->cs_wallet);
-            // This is only a timeout heuristic. mapWallet::size() is O(1),
-            // unlike walking every historical output while GUI wallet RPCs
-            // wait on cs_wallet.
-            wallet_output_count = pwallet->mapWallet.size();
-        }
-        // Historical wallet entries include spent outputs. Cap their effect so
-        // a long-lived wallet never turns the shutdown-aware loop into a
-        // multi-minute polling interval.
-        const size_t timeout_output_count = std::min<size_t>(wallet_output_count, 1'000'000);
-        pos_timio = gArgs.GetIntArg("-staketimio", DEFAULT_STAKETIMIO) + 30 * sqrt(timeout_output_count);
-        pwallet->WalletLogPrintf("Set proof-of-stake timeout: %ums for approximately %u wallet outputs\n", pos_timio, wallet_output_count);
+        pwallet->WalletLogPrintf("Set proof-of-stake timeout: %ums; %u live wallet outputs indexed for staking\n",
+                                 pos_timio, pwallet->GetLiveUnspentStakeOutputCount());
     }
 
     unsigned int assembly_failures{0};
