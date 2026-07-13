@@ -1688,25 +1688,20 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     return &wtx;
 }
 
-bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx)
+bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx, bool reconcile_chainstate)
 {
     const auto& ins = mapWallet.emplace(std::piecewise_construct, std::forward_as_tuple(hash), std::forward_as_tuple(nullptr, TxStateInactive{}));
     CWalletTx& wtx = ins.first->second;
     if (!fill_wtx(wtx, ins.second)) {
         return false;
     }
-    // If wallet doesn't have a chain (e.g. when using the wallet tool),
-    // don't bother to update txn.
-    if (HaveChain()) {
+    // Non-database callers retain the historical immediate reconciliation.
+    // WalletBatch loading defers this step so LoadWallet can query all block
+    // states from one immutable chain snapshot without holding cs_wallet.
+    if (reconcile_chainstate && HaveChain()) {
         bool active;
-        auto lookup_block = [&](const uint256& hash, int& height, TxState& state) {
-            // If tx block (or conflicting block) was reorged out of chain
-            // while the wallet was shutdown, change tx status to UNCONFIRMED
-            // and reset block height, hash, and index. ABANDONED tx don't have
-            // associated blocks and don't need to be updated. The case where a
-            // transaction was reorged out while online and then reconfirmed
-            // while offline is covered by the rescan logic.
-            if (!chain().findBlock(hash, FoundBlock().inActiveChain(active).height(height)) || !active) {
+        auto lookup_block = [&](const uint256& block_hash, int& height, TxState& state) {
+            if (!chain().findBlock(block_hash, FoundBlock().inActiveChain(active).height(height)) || !active) {
                 state = TxStateInactive{};
             }
         };
@@ -4057,12 +4052,61 @@ bool CWallet::CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std:
 
 DBErrors CWallet::LoadWallet()
 {
-    // LoadToWallet reconciles persisted confirmed/conflicted states against
-    // chainstate. Take the canonical order so the database callback cannot
-    // acquire cs_main while holding only cs_wallet.
-    LOCK2(::cs_main, cs_wallet);
+    DBErrors nLoadWalletRet;
+    std::set<uint256> referenced_blocks;
+    {
+        LOCK(cs_wallet);
+        nLoadWalletRet = WalletBatch(GetDatabase()).LoadWallet(this);
+        if (HaveChain()) {
+            for (const auto& [_, wtx] : mapWallet) {
+                if (const auto* conf = wtx.state<TxStateConfirmed>()) {
+                    referenced_blocks.insert(conf->confirmed_block_hash);
+                } else if (const auto* conf = wtx.state<TxStateConflicted>()) {
+                    referenced_blocks.insert(conf->conflicting_block_hash);
+                }
+            }
+        }
+    }
 
-    DBErrors nLoadWalletRet = WalletBatch(GetDatabase()).LoadWallet(this);
+    // Snapshot every referenced block against one active-chain view without
+    // holding cs_wallet. Keeping database loading, chain lookup, and wallet
+    // reconciliation in separate phases avoids nested chain/wallet locks.
+    std::map<uint256, std::optional<int>> active_block_heights;
+    if (HaveChain() && !referenced_blocks.empty()) {
+        LOCK(::cs_main);
+        ChainstateManager& chainman = chain().chainman();
+        for (const uint256& block_hash : referenced_blocks) {
+            const CBlockIndex* block_index = chainman.m_blockman.LookupBlockIndex(block_hash);
+            if (block_index && chainman.ActiveChain().Contains(block_index)) {
+                active_block_heights.emplace(block_hash, block_index->nHeight);
+            } else {
+                active_block_heights.emplace(block_hash, std::nullopt);
+            }
+        }
+    }
+
+    LOCK(cs_wallet);
+    if (HaveChain()) {
+        for (auto& entry : mapWallet) {
+            CWalletTx& wtx = entry.second;
+            auto reconcile_block = [&](const uint256& block_hash, int& height) {
+                const auto snapshot = active_block_heights.find(block_hash);
+                if (snapshot == active_block_heights.end()) return;
+                if (!snapshot->second) {
+                    // The transaction's block (or conflicting block) was
+                    // reorged out while the wallet was offline.
+                    wtx.m_state = TxStateInactive{};
+                } else {
+                    height = *snapshot->second;
+                }
+            };
+            if (auto* conf = wtx.state<TxStateConfirmed>()) {
+                reconcile_block(conf->confirmed_block_hash, conf->confirmed_block_height);
+            } else if (auto* conf = wtx.state<TxStateConflicted>()) {
+                reconcile_block(conf->conflicting_block_hash, conf->conflicting_block_height);
+            }
+        }
+    }
     RecomputeShadowSolveIndex();
     RecomputeLiveUnspentStakeOutpoints();
     if (nLoadWalletRet == DBErrors::NEED_REWRITE)
@@ -6322,6 +6366,13 @@ bool CWallet::AttachChain(const std::shared_ptr<CWallet>& walletInstance, interf
     }
     walletInstance->m_attaching_chain = false;
 
+    // AttachChain inherits Bitcoin Core's startup-only wallet -> chain lock
+    // order and completes before this wallet is published to RPC or staking
+    // threads. Registered notifications cannot acquire cs_wallet until this
+    // scope releases it. Reset that unreachable startup lock history here so
+    // DEBUG_LOCKORDER begins the published wallet lifecycle with the runtime
+    // chain -> wallet order. DeleteLock is a no-op outside DEBUG_LOCKORDER.
+    DeleteLock(&walletInstance->cs_wallet);
     return true;
 }
 

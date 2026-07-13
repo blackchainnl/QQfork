@@ -1600,7 +1600,7 @@ static DBErrors LoadTxRecords(CWallet* pwallet, DatabaseBatch& batch, std::vecto
 
             return true;
         };
-        if (!pwallet->LoadToWallet(hash, fill_wtx)) {
+        if (!pwallet->LoadToWallet(hash, fill_wtx, /*reconcile_chainstate=*/false)) {
             // Use std::max as fill_wtx may have already set result to CORRUPT
             result = std::max(result, DBErrors::NEED_RESCAN);
         }

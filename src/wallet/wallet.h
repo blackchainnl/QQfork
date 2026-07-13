@@ -923,7 +923,7 @@ public:
     CWalletTx* AddToWallet(CTransactionRef tx, const TxState& state, const UpdateWalletTxFn& update_wtx=nullptr,
                            bool fFlushOnClose=true, bool rescanning_old_block = false,
                            std::optional<WalletBlockTime> block_time = std::nullopt);
-    bool LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx, bool reconcile_chainstate = true) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void transactionAddedToMempool(const CTransactionRef& tx) override;
     void blockConnected(ChainstateRole role, const interfaces::BlockInfo& block) override;
     void blockDisconnected(const interfaces::BlockInfo& block) override;

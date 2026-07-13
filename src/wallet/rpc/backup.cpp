@@ -99,8 +99,9 @@ static void RescanWallet(CWallet& wallet, const WalletRescanReserver& reserver, 
     }
 }
 
-static void EnsureBlockDataFromTime(const CWallet& wallet, int64_t timestamp)
+static void EnsureBlockDataFromTime(const CWallet& wallet, int64_t timestamp) LOCKS_EXCLUDED(wallet.cs_wallet)
 {
+    AssertLockNotHeld(wallet.cs_wallet);
     auto& chain{wallet.chain()};
 
     int height{0};
@@ -532,7 +533,7 @@ RPCHelpMan importwallet()
     const uint256 last_block_hash = WITH_LOCK(pwallet->cs_wallet, return pwallet->GetLastBlockHash());
     CHECK_NONFATAL(pwallet->chain().findBlock(last_block_hash, FoundBlock().time(nTimeBegin)));
     {
-        LOCK(pwallet->cs_wallet);
+        WAIT_LOCK(pwallet->cs_wallet, wallet_lock);
 
         EnsureWalletIsUnlocked(*pwallet);
 
@@ -625,7 +626,14 @@ RPCHelpMan importwallet()
             }
         }
         file.close();
-        EnsureBlockDataFromTime(*pwallet, nTimeBegin);
+        {
+            // Chain queries acquire cs_main. Drop cs_wallet so this follows
+            // the global cs_main -> cs_wallet order instead of inverting it.
+            REVERSE_LOCK(wallet_lock);
+            EnsureBlockDataFromTime(*pwallet, nTimeBegin);
+        }
+        // The wallet may have been relocked while cs_wallet was released.
+        EnsureWalletIsUnlocked(*pwallet);
         // We now know whether we are importing private keys, so we can error if private keys are disabled
         if ((keys.size() > 0 || quantum_keys.size() > 0) && pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
             pwallet->chain().showProgress("", 100, false); // hide progress dialog in GUI
