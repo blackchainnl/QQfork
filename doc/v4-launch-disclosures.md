@@ -28,11 +28,14 @@ PoW Gold Rush claims are not whitelist-gated. A valid claim transaction contains
 the proof and a quantum payout address, and the reward is credited to that
 quantum address when an upgraded node validates the block.
 
-The PoW side uses a winner-take-claim pool model. A well-resourced miner can win
-more of the PoW migration pool than a lightly provisioned miner. This is an
-accepted launch tradeoff: the PoW path exists to give non-whitelisted and smaller
-holders a direct quantum-entry path, while the PoS side remains snapshot-limited
-and equalized across active eligible targets.
+Through height 5,993,199, the PoW side preserves v30.1.0's first-valid-claim
+allocation. From height 5,993,200, competing valid claims are ranked
+independently of transaction order; evaluated losers recover their capped base
+fee from the fixed pool and the winner receives the remainder. Total shadow
+issuance is unchanged. A well-resourced miner can still win more of the PoW
+migration pool than a lightly provisioned miner. The PoW path exists to give
+non-whitelisted and smaller holders a direct quantum-entry path, while the PoS
+side remains snapshot-limited and equalized across active eligible targets.
 
 ## Wallet protections and consensus backstops
 
@@ -72,14 +75,15 @@ outputs and treasury outputs are exempt according to the consensus rules.
 
 ## Closeout findings addressed
 
-The final red-team pass identified four items that were handled before export:
+The final red-team pass identified six items that were handled before export:
 
 - shadow emission cap rejection is atomic on connect and symmetric on disconnect;
 - wallet exclusions have consensus backstop tests for raw crafted spends;
-- the PoW winner-take-claim model is explicitly disclosed as a launch tradeoff;
+- the historical and post-activation PoW competing-claim rules are explicitly
+  disclosed;
 - partially decayed outputs use effective-value accounting in wallet funding.
 - pre-Gold-Rush unknown-witness block behavior, signed transaction wire format,
-  PoS kernel flags, and legacy coin timestamps were red-team checked against
-  the designated legacy implementation;
+  PoS kernel flags, and v30.1.0 block-time provenance were red-team checked
+  against the designated legacy implementation;
 - Final/demurrage activation is height-authoritative and survives restart,
   reorg, and `-reindex-chainstate`.

@@ -296,13 +296,14 @@ transactions carried in OP_RETURN outputs:
 - **QQSPROOF (Proof-of-Work side).** A miner grinds an Argon2id proof (magic
   `QQSPROOF`, `src/shadow.cpp`) against the target difficulty, a 12-bit base, ASERT-
   retargeted every 64 blocks within a [10-bit, 18-bit] band, and submits it in a claim
-  transaction that is validated before mempool acceptance. Custom blocks can carry
-  competing claims, so v30.1.1 canonically ranks candidates independently of transaction
-  order and evaluates at most 64 Argon2 proofs. The lowest-ranked valid claim receives
-  the fixed PoW pool after each other evaluated valid claimant is reimbursed its actual
-  base fee, capped at 0.01 BLK. At most 0.63 BLK can be reimbursed in one block. Invalid,
-  malformed, and excess claims receive nothing, and all credits still sum exactly to the
-  pre-existing pool.
+  transaction that is validated before mempool acceptance. Already-mined blocks through
+  5,993,199 retain the v30.1.0 first-valid-claim allocation. At the first scheduled
+  halving, height 5,993,200, v30.1.1 begins canonically ranking competing candidates
+  independently of transaction order and evaluates at most 64 Argon2 proofs. The
+  lowest-ranked valid claim receives the fixed PoW pool after each other evaluated valid
+  claimant is reimbursed its actual base fee, capped at 0.01 BLK. At most 0.63 BLK can
+  be reimbursed in one block. Invalid, malformed, and excess claims receive nothing, and
+  all credits still sum exactly to the pre-existing pool.
 
 The wallet automates both. See §9 for the exact RPCs (`sendshadowsignal`,
 `sendshadowpowclaim`, `setpowmining`, `getgoldrushinfo`).
@@ -809,19 +810,24 @@ that help nearly effortless, and burns realized decay rather than redistributing
 
 ## Appendix A: Consensus Constant Reference
 
-All values from version 30.1.0 source.
+Values reflect the v30.1.1 candidate source. The nominal time anchors and
+durations descend from v30.1.0. v30.1.1 makes the mainnet lifecycle
+height-authoritative, starts demurrage automatically at Final Lockout, and adds
+the competing-claim boundary shown below.
 
 | Constant | Value | Meaning | Defined in |
 |----------|-------|---------|-----------|
-| `QUANTUM_QUASAR_MAINNET_V4_TIME` | 1783835299 (2026-07-12 05:48:19 UTC) | V4 activation (MTP) | `consensus/params.h` |
+| `QUANTUM_QUASAR_MAINNET_V4_TIME` | 1783835299 (2026-07-12 05:48:19 UTC) | Nominal V4 time anchor; v30.1.1 mainnet lifecycle is height-authoritative | `consensus/params.h` |
 | `QUANTUM_QUASAR_GOLD_RUSH_SECONDS` | 15,552,000 (180 days) | Gold Rush duration | `consensus/params.h` |
 | `QUANTUM_QUASAR_MIGRATION_SECONDS` | 46,656,000 (540 days) | Migration window | `consensus/params.h` |
-| Final lockout time | 1846043299 (2028-07-09 05:48:19 UTC) | Legacy spends close (V4 + 24 mo) | derived |
+| Nominal final-lockout time | 1846043299 (2028-07-09 05:48:19 UTC) | Time-schedule reference (V4 + 24 mo) | derived |
 | `SHADOW_WHITELIST_HEIGHT` | 5,945,000 | Balance snapshot height | `shadow_schedule.cpp` |
 | `SHADOW_WHITELIST_MIN_BALANCE` | 10,000 BLK | Whitelist eligibility threshold | `shadow.h` |
 | `SHADOW_REWARD_START_HEIGHT` | 5,950,000 | Gold Rush rewards begin | `shadow_schedule.cpp` |
+| `MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT` | 5,993,200 | Canonical competing-claim allocation begins | `shadow.h` |
 | `SHADOW_GOLD_RUSH_BLOCKS` | 243,000 (180 days) | Gold Rush length | `shadow_schedule.cpp` |
 | `SHADOW_REWARD_END_HEIGHT` | 6,192,999 | Gold Rush rewards end | `shadow_schedule.cpp` |
+| `MAINNET_QUANTUM_FINAL_START_HEIGHT` | 6,922,000 | Height-authoritative Final Lockout and automatic demurrage begin | `shadow.h` |
 | `SHADOW_PHASE1_END_HEIGHT` | 6,187,599 | Halving phase ends | `shadow_schedule.cpp` |
 | `SHADOW_HALVING_INTERVAL_BLOCKS` | 43,200 (≈30 days) | Reward-halving period | `shadow_schedule.cpp` |
 | Phase-1 base reward | 580 BLK/block, halving | Gold Rush emission (halving) | `shadow.cpp` |

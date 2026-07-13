@@ -55,11 +55,13 @@ current work parameters and broadcasts a `QQSPROOF` transaction. The transaction
 authenticates the claimant with a legacy spend and specifies a quantum payout
 address. If a staker includes a valid claim, the upgraded rules credit the
 claim's reward to that quantum address. Claim transactions pay ordinary network
-fees. From Gold Rush height 5,950,000, if a custom block contains multiple
-valid claims, v30.1.1 chooses the winner by a transaction-order-independent
-rank. Each evaluated valid loser receives its actual fee capped at 0.01 BLK,
-and the winner receives the fixed pool remainder. Malformed and over-limit
-claims receive nothing; the total credit never exceeds the existing pool.
+fees. Through height 5,993,199, replay preserves the v30.1.0 allocation rule so
+already-mined shadow history is not reassigned. From the first scheduled Gold
+Rush halving at height 5,993,200, if a custom block contains multiple valid
+claims, v30.1.1 chooses the winner by a transaction-order-independent rank. Each
+evaluated valid loser receives its actual fee capped at 0.01 BLK, and the winner
+receives the fixed pool remainder. Malformed and over-limit claims receive
+nothing; the total credit never exceeds the existing pool.
 
 The wallet exposes helper RPCs for both paths, including `getgoldrushstate`,
 `getgoldrushinfo`, `sendshadowsignal`, `getshadowpowwork`,
@@ -122,8 +124,9 @@ periodic attestations while staking.
 
 v30.1.1 changes the persisted shadow and demurrage state to authenticated
 schema 11, recomputes the
-canonical competing-claim result from Gold Rush height 5,950,000, and normalizes
-legacy-compatible pre-Gold-Rush coin timestamps. Operators upgrading from
+canonical competing-claim result from height 5,993,200, and preserves v30.1.0
+block-time provenance for transaction outputs across live validation and replay.
+Operators upgrading from
 v30.1.0 must back up wallets, stop the daemon, and run one full
 `-reindex-chainstate` before relying on the node for staking or mining:
 
@@ -169,6 +172,23 @@ height, best-block hash, UTXO MuHash, Gold Rush totals, and the complete
 `replay_state` object match byte-for-byte. For release-candidate qualification,
 repeat once more with `-reindex-chainstate` at the same pinned tip and compare
 again before enabling networking, staking, or mining.
+
+Optional indexes have independent replay state. v30.1.1 automatically wipes
+and rebuilds prerelease shadowindex schema 4 as schema 5 and prerelease
+coinstatsindex schema 2 as schema 3. The automatic index-only rebuild is enough
+when complete active-chain block files are present; `-reindex-chainstate` does
+not itself wipe either index. If required block files were pruned, disable the
+affected index or restore full history with `prune=0` and `-reindex`.
+
+This automatic repair does not extend to a wallet database created by a
+prerelease source build that used the superseded height-5,950,000 canonical
+claim rule. Such a wallet can retain a synthetic payout transaction whose base
+block is still active even though corrected chainstate no longer contains that
+payout. A normal rescan can add missing corrected payouts but does not remove
+that obsolete confirmed synthetic record. Restore a wallet backup made before
+running that prerelease (and verify that it contains every quantum key) before
+rescanning from height 5,950,000. If no complete pre-prerelease wallet backup
+exists, keep staking and spending disabled pending an explicit wallet repair.
 
 After the authenticated Quantum Quasar namespace begins, a process or power
 failure during a multi-batch chainstate flush also fails closed on restart and

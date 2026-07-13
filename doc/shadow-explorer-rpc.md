@@ -21,6 +21,15 @@ index can continue following new blocks on a pruned node, but a later rebuild
 cannot cross deleted block data. Explorer operators should therefore use
 `-prune=0`. `-reindex` wipes and deterministically rebuilds the index.
 
+v30.1.1 uses shadowindex schema 5. It automatically discards and rebuilds
+prerelease schema-4 data, which classified historical claims under the
+superseded height-5,950,000 activation. Coinstatsindex schema 3 performs the
+same invalidation for prerelease schema-2 synthetic-payout statistics. This
+index-only rebuild does not require a full block or chainstate reindex when all
+active-chain block files remain available. A pruned operator without the
+required history must disable the affected index or restore the history with a
+full `-reindex`.
+
 ## Data model
 
 A Gold Rush credit is a deterministic upgraded-ledger transaction anchored to
@@ -68,6 +77,11 @@ dispositions are `invalid_location`, `malformed_transaction`, `invalid_proof`,
 `reimbursed_loser`. A positive winner or reimbursed-loser credit carries the
 exact synthetic transaction ID. Zero-fee valid losers remain visible as
 `reimbursed_loser` records with zero credit and no synthetic output.
+
+On mainnet this canonical per-claim classification begins at height 5,993,200.
+Earlier Gold Rush blocks intentionally reproduce the v30.1.0 first-valid-claim
+allocation and therefore do not expose a retroactively invented canonical
+winner or loser reimbursement.
 
 Index construction authenticates the historical pool context while holding the
 chain/view lock, then releases that lock before the shared Argon2 evaluator is

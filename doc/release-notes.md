@@ -74,10 +74,15 @@ Notable changes
 - Gold Rush staking and PoW claim paths credit the upgraded shadow ledger to
   quantum addresses while preserving legacy-compatible base block rewards during
   the bridge period.
-- From Gold Rush height 5,950,000, competing valid PoW claims are ranked
-  independently of transaction order. Evaluated valid losers recover their actual
-  base fee up to 0.01 BLK from the fixed pool, the canonical winner receives the
-  remainder, and the authenticated shadow state is replayed under schema 11.
+- Already-mined Gold Rush blocks retain v30.1.0 PoW-claim allocation exactly.
+  From the first scheduled halving at height 5,993,200, competing valid PoW
+  claims are ranked independently of transaction order. Evaluated valid losers
+  recover their actual base fee up to 0.01 BLK from the fixed pool, the canonical
+  winner receives the remainder, and authenticated shadow replay commits to the
+  activation boundary under schema 11.
+- Optional shadowindex schema 5 and coinstatsindex schema 3 automatically
+  invalidate and rebuild prerelease index records derived with the superseded
+  height-5,950,000 competing-claim boundary.
 - ML-DSA quantum spends, EUTXO spends, larger post-quantum script elements, and
   expanded block limits are deferred until after the Gold Rush reward-height
   window, during the migration/final-lockout phases.
