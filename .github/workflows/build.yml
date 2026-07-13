@@ -154,14 +154,17 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   safety-gate:
-    name: Exhaustive exact-SHA safety gate
+    name: Exact-SHA alpha or production safety gate
     needs: resolve-target
     permissions:
       contents: read
     uses: ./.github/workflows/pr-gate.yml
     with:
       target_sha: ${{ needs.resolve-target.outputs.target_sha }}
-      release_mode: true
+      # Manual, unpublished alpha artifacts wait for the core gate. Only the
+      # authenticated tag-push publication path may request the production-only
+      # exhaustive, native-macOS, sanitizer, and fuzz jobs.
+      release_mode: ${{ needs.resolve-target.outputs.publish == 'true' }}
 
   select-targets:
     name: Select build target

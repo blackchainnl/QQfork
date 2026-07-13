@@ -9,7 +9,7 @@ on:
         required: false
         type: string
       release_mode:
-        description: Also run the complete extended functional suite
+        description: Also run production-only exhaustive, native macOS, sanitizer, and fuzz gates
         required: true
         type: boolean
         default: false
@@ -29,7 +29,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: safety-gate-${{ inputs.target_sha || github.event.pull_request.head.sha || github.sha }}
+  # Keep an open pull request's full gate independent from an exact-SHA alpha
+  # artifact gate for the same commit. Superseded runs of the same event/mode
+  # still cancel normally, while production runs remain non-cancelable.
+  group: safety-gate-${{ github.event_name }}-${{ inputs.release_mode == true && 'release' || 'core' }}-${{ inputs.target_sha || github.event.pull_request.head.sha || github.sha }}
   cancel-in-progress: ${{ inputs.release_mode != true }}
 
 env:
