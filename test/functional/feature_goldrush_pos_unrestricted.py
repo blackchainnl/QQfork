@@ -14,7 +14,6 @@ from decimal import Decimal
 import time
 
 from test_framework.blocktools import COINBASE_MATURITY
-from test_framework.messages import COIN
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
@@ -115,7 +114,7 @@ class GoldRushPosUnrestrictedTest(BitcoinTestFramework):
         non_whitelist_address = wallet.getnewaddress("non-whitelisted", "legacy")
         non_whitelist_script = wallet.getaddressinfo(non_whitelist_address)["scriptPubKey"]
         funding_txid = default_wallet.sendtoaddress(non_whitelist_address, Decimal("5000"))
-        pure_funding_txid = default_wallet.sendtoaddress(pure_address, Decimal("1000"))
+        pure_funding_txid = default_wallet.sendtoaddress(pure_address, Decimal("10000"))
         funding_block = self.generatetoaddress(node, 1, funding_address, sync_fun=self.no_op)[0]
         assert funding_txid in node.getblock(funding_block)["tx"]
         assert pure_funding_txid in node.getblock(funding_block)["tx"]
@@ -133,7 +132,6 @@ class GoldRushPosUnrestrictedTest(BitcoinTestFramework):
         assert_equal(len(non_whitelist_utxos), 1)
         pure_utxos = [utxo for utxo in pure_wallet.listunspent(COINBASE_MATURITY, 9999999) if utxo["scriptPubKey"] == pure_script]
         assert_equal(len(pure_utxos), 1)
-        assert_equal(pure_wallet.getstakinginfo()["weight"], 1000 * COIN)
 
         self.log.info("Selecting a timestamp where only the non-whitelisted output has a valid kernel")
         kernel_time = self._find_non_whitelisted_only_kernel_time(

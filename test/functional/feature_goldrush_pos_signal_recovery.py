@@ -210,6 +210,7 @@ class GoldRushPosSignalRecoveryTest(BitcoinTestFramework):
             "-persistmempool=0",
             "-walletbroadcast=0",
             "-autostartstaking=0",
+            "-minstakingamount=1000000",
             f"-mocktime={self.mock_time}",
         ])
         node = self.nodes[0]
@@ -232,12 +233,13 @@ class GoldRushPosSignalRecoveryTest(BitcoinTestFramework):
         finally:
             wallet.staking(False)
 
+        assert_equal(self._is_abandoned(wallet, second_signal["txid"]), True)
+        assert second_signal["txid"] not in node.getrawmempool()
         spendable = wallet.listunspent(1, 9999999)
         assert any(
             utxo["txid"] == second_outpoint["txid"] and utxo["vout"] == second_outpoint["vout"]
             for utxo in spendable
         ), "terminal QQSIGNAL must not keep its legacy input reserved"
-        assert second_signal["txid"] not in node.getrawmempool()
 
 
 if __name__ == "__main__":
