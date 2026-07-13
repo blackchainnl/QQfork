@@ -36,6 +36,18 @@ struct ShadowGoldRushInfo {
     unsigned int pow_target_bits{0};
 };
 
+struct ShadowReplayStateInfo {
+    uint32_t schema{0};
+    bool required_for_tip{false};
+    bool present{false};
+    bool marker_valid{false};
+    bool valid_for_tip{false};
+    uint32_t marker_height{0};
+    uint32_t marker_time{0};
+    uint256 marker_block_hash{};
+    std::vector<unsigned char> commitment{};
+};
+
 struct ShadowSolverActivity {
     uint32_t height{0};
     int64_t time{0};
@@ -276,6 +288,7 @@ bool ValidateShadowPowProofForWork(const ShadowPowWork& work, const std::vector<
  *  No configuration, RPC, or network path can arm this hook. */
 void SetShadowArgon2FailuresForTesting(uint64_t count = 1);
 void ClearShadowArgon2FailuresForTesting();
+COutPoint ShadowReplayStateOutpointForTesting();
 /** Test-only oracle for the authenticated pool/active-signal pair invariant. */
 bool ShadowActiveSignalPoolPairValidForTesting(const Consensus::Params& consensus,
                                                const CBlockIndex* pindex,
@@ -339,6 +352,11 @@ bool HasShadowReplayState(const CCoinsViewCache& view);
 bool HasCurrentShadowReplayState(const CCoinsViewCache& view, const Consensus::Params& consensus,
                                  const CBlockIndex* pindex,
                                  const ShadowBlockReader* read_block = nullptr);
+/** Return the authenticated replay marker and exact-tip verification state for
+ * offline upgrade/reindex comparison. */
+ShadowReplayStateInfo GetShadowReplayStateInfo(const CCoinsViewCache& view,
+                                               const Consensus::Params& consensus,
+                                               const CBlockIndex* pindex);
 /** Remove every authenticated internal shadow-state family while preserving
  *  marker-shaped user UTXOs at ordinary outpoints. The block reader is used
  *  only to authenticate legacy base-transaction payout markers. */

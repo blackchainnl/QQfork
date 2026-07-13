@@ -783,6 +783,108 @@ BOOST_AUTO_TEST_CASE(active_signal_and_pool_state_are_atomic_and_fail_closed)
     first_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_TRUE));
     BOOST_REQUIRE(ApplyShadowBlock(view, first_block, &first_index));
 
+    const ShadowReplayStateInfo absent_replay = GetShadowReplayStateInfo(
+        view, Params().GetConsensus(), &first_index);
+    BOOST_CHECK_EQUAL(absent_replay.schema, 11U);
+    BOOST_CHECK(absent_replay.required_for_tip);
+    BOOST_CHECK(!absent_replay.present);
+    BOOST_CHECK(!absent_replay.valid_for_tip);
+
+    // ApplyShadowBlock is the isolated accounting helper; full validation
+    // writes QQRSTATE only after all sibling checkpoints advance. The fixture
+    // has completed those transitions, so writing the exact-tip marker here
+    // makes the authenticated replay state current.
+    WriteShadowReplayStateMarker(view, &first_index, Params().GetConsensus());
+    const ShadowReplayStateInfo replay = GetShadowReplayStateInfo(
+        view, Params().GetConsensus(), &first_index);
+    BOOST_CHECK(replay.present);
+    BOOST_CHECK(replay.marker_valid);
+    BOOST_CHECK(replay.valid_for_tip);
+    BOOST_CHECK_EQUAL(replay.marker_height, static_cast<uint32_t>(first_index.nHeight));
+    BOOST_CHECK_EQUAL(replay.marker_time, static_cast<uint32_t>(first_index.GetBlockTime()));
+    BOOST_CHECK(replay.marker_block_hash == first_index.GetBlockHash());
+    BOOST_CHECK_EQUAL(replay.commitment.size(), uint256::size());
+
+    const COutPoint replay_outpoint = ShadowReplayStateOutpointForTesting();
+    Coin canonical_replay_coin;
+    BOOST_REQUIRE(view.GetCoin(replay_outpoint, canonical_replay_coin));
+
+    const auto replace_replay_coin = [&](Coin replacement) {
+        BOOST_REQUIRE(view.SpendCoin(replay_outpoint));
+        view.AddCoin(replay_outpoint, std::move(replacement), true);
+    };
+    const auto require_rejected_replay_coin = [&](Coin replacement,
+                                                   bool structurally_valid) {
+        replace_replay_coin(std::move(replacement));
+        const ShadowReplayStateInfo rejected = GetShadowReplayStateInfo(
+            view, Params().GetConsensus(), &first_index);
+        BOOST_CHECK(rejected.present);
+        BOOST_CHECK_EQUAL(rejected.marker_valid, structurally_valid);
+        BOOST_CHECK(!rejected.valid_for_tip);
+        BOOST_CHECK(!HasCurrentShadowReplayState(
+            view, Params().GetConsensus(), &first_index));
+        replace_replay_coin(canonical_replay_coin);
+        BOOST_REQUIRE(HasCurrentShadowReplayState(
+            view, Params().GetConsensus(), &first_index));
+    };
+
+    Coin nonzero_replay = canonical_replay_coin;
+    nonzero_replay.out.nValue = 1;
+    require_rejected_replay_coin(std::move(nonzero_replay), false);
+
+    Coin non_coinbase_replay = canonical_replay_coin;
+    non_coinbase_replay.fCoinBase = false;
+    require_rejected_replay_coin(std::move(non_coinbase_replay), false);
+
+    Coin coinstake_replay = canonical_replay_coin;
+    coinstake_replay.fCoinStake = true;
+    require_rejected_replay_coin(std::move(coinstake_replay), false);
+
+    Coin wrong_height_replay = canonical_replay_coin;
+    --wrong_height_replay.nHeight;
+    require_rejected_replay_coin(std::move(wrong_height_replay), false);
+
+    Coin wrong_time_replay = canonical_replay_coin;
+    ++wrong_time_replay.nTime;
+    require_rejected_replay_coin(std::move(wrong_time_replay), false);
+
+    Coin noncanonical_replay = canonical_replay_coin;
+    const CScript& canonical_script = canonical_replay_coin.out.scriptPubKey;
+    BOOST_REQUIRE_GE(canonical_script.size(), 12U);
+    const size_t tag_size = canonical_script[2];
+    BOOST_REQUIRE_EQUAL(tag_size, 8U);
+    CScript noncanonical_script;
+    noncanonical_script.push_back(OP_FALSE);
+    noncanonical_script.push_back(OP_RETURN);
+    noncanonical_script.push_back(OP_PUSHDATA1);
+    noncanonical_script.push_back(static_cast<unsigned char>(tag_size));
+    noncanonical_script.insert(noncanonical_script.end(),
+                               canonical_script.begin() + 3,
+                               canonical_script.begin() + 3 + tag_size);
+    noncanonical_script.insert(noncanonical_script.end(),
+                               canonical_script.begin() + 3 + tag_size,
+                               canonical_script.end());
+    noncanonical_replay.out.scriptPubKey = std::move(noncanonical_script);
+    require_rejected_replay_coin(std::move(noncanonical_replay), false);
+
+    Coin wrong_payload_replay = canonical_replay_coin;
+    wrong_payload_replay.out.scriptPubKey.back() ^= 1;
+    require_rejected_replay_coin(std::move(wrong_payload_replay), true);
+
+    uint256 stale_hash;
+    CBlockIndex stale_index;
+    InitIndex(stale_index, first_index.nHeight, &whitelist_index, stale_hash);
+    stale_hash = uint256::ONE;
+    WriteShadowReplayStateMarker(
+        view, &stale_index, Params().GetConsensus());
+    const ShadowReplayStateInfo stale_replay = GetShadowReplayStateInfo(
+        view, Params().GetConsensus(), &first_index);
+    BOOST_CHECK(stale_replay.marker_valid);
+    BOOST_CHECK(!stale_replay.valid_for_tip);
+    BOOST_CHECK(!HasCurrentShadowReplayState(
+        view, Params().GetConsensus(), &first_index));
+    replace_replay_coin(canonical_replay_coin);
+
     Coin pool_coin;
     Coin signal_coin;
     BOOST_REQUIRE(view.GetCoin(PoolOutpointForTest(), pool_coin));

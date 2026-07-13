@@ -13,6 +13,7 @@
 #include <logging.h>
 #include <node/blockstorage.h>
 #include <node/caches.h>
+#include <node/utxo_snapshot.h>
 #include <sync.h>
 #include <threadsafety.h>
 #include <tinyformat.h>
@@ -31,6 +32,93 @@
 #include <vector>
 
 namespace node {
+
+static bilingual_str ChainstateRebuildRequiredMessage()
+{
+    return _("Quantum Quasar v30.1.1 requires a one-time chainstate rebuild. Back up wallets and restart once with -reindex-chainstate. This startup did not wipe the existing chainstate.");
+}
+
+std::optional<int> FindChainstateRebuildPreflightFailureHeight(
+    const CBlockIndex* target, const uint256& expected_genesis)
+{
+    AssertLockHeld(::cs_main);
+    const CBlockIndex* block = target;
+    while (block) {
+        if (!(block->nStatus & BLOCK_HAVE_DATA)) return block->nHeight;
+        if (block->nHeight == 0) {
+            return block->GetBlockHash() == expected_genesis
+                ? std::nullopt
+                : std::optional<int>{0};
+        }
+        const int expected_parent_height = block->nHeight - 1;
+        block = block->pprev;
+        if (!block || block->nHeight != expected_parent_height) {
+            return expected_parent_height;
+        }
+    }
+    return std::nullopt;
+}
+
+static ChainstateLoadResult PreflightChainstateRebuild(
+    ChainstateManager& chainman,
+    const CacheSizes& cache_sizes,
+    const ChainstateLoadOptions& options) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    AssertLockHeld(::cs_main);
+    if (options.coins_db_in_memory) return {ChainstateLoadStatus::SUCCESS, {}};
+
+    const size_t cache_bytes = std::max<size_t>(1, cache_sizes.coins_db / 5);
+    for (Chainstate* chainstate : chainman.GetAll()) {
+        fs::path leveldb_name{"chainstate"};
+        if (chainstate->m_from_snapshot_blockhash) {
+            leveldb_name += std::string{SNAPSHOT_CHAINSTATE_SUFFIX};
+        }
+        const fs::path db_path = chainman.m_options.datadir / leveldb_name;
+        if (!fs::exists(db_path)) continue;
+
+        chainstate->InitCoinsDB(cache_bytes, /*in_memory=*/false,
+                                /*should_wipe=*/false);
+        CCoinsViewDB& coins_db = chainstate->CoinsDB();
+        const std::vector<uint256> heads = coins_db.GetHeadBlocks();
+        uint256 target = coins_db.GetBestBlock();
+        if (!heads.empty()) {
+            // BatchWrite persists exactly [new_tip, old_tip]. A null new tip
+            // cannot be produced by a valid flush and must not authorize a
+            // destructive rebuild.
+            if (heads.size() != 2 || heads.front().IsNull()) {
+                chainstate->ResetCoinsViews();
+                return {ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED,
+                        _("Cannot run -reindex-chainstate because the existing chainstate has an unrecognized interrupted-flush marker. The existing chainstate was not wiped. Restart with full -reindex to redownload and rebuild block history; wallets are not removed.")};
+            }
+            target = heads.front();
+        }
+
+        if (target.IsNull()) {
+            chainstate->ResetCoinsViews();
+            continue;
+        }
+
+        const CBlockIndex* block = chainman.m_blockman.LookupBlockIndex(target);
+        if (!block) {
+            chainstate->ResetCoinsViews();
+            return {ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED,
+                    _("Cannot run -reindex-chainstate because its saved tip is absent from the local block index. The existing chainstate was not wiped. Restart with full -reindex to rebuild the block index and chainstate; wallets are not removed.")};
+        }
+
+        const std::optional<int> missing_height =
+            FindChainstateRebuildPreflightFailureHeight(
+                block, chainman.GetConsensus().hashGenesisBlock);
+        if (missing_height) {
+            chainstate->ResetCoinsViews();
+            return {ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED,
+                    strprintf(_("Cannot run -reindex-chainstate because local block data is missing at height %d. The existing chainstate was not wiped. Disable pruning and restart with full -reindex to redownload missing history; wallets are not removed."),
+                              *missing_height)};
+        }
+        chainstate->ResetCoinsViews();
+    }
+    return {ChainstateLoadStatus::SUCCESS, {}};
+}
+
 // Complete initialization of chainstates after the initial call has been made
 // to ChainstateManager::InitializeChainstate().
 static ChainstateLoadResult CompleteChainstateInitialization(
@@ -67,6 +155,24 @@ static ChainstateLoadResult CompleteChainstateInitialization(
         // If the loaded chain has a wrong genesis, bail out immediately
         // (we're likely using a testnet datadir, or the other way around).
         return {ChainstateLoadStatus::FAILURE_INCOMPATIBLE_DB, _("Incorrect or no genesis block found. Wrong datadir for network?")};
+    }
+
+    // A chainstate-only rebuild is safe only if every block needed to recreate
+    // each persisted chainstate is still present. Check this before opening any
+    // coins database with wipe_data=true or deleting an assumeUTXO snapshot.
+    if (options.reindex_chainstate && !options.reindex) {
+        const auto [preflight_status, preflight_error] =
+            PreflightChainstateRebuild(chainman, cache_sizes, options);
+        if (preflight_status != ChainstateLoadStatus::SUCCESS) {
+            return {preflight_status, preflight_error};
+        }
+    }
+
+    if (chainman.IsSnapshotActive() && options.reindex_chainstate && !options.reindex) {
+        LogPrintf("[snapshot] deleting snapshot chainstate after rebuild preflight\n");
+        if (!chainman.DeleteSnapshotChainstate()) {
+            return {ChainstateLoadStatus::FAILURE_FATAL, Untranslated("Couldn't remove snapshot chainstate.")};
+        }
     }
 
     // At this point blocktree args are consistent with what's on disk.
@@ -108,17 +214,28 @@ static ChainstateLoadResult CompleteChainstateInitialization(
         // Refuse to load unsupported database format.
         // This is a no-op if we cleared the coinsviewdb with -reindex or -reindex-chainstate
         if (chainstate->CoinsDB().NeedsUpgrade()) {
-            return {ChainstateLoadStatus::FAILURE_INCOMPATIBLE_DB, _("Unsupported chainstate database format found. "
-                                                                     "Please restart with -reindex-chainstate. This will "
-                                                                     "rebuild the chainstate database.")};
+            return {ChainstateLoadStatus::FAILURE_CHAINSTATE_REBUILD_REQUIRED,
+                    ChainstateRebuildRequiredMessage()};
         }
 
         // ReplayBlocks is a no-op if we cleared the coinsviewdb with -reindex or -reindex-chainstate
-        if (!chainstate->ReplayBlocks()) {
-            return {ChainstateLoadStatus::FAILURE, _("Unable to replay blocks. You will need to rebuild the database using -reindex-chainstate.")};
+        const Chainstate::ReplayResult replay_result = chainstate->ReplayBlocks();
+        if (replay_result == Chainstate::ReplayResult::CHAINSTATE_REBUILD_REQUIRED) {
+            return {ChainstateLoadStatus::FAILURE_CHAINSTATE_REBUILD_REQUIRED,
+                    ChainstateRebuildRequiredMessage()};
         }
-        if (!chainstate->ReplayShadowBlocks()) {
-            return {ChainstateLoadStatus::FAILURE, _("Unable to replay Quantum Quasar Gold Rush state. Restart with -reindex-chainstate. If block files were pruned or are incomplete, disable pruning and use a full -reindex to redownload and rebuild.")};
+        if (replay_result == Chainstate::ReplayResult::FAILURE) {
+            return {ChainstateLoadStatus::FAILURE_CHAINSTATE_REBUILD_REQUIRED,
+                    ChainstateRebuildRequiredMessage()};
+        }
+        const Chainstate::ReplayResult shadow_result = chainstate->ReplayShadowBlocks();
+        if (shadow_result == Chainstate::ReplayResult::CHAINSTATE_REBUILD_REQUIRED) {
+            return {ChainstateLoadStatus::FAILURE_CHAINSTATE_REBUILD_REQUIRED,
+                    ChainstateRebuildRequiredMessage()};
+        }
+        if (shadow_result == Chainstate::ReplayResult::FAILURE) {
+            return {ChainstateLoadStatus::FAILURE_CHAINSTATE_REBUILD_REQUIRED,
+                    ChainstateRebuildRequiredMessage()};
         }
 
         // The on-disk coinsdb is now in a good state, create the cache
@@ -177,13 +294,16 @@ ChainstateLoadResult LoadChainstate(ChainstateManager& chainman, const CacheSize
     // Load the fully validated chainstate.
     chainman.InitializeChainstate(options.mempool);
 
-    // Load a chain created from a UTXO snapshot, if any exist.
-    bool has_snapshot = chainman.DetectSnapshotChainstate();
-
-    if (has_snapshot && (options.reindex || options.reindex_chainstate)) {
-        LogPrintf("[snapshot] deleting snapshot chainstate due to reindexing\n");
+    // Load a chain created from a UTXO snapshot, if any exist. A full reindex
+    // removes it before the block index is wiped, so an interrupted startup
+    // cannot leave an empty index paired with a stale snapshot. A
+    // chainstate-only rebuild defers deletion until block-data preflight.
+    const bool has_snapshot = chainman.DetectSnapshotChainstate();
+    if (has_snapshot && options.reindex) {
+        LogPrintf("[snapshot] deleting snapshot chainstate before full reindex\n");
         if (!chainman.DeleteSnapshotChainstate()) {
-            return {ChainstateLoadStatus::FAILURE_FATAL, Untranslated("Couldn't remove snapshot chainstate.")};
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    Untranslated("Couldn't remove snapshot chainstate.")};
         }
     }
 

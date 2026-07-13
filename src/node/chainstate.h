@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <tuple>
 
 class CTxMemPool;
@@ -19,6 +20,12 @@ class CTxMemPool;
 namespace node {
 
 struct CacheSizes;
+
+/** Return the first height that cannot be replayed, or std::nullopt when target
+ * has block data and contiguous ancestry through the configured genesis. */
+std::optional<int> FindChainstateRebuildPreflightFailureHeight(
+    const CBlockIndex* target,
+    const uint256& expected_genesis) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
 struct ChainstateLoadOptions {
     CTxMemPool* mempool{nullptr};
@@ -48,6 +55,8 @@ enum class ChainstateLoadStatus {
     FAILURE_FATAL, //!< Fatal error which should not prompt to reindex
     FAILURE_INCOMPATIBLE_DB,
     FAILURE_INSUFFICIENT_DBCACHE,
+    FAILURE_CHAINSTATE_REBUILD_REQUIRED, //!< Restart explicitly with -reindex-chainstate
+    FAILURE_FULL_REINDEX_REQUIRED, //!< Local block history cannot rebuild chainstate
     INTERRUPTED,
 };
 

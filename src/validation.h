@@ -766,10 +766,16 @@ public:
     void ResetBlockFailureFlags(CBlockIndex* pindex) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Replay blocks that aren't fully applied to the database. */
-    bool ReplayBlocks();
+    enum class ReplayResult {
+        SUCCESS,
+        FAILURE,
+        CHAINSTATE_REBUILD_REQUIRED,
+    };
+
+    ReplayResult ReplayBlocks();
 
     /** Replay locally stored Gold Rush blocks if the shadow ledger is missing or stale. */
-    bool ReplayShadowBlocks();
+    ReplayResult ReplayShadowBlocks();
 
     /** Whether the chain state needs to be redownloaded due to lack of witness data */
     [[nodiscard]] bool NeedsRedownload() const EXCLUSIVE_LOCKS_REQUIRED(cs_main);

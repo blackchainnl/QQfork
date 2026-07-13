@@ -66,8 +66,9 @@ class GoldRushShadowReplayTest(BitcoinTestFramework):
         node.assert_start_raises_init_error(
             extra_args=BASE_ARGS,
             expected_msg=(
-                r"Unable to replay Quantum Quasar Gold Rush state\. "
-                r"Restart with -reindex-chainstate"
+                r"Quantum Quasar v30\.1\.1 requires a one-time chainstate rebuild\. "
+                r"Back up wallets and restart once with -reindex-chainstate\. "
+                r"This startup did not wipe the existing chainstate\."
             ),
             match=ErrorMatch.PARTIAL_REGEX,
         )
@@ -86,6 +87,14 @@ class GoldRushShadowReplayTest(BitcoinTestFramework):
         assert_equal(repaired_state["pow_amount"], expected_half_pool)
         assert_equal(repaired_state["pos_amount"], expected_half_pool)
         assert_equal(repaired_state["claimed_amount"], 0)
+        assert_equal(repaired_state["height"], 1 + REWARD_BLOCKS_CONNECTED)
+        assert_equal(repaired_state["bestblock"], legacy_tip)
+        assert_equal(repaired_state["replay_state"]["schema"], 11)
+        assert_equal(repaired_state["replay_state"]["required_for_tip"], True)
+        assert_equal(repaired_state["replay_state"]["present"], True)
+        assert_equal(repaired_state["replay_state"]["marker_valid"], True)
+        assert_equal(repaired_state["replay_state"]["valid_for_tip"], True)
+        assert_equal(len(repaired_state["replay_state"]["commitment"]), 64)
         assert_equal(node.getblockcount(), 1 + REWARD_BLOCKS_CONNECTED)
         assert_equal(node.getbestblockhash(), legacy_tip)
         rebuilt_fingerprint = self.state_fingerprint(node)

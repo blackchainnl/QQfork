@@ -601,6 +601,16 @@ BlockfileType BlockManager::BlockfileTypeForHeight(int height)
     return (height >= *m_snapshot_height) ? BlockfileType::ASSUMED : BlockfileType::NORMAL;
 }
 
+void BlockManager::ExitSnapshotBlockfileMode()
+{
+    AssertLockHeld(::cs_main);
+    LOCK(cs_LastBlockFile);
+    const int latest_file = MaxBlockfileNum();
+    m_snapshot_height.reset();
+    m_blockfile_cursors[BlockfileType::NORMAL] = BlockfileCursor{latest_file};
+    m_blockfile_cursors[BlockfileType::ASSUMED].reset();
+}
+
 bool BlockManager::FlushChainstateBlockFile(int tip_height)
 {
     LOCK(cs_LastBlockFile);

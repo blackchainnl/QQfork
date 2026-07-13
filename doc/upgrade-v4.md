@@ -128,7 +128,8 @@ v30.1.0 must back up wallets, stop the daemon, and run one full
 `-reindex-chainstate` before relying on the node for staking or mining:
 
 ```bash
-blackcoind -datadir=/path/to/data -reindex-chainstate -daemonwait
+blackcoind -datadir=/path/to/data -networkactive=0 -staking=0 \
+  -reindex-chainstate -daemonwait
 ```
 
 The rebuild requires complete active-chain block data for every height it must
@@ -140,6 +141,13 @@ or available block files. Allow sufficient disk space and keep the pre-upgrade
 backup until the rebuilt node has synchronized and passed a clean-restart
 comparison.
 
+v30.1.1 checks the saved chainstate tip and every ancestor through genesis
+before wiping. If a known-pruned block is missing, startup stops with a full
+`-reindex` instruction and leaves the existing chainstate intact. This check
+also runs before an assumeUTXO snapshot is removed. It cannot predict a later
+disk or checksum failure, so use a copied datadir for the first alpha test and
+retain the original backup.
+
 After the rebuild, record these RPC results:
 
 ```bash
@@ -148,9 +156,19 @@ blackcoin-cli gettxoutsetinfo muhash
 blackcoin-cli getgoldrushstate
 ```
 
-Stop cleanly, restart without either reindex option, and confirm that height,
-best-block hash, UTXO MuHash, and Gold Rush totals match. Do not enable staking
-or mining until this comparison succeeds.
+In `getgoldrushstate`, require `replay_state.schema` to equal `11` and
+`replay_state.present`, `marker_valid`, and `valid_for_tip` to all be `true` at
+or after the whitelist height. Record its 64-hex-character `commitment`, marker
+height, marker block hash, active height, and best-block hash. The UTXO MuHash
+does not include zero-value internal markers; the replay commitment is the
+separate proof that the pool, signals, whitelist, Gold Rush inventory, and
+demurrage inventory match the same tip.
+
+Stop cleanly and restart offline without either reindex option. Confirm that
+height, best-block hash, UTXO MuHash, Gold Rush totals, and the complete
+`replay_state` object match byte-for-byte. For release-candidate qualification,
+repeat once more with `-reindex-chainstate` at the same pinned tip and compare
+again before enabling networking, staking, or mining.
 
 After the authenticated Quantum Quasar namespace begins, a process or power
 failure during a multi-batch chainstate flush also fails closed on restart and

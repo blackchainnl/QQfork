@@ -3903,6 +3903,32 @@ void RewindShadowReplayStateMarker(CCoinsViewCache& view, const CBlockIndex* dis
     }
 }
 
+static bool ValidateCanonicalShadowReplayStateMarker(
+    const Coin& coin, const CBlockIndex* pindex, valtype& payload,
+    const CBlockIndex*& marker_block)
+{
+    marker_block = nullptr;
+    payload.clear();
+    if (!pindex || pindex->nHeight < 0 || coin.IsSpent() ||
+        coin.nHeight > static_cast<uint32_t>(pindex->nHeight)) {
+        return false;
+    }
+
+    marker_block = SafeGetAncestor(pindex, static_cast<int>(coin.nHeight));
+    if (!marker_block || coin.out.nValue != 0 || !coin.fCoinBase ||
+        coin.fCoinStake ||
+        coin.nTime != static_cast<uint32_t>(marker_block->GetBlockTime()) ||
+        coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
+        !ParseMarkerScript(coin.out.scriptPubKey, MARKER_REPLAY_STATE, &payload) ||
+        payload.size() != uint256::size()) {
+        return false;
+    }
+
+    // General marker discovery accepts non-minimal pushes. QQRSTATE has one
+    // exact authenticated encoding.
+    return coin.out.scriptPubKey == MarkerScript(MARKER_REPLAY_STATE, payload);
+}
+
 bool HasCurrentShadowReplayState(const CCoinsViewCache& view, const Consensus::Params& consensus,
                                  const CBlockIndex* pindex,
                                  const ShadowBlockReader* read_block)
@@ -3932,18 +3958,42 @@ bool HasCurrentShadowReplayState(const CCoinsViewCache& view, const Consensus::P
     if (!Consensus::HasCurrentDemurrageInventory(view, pindex, consensus)) return false;
     Coin coin;
     valtype payload;
+    const CBlockIndex* marker_block{nullptr};
     return view.GetCoin(ReplayStateOutpoint(), coin) &&
-           coin.nHeight == static_cast<uint32_t>(pindex->nHeight) &&
-           coin.nTime == static_cast<uint32_t>(pindex->GetBlockTime()) &&
-           ParseMarkerScript(coin.out.scriptPubKey, MARKER_REPLAY_STATE, &payload) &&
+           ValidateCanonicalShadowReplayStateMarker(
+               coin, pindex, payload, marker_block) &&
+           marker_block == pindex &&
            payload == ReplayStateFingerprint(consensus, pindex, view);
 }
 
 bool HasShadowReplayState(const CCoinsViewCache& view)
 {
+    return view.HaveCoin(ReplayStateOutpoint());
+}
+
+ShadowReplayStateInfo GetShadowReplayStateInfo(const CCoinsViewCache& view,
+                                               const Consensus::Params& consensus,
+                                               const CBlockIndex* pindex)
+{
+    ShadowReplayStateInfo info;
+    info.schema = SHADOW_REPLAY_STATE_VERSION;
+    info.required_for_tip = pindex && pindex->nHeight >= SHADOW_WHITELIST_HEIGHT;
+
     Coin coin;
-    return view.GetCoin(ReplayStateOutpoint(), coin) &&
-           ParseMarkerScript(coin.out.scriptPubKey, MARKER_REPLAY_STATE);
+    if (!view.GetCoin(ReplayStateOutpoint(), coin) || coin.IsSpent()) return info;
+    info.present = true;
+    info.marker_height = coin.nHeight;
+    info.marker_time = coin.nTime;
+
+    valtype payload;
+    const CBlockIndex* marker_block{nullptr};
+    info.marker_valid = ValidateCanonicalShadowReplayStateMarker(
+        coin, pindex, payload, marker_block);
+    if (marker_block) info.marker_block_hash = marker_block->GetBlockHash();
+    if (info.marker_valid) info.commitment = std::move(payload);
+    info.valid_for_tip = info.marker_valid &&
+                         HasCurrentShadowReplayState(view, consensus, pindex);
+    return info;
 }
 
 std::vector<ShadowSyntheticPayoutTransaction> GetAppliedShadowClaimPayoutTransactionRecords(const CCoinsViewCache& view, int height, const uint256& block_hash, int64_t block_time)
@@ -4327,6 +4377,11 @@ void SetShadowArgon2FailuresForTesting(uint64_t count)
 void ClearShadowArgon2FailuresForTesting()
 {
     g_shadow_argon2_test_failures.store(0, std::memory_order_relaxed);
+}
+
+COutPoint ShadowReplayStateOutpointForTesting()
+{
+    return ReplayStateOutpoint();
 }
 
 bool TransactionHasShadowProof(const CTransaction& tx)

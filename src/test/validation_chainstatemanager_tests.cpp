@@ -409,6 +409,57 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_activate_snapshot, SnapshotTestSetup)
     this->SetupSnapshot();
 }
 
+//! Deleting an active snapshot for reindex must return the node mempool to the
+//! background chainstate before the snapshot object is destroyed.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_delete_snapshot_rehomes_mempool, SnapshotTestSetup)
+{
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    Chainstate& background_chainstate = chainman.ActiveChainstate();
+    this->SetupSnapshot();
+    CTxMemPool* const node_mempool = Assert(m_node.mempool.get());
+    const fs::path snapshot_dir = *node::FindSnapshotChainstateDir(
+        chainman.m_options.datadir);
+    BOOST_REQUIRE(chainman.IsSnapshotActive());
+    BOOST_REQUIRE(chainman.ActiveChainstate().GetMempool() == node_mempool);
+    const uint256 snapshot_tip_hash = WITH_LOCK(
+        chainman.GetMutex(), return chainman.ActiveTip()->GetBlockHash());
+    BOOST_REQUIRE(!snapshot_tip_hash.IsNull());
+    BOOST_REQUIRE_EQUAL(chainman.GetAll().size(), 2U);
+
+    // Keep the background chain below the snapshot base so restart detects an
+    // active, not already-completed, snapshot chainstate.
+    DisconnectedBlockTransactions unused_pool{MAX_DISCONNECTED_TX_POOL_SIZE * 1000};
+    BlockValidationState unused_state;
+    {
+        LOCK2(::cs_main, background_chainstate.MempoolMutex());
+        BOOST_REQUIRE(background_chainstate.DisconnectTip(
+            unused_state, &unused_pool));
+        unused_pool.clear();
+    }
+    BOOST_REQUIRE_EQUAL(background_chainstate.m_chain.Height(), 109);
+
+    this->SimulateNodeRestart();
+    m_args.ForceSetArg("-reindex-chainstate", "1");
+    this->LoadVerifyActivateChainstate();
+
+    ChainstateManager& rebuilt = *Assert(m_node.chainman);
+    BOOST_CHECK(!rebuilt.IsSnapshotActive());
+    BOOST_CHECK(rebuilt.ActiveChainstate().GetMempool() == node_mempool);
+    BOOST_CHECK(!rebuilt.m_blockman.m_snapshot_height);
+    BOOST_CHECK_EQUAL(rebuilt.GetAll().size(), 1U);
+
+    BOOST_CHECK(!fs::exists(snapshot_dir));
+
+    // Exercise block creation, undo writing, and activation after the rebuild.
+    const int previous_height = WITH_LOCK(
+        rebuilt.GetMutex(), return rebuilt.ActiveHeight());
+    mineBlocks(1);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        rebuilt.GetMutex(), return rebuilt.ActiveHeight()), previous_height + 1);
+    BOOST_CHECK(rebuilt.ActiveChainstate().GetMempool() == node_mempool);
+    BOOST_CHECK(!rebuilt.m_blockman.m_snapshot_height);
+}
+
 //! Test LoadBlockIndex behavior when multiple chainstates are in use.
 //!
 //! - First, verify that setBlockIndexCandidates is as expected when using a single,

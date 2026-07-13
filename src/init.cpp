@@ -1663,7 +1663,14 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             }
         }
 
-        if (status == node::ChainstateLoadStatus::FAILURE_FATAL || status == node::ChainstateLoadStatus::FAILURE_INCOMPATIBLE_DB || status == node::ChainstateLoadStatus::FAILURE_INSUFFICIENT_DBCACHE) {
+        if (status == node::ChainstateLoadStatus::FAILURE_FATAL ||
+            status == node::ChainstateLoadStatus::FAILURE_INCOMPATIBLE_DB ||
+            status == node::ChainstateLoadStatus::FAILURE_INSUFFICIENT_DBCACHE ||
+            status == node::ChainstateLoadStatus::FAILURE_CHAINSTATE_REBUILD_REQUIRED ||
+            status == node::ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED ||
+            (options.reindex_chainstate &&
+             status != node::ChainstateLoadStatus::SUCCESS &&
+             status != node::ChainstateLoadStatus::INTERRUPTED)) {
             return InitError(error);
         }
 
@@ -1671,8 +1678,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             // first suggest a reindex
             if (!options.reindex) {
                 bool fRet = uiInterface.ThreadSafeQuestion(
-                    error + Untranslated(".\n\n") + _("Do you want to rebuild the block database now?"),
-                    error.original + ".\nPlease restart with -reindex or -reindex-chainstate to recover.",
+                    error + Untranslated(".\n\n") + _("Do you want to rebuild the full block database now?"),
+                    error.original + ".\nPlease restart with -reindex to rebuild the full block database.",
                     "", CClientUIInterface::MSG_ERROR | CClientUIInterface::BTN_ABORT);
                 if (fRet) {
                     fReindex = true;

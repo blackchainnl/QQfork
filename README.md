@@ -58,7 +58,8 @@ mining under v30.1.1 until it has completed one explicit chainstate rebuild.
 Back up every wallet, stop the old process completely, and run:
 
 ```bash
-blackcoind -datadir=/path/to/data -reindex-chainstate -daemonwait
+blackcoind -datadir=/path/to/data -networkactive=0 -staking=0 \
+  -reindex-chainstate -daemonwait
 ```
 
 `-reindex-chainstate` reconstructs state from local block files; it does not
@@ -66,7 +67,9 @@ retrieve block history that has already been pruned. The datadir must contain
 the complete active-chain block data needed for the rebuild. If block files are
 pruned or incomplete, set `prune=0` and use a full `-reindex` so the missing
 history can be downloaded and the block index and chainstate rebuilt. Do not
-delete wallet files or available block files.
+delete wallet files or available block files. v30.1.1 checks required block
+availability before wiping and leaves the existing chainstate intact if known
+pruned history makes a chainstate-only rebuild impossible.
 
 After synchronization, record and compare the height, best-block hash, UTXO
 MuHash, and Gold Rush totals across a clean restart:
@@ -77,8 +80,10 @@ blackcoin-cli gettxoutsetinfo muhash
 blackcoin-cli getgoldrushstate
 ```
 
-Keep the pre-upgrade wallet backup until those values remain stable after the
-clean restart.
+At or after the whitelist height, also require `getgoldrushstate.replay_state`
+to report schema 11 with `present`, `marker_valid`, and `valid_for_tip` all
+true. Keep the pre-upgrade wallet backup until the values and replay commitment
+remain stable after a clean restart and a second offline chainstate rebuild.
 
 ## First run and data migration
 

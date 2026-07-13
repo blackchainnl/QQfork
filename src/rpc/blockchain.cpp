@@ -2013,6 +2013,20 @@ static RPCHelpMan getgoldrushstate()
                         {RPCResult::Type::NUM, "last_pos_height", "Block height of the last PoS"},
                         {RPCResult::Type::NUM, "recent_count", "Recent Shadow claim samples tracked for PoW retargeting"},
                         {RPCResult::Type::NUM, "pow_target_bits", "Current PoW target bits"},
+                        {RPCResult::Type::NUM, "height", "Active chainstate height"},
+                        {RPCResult::Type::STR_HEX, "bestblock", "Active chainstate tip hash"},
+                        {RPCResult::Type::OBJ, "replay_state", "Authenticated auxiliary-state rebuild commitment",
+                            {
+                                {RPCResult::Type::NUM, "schema", "Required replay schema version"},
+                                {RPCResult::Type::BOOL, "required_for_tip", "Whether this tip must contain the replay marker"},
+                                {RPCResult::Type::BOOL, "present", "Whether the reserved replay marker exists"},
+                                {RPCResult::Type::BOOL, "marker_valid", "Whether the marker has canonical structure and matches candidate active-chain height/time metadata"},
+                                {RPCResult::Type::BOOL, "valid_for_tip", "Whether the commitment exactly authenticates this tip and schedule; this is the authoritative acceptance field"},
+                                {RPCResult::Type::NUM, "marker_height", "Marker anchor height, or 0 when absent"},
+                                {RPCResult::Type::NUM_TIME, "marker_time", "Marker anchor block time, or 0 when absent"},
+                                {RPCResult::Type::STR_HEX, "marker_blockhash", "Candidate active-chain anchor hash at marker_height, empty when unavailable"},
+                                {RPCResult::Type::STR_HEX, "commitment", "Raw 32-byte replay commitment, authoritative only when valid_for_tip is true; empty when malformed or absent"},
+                            }},
                     }},
                 RPCExamples{
                     HelpExampleCli("getgoldrushstate", "")
@@ -2041,6 +2055,24 @@ static RPCHelpMan getgoldrushstate()
     obj.pushKV("last_pos_height", info.last_pos_height);
     obj.pushKV("recent_count", info.recent_count);
     obj.pushKV("pow_target_bits", (uint64_t)info.pow_target_bits);
+    obj.pushKV("height", pindex->nHeight);
+    obj.pushKV("bestblock", pindex->GetBlockHash().GetHex());
+
+    const ShadowReplayStateInfo replay = GetShadowReplayStateInfo(
+        active_chainstate.CoinsTip(), chainman.GetConsensus(), pindex);
+    UniValue replay_obj(UniValue::VOBJ);
+    replay_obj.pushKV("schema", replay.schema);
+    replay_obj.pushKV("required_for_tip", replay.required_for_tip);
+    replay_obj.pushKV("present", replay.present);
+    replay_obj.pushKV("marker_valid", replay.marker_valid);
+    replay_obj.pushKV("valid_for_tip", replay.valid_for_tip);
+    replay_obj.pushKV("marker_height", replay.marker_height);
+    replay_obj.pushKV("marker_time", replay.marker_time);
+    replay_obj.pushKV("marker_blockhash", replay.marker_block_hash.IsNull()
+        ? std::string{} : replay.marker_block_hash.GetHex());
+    replay_obj.pushKV("commitment", replay.commitment.empty()
+        ? std::string{} : HexStr(replay.commitment));
+    obj.pushKV("replay_state", std::move(replay_obj));
 
     return obj;
 },

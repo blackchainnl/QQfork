@@ -36,13 +36,18 @@ blackcoin-cli -rpcwallet=<wallet> getmigrationstatus
 4. Run one explicit schema-11 rebuild before enabling staking or mining:
 
    ```bash
-   blackcoind -datadir=/path/to/data -reindex-chainstate -daemonwait
+   blackcoind -datadir=/path/to/data -networkactive=0 -staking=0 \
+     -reindex-chainstate -daemonwait
    ```
 
 5. Wait for synchronization, then record `getblockchaininfo`,
    `gettxoutsetinfo muhash`, and `getgoldrushstate`.
-6. Stop cleanly, restart without a reindex option, and confirm the height,
-   best-block hash, UTXO MuHash, and Gold Rush totals match.
+6. At or after the whitelist height, require `getgoldrushstate.replay_state`
+   schema 11 with `present`, `marker_valid`, and `valid_for_tip` all true.
+   Stop cleanly, restart without a reindex option, and confirm the height,
+   best-block hash, UTXO MuHash, Gold Rush totals, and replay commitment match.
+   Repeat one offline `-reindex-chainstate` comparison for release-candidate
+   qualification before enabling networking, staking, or mining.
 7. Use `getmigrationstatus` to inspect remaining legacy funds.
 8. Use `migratetoquantum` during the migration window when ready to move legacy
    wallet coins into ML-DSA-backed quantum migration outputs.
@@ -57,7 +62,9 @@ repair.
 deleted by pruning. It requires complete active-chain block data for the replay.
 If the datadir is pruned or block files are incomplete, set `prune=0` and use a
 full `-reindex` to redownload missing history and rebuild both the block index
-and chainstate. Preserve wallets and all available block files.
+and chainstate. v30.1.1 performs this availability check before wiping and
+leaves the existing chainstate intact when known-pruned history is missing.
+Preserve wallets and all available block files.
 
 ## Gold Rush
 

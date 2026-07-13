@@ -6462,7 +6462,7 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
     return true;
 }
 
-bool Chainstate::ReplayBlocks()
+Chainstate::ReplayResult Chainstate::ReplayBlocks()
 {
     LOCK(cs_main);
 
@@ -6470,8 +6470,11 @@ bool Chainstate::ReplayBlocks()
     CCoinsViewCache cache(&db);
 
     std::vector<uint256> hashHeads = db.GetHeadBlocks();
-    if (hashHeads.empty()) return true; // We're already in a consistent state.
-    if (hashHeads.size() != 2) return error("ReplayBlocks(): unknown inconsistent state");
+    if (hashHeads.empty()) return ReplayResult::SUCCESS; // We're already in a consistent state.
+    if (hashHeads.size() != 2) {
+        error("ReplayBlocks(): unknown inconsistent state");
+        return ReplayResult::FAILURE;
+    }
 
     m_chainman.GetNotifications().progress(_("Replaying blocks…"), 0, false);
     LogPrintf("Replaying blocks\n");
@@ -6481,13 +6484,15 @@ bool Chainstate::ReplayBlocks()
     const CBlockIndex* pindexFork = nullptr; // Latest block common to both the old and the new tip.
 
     if (m_blockman.m_block_index.count(hashHeads[0]) == 0) {
-        return error("ReplayBlocks(): reorganization to unknown block requested");
+        error("ReplayBlocks(): reorganization to unknown block requested");
+        return ReplayResult::FAILURE;
     }
     pindexNew = &(m_blockman.m_block_index[hashHeads[0]]);
 
     if (!hashHeads[1].IsNull()) { // The old tip is allowed to be 0, indicating it's the first flush.
         if (m_blockman.m_block_index.count(hashHeads[1]) == 0) {
-            return error("ReplayBlocks(): reorganization from unknown block requested");
+            error("ReplayBlocks(): reorganization from unknown block requested");
+            return ReplayResult::FAILURE;
         }
         pindexOld = &(m_blockman.m_block_index[hashHeads[1]]);
         pindexFork = LastCommonAncestor(pindexOld, pindexNew);
@@ -6505,7 +6510,8 @@ bool Chainstate::ReplayBlocks()
     // coins, and final best-block marker commit atomically.
     if (pindexNew->nHeight >= SHADOW_WHITELIST_HEIGHT ||
         (pindexOld && pindexOld->nHeight >= SHADOW_WHITELIST_HEIGHT)) {
-        return error("ReplayBlocks(): interrupted multi-batch flush crossed authenticated Quantum Quasar state; restart with -reindex-chainstate");
+        error("ReplayBlocks(): interrupted multi-batch flush crossed authenticated Quantum Quasar state; restart with -reindex-chainstate");
+        return ReplayResult::CHAINSTATE_REBUILD_REQUIRED;
     }
 
     // Rollback along the old branch.
@@ -6513,13 +6519,15 @@ bool Chainstate::ReplayBlocks()
         if (pindexOld->nHeight > 0) { // Never disconnect the genesis block.
             CBlock block;
             if (!m_blockman.ReadBlockFromDisk(block, *pindexOld)) {
-                return error("RollbackBlock(): ReadBlockFromDisk() failed at %d, hash=%s", pindexOld->nHeight, pindexOld->GetBlockHash().ToString());
+                error("RollbackBlock(): ReadBlockFromDisk() failed at %d, hash=%s", pindexOld->nHeight, pindexOld->GetBlockHash().ToString());
+                return ReplayResult::FAILURE;
             }
             LogPrintf("Rolling back %s (%i)\n", pindexOld->GetBlockHash().ToString(), pindexOld->nHeight);
             DisconnectResult res = DisconnectBlock(block, pindexOld, cache,
                                                    /*disconnect_auxiliary_state=*/false);
             if (res == DISCONNECT_FAILED) {
-                return error("RollbackBlock(): DisconnectBlock failed at %d, hash=%s", pindexOld->nHeight, pindexOld->GetBlockHash().ToString());
+                error("RollbackBlock(): DisconnectBlock failed at %d, hash=%s", pindexOld->nHeight, pindexOld->GetBlockHash().ToString());
+                return ReplayResult::FAILURE;
             }
             // If DISCONNECT_UNCLEAN is returned, it means a non-existing UTXO was deleted, or an existing UTXO was
             // overwritten. It corresponds to cases where the block-to-be-disconnect never had all its operations
@@ -6536,17 +6544,24 @@ bool Chainstate::ReplayBlocks()
 
         LogPrintf("Rolling forward %s (%i)\n", pindex.GetBlockHash().ToString(), nHeight);
         m_chainman.GetNotifications().progress(_("Replaying blocks…"), (int)((nHeight - nForkHeight) * 100.0 / (pindexNew->nHeight - nForkHeight)), false);
-        if (!RollforwardBlock(&pindex, cache, /*apply_auxiliary_state=*/false)) return false;
+        if (!RollforwardBlock(&pindex, cache, /*apply_auxiliary_state=*/false)) {
+            return ReplayResult::FAILURE;
+        }
     }
 
     cache.SetBestBlock(pindexNew->GetBlockHash());
 
-    if (!cache.Flush()) return error("ReplayBlocks(): failed to flush recovered base chainstate");
-    if (!ReplayShadowBlocks()) {
-        return error("ReplayBlocks(): failed to rebuild pre-whitelist Quantum Quasar auxiliary state");
+    if (!cache.Flush()) {
+        error("ReplayBlocks(): failed to flush recovered base chainstate");
+        return ReplayResult::FAILURE;
+    }
+    const ReplayResult shadow_result = ReplayShadowBlocks();
+    if (shadow_result != ReplayResult::SUCCESS) {
+        error("ReplayBlocks(): failed to rebuild pre-whitelist Quantum Quasar auxiliary state");
+        return shadow_result;
     }
     m_chainman.GetNotifications().progress(bilingual_str{}, 100, false);
-    return true;
+    return ReplayResult::SUCCESS;
 }
 
 static std::optional<CAmount> AddMoney(CAmount a, CAmount b)
@@ -6595,7 +6610,7 @@ static bool PurgeShadowMarkers(CCoinsViewCache& view, const CBlockIndex* pindexT
         }, removed);
 }
 
-bool Chainstate::ReplayShadowBlocks()
+Chainstate::ReplayResult Chainstate::ReplayShadowBlocks()
 {
     LOCK(cs_main);
 
@@ -6607,11 +6622,12 @@ bool Chainstate::ReplayShadowBlocks()
 
     CCoinsView& db = this->CoinsDB();
     const uint256 best_block = db.GetBestBlock();
-    if (best_block.IsNull()) return true;
+    if (best_block.IsNull()) return ReplayResult::SUCCESS;
 
     const auto tip_it = m_blockman.m_block_index.find(best_block);
     if (tip_it == m_blockman.m_block_index.end()) {
-        return error("ReplayShadowBlocks(): unknown coins tip %s", best_block.ToString());
+        error("ReplayShadowBlocks(): unknown coins tip %s", best_block.ToString());
+        return ReplayResult::FAILURE;
     }
     const CBlockIndex* pindexTip = &tip_it->second;
 
@@ -6629,7 +6645,7 @@ bool Chainstate::ReplayShadowBlocks()
     // maintenance and migration QA.
     if (!whitelist_missing && HasCurrentShadowReplayState(
             cache, m_chainman.GetConsensus(), pindexTip, &replay_block_reader)) {
-        return true;
+        return ReplayResult::SUCCESS;
     }
 
     // At/after the whitelist boundary there is no safe in-place repair path:
@@ -6638,16 +6654,23 @@ bool Chainstate::ReplayShadowBlocks()
     // checkpoint also fails in bounded time rather than delaying the recovery
     // instruction by up to the entire Gold Rush window.
     if (pindexTip->nHeight >= SHADOW_WHITELIST_HEIGHT) {
-        return error("ReplayShadowBlocks(): Quantum Quasar v30.1.1 schema-11 auxiliary checkpoint is missing or inconsistent at height %d. Restart with -reindex-chainstate; if required block files were pruned or are incomplete, disable pruning and use a full -reindex to redownload and rebuild",
-                     pindexTip->nHeight);
+        error("ReplayShadowBlocks(): Quantum Quasar v30.1.1 schema-11 auxiliary checkpoint is missing or inconsistent at height %d",
+              pindexTip->nHeight);
+        return ReplayResult::CHAINSTATE_REBUILD_REQUIRED;
     }
 
     int first_active_height{0};
     const auto expected = GetExpectedShadowObligation(m_chainman.GetConsensus(), pindexTip, &first_active_height);
-    if (!expected) return error("ReplayShadowBlocks(): failed to compute expected Quantum Quasar shadow obligation");
+    if (!expected) {
+        error("ReplayShadowBlocks(): failed to compute expected Quantum Quasar shadow obligation");
+        return ReplayResult::FAILURE;
+    }
 
     const auto current = GetCurrentShadowObligation(cache, pindexTip);
-    if (!current) return error("ReplayShadowBlocks(): failed to read current Quantum Quasar shadow obligation");
+    if (!current) {
+        error("ReplayShadowBlocks(): failed to read current Quantum Quasar shadow obligation");
+        return ReplayResult::FAILURE;
+    }
     const bool replay_state_current = HasCurrentShadowReplayState(
         cache, m_chainman.GetConsensus(), pindexTip, &replay_block_reader);
     // Do not add a second aggregate-only success path here. Reaching this line
@@ -6658,29 +6681,43 @@ bool Chainstate::ReplayShadowBlocks()
         uint64_t demurrage_removed{0};
         if (*current != 0 || replay_state_present) {
             if (!PurgeShadowMarkers(cache, pindexTip, m_blockman, removed)) {
-                return error("ReplayShadowBlocks(): failed to authenticate stale pre-Gold-Rush shadow state");
+                error("ReplayShadowBlocks(): failed to authenticate stale pre-Gold-Rush shadow state");
+                return ReplayResult::FAILURE;
+            }
+            // The replay outpoint is protocol-reserved. Any record left there
+            // after authenticated cleanup is malformed auxiliary state, not a
+            // user UTXO that startup may ignore.
+            if (HasShadowReplayState(cache)) {
+                error("ReplayShadowBlocks(): malformed pre-whitelist replay marker remains at the reserved outpoint");
+                return ReplayResult::CHAINSTATE_REBUILD_REQUIRED;
             }
             const auto repaired = GetCurrentShadowObligation(cache, pindexTip);
             if (!repaired || *repaired != 0) {
-                return error("ReplayShadowBlocks(): failed to clear stale pre-Gold-Rush shadow obligation");
+                error("ReplayShadowBlocks(): failed to clear stale pre-Gold-Rush shadow obligation");
+                return ReplayResult::FAILURE;
             }
             LogPrintf("Quantum Quasar: removed %u stale pre-whitelist shadow records at height %d\n", removed, pindexTip->nHeight);
         }
         if (!Consensus::PurgeAuthenticatedDemurrageState(cache, pindexTip, demurrage_removed)) {
-            return error("ReplayShadowBlocks(): failed to authenticate stale pre-whitelist demurrage state");
+            error("ReplayShadowBlocks(): failed to authenticate stale pre-whitelist demurrage state");
+            return ReplayResult::FAILURE;
         }
         // A pre-whitelist chainstate has nothing to rebuild. Do not add a
         // marker: the official mainnet assumeUTXO snapshot predates QQRSTATE,
         // and its registered serialized hash must remain reproducible.
         if (*current != 0 || removed != 0 || demurrage_removed != 0) {
             cache.SetBestBlock(pindexTip->GetBlockHash());
-            if (!cache.Flush()) return error("ReplayShadowBlocks(): failed to flush repaired pre-whitelist state");
+            if (!cache.Flush()) {
+                error("ReplayShadowBlocks(): failed to flush repaired pre-whitelist state");
+                return ReplayResult::FAILURE;
+            }
         }
-        return true;
+        return ReplayResult::SUCCESS;
     }
 
-    return error("ReplayShadowBlocks(): unexpected pre-whitelist Quantum Quasar obligation at height %d",
-                 pindexTip->nHeight);
+    error("ReplayShadowBlocks(): unexpected pre-whitelist Quantum Quasar obligation at height %d",
+          pindexTip->nHeight);
+    return ReplayResult::FAILURE;
 }
 
 bool Chainstate::NeedsRedownload() const
@@ -8036,14 +8073,45 @@ bool ChainstateManager::DeleteSnapshotChainstate()
     Assert(m_snapshot_chainstate);
     Assert(m_ibd_chainstate);
 
-    fs::path snapshot_datadir = GetSnapshotCoinsDBPath(*m_snapshot_chainstate);
-    if (!DeleteCoinsDBFromDisk(snapshot_datadir, /*is_snapshot=*/ true)) {
-        LogPrintf("Deletion of %s failed. Please remove it manually to continue reindexing.\n",
-                  fs::PathToString(snapshot_datadir));
+    // Reindex can reach this path before the snapshot CoinsDB is initialized.
+    // Resolve the persisted directory directly instead of dereferencing an
+    // absent CoinsViews object.
+    const std::optional<fs::path> snapshot_datadir =
+        node::FindSnapshotChainstateDir(m_options.datadir);
+    if (!snapshot_datadir) {
+        LogPrintf("Snapshot chainstate directory disappeared before deletion.\n");
         return false;
     }
+    m_snapshot_chainstate->ResetCoinsViews();
+    if (!DeleteCoinsDBFromDisk(*snapshot_datadir, /*is_snapshot=*/ true)) {
+        LogPrintf("Deletion of %s failed. Please remove it manually to continue reindexing.\n",
+                  fs::PathToString(*snapshot_datadir));
+        return false;
+    }
+
+    // ActivateExistingSnapshot moved the node mempool from the background
+    // chainstate to the snapshot chainstate. Move it back before destroying
+    // the snapshot so the rebuilt active chainstate remains usable.
+    Assert(m_active_chainstate == m_snapshot_chainstate.get());
+    Assert(!m_ibd_chainstate->m_mempool);
+    Assert(m_snapshot_chainstate->m_mempool);
+    m_ibd_chainstate->m_mempool = m_snapshot_chainstate->m_mempool;
+    m_snapshot_chainstate->m_mempool = nullptr;
+    m_blockman.ExitSnapshotBlockfileMode();
     m_active_chainstate = m_ibd_chainstate.get();
     m_snapshot_chainstate.reset();
+
+    // LoadBlockIndex populated the former background chainstate only with
+    // candidates leading to the snapshot base. It is active now, so rebuild
+    // its candidate set from fully transaction-valid history. Assumed-only
+    // snapshot entries remain excluded by the validity predicate.
+    m_active_chainstate->ClearBlockIndexCandidates();
+    for (auto& [_, block_index] : m_blockman.m_block_index) {
+        if (block_index.IsValid(BLOCK_VALID_TRANSACTIONS) &&
+            (block_index.HaveNumChainTxs() || block_index.pprev == nullptr)) {
+            m_active_chainstate->TryAddBlockIndexCandidate(&block_index);
+        }
+    }
     return true;
 }
 

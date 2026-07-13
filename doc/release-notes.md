@@ -32,18 +32,23 @@ An existing v30.1.0 datadir requires one explicit authenticated schema-11
 chainstate rebuild before staking or mining under v30.1.1:
 
 ```bash
-blackcoind -datadir=/path/to/data -reindex-chainstate -daemonwait
+blackcoind -datadir=/path/to/data -networkactive=0 -staking=0 \
+  -reindex-chainstate -daemonwait
 ```
 
 `-reindex-chainstate` reads local block files and does not fetch history removed
 by pruning. If block files are pruned or incomplete, set `prune=0` and use a
 full `-reindex` to redownload missing history and rebuild both the block index
-and chainstate. Preserve wallet files and all available block files.
+and chainstate. The client checks known block availability before wiping and
+leaves the existing chainstate intact when a chainstate-only rebuild is not
+possible. Preserve wallet files and all available block files.
 
 After synchronization, record `getblockchaininfo`, `gettxoutsetinfo muhash`, and
 `getgoldrushstate`. Stop cleanly, restart without a reindex option, and confirm
-that height, best-block hash, UTXO MuHash, and Gold Rush totals match before
-enabling staking or mining.
+that height, best-block hash, UTXO MuHash, Gold Rush totals, and the schema-11
+`replay_state` commitment match. At or after the whitelist height, `present`,
+`marker_valid`, and `valid_for_tip` must all be true. Repeat one offline
+chainstate rebuild comparison before enabling networking, staking, or mining.
 
 Compatibility
 ==============

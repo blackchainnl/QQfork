@@ -159,6 +159,8 @@ private:
 
     [[nodiscard]] bool FindBlockPos(FlatFilePos& pos, unsigned int nAddSize, unsigned int nHeight, uint64_t nTime, bool fKnown);
     [[nodiscard]] bool FlushChainstateBlockFile(int tip_height);
+    /** Leave assumeUTXO file segmentation after deleting the snapshot. */
+    void ExitSnapshotBlockfileMode() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool FindUndoPos(BlockValidationState& state, int nFile, FlatFilePos& pos, unsigned int nAddSize);
 
     FlatFileSeq BlockFileSeq() const;

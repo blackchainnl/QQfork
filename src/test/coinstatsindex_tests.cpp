@@ -28,7 +28,7 @@ BOOST_FIXTURE_TEST_CASE(shadow_replay_preserves_pre_whitelist_snapshot_stats, Te
         chainstate.m_blockman);
     BOOST_REQUIRE(before);
 
-    BOOST_REQUIRE(chainstate.ReplayShadowBlocks());
+    BOOST_REQUIRE(chainstate.ReplayShadowBlocks() == Chainstate::ReplayResult::SUCCESS);
 
     const auto after = kernel::ComputeUTXOStats(
         kernel::CoinStatsHashType::HASH_SERIALIZED,
@@ -41,6 +41,44 @@ BOOST_FIXTURE_TEST_CASE(shadow_replay_preserves_pre_whitelist_snapshot_stats, Te
 
     CCoinsViewCache view(&chainstate.CoinsDB());
     BOOST_CHECK(!HasShadowReplayState(view));
+}
+
+BOOST_FIXTURE_TEST_CASE(shadow_replay_rejects_malformed_reserved_pre_whitelist_marker, TestChain100Setup)
+{
+    Chainstate& chainstate = Assert(m_node.chainman)->ActiveChainstate();
+    chainstate.ForceFlushStateToDisk();
+    const COutPoint replay_outpoint = ShadowReplayStateOutpointForTesting();
+
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip = chainstate.m_chain.Tip();
+        BOOST_REQUIRE(tip);
+        Coin malformed;
+        malformed.out.nValue = 1;
+        malformed.out.scriptPubKey = CScript{} << OP_FALSE << OP_RETURN
+            << std::vector<unsigned char>{'Q', 'Q', 'R', 'E', 'P', 'L', 'A', 'Y'}
+            << std::vector<unsigned char>(32, 0);
+        malformed.fCoinBase = true;
+        malformed.fCoinStake = false;
+        malformed.nHeight = tip->nHeight;
+        malformed.nTime = tip->GetBlockTime();
+
+        CCoinsViewCache cache(&chainstate.CoinsDB());
+        cache.SetBestBlock(chainstate.CoinsDB().GetBestBlock());
+        cache.AddCoin(replay_outpoint, std::move(malformed), true);
+        BOOST_REQUIRE(cache.Flush());
+    }
+
+    BOOST_CHECK(chainstate.ReplayShadowBlocks() ==
+                Chainstate::ReplayResult::CHAINSTATE_REBUILD_REQUIRED);
+
+    {
+        LOCK(cs_main);
+        CCoinsViewCache cache(&chainstate.CoinsDB());
+        Coin persisted;
+        BOOST_REQUIRE(cache.GetCoin(replay_outpoint, persisted));
+        BOOST_CHECK_EQUAL(persisted.out.nValue, 1);
+    }
 }
 
 BOOST_FIXTURE_TEST_CASE(coinstatsindex_initial_sync, TestChain100Setup)
