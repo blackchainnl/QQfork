@@ -98,7 +98,13 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
                 assert "proof-of-stake" in block["flags"]
                 txids = [tx["txid"] for tx in block["tx"]]
                 assert claim_txid in txids[2:], "QQSPROOF claim must be a fee-paying transaction"
+                # Node 0 validates the in-memory block object produced by its
+                # wallet. Node 1 validates the network-serialized copy, where
+                # version-2 transaction nTime is absent. Both must derive the
+                # stake input time from the source block and accept the exact
+                # same PoS block.
                 self.sync_blocks()
+                assert_equal(self.nodes[1].getbestblockhash(), block_hash)
                 return block_hash
             except AssertionError as e:
                 last_error = e
@@ -142,7 +148,8 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         """Reference explorer loop with bounded pages and supply reconciliation."""
         node = self.nodes[1]
         observed = []
-        for height in range(20, 30):
+        last_reward_height = min(node.getblockcount(), 29)
+        for height in range(20, last_reward_height + 1):
             offset = 0
             while True:
                 page = node.getshadowblock(height, offset, 2)
@@ -287,6 +294,11 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         assert_equal(payout_record["base_anchor"]["blockhash"], claim_block_hash)
         assert_equal(payout_record["pow_claim_source"]["txid"], claim["txid"])
         assert_equal(payout_record["pow_claim_source"]["disposition"], "winner")
+        address_history = self.nodes[1].getshadowaddress(payout_address)
+        assert_equal(address_history["schema"], "blackcoin.shadow.address.v1")
+        assert_equal(address_history["address"], payout_address)
+        assert_equal(address_history["count"], 1)
+        assert_equal(address_history["records"][0]["synthetic_txid"], payout_utxo["txid"])
         observed, shadow_supply = self._ingest_shadow_reward_window()
         assert_equal([item["synthetic_txid"] for item in observed], [payout_utxo["txid"]])
         assert_equal(shadow_supply["unspent_count"], 1)

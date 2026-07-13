@@ -5,7 +5,10 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chainparams.h>
+#include <common/args.h>
+#include <dbwrapper.h>
 #include <index/coinstatsindex.h>
+#include <index/shadowindex.h>
 #include <interfaces/chain.h>
 #include <kernel/coinstats.h>
 #include <shadow.h>
@@ -17,6 +20,119 @@
 #include <boost/test/unit_test.hpp>
 
 BOOST_AUTO_TEST_SUITE(coinstatsindex_tests)
+
+BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds, TestChain100Setup)
+{
+    static constexpr uint8_t SCHEMA_KEY{'V'};
+    static constexpr uint32_t PRERELEASE_COINSTATS_SCHEMA{2};
+    static constexpr uint32_t CURRENT_COINSTATS_SCHEMA{3};
+    static constexpr uint32_t PRERELEASE_SHADOW_SCHEMA{4};
+    static constexpr uint32_t CURRENT_SHADOW_SCHEMA{5};
+    const std::string sentinel{"prerelease-claim-allocation"};
+
+    const auto build_index = [](BaseIndex& index) {
+        BOOST_REQUIRE(index.Init());
+        BOOST_REQUIRE(index.StartBackgroundSync());
+        IndexWaitSynced(index);
+        BOOST_CHECK(index.BlockUntilSyncedToCurrentChain());
+        index.Stop();
+    };
+
+    const fs::path coinstats_path = gArgs.GetDataDirNet() / "indexes" / "coinstats" / "db";
+    {
+        CoinStatsIndex index{interfaces::MakeChain(m_node), 1 << 20};
+        build_index(index);
+    }
+    {
+        CDBWrapper db({.path = coinstats_path, .cache_bytes = 1 << 20});
+        BOOST_REQUIRE(db.Write(SCHEMA_KEY, PRERELEASE_COINSTATS_SCHEMA));
+        BOOST_REQUIRE(db.Write(sentinel, true));
+    }
+    {
+        CoinStatsIndex index{interfaces::MakeChain(m_node), 1 << 20};
+        build_index(index);
+    }
+    {
+        CDBWrapper db({.path = coinstats_path, .cache_bytes = 1 << 20});
+        uint32_t schema{0};
+        BOOST_REQUIRE(db.Read(SCHEMA_KEY, schema));
+        BOOST_CHECK_EQUAL(schema, CURRENT_COINSTATS_SCHEMA);
+        BOOST_CHECK(!db.Exists(sentinel));
+    }
+
+    // A partially populated, unversioned index must be discarded rather than
+    // relabeled as current. Its persisted MuHash provenance is unknowable.
+    {
+        CDBWrapper db({.path = coinstats_path, .cache_bytes = 1 << 20});
+        BOOST_REQUIRE(db.Erase(SCHEMA_KEY));
+        BOOST_REQUIRE(db.Write(sentinel, true));
+    }
+    {
+        CoinStatsIndex index{interfaces::MakeChain(m_node), 1 << 20};
+        build_index(index);
+    }
+    {
+        CDBWrapper db({.path = coinstats_path, .cache_bytes = 1 << 20});
+        uint32_t schema{0};
+        BOOST_REQUIRE(db.Read(SCHEMA_KEY, schema));
+        BOOST_CHECK_EQUAL(schema, CURRENT_COINSTATS_SCHEMA);
+        BOOST_CHECK(!db.Exists(sentinel));
+    }
+
+    const fs::path shadow_path = gArgs.GetDataDirNet() / "indexes" / "shadow";
+    {
+        ShadowIndex index{interfaces::MakeChain(m_node), 1 << 20};
+        build_index(index);
+    }
+    {
+        CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
+        BOOST_REQUIRE(db.Write(SCHEMA_KEY, PRERELEASE_SHADOW_SCHEMA));
+        BOOST_REQUIRE(db.Write(sentinel, true));
+    }
+    {
+        ShadowIndex index{interfaces::MakeChain(m_node), 1 << 20};
+        build_index(index);
+    }
+    {
+        CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
+        uint32_t schema{0};
+        BOOST_REQUIRE(db.Read(SCHEMA_KEY, schema));
+        BOOST_CHECK_EQUAL(schema, CURRENT_SHADOW_SCHEMA);
+        BOOST_CHECK(!db.Exists(sentinel));
+    }
+
+    // An unversioned but populated database must not be relabeled as current.
+    // Its records have no authenticated claim-allocation provenance.
+    {
+        CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
+        BOOST_REQUIRE(db.Erase(SCHEMA_KEY));
+        BOOST_REQUIRE(db.Write(sentinel, true));
+    }
+    {
+        ShadowIndex index{interfaces::MakeChain(m_node), 1 << 20};
+        build_index(index);
+    }
+    {
+        CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
+        uint32_t schema{0};
+        BOOST_REQUIRE(db.Read(SCHEMA_KEY, schema));
+        BOOST_CHECK_EQUAL(schema, CURRENT_SHADOW_SCHEMA);
+        BOOST_CHECK(!db.Exists(sentinel));
+    }
+
+    // A newer schema may contain semantics this binary does not understand.
+    // Downgrades fail closed instead of deleting that database.
+    {
+        CDBWrapper db({.path = coinstats_path, .cache_bytes = 1 << 20});
+        BOOST_REQUIRE(db.Write(SCHEMA_KEY, CURRENT_COINSTATS_SCHEMA + 1));
+    }
+    BOOST_CHECK_THROW((CoinStatsIndex{interfaces::MakeChain(m_node), 1 << 20}), std::runtime_error);
+    {
+        CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
+        BOOST_REQUIRE(db.Write(SCHEMA_KEY, CURRENT_SHADOW_SCHEMA + 1));
+    }
+    BOOST_CHECK_THROW((ShadowIndex{interfaces::MakeChain(m_node), 1 << 20}), std::runtime_error);
+}
 
 BOOST_FIXTURE_TEST_CASE(shadow_replay_preserves_pre_whitelist_snapshot_stats, TestChain100Setup)
 {

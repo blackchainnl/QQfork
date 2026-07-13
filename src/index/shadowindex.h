@@ -227,7 +227,7 @@ protected:
     class DB;
 
 private:
-    const std::unique_ptr<DB> m_db;
+    std::unique_ptr<DB> m_db;
 
 protected:
     bool CustomInit(const std::optional<interfaces::BlockKey>& block) override;

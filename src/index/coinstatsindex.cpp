@@ -30,7 +30,10 @@ static constexpr uint8_t DB_BLOCK_HEIGHT{'t'};
 static constexpr uint8_t DB_MUHASH{'M'};
 static constexpr uint8_t DB_SHADOW_PAYOUTS{'q'};
 static constexpr uint8_t DB_SCHEMA_VERSION{'V'};
-static constexpr uint32_t COINSTATS_SCHEMA_VERSION{2};
+// Schema 3 invalidates prerelease schema-2 MuHash and per-block synthetic
+// payout records derived with the superseded height-5,950,000 competing-claim
+// activation boundary.
+static constexpr uint32_t COINSTATS_SCHEMA_VERSION{3};
 
 namespace {
 
@@ -152,10 +155,20 @@ CoinStatsIndex::CoinStatsIndex(std::unique_ptr<interfaces::Chain> chain, size_t 
 
     uint32_t stored_version{0};
     const bool has_version = m_db->Read(DB_SCHEMA_VERSION, stored_version);
-    const bool populated_legacy_index = !has_version && m_db->Exists(DB_MUHASH);
-    if (!f_wipe && (populated_legacy_index || (has_version && stored_version != COINSTATS_SCHEMA_VERSION))) {
-        LogPrintf("CoinStatsIndex: rebuilding incompatible schema version %u as version %u\n",
-                  has_version ? stored_version : 1, COINSTATS_SCHEMA_VERSION);
+    if (!has_version && m_db->Exists(DB_SCHEMA_VERSION)) {
+        throw std::runtime_error("Unable to read coinstatsindex schema version");
+    }
+    if (has_version && stored_version > COINSTATS_SCHEMA_VERSION) {
+        throw std::runtime_error(strprintf(
+            "Unsupported newer coinstatsindex schema %u (maximum supported %u)",
+            stored_version, COINSTATS_SCHEMA_VERSION));
+    }
+    const bool populated_unversioned_index = !has_version && !m_db->IsEmpty();
+    const bool obsolete_version = has_version && stored_version < COINSTATS_SCHEMA_VERSION;
+    if (!f_wipe && (populated_unversioned_index || obsolete_version)) {
+        LogPrintf("CoinStatsIndex: rebuilding incompatible schema %s as version %u\n",
+                  populated_unversioned_index ? "without a version" : strprintf("version %u", stored_version),
+                  COINSTATS_SCHEMA_VERSION);
         m_db.reset();
         m_db = std::make_unique<CoinStatsIndex::DB>(db_path, n_cache_size, f_memory, /*f_wipe=*/true);
     }

@@ -36,7 +36,11 @@ static constexpr uint8_t DB_QUANTUM_WITNESS_OUTPUT{'w'};
 static constexpr uint8_t DB_QUANTUM_WITNESS_BLOCK{'W'};
 static constexpr uint8_t DB_POW_CLAIM{'c'};
 static constexpr uint8_t DB_CUSTOM_TIP{'T'};
-static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{4};
+// Schema 5 invalidates prerelease schema-4 records whose competing-claim
+// classification was derived with the superseded height-5,950,000 activation
+// boundary. The index is auxiliary and fully reconstructible, so a recognized
+// older schema is wiped and rebuilt instead of being interpreted in place.
+static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{5};
 static constexpr size_t MAX_SCRIPT_QUERY_RESULTS{1000};
 
 uint256 ShadowScriptHash(const CScript& script)
@@ -283,18 +287,7 @@ class ShadowIndex::DB final : public BaseIndex::DB
 public:
     explicit DB(size_t cache_size, bool memory, bool wipe)
         : BaseIndex::DB(gArgs.GetDataDirNet() / "indexes" / "shadow", cache_size, memory, wipe)
-    {
-        uint32_t version{0};
-        if (Read(DB_SCHEMA_VERSION, version)) {
-            if (version != SHADOW_INDEX_SCHEMA_VERSION) {
-                throw std::runtime_error(strprintf(
-                    "Unsupported shadowindex schema %u (expected %u); restart with -reindex",
-                    version, SHADOW_INDEX_SCHEMA_VERSION));
-            }
-        } else if (Exists(DB_SCHEMA_VERSION) || !Write(DB_SCHEMA_VERSION, SHADOW_INDEX_SCHEMA_VERSION)) {
-            throw std::runtime_error("Unable to initialize shadowindex schema");
-        }
-    }
+    {}
 
     bool ReadBlock(const uint256& hash, ShadowIndexBlockRecord& record) const
     {
@@ -317,6 +310,28 @@ ShadowIndex::ShadowIndex(std::unique_ptr<interfaces::Chain> chain, size_t cache_
     : BaseIndex(std::move(chain), "shadowindex"),
       m_db(std::make_unique<ShadowIndex::DB>(cache_size, memory, wipe))
 {
+    uint32_t stored_version{0};
+    const bool has_version = m_db->Read(DB_SCHEMA_VERSION, stored_version);
+    if (!has_version && m_db->Exists(DB_SCHEMA_VERSION)) {
+        throw std::runtime_error("Unable to read shadowindex schema version");
+    }
+    if (has_version && stored_version > SHADOW_INDEX_SCHEMA_VERSION) {
+        throw std::runtime_error(strprintf(
+            "Unsupported newer shadowindex schema %u (maximum supported %u)",
+            stored_version, SHADOW_INDEX_SCHEMA_VERSION));
+    }
+    const bool populated_unversioned_index = !has_version && !m_db->IsEmpty();
+    const bool obsolete_version = has_version && stored_version < SHADOW_INDEX_SCHEMA_VERSION;
+    if (!wipe && (populated_unversioned_index || obsolete_version)) {
+        LogPrintf("ShadowIndex: rebuilding incompatible schema %s as version %u\n",
+                  populated_unversioned_index ? "without a version" : strprintf("version %u", stored_version),
+                  SHADOW_INDEX_SCHEMA_VERSION);
+        m_db.reset();
+        m_db = std::make_unique<ShadowIndex::DB>(cache_size, memory, /*wipe=*/true);
+    }
+    if (!m_db->Write(DB_SCHEMA_VERSION, SHADOW_INDEX_SCHEMA_VERSION)) {
+        throw std::runtime_error("Unable to write shadowindex schema version");
+    }
 }
 
 ShadowIndex::~ShadowIndex() = default;

@@ -52,13 +52,27 @@ bool AddInventoryValue(WitnessInventoryBucket& bucket, CAmount amount)
     return true;
 }
 
+std::string InventoryDecimal(arith_uint256 value)
+{
+    if (value == 0) return "0";
+    std::string result;
+    while (value != 0) {
+        const arith_uint256 quotient = value / 10;
+        const arith_uint256 remainder = value - quotient * 10;
+        result.push_back(static_cast<char>('0' + remainder.GetLow64()));
+        value = quotient;
+    }
+    std::reverse(result.begin(), result.end());
+    return result;
+}
+
 UniValue InventoryAmount(const arith_uint256& amount_atomic)
 {
     const arith_uint256 coin{static_cast<uint64_t>(COIN)};
     const arith_uint256 whole = amount_atomic / coin;
     const arith_uint256 remainder = amount_atomic - whole * static_cast<uint32_t>(COIN);
     return UniValue(UniValue::VNUM,
-                    strprintf("%s.%08u", whole.ToString(),
+                    strprintf("%s.%08u", InventoryDecimal(whole),
                               static_cast<unsigned int>(remainder.GetLow64())));
 }
 
@@ -67,7 +81,7 @@ UniValue InventoryBucketToJSON(const WitnessInventoryBucket& bucket)
     UniValue result(UniValue::VOBJ);
     result.pushKV("count", bucket.count);
     result.pushKV("amount", InventoryAmount(bucket.amount_atomic));
-    result.pushKV("amount_atomic", bucket.amount_atomic.ToString());
+    result.pushKV("amount_atomic", InventoryDecimal(bucket.amount_atomic));
     return result;
 }
 
@@ -331,7 +345,8 @@ RPCHelpMan getshadowblock()
             {"claim_offset", RPCArg::Type::NUM, RPCArg::Default{0}, "Zero-based canonical POW-claim accounting offset"},
             {"claim_count", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_SHADOW_PAGE_SIZE}, "Maximum POW-claim records to return (1-1000)"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing shadow block record"},
+        RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing shadow block record",
+            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
         RPCExamples{
             HelpExampleCli("getshadowblock", "5950003") +
             HelpExampleRpc("getshadowblock", "5950003, 0, 100")
@@ -473,7 +488,8 @@ RPCHelpMan getshadowtransaction()
         "getshadowtransaction",
         "Returns one deterministic synthetic shadow-ledger payout and its active-chain origin/spend status.\n",
         {{"synthetic_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Synthetic payout transaction id"}},
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing synthetic transaction record"},
+        RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing synthetic transaction record",
+            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
         RPCExamples{
             HelpExampleCli("getshadowtransaction", "\"txid\"") +
             HelpExampleRpc("getshadowtransaction", "\"txid\"")
@@ -515,7 +531,8 @@ RPCHelpMan getshadowaddress()
             {"after_txid", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"null"}, "Exclusive cursor synthetic transaction id; provide with after_height"},
             {"count", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_SHADOW_PAGE_SIZE}, "Maximum records to return (1-1000)"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned address-history page"},
+        RPCResult{RPCResult::Type::OBJ, "", "Versioned address-history page",
+            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
         RPCExamples{
             HelpExampleCli("getshadowaddress", "\"blk1...\"") +
             HelpExampleCli("getshadowaddress", "\"blk1...\" 5950003 \"txid\" 100")
@@ -604,7 +621,8 @@ RPCHelpMan getquantumwitnessinventory()
             {"count", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_SHADOW_PAGE_SIZE}, "Maximum records to return (1-1000)"},
             {"max_history_records", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_EFFECTIVE_SCAN_LIMIT}, "Hard cap for historical index reconciliation (1-10000000)"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned witness inventory, history coverage, and selected records page"},
+        RPCResult{RPCResult::Type::OBJ, "", "Versioned witness inventory, history coverage, and selected records page",
+            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
         RPCExamples{
             HelpExampleCli("getquantumwitnessinventory", "") +
             HelpExampleCli("getquantumwitnessinventory", "\"history\" 0 100")
@@ -690,7 +708,13 @@ RPCHelpMan getquantumwitnessinventory()
                             IsQuantumMigrationScript(coin.out.scriptPubKey);
                         const bool synthetic_shadow = authenticated_payout_markers.count(
                             GetGoldRushPayoutMarkerOutpoint(outpoint)) != 0;
-                        if (payout_shape != synthetic_shadow) {
+                        // On regtest-style schedules Gold Rush can overlap the
+                        // ordinary PoW range, so an authenticated synthetic
+                        // payout need not have the production-only
+                        // post-nLastPOWBlock shape. The reverse remains a
+                        // fail-closed invariant: on production-style schedules
+                        // that shape cannot be an ordinary base-chain output.
+                        if (payout_shape && !synthetic_shadow) {
                             throw JSONRPCError(
                                 RPC_INTERNAL_ERROR,
                                 strprintf("Gold Rush payout provenance mismatch for %s; chainstate audit required",
@@ -945,7 +969,8 @@ RPCHelpMan getshadowsupply()
             {"include_effective", RPCArg::Type::BOOL, RPCArg::Default{true}, "Calculate current demurrage-adjusted unspent value when demurrage is active"},
             {"max_records", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_EFFECTIVE_SCAN_LIMIT}, "Hard cap for an effective-value scan (1-10000000)"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing shadow supply record"},
+        RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing shadow supply record",
+            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
         RPCExamples{
             HelpExampleCli("getshadowsupply", "") +
             HelpExampleRpc("getshadowsupply", "")
