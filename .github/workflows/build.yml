@@ -370,9 +370,13 @@ jobs:
               ;;
             windows-64-bit)
               normalize_tree "depends/$HOST/bin"
-              mapfile -t files < <(cd "depends/$HOST/bin" && find . -maxdepth 1 -type f -name 'blackcoin*.exe' -printf '%P\n' | sort)
-              test "${#files[@]}" -gt 0
+              mapfile -t files < <(python3 ci/release/verify_windows_payload.py names)
+              for file in "${files[@]}"; do
+                test -f "depends/$HOST/bin/$file" && test ! -L "depends/$HOST/bin/$file"
+              done
               (cd "depends/$HOST/bin" && printf '%s\n' "${files[@]}" | zip -X -9j "$OUT/Blackcoin-$VERSION-Windows-x86_64-Portable.zip" -@)
+              python3 ci/release/verify_windows_payload.py archive \
+                "$OUT/Blackcoin-$VERSION-Windows-x86_64-Portable.zip"
               mapfile -t installers < <(find . -maxdepth 1 -type f -name "blackcoin-$VERSION*-win64-setup.exe" -printf '%P\n' | sort)
               test "${#installers[@]}" -eq 1
               cp "${installers[0]}" "$OUT/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
@@ -396,6 +400,15 @@ jobs:
         with:
           name: release-${{ matrix.name }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
           path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload configured Windows installer recipe
+        if: ${{ matrix.name == 'windows-64-bit' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-installer-recipe-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
+          path: share/setup.nsi
           if-no-files-found: error
           retention-days: 7
 
@@ -450,6 +463,22 @@ jobs:
             done < <(cd "$primary" && find . -type f -printf '%P\n' | sort)
           done
           printf 'source_commit=%s\n' "$TARGET_SHA" >> "$report"
+
+      - name: Download both isolated Windows installer recipes
+        if: ${{ needs.select-targets.outputs.windows_selected == 'true' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: installer-recipes
+          pattern: windows-installer-recipe-*-${{ needs.resolve-target.outputs.target_sha }}
+
+      - name: Verify the Windows installer recipe is reproducible
+        if: ${{ needs.select-targets.outputs.windows_selected == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ci/release/verify_reproducible.py \
+            --primary "installer-recipes/windows-installer-recipe-primary-$TARGET_SHA" \
+            --verifier "installer-recipes/windows-installer-recipe-verifier-$TARGET_SHA"
 
       - name: Upload reproducibility evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -525,18 +554,33 @@ jobs:
       WINDOWS_CERTIFICATE_SHA256: ${{ vars.WINDOWS_CERTIFICATE_SHA256 }}
       WINDOWS_TIMESTAMP_URL: ${{ vars.WINDOWS_TIMESTAMP_URL }}
     steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ needs.resolve-target.outputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+
       - name: Download reproducible Windows artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
           pattern: release-windows-64-bit-primary-${{ needs.resolve-target.outputs.target_sha }}
 
+      - name: Download reproducible Windows installer recipe
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: installer-recipe
+          name: windows-installer-recipe-primary-${{ needs.resolve-target.outputs.target_sha }}
+
       - name: Install signing tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends osslsigncode openssl unzip zip
+          sudo apt-get install -y --no-install-recommends nsis osslsigncode openssl p7zip-full unzip zip
 
-      - name: Verify certificate identity and sign every executable
+      - name: Sign portable payload, rebuild installer, and verify installed signatures
         shell: bash
         run: |
           set -euo pipefail
@@ -548,11 +592,17 @@ jobs:
             sed 's/^[^=]*=//; s/://g' | tr '[:lower:]' '[:upper:]')
           test "$fingerprint" = "${WINDOWS_CERTIFICATE_SHA256^^}"
 
-          mkdir -p work release-assets
-          portable=$(find artifacts -type f -name '*Windows-x86_64-Portable.zip' -print -quit)
-          installer=$(find artifacts -type f -name '*Windows-x86_64-Installer.exe' -print -quit)
-          test -n "$portable" && test -n "$installer"
-          unzip -q "$portable" -d work
+          mkdir -p work/payload release-assets
+          mapfile -t portable_archives < <(find artifacts -type f -name '*Windows-x86_64-Portable.zip' -print | sort)
+          mapfile -t installer_recipes < <(find installer-recipe -type f -name setup.nsi -print | sort)
+          test "${#portable_archives[@]}" -eq 1
+          test "${#installer_recipes[@]}" -eq 1
+          portable="${portable_archives[0]}"
+          recipe="${installer_recipes[0]}"
+          python3 ci/release/verify_windows_payload.py archive "$portable"
+          unzip -q "$portable" -d work/payload
+          python3 ci/release/verify_windows_payload.py directory work/payload
+          mapfile -t executable_names < <(python3 ci/release/verify_windows_payload.py names)
 
           sign_file() {
             local input="$1"
@@ -566,16 +616,52 @@ jobs:
             osslsigncode verify -CAfile release-cert.pem -in "$input"
           }
 
-          while IFS= read -r executable; do
-            sign_file "$executable"
-          done < <(find work -type f -name '*.exe' | sort)
-          cp "$installer" work/installer.exe
-          sign_file work/installer.exe
+          for name in "${executable_names[@]}"; do
+            sign_file "work/payload/$name"
+          done
+          python3 ci/release/verify_windows_payload.py directory work/payload
 
-          find work -type f -name 'blackcoin*.exe' -exec touch -d "@$SOURCE_DATE_EPOCH" {} +
-          (cd work && find . -maxdepth 1 -type f -name 'blackcoin*.exe' -printf '%P\n' | sort |
-            zip -X -9j "../release-assets/Blackcoin-$VERSION-Windows-x86_64-Portable.zip" -@)
-          cp work/installer.exe "release-assets/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
+          find work/payload -type f -name '*.exe' -exec touch -d "@$SOURCE_DATE_EPOCH" {} +
+          signed_portable="release-assets/Blackcoin-$VERSION-Windows-x86_64-Portable.zip"
+          (cd work/payload && printf '%s\n' "${executable_names[@]}" | zip -X -9j "../../$signed_portable" -@)
+          python3 ci/release/verify_windows_payload.py archive "$signed_portable"
+          mkdir work/portable-verification
+          unzip -q "$signed_portable" -d work/portable-verification
+          python3 ci/release/verify_windows_payload.py directory work/portable-verification
+          for name in "${executable_names[@]}"; do
+            osslsigncode verify -CAfile release-cert.pem -in "work/portable-verification/$name"
+          done
+
+          unsigned_installer="$GITHUB_WORKSPACE/work/installer-unsigned.exe"
+          makensis -V2 \
+            -DBLACKCOIN_SOURCE_DIR="$GITHUB_WORKSPACE" \
+            -DBLACKCOIN_PAYLOAD_DIR="$GITHUB_WORKSPACE/work/payload" \
+            -DBLACKCOIN_OUTPUT_FILE="$unsigned_installer" \
+            "$recipe"
+          test -s "$unsigned_installer"
+
+          verify_installer_payload() {
+            local installer="$1"
+            local destination="$2"
+            rm -rf "$destination"
+            mkdir -p "$destination"
+            7z x -bd -y "-o$destination" "$installer" >/dev/null
+            mapfile -t installed_executables < <(
+              python3 ci/release/verify_windows_payload.py installer "$destination" \
+                --portable-dir work/payload
+            )
+            test "${#installed_executables[@]}" -eq "${#executable_names[@]}"
+            for executable in "${installed_executables[@]}"; do
+              osslsigncode verify -CAfile release-cert.pem -in "$executable"
+            done
+          }
+
+          verify_installer_payload "$unsigned_installer" work/installer-before-outer-signing
+          sign_file "$unsigned_installer"
+          osslsigncode verify -CAfile release-cert.pem -in "$unsigned_installer"
+          verify_installer_payload "$unsigned_installer" work/installer-after-outer-signing
+
+          cp "$unsigned_installer" "release-assets/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
           printf '%s\n' "$TARGET_SHA" > "release-assets/Blackcoin-$VERSION-windows-64-bit-SOURCE_COMMIT.txt"
           rm -f release-cert.pfx release-cert.pem
 

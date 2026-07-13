@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from unittest import mock
+import zipfile
 
 
 TOOLS = Path(__file__).resolve().parent
@@ -61,6 +62,74 @@ class ReleaseToolTests(unittest.TestCase):
         with mock.patch.object(identity.subprocess, "run", return_value=bad):
             with self.assertRaises(RuntimeError):
                 identity.verify_openpgp_signature("HEAD", "commit", FINGERPRINT)
+
+    def test_windows_payload_inventory_is_exact_and_excludes_test_binary(self):
+        verifier = load_module("verify_windows_payload")
+        self.assertIn("blackcoin-util.exe", verifier.EXPECTED_EXECUTABLES)
+        self.assertNotIn("test_blackcoin.exe", verifier.EXPECTED_EXECUTABLES)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "payload"
+            payload.mkdir()
+            for name in verifier.EXPECTED_EXECUTABLES:
+                (payload / name).write_bytes(name.encode("ascii"))
+            self.assertEqual(
+                tuple(path.name for path in verifier.verify_directory(payload)),
+                verifier.EXPECTED_EXECUTABLES,
+            )
+
+            archive = root / "portable.zip"
+            with zipfile.ZipFile(archive, "w") as zipped:
+                for name in verifier.EXPECTED_EXECUTABLES:
+                    zipped.write(payload / name, name)
+            self.assertEqual(verifier.verify_archive(archive), verifier.EXPECTED_EXECUTABLES)
+
+            unsafe_archive = root / "unsafe-portable.zip"
+            with zipfile.ZipFile(unsafe_archive, "w") as zipped:
+                for name in verifier.EXPECTED_EXECUTABLES:
+                    archived_name = f"../{name}" if name == "blackcoin-cli.exe" else name
+                    zipped.write(payload / name, archived_name)
+            with self.assertRaisesRegex(RuntimeError, "flat filename"):
+                verifier.verify_archive(unsafe_archive)
+
+            (payload / "test_blackcoin.exe").write_bytes(b"forbidden")
+            with self.assertRaisesRegex(RuntimeError, "unexpected entries"):
+                verifier.verify_directory(payload)
+
+    def test_windows_installer_must_embed_the_signed_portable_bytes(self):
+        verifier = load_module("verify_windows_payload")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "payload"
+            extracted = root / "extracted"
+            payload.mkdir()
+            extracted.mkdir()
+            for name in verifier.EXPECTED_EXECUTABLES:
+                content = f"signed:{name}".encode("ascii")
+                (payload / name).write_bytes(content)
+                destination = extracted / ("root" if name == "blackcoin-qt.exe" else "daemon") / name
+                destination.parent.mkdir(exist_ok=True)
+                destination.write_bytes(content)
+
+            embedded = verifier.verify_installer_extraction(extracted, payload)
+            self.assertEqual(tuple(path.name for path in embedded), verifier.EXPECTED_EXECUTABLES)
+
+            (extracted / "daemon" / "blackcoin-util.exe").write_bytes(b"unsigned-or-different")
+            with self.assertRaisesRegex(RuntimeError, "differs from signed portable"):
+                verifier.verify_installer_extraction(extracted, payload)
+
+            (extracted / "daemon" / "blackcoin-util.exe").write_bytes(b"signed:blackcoin-util.exe")
+            (extracted / "daemon" / "test_blackcoin.exe").write_bytes(b"forbidden")
+            with self.assertRaisesRegex(RuntimeError, "forbidden test executable"):
+                verifier.verify_installer_extraction(extracted, payload)
+
+    def test_windows_installer_recipe_uses_production_payload_only(self):
+        template = (TOOLS.parent.parent / "share" / "setup.nsi.in").read_text(encoding="utf-8")
+        self.assertIn("@BITCOIN_UTIL_NAME@@EXEEXT@", template)
+        self.assertNotIn("@BITCOIN_TEST_NAME@@EXEEXT@", template)
+        self.assertIn("${BLACKCOIN_PAYLOAD_DIR}", template)
+        self.assertIn("${BLACKCOIN_OUTPUT_FILE}", template)
 
     def test_sbom_and_provenance_are_bound_to_artifacts_and_source(self):
         with tempfile.TemporaryDirectory() as temporary:
