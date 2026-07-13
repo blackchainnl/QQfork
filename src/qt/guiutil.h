@@ -12,6 +12,7 @@
 #include <util/fs.h>
 
 #include <QApplication>
+#include <QColor>
 #include <QEvent>
 #include <QHeaderView>
 #include <QItemDelegate>
@@ -19,6 +20,7 @@
 #include <QMessageBox>
 #include <QMetaObject>
 #include <QObject>
+#include <QPalette>
 #include <QProgressBar>
 #include <QString>
 #include <QTableView>
@@ -248,6 +250,19 @@ namespace GUIUtil
     QString formatBytes(uint64_t bytes);
 
     qreal calculateIdealFontSize(int width, const QString& text, QFont font, qreal minPointSize = 4, qreal startPointSize = 14);
+
+    /** Return the WCAG 2 contrast ratio for two opaque sRGB colors. */
+    qreal ColorContrastRatio(const QColor& first, const QColor& second);
+
+    /**
+     * Keep a semantic color as close as possible to its preferred value while
+     * making it readable on the supplied background. The palette foreground is
+     * used as a final native fallback.
+     */
+    QColor ReadableColor(const QColor& preferred, const QColor& background, const QColor& palette_foreground, qreal minimum_contrast = 4.5);
+
+    /** Configure a QLabel as a native, palette-driven information panel. */
+    void ConfigureThemedLabelPanel(QLabel* label, QPalette::ColorRole background_role, QPalette::ColorRole foreground_role, int margin);
 
     class ThemedLabel : public QLabel
     {

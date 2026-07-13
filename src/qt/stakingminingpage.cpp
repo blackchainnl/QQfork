@@ -44,6 +44,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QPalette>
 #include <QPushButton>
 #include <QSettings>
 #include <QScrollArea>
@@ -344,16 +345,14 @@ void StakingMiningPage::setupUi()
     auto configureInfoPanel = [](QLabel* label) {
         label->setWordWrap(true);
         label->setTextFormat(Qt::RichText);
-        label->setStyleSheet(QStringLiteral("QLabel { background: #f5f7fb; border: 1px solid #d8dee9; border-radius: 6px; padding: 8px; }"));
+        GUIUtil::ConfigureThemedLabelPanel(label, QPalette::AlternateBase, QPalette::Text, 8);
     };
     auto configureStatusCard = [](QLabel* label) {
         label->setWordWrap(true);
         label->setTextFormat(Qt::RichText);
         label->setMinimumHeight(74);
         label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-        label->setStyleSheet(QStringLiteral(
-            "QLabel { background: #ffffff; border: 1px solid #cfd8e3; border-radius: 6px; padding: 10px; }"
-            "QLabel[attention=\"true\"] { background: #fff7e6; border-color: #d8a441; }"));
+        GUIUtil::ConfigureThemedLabelPanel(label, QPalette::Base, QPalette::Text, 10);
     };
     auto makeHelpButton = [this](const QString& text, const QString& title, const QString& html, QWidget* parent) {
         auto* button = new QPushButton(text, parent);
@@ -387,7 +386,7 @@ void StakingMiningPage::setupUi()
     m_dashboard_action->setObjectName(QStringLiteral("stakingMiningDashboardAction"));
     m_dashboard_action->setWordWrap(true);
     m_dashboard_action->setTextFormat(Qt::RichText);
-    m_dashboard_action->setStyleSheet(QStringLiteral("QLabel { background: #eef6ff; border: 1px solid #b8d7f5; border-radius: 6px; padding: 10px; }"));
+    GUIUtil::ConfigureThemedLabelPanel(m_dashboard_action, QPalette::Highlight, QPalette::HighlightedText, 10);
     m_dashboard_wallet = new QLabel(tr("Wallet status will appear here."), dashboardBox);
     m_dashboard_wallet->setObjectName(QStringLiteral("stakingMiningDashboardWallet"));
     configureStatusCard(m_dashboard_wallet);
@@ -486,7 +485,6 @@ void StakingMiningPage::setupUi()
     m_quantum_legacy_unlock_note = new QLabel(tr("Gold Rush whitelist status will appear after the wallet is loaded."), stakingBox);
     m_quantum_legacy_unlock_note->setObjectName(QStringLiteral("quantumLegacyUnlockNote"));
     m_quantum_legacy_unlock_note->setWordWrap(true);
-    m_quantum_legacy_unlock_note->setStyleSheet(QStringLiteral("QLabel { color: #6b5d00; }"));
     m_staking_status = new QLabel(tr("Staking is off"), stakingBox);
     m_staking_status->setObjectName(QStringLiteral("stakingStatus"));
     m_stake_weight = new QLabel(QStringLiteral("-"), stakingBox);
@@ -628,7 +626,7 @@ void StakingMiningPage::setupUi()
     m_pow_warning->setText(tr("<b>Important:</b> Gold Rush PoW rewards are paid to the quantum address above. "
                               "Back up this wallet after the address is created. Rewards remain locked until Gold Rush ends, "
                               "then become ordinary direct quantum funds after normal maturity."));
-    m_pow_warning->setStyleSheet(QStringLiteral("QLabel { color: #8a6d00; background: #fff6d6; padding: 6px; border-radius: 4px; }"));
+    GUIUtil::ConfigureThemedLabelPanel(m_pow_warning, QPalette::Highlight, QPalette::HighlightedText, 6);
     auto* powHelp = makeHelpButton(
         tr("PoW"),
         tr("Gold Rush Proof-of-Work guide"),

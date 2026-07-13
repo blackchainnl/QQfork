@@ -35,6 +35,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPalette>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QTextEdit>
@@ -87,9 +88,7 @@ QLabel* makeCard(const QString& text, QWidget* parent)
     label->setWordWrap(true);
     label->setTextFormat(Qt::RichText);
     label->setMinimumHeight(78);
-    label->setStyleSheet(QStringLiteral(
-        "QLabel { background: #ffffff; border: 1px solid #cfd8e3; border-radius: 6px; padding: 10px; }"
-        "QLabel[attention=\"true\"] { background: #fff7e6; border-color: #d8a441; }"));
+    GUIUtil::ConfigureThemedLabelPanel(label, QPalette::Base, QPalette::Text, 10);
     return label;
 }
 
@@ -290,10 +289,14 @@ void AccountPage::setupUi()
     cards->setHorizontalSpacing(8);
     cards->setVerticalSpacing(8);
     m_total_card = makeCard(tr("Wallet totals will appear here."), this);
+    m_total_card->setObjectName(QStringLiteral("accountTotalCard"));
     m_legacy_card = makeCard(tr("Legacy balance will appear here."), this);
+    m_legacy_card->setObjectName(QStringLiteral("accountLegacyCard"));
     m_quantum_card = makeCard(tr("Quantum balance will appear here."), this);
+    m_quantum_card->setObjectName(QStringLiteral("accountQuantumCard"));
     m_attention_card = makeCard(tr("Migration and staking attention items will appear here."), this);
-    m_attention_card->setProperty("attention", true);
+    m_attention_card->setObjectName(QStringLiteral("accountAttentionCard"));
+    GUIUtil::ConfigureThemedLabelPanel(m_attention_card, QPalette::Highlight, QPalette::HighlightedText, 10);
     cards->addWidget(m_total_card, 0, 0);
     cards->addWidget(m_legacy_card, 0, 1);
     cards->addWidget(m_quantum_card, 1, 0);

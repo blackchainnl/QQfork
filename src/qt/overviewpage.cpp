@@ -23,6 +23,7 @@
 #include <QLabel>
 #include <QPainter>
 #include <QStatusTipEvent>
+#include <QStyle>
 
 #include <algorithm>
 #include <map>
@@ -62,12 +63,18 @@ public:
         QString address = index.data(Qt::DisplayRole).toString();
         qint64 amount = index.data(TransactionTableModel::AmountRole).toLongLong();
         bool confirmed = index.data(TransactionTableModel::ConfirmedRole).toBool();
+        const bool selected = option.state & QStyle::State_Selected;
+        const QPalette& content_palette = !selected && option.widget && option.widget->parentWidget()
+            ? option.widget->parentWidget()->palette()
+            : option.palette;
+        const QColor background = content_palette.color(selected ? QPalette::Highlight : QPalette::Window);
+        const QColor palette_foreground = content_palette.color(selected ? QPalette::HighlightedText : QPalette::WindowText);
         QVariant value = index.data(Qt::ForegroundRole);
-        QColor foreground = option.palette.color(QPalette::Text);
+        QColor foreground = palette_foreground;
         if(value.canConvert<QBrush>())
         {
             QBrush brush = qvariant_cast<QBrush>(value);
-            foreground = brush.color();
+            foreground = GUIUtil::ReadableColor(brush.color(), background, palette_foreground);
         }
 
         if (index.data(TransactionTableModel::WatchonlyRole).toBool()) {
@@ -84,15 +91,15 @@ public:
 
         if(amount < 0)
         {
-            foreground = COLOR_NEGATIVE;
+            foreground = GUIUtil::ReadableColor(COLOR_NEGATIVE, background, palette_foreground);
         }
         else if(!confirmed)
         {
-            foreground = COLOR_UNCONFIRMED;
+            foreground = GUIUtil::ReadableColor(COLOR_UNCONFIRMED, background, palette_foreground);
         }
         else
         {
-            foreground = option.palette.color(QPalette::Text);
+            foreground = palette_foreground;
         }
         painter->setPen(foreground);
         QString amountText = BitcoinUnits::formatWithUnit(unit, amount, true, BitcoinUnits::SeparatorStyle::ALWAYS);
@@ -104,7 +111,7 @@ public:
         QRect amount_bounding_rect;
         painter->drawText(amountRect, Qt::AlignRight | Qt::AlignVCenter, amountText, &amount_bounding_rect);
 
-        painter->setPen(option.palette.color(QPalette::Text));
+        painter->setPen(palette_foreground);
         QRect date_bounding_rect;
         painter->drawText(amountRect, Qt::AlignLeft | Qt::AlignVCenter, GUIUtil::dateTimeStr(date), &date_bounding_rect);
 
@@ -148,9 +155,13 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
     ui->setupUi(this);
 
     m_label_legacy_balance_text = new QLabel(tr("Legacy spendable:"), this);
+    m_label_legacy_balance_text->setObjectName(QStringLiteral("overviewLegacyBalanceText"));
     m_label_legacy_balance = new QLabel(QStringLiteral("0.00000000 BLK"), this);
+    m_label_legacy_balance->setObjectName(QStringLiteral("overviewLegacyBalance"));
     m_label_quantum_balance_text = new QLabel(tr("Quantum-controlled:"), this);
+    m_label_quantum_balance_text->setObjectName(QStringLiteral("overviewQuantumBalanceText"));
     m_label_quantum_balance = new QLabel(QStringLiteral("0.00000000 BLK"), this);
+    m_label_quantum_balance->setObjectName(QStringLiteral("overviewQuantumBalance"));
     for (QLabel* label : {m_label_legacy_balance, m_label_quantum_balance}) {
         label->setCursor(Qt::IBeamCursor);
         label->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
