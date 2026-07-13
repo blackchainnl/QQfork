@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <ios>
 #include <memory>
 #include <optional>
 #include <vector>

@@ -738,8 +738,13 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         return error("%s: too many POW claim accounting records", __func__);
     }
     std::vector<const ShadowSyntheticPayoutTransaction*> pow_payouts;
+    CAmount pow_payout_total{0};
     for (const ShadowSyntheticPayoutTransaction& payout : payouts) {
-        if (payout.proof_of_work) pow_payouts.push_back(&payout);
+        if (!payout.proof_of_work) continue;
+        if (!AddMoney(pow_payout_total, payout.amount)) {
+            return error("%s: POW synthetic payout total overflow", __func__);
+        }
+        pow_payouts.push_back(&payout);
     }
     size_t next_pow_payout{0};
     std::map<uint256, ShadowIndexPowClaimSource> pow_payout_sources;
@@ -811,7 +816,8 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
             block_record.pow_claims.record_count ||
         block_record.pow_claims.winner_credited_total +
                 block_record.pow_claims.reimbursed_credited_total !=
-            block_record.pow_claims.credited_total) {
+            block_record.pow_claims.credited_total ||
+        block_record.pow_claims.credited_total != pow_payout_total) {
         return error("%s: inconsistent POW claim accounting summary", __func__);
     }
 
