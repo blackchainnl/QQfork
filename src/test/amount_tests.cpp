@@ -85,8 +85,15 @@ BOOST_AUTO_TEST_CASE(GetFeeTest)
     // some more integer checks
     BOOST_CHECK(CFeeRate(CAmount(26), 789) == CFeeRate(32));
     BOOST_CHECK(CFeeRate(CAmount(27), 789) == CFeeRate(34));
-    // Maximum size in bytes, should not crash
-    CFeeRate(MAX_MONEY, std::numeric_limits<uint32_t>::max()).GetFeePerK();
+    // Large fees must retain exact integer semantics without overflowing the
+    // intermediate multiplication.
+    BOOST_CHECK(CFeeRate(MAX_MONEY, 1000) == CFeeRate(MAX_MONEY));
+    BOOST_CHECK(CFeeRate(-MAX_MONEY, 1000) == CFeeRate(-MAX_MONEY));
+    BOOST_CHECK(CFeeRate(MAX_MONEY, std::numeric_limits<uint32_t>::max()) == CFeeRate(465661287416LL));
+    BOOST_CHECK(CFeeRate(-MAX_MONEY, std::numeric_limits<uint32_t>::max()) == CFeeRate(-465661287416LL));
+    // Saturate when the fee rate itself cannot be represented by CAmount.
+    BOOST_CHECK(CFeeRate(MAX_MONEY, 1) == CFeeRate(std::numeric_limits<CAmount>::max()));
+    BOOST_CHECK(CFeeRate(-MAX_MONEY, 1) == CFeeRate(std::numeric_limits<CAmount>::min()));
 }
 
 BOOST_AUTO_TEST_CASE(BinaryOperatorTest)

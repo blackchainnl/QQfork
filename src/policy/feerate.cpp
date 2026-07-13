@@ -11,13 +11,37 @@
 #include <tinyformat.h>
 
 #include <cmath>
+#include <limits>
 
 CFeeRate::CFeeRate(const CAmount& nFeePaid, uint32_t num_bytes)
 {
     const int64_t nSize{num_bytes};
 
     if (nSize > 0) {
-        nSatoshisPerK = nFeePaid * 1000 / nSize;
+        // Split the calculation so a representable fee rate does not overflow
+        // while scaling the fee. Saturate only when the mathematical result
+        // itself cannot be represented by CAmount.
+        constexpr CAmount SCALE{1000};
+        const CAmount quotient{nFeePaid / nSize};
+        const CAmount remainder{nFeePaid % nSize};
+        const CAmount max{std::numeric_limits<CAmount>::max()};
+        const CAmount min{std::numeric_limits<CAmount>::min()};
+
+        if (quotient > max / SCALE) {
+            nSatoshisPerK = max;
+        } else if (quotient < min / SCALE) {
+            nSatoshisPerK = min;
+        } else {
+            const CAmount whole{quotient * SCALE};
+            const CAmount fractional{remainder * SCALE / nSize};
+            if (fractional > 0 && whole > max - fractional) {
+                nSatoshisPerK = max;
+            } else if (fractional < 0 && whole < min - fractional) {
+                nSatoshisPerK = min;
+            } else {
+                nSatoshisPerK = whole + fractional;
+            }
+        }
     } else {
         nSatoshisPerK = 0;
     }
