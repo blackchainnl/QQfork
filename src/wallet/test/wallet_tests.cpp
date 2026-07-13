@@ -33,6 +33,8 @@
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <undo.h>
+#include <util/fs_helpers.h>
+#include <util/getuniquepath.h>
 #include <util/readwritefile.h>
 #include <util/translation.h>
 #include <validation.h>
@@ -483,6 +485,7 @@ BOOST_FIXTURE_TEST_CASE(goldrush_shadow_payouts_sync_on_connect_disconnect_and_r
         first_shadow_block.vtx.push_back(MakeShadowWalletCoinstakeTx(legacy_target));
         first_shadow_undo = MakeShadowWalletUndo(first_shadow_block, {{1, legacy_target}});
         BOOST_REQUIRE(ApplyShadowBlock(coins_tip, first_shadow_block, first_index, &first_shadow_undo));
+        BOOST_REQUIRE(AdvanceGoldRushInventoryTip(coins_tip, first_index));
 
         std::vector<unsigned char> signal;
         BOOST_REQUIRE(BuildShadowSignalData(legacy_target, quantum_script, first_index->nHeight, first_index->GetBlockHash(), signal));
@@ -492,6 +495,7 @@ BOOST_FIXTURE_TEST_CASE(goldrush_shadow_payouts_sync_on_connect_disconnect_and_r
         reward_shadow_block.vtx.push_back(MakeShadowWalletSignalTx(legacy_target, signal));
         reward_shadow_undo = MakeShadowWalletUndo(reward_shadow_block, {{1, legacy_target}, {2, legacy_target}});
         BOOST_REQUIRE(ApplyShadowBlock(coins_tip, reward_shadow_block, reward_index, &reward_shadow_undo));
+        BOOST_REQUIRE(AdvanceGoldRushInventoryTip(coins_tip, reward_index));
 
         const std::vector<CTransactionRef> payouts = GetAppliedShadowClaimPayoutTransactions(
             coins_tip, reward_index->nHeight, reward_index->GetBlockHash(), reward_index->GetBlockTime());
@@ -530,6 +534,7 @@ BOOST_FIXTURE_TEST_CASE(goldrush_shadow_payouts_sync_on_connect_disconnect_and_r
         LOCK(Assert(m_node.chainman)->GetMutex());
         CCoinsViewCache& coins_tip = m_node.chainman->ActiveChainstate().CoinsTip();
         BOOST_REQUIRE(UndoShadowBlock(coins_tip, reward_shadow_block, reward_index, &reward_shadow_undo));
+        BOOST_REQUIRE(RewindGoldRushInventoryTip(coins_tip, reward_index));
     }
     wallet.blockDisconnected(reward_block_info);
     {
@@ -544,6 +549,7 @@ BOOST_FIXTURE_TEST_CASE(goldrush_shadow_payouts_sync_on_connect_disconnect_and_r
         LOCK(Assert(m_node.chainman)->GetMutex());
         CCoinsViewCache& coins_tip = m_node.chainman->ActiveChainstate().CoinsTip();
         BOOST_REQUIRE(ApplyShadowBlock(coins_tip, reward_shadow_block, reward_index, &reward_shadow_undo));
+        BOOST_REQUIRE(AdvanceGoldRushInventoryTip(coins_tip, reward_index));
     }
 
     CWallet rescan_wallet(m_node.chain.get(), "", CreateMockableWalletDatabase());
@@ -578,7 +584,9 @@ BOOST_FIXTURE_TEST_CASE(goldrush_shadow_payouts_sync_on_connect_disconnect_and_r
         LOCK(Assert(m_node.chainman)->GetMutex());
         CCoinsViewCache& coins_tip = m_node.chainman->ActiveChainstate().CoinsTip();
         BOOST_REQUIRE(UndoShadowBlock(coins_tip, reward_shadow_block, reward_index, &reward_shadow_undo));
+        BOOST_REQUIRE(RewindGoldRushInventoryTip(coins_tip, reward_index));
         BOOST_REQUIRE(UndoShadowBlock(coins_tip, first_shadow_block, first_index, &first_shadow_undo));
+        BOOST_REQUIRE(RewindGoldRushInventoryTip(coins_tip, first_index));
         UndoLegacyWhitelistSnapshot(coins_tip, whitelist_index);
         coins_tip.SpendCoin(snapshot_coin_outpoint);
     }
@@ -866,10 +874,13 @@ static CMutableTransaction QuantumWalletSpendFixture(const CTxDestination& dest,
     return spend;
 }
 
-static void CheckQuantumWalletSigning(CWallet& wallet, const CTxDestination& dest) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
+static void CheckQuantumWalletSigning(CWallet& wallet, const CTxDestination& dest)
 {
     const CScript quantum_script = GetScriptForDestination(dest);
-    BOOST_CHECK(wallet.IsMine(quantum_script) & ISMINE_SPENDABLE);
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.IsMine(quantum_script) & ISMINE_SPENDABLE);
+    }
 
     std::map<COutPoint, Coin> coins;
     CMutableTransaction spend = QuantumWalletSpendFixture(dest, coins);
@@ -899,62 +910,98 @@ static void CheckQuantumKeyChallenge(CWallet& wallet, const CTxDestination& dest
     BOOST_CHECK(ML_DSA::Verify(public_key, challenge.begin(), uint256::size(), signature));
 }
 
-static std::shared_ptr<CWallet> TestLoadQuantumWallet(const std::string& name, DatabaseFormat format)
+class QuantumWalletSigningTestingSetup : public TestChain100Setup
+{
+public:
+    QuantumWalletSigningTestingSetup()
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-shadowwhitelistheight=99",
+              "-shadowgoldrushstartheight=100",
+              "-shadowgoldrushendheight=100",
+              "-qqgoldrushendheight=100",
+              "-qqmigrationendheight=200",
+          }}
+    {
+    }
+};
+
+static std::shared_ptr<CWallet> TestLoadQuantumWallet(const std::string& name, DatabaseFormat format, interfaces::Chain* chain = nullptr)
 {
     DatabaseOptions options;
     options.require_format = format;
     DatabaseStatus status;
     bilingual_str error;
     auto database{MakeWalletDatabase(name, options, status, error)};
-    auto wallet{std::make_shared<CWallet>(/*chain=*/nullptr, "", std::move(database))};
+    auto wallet{std::make_shared<CWallet>(chain, "", std::move(database))};
     BOOST_CHECK_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
     return wallet;
 }
 
 static std::shared_ptr<CWallet> TestLoadQuantumWalletBackup(const fs::path& path)
 {
+    // A wallet backup is a standalone data file. Load it from an isolated
+    // wallet directory so SQLiteDataFile() does not append wallet.dat to the
+    // backup filename and probe <backup>/wallet.dat.
+    const fs::path scratch_dir{GetUniquePath(path.parent_path())};
+    BOOST_REQUIRE(TryCreateDirectories(scratch_dir));
+    fs::copy_file(path, scratch_dir / "wallet.dat", fs::copy_options::none);
+
     DatabaseOptions options;
     options.require_existing = true;
     options.verify = true;
     DatabaseStatus status;
     bilingual_str error;
-    auto database{MakeDatabase(path, options, status, error)};
+    auto database{MakeDatabase(scratch_dir, options, status, error)};
     BOOST_REQUIRE_MESSAGE(database, error.original);
-    auto wallet{std::make_shared<CWallet>(/*chain=*/nullptr, "restored-quantum-backup", std::move(database))};
+    auto wallet = std::shared_ptr<CWallet>{
+        new CWallet(/*chain=*/nullptr, "restored-quantum-backup", std::move(database)),
+        [scratch_dir](CWallet* wallet) {
+            delete wallet;
+            try {
+                fs::remove_all(scratch_dir);
+            } catch (const std::exception&) {
+                // The fixture root is removed after the test. A cleanup
+                // failure must not mask the backup verification result.
+            }
+        }};
     BOOST_REQUIRE_EQUAL(wallet->LoadWallet(), DBErrors::LOAD_OK);
     return wallet;
 }
 
-BOOST_AUTO_TEST_CASE(QuantumWalletKeysPersistAndSign)
+BOOST_FIXTURE_TEST_CASE(QuantumWalletKeysPersistAndSign, QuantumWalletSigningTestingSetup)
 {
     for (DatabaseFormat format : DATABASE_FORMATS) {
         const std::string name{strprintf("quantum-wallet-keys-%i", format)};
         CTxDestination dest;
         {
-            auto wallet{TestLoadQuantumWallet(name, format)};
-            LOCK(wallet->cs_wallet);
-            auto op_dest = wallet->GetNewQuantumDestination("quantum");
-            BOOST_REQUIRE(op_dest);
-            dest = *op_dest;
-            BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
-            BOOST_CHECK(!wallet->IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET));
-            const auto info = wallet->GetQuantumKeyInfo(dest);
-            BOOST_REQUIRE(info.has_value());
-            BOOST_CHECK(!info->encrypted);
-            BOOST_CHECK(info->durably_stored);
-            BOOST_CHECK(!info->backup_verified);
+            auto wallet{TestLoadQuantumWallet(name, format, m_node.chain.get())};
+            {
+                LOCK(wallet->cs_wallet);
+                auto op_dest = wallet->GetNewQuantumDestination("quantum");
+                BOOST_REQUIRE(op_dest);
+                dest = *op_dest;
+                BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
+                BOOST_CHECK(!wallet->IsWalletFlagSet(WALLET_FLAG_BLANK_WALLET));
+                const auto info = wallet->GetQuantumKeyInfo(dest);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(!info->encrypted);
+                BOOST_CHECK(info->durably_stored);
+                BOOST_CHECK(!info->backup_verified);
+            }
             CheckQuantumWalletSigning(*wallet, dest);
         }
         {
-            auto wallet{TestLoadQuantumWallet(name, format)};
-            LOCK(wallet->cs_wallet);
-            BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
-            BOOST_CHECK(wallet->IsMine(dest) & ISMINE_SPENDABLE);
-            const auto info = wallet->GetQuantumKeyInfo(dest);
-            BOOST_REQUIRE(info.has_value());
-            BOOST_CHECK(!info->encrypted);
-            BOOST_CHECK(info->durably_stored);
-            BOOST_CHECK(!info->backup_verified);
+            auto wallet{TestLoadQuantumWallet(name, format, m_node.chain.get())};
+            {
+                LOCK(wallet->cs_wallet);
+                BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
+                BOOST_CHECK(wallet->IsMine(dest) & ISMINE_SPENDABLE);
+                const auto info = wallet->GetQuantumKeyInfo(dest);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(!info->encrypted);
+                BOOST_CHECK(info->durably_stored);
+                BOOST_CHECK(!info->backup_verified);
+            }
             CheckQuantumWalletSigning(*wallet, dest);
         }
     }
@@ -1035,6 +1082,52 @@ BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)
     }
 }
 
+BOOST_AUTO_TEST_CASE(QuantumWalletEncryptionUsesCheckedDurabilityBarrier)
+{
+    CWallet master_write_failure_wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(master_write_failure_wallet.LoadWallet(), DBErrors::LOAD_OK);
+    auto master_write_failure_destination = master_write_failure_wallet.GetNewQuantumDestination("master-write-failure");
+    BOOST_REQUIRE(master_write_failure_destination);
+    MockableDatabase& master_write_failure_database = GetMockableDatabase(master_write_failure_wallet);
+    master_write_failure_database.m_fail_write_at = 0;
+    BOOST_CHECK(!master_write_failure_wallet.EncryptWallet("pass"));
+    BOOST_CHECK(master_write_failure_database.m_last_txn_durable);
+    BOOST_CHECK(!master_write_failure_wallet.IsCrypted());
+    {
+        LOCK(master_write_failure_wallet.cs_wallet);
+        const auto info = master_write_failure_wallet.GetQuantumKeyInfo(*master_write_failure_destination);
+        BOOST_REQUIRE(info.has_value());
+        BOOST_CHECK(!info->encrypted);
+        CheckQuantumKeyChallenge(master_write_failure_wallet, *master_write_failure_destination);
+    }
+
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    auto destination = wallet.GetNewQuantumDestination("durable-encryption");
+    BOOST_REQUIRE(destination);
+
+    MockableDatabase& database = GetMockableDatabase(wallet);
+    database.m_last_txn_durable = false;
+    BOOST_REQUIRE(wallet.EncryptWallet("pass"));
+    BOOST_CHECK(database.m_last_txn_durable);
+
+    CWallet rewrite_failure_wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(rewrite_failure_wallet.LoadWallet(), DBErrors::LOAD_OK);
+    auto rewrite_failure_destination = rewrite_failure_wallet.GetNewQuantumDestination("rewrite-failure");
+    BOOST_REQUIRE(rewrite_failure_destination);
+    MockableDatabase& rewrite_failure_database = GetMockableDatabase(rewrite_failure_wallet);
+    rewrite_failure_database.m_last_txn_durable = false;
+    rewrite_failure_database.m_fail_rewrite = true;
+    BOOST_CHECK(!rewrite_failure_wallet.EncryptWallet("pass"));
+    BOOST_CHECK(rewrite_failure_database.m_last_txn_durable);
+    BOOST_CHECK(rewrite_failure_wallet.IsCrypted());
+    BOOST_CHECK(rewrite_failure_wallet.IsLocked());
+    LOCK(rewrite_failure_wallet.cs_wallet);
+    const auto info = rewrite_failure_wallet.GetQuantumKeyInfo(*rewrite_failure_destination);
+    BOOST_REQUIRE(info.has_value());
+    BOOST_CHECK(info->encrypted);
+}
+
 BOOST_AUTO_TEST_CASE(QuantumWalletVerifiedBackupsAreCompleteAndRestorable)
 {
     for (DatabaseFormat format : DATABASE_FORMATS) {
@@ -1046,6 +1139,7 @@ BOOST_AUTO_TEST_CASE(QuantumWalletVerifiedBackupsAreCompleteAndRestorable)
 
         CTxDestination first_destination;
         CTxDestination second_destination;
+        CTxDestination third_destination;
         std::string wallet_filename;
         {
             auto wallet{TestLoadQuantumWallet(name, format)};
@@ -1099,16 +1193,23 @@ BOOST_AUTO_TEST_CASE(QuantumWalletVerifiedBackupsAreCompleteAndRestorable)
             // injected failure may modify a pre-existing good destination;
             // only the final verified stage is ever atomically promoted.
             const fs::path current_backup_path = current_backup_dir / fs::PathFromString(wallet_filename);
-            const std::array<std::string_view, 9> failpoints{{
+            const std::array<std::string_view, 16> failpoints{{
                 "before_first_copy",
+                "fail_initial_file_commit",
+                "fail_initial_file_close",
+                "fail_initial_stage_directory_commit",
                 "after_first_copy",
-                "before_stage_directory_commit",
                 "before_marker_prepare",
                 "after_marker_prepare",
+                "fail_marked_file_commit",
+                "fail_marked_file_close",
+                "fail_marked_stage_directory_commit",
                 "after_marker_commit",
                 "before_final_verify",
                 "after_final_verify",
                 "before_promote",
+                "before_final_identity_revalidation",
+                "fail_rename",
             }};
             for (const std::string_view injected : failpoints) {
                 error.clear();
@@ -1128,29 +1229,107 @@ BOOST_AUTO_TEST_CASE(QuantumWalletVerifiedBackupsAreCompleteAndRestorable)
                 BOOST_CHECK_EQUAL(static_cast<size_t>(std::distance(fs::directory_iterator(current_backup_dir), fs::directory_iterator{})), 1U);
             }
 
-            // Once the verified stage has been atomically installed, a
-            // directory-sync failure cannot safely be rolled back. Report the
-            // failure without deleting the complete destination or claiming
-            // that a newly added source key was covered. The independently
-            // verified destination must remain usable.
+            // The exact bytes challenged by the final reopen must be the bytes
+            // atomically promoted. Even a same-process replacement inside the
+            // otherwise private staging directory is detected by the immediate
+            // identity revalidation and cannot modify a known-good destination.
+            const auto [identity_before_ok, identity_before] = ReadBinaryFile(current_backup_path);
+            BOOST_REQUIRE(identity_before_ok);
+            bool tampered_stage{false};
+            wallet->m_quantum_backup_failpoint = [&](std::string_view point) {
+                if (point != "before_final_identity_revalidation") return false;
+                for (const auto& entry : fs::directory_iterator(current_backup_dir)) {
+                    const fs::path candidate{entry.path()};
+                    const std::string name = fs::PathToString(candidate.filename());
+                    if (!entry.is_directory() || name.rfind(".blackcoin-wallet-backup-stage-", 0) != 0) continue;
+                    tampered_stage = WriteBinaryFile(candidate / "wallet.dat", "tampered after verification");
+                    break;
+                }
+                return false;
+            };
             error.clear();
-            wallet->m_quantum_backup_failpoint = [](std::string_view point) { return point == "before_final_directory_commit"; };
             BOOST_CHECK(!wallet->BackupWallet(fs::PathToString(current_backup_dir), &error));
             wallet->m_quantum_backup_failpoint = {};
+            BOOST_REQUIRE(tampered_stage);
             BOOST_CHECK(!error.empty());
-            BOOST_CHECK(fs::is_regular_file(current_backup_path));
+            const auto [identity_after_ok, identity_after] = ReadBinaryFile(current_backup_path);
+            BOOST_REQUIRE(identity_after_ok);
+            BOOST_CHECK_EQUAL_COLLECTIONS(identity_before.begin(), identity_before.end(), identity_after.begin(), identity_after.end());
             BOOST_CHECK_EQUAL(static_cast<size_t>(std::distance(fs::directory_iterator(current_backup_dir), fs::directory_iterator{})), 1U);
+
+            auto third = wallet->GetNewQuantumDestination("source-marker-failure");
+            BOOST_REQUIRE(third);
+            third_destination = *third;
             {
-                auto restored{TestLoadQuantumWalletBackup(current_backup_path)};
-                LOCK(restored->cs_wallet);
-                const auto infos = restored->ListQuantumKeyInfos();
-                BOOST_REQUIRE_EQUAL(infos.size(), 2U);
-                BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) {
-                    return info.durably_stored && info.backup_verified;
-                }));
+                LOCK(wallet->cs_wallet);
+                const auto info = wallet->GetQuantumKeyInfo(third_destination);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(!info->backup_verified);
             }
+
+            // Once the verified stage has been atomically installed, a
+            // directory-sync failure cannot safely be rolled back. Report the
+            // failure without deleting the complete destination. A source
+            // marker failure is also reported after the independently verified
+            // destination is installed, and that destination remains usable.
+            for (const std::string_view injected : {
+                     std::string_view{"before_final_directory_commit"},
+                     std::string_view{"before_final_stage_directory_commit"},
+                     std::string_view{"before_source_marker_commit"}}) {
+                error.clear();
+                wallet->m_quantum_backup_failpoint = [injected](std::string_view point) { return point == injected; };
+                BOOST_CHECK(!wallet->BackupWallet(fs::PathToString(current_backup_dir), &error));
+                wallet->m_quantum_backup_failpoint = {};
+                BOOST_CHECK(!error.empty());
+                BOOST_CHECK(fs::is_regular_file(current_backup_path));
+                BOOST_CHECK_EQUAL(static_cast<size_t>(std::distance(fs::directory_iterator(current_backup_dir), fs::directory_iterator{})), 1U);
+                {
+                    auto restored{TestLoadQuantumWalletBackup(current_backup_path)};
+                    LOCK(restored->cs_wallet);
+                    const auto infos = restored->ListQuantumKeyInfos();
+                    BOOST_REQUIRE_EQUAL(infos.size(), 3U);
+                    BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) {
+                        return info.durably_stored && info.backup_verified;
+                    }));
+                }
+                {
+                    LOCK(wallet->cs_wallet);
+                    const auto info = wallet->GetQuantumKeyInfo(third_destination);
+                    BOOST_REQUIRE(info.has_value());
+                    BOOST_CHECK(!info->backup_verified);
+                }
+            }
+
+            // Revalidate the exact installed bytes before recording source
+            // markers. A same-user process can always alter an external file
+            // later, but a replacement racing the promotion itself must fail
+            // closed and leave a newly added source key unverified.
+            bool tampered_destination{false};
+            wallet->m_quantum_backup_failpoint = [&](std::string_view point) {
+                if (point != "before_installed_identity_revalidation") return false;
+                tampered_destination = WriteBinaryFile(current_backup_path, "tampered during promotion");
+                return false;
+            };
+            error.clear();
+            BOOST_CHECK(!wallet->BackupWallet(fs::PathToString(current_backup_dir), &error));
+            wallet->m_quantum_backup_failpoint = {};
+            BOOST_REQUIRE(tampered_destination);
+            BOOST_CHECK(!error.empty());
+            {
+                LOCK(wallet->cs_wallet);
+                const auto info = wallet->GetQuantumKeyInfo(third_destination);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(!info->backup_verified);
+            }
+
             error.clear();
             BOOST_REQUIRE_MESSAGE(wallet->BackupWallet(fs::PathToString(current_backup_dir), &error), error.original);
+            {
+                LOCK(wallet->cs_wallet);
+                const auto info = wallet->GetQuantumKeyInfo(third_destination);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(info->backup_verified);
+            }
         }
 
         const fs::path first_backup_path = first_backup_dir / fs::PathFromString(wallet_filename);
@@ -1173,12 +1352,13 @@ BOOST_AUTO_TEST_CASE(QuantumWalletVerifiedBackupsAreCompleteAndRestorable)
             auto restored{TestLoadQuantumWalletBackup(current_backup_path)};
             LOCK(restored->cs_wallet);
             const auto infos = restored->ListQuantumKeyInfos();
-            BOOST_REQUIRE_EQUAL(infos.size(), 2U);
+            BOOST_REQUIRE_EQUAL(infos.size(), 3U);
             BOOST_CHECK(std::all_of(infos.begin(), infos.end(), [](const QuantumKeyInfo& info) {
                 return info.durably_stored && info.backup_verified;
             }));
             CheckQuantumKeyChallenge(*restored, first_destination);
             CheckQuantumKeyChallenge(*restored, second_destination);
+            CheckQuantumKeyChallenge(*restored, third_destination);
         }
     }
 }
@@ -1262,7 +1442,7 @@ BOOST_AUTO_TEST_CASE(QuantumWalletEncryptedBackupAndOldWalletCompatibility)
     }
 }
 
-BOOST_FIXTURE_TEST_CASE(QuantumWalletInactiveSpendKeepsSpecificError, WalletTestingSetup)
+BOOST_FIXTURE_TEST_CASE(QuantumWalletInactiveSpendFailsBeforeSigning, WalletTestingSetup)
 {
     CTxDestination dest;
     {
@@ -1277,31 +1457,36 @@ BOOST_FIXTURE_TEST_CASE(QuantumWalletInactiveSpendKeepsSpecificError, WalletTest
     std::map<int, bilingual_str> input_errors;
     BOOST_CHECK(!m_wallet.SignTransaction(spend, coins, SIGHASH_ALL, input_errors));
     BOOST_REQUIRE(input_errors.count(0));
-    BOOST_CHECK_EQUAL(input_errors.at(0).original, "Quantum migration spends are not active until the post-Gold-Rush migration window");
+    BOOST_CHECK_EQUAL(input_errors.at(0).original, "quantum-output-premature");
+    BOOST_CHECK(spend.vin[0].scriptWitness.IsNull());
 }
 
-BOOST_AUTO_TEST_CASE(QuantumWalletChangeKeysPersistAndStayOffReceiveBook)
+BOOST_FIXTURE_TEST_CASE(QuantumWalletChangeKeysPersistAndStayOffReceiveBook, QuantumWalletSigningTestingSetup)
 {
     for (DatabaseFormat format : DATABASE_FORMATS) {
         const std::string name{strprintf("quantum-wallet-change-keys-%i", format)};
         CTxDestination dest;
         {
-            auto wallet{TestLoadQuantumWallet(name, format)};
-            LOCK(wallet->cs_wallet);
-            auto op_dest = wallet->GetNewQuantumChangeDestination();
-            BOOST_REQUIRE(op_dest);
-            dest = *op_dest;
-            BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
-            BOOST_CHECK(wallet->IsMine(dest) & ISMINE_SPENDABLE);
-            BOOST_CHECK(wallet->FindAddressBookEntry(dest) == nullptr);
+            auto wallet{TestLoadQuantumWallet(name, format, m_node.chain.get())};
+            {
+                LOCK(wallet->cs_wallet);
+                auto op_dest = wallet->GetNewQuantumChangeDestination();
+                BOOST_REQUIRE(op_dest);
+                dest = *op_dest;
+                BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
+                BOOST_CHECK(wallet->IsMine(dest) & ISMINE_SPENDABLE);
+                BOOST_CHECK(wallet->FindAddressBookEntry(dest) == nullptr);
+            }
             CheckQuantumWalletSigning(*wallet, dest);
         }
         {
-            auto wallet{TestLoadQuantumWallet(name, format)};
-            LOCK(wallet->cs_wallet);
-            BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
-            BOOST_CHECK(wallet->IsMine(dest) & ISMINE_SPENDABLE);
-            BOOST_CHECK(wallet->FindAddressBookEntry(dest) == nullptr);
+            auto wallet{TestLoadQuantumWallet(name, format, m_node.chain.get())};
+            {
+                LOCK(wallet->cs_wallet);
+                BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
+                BOOST_CHECK(wallet->IsMine(dest) & ISMINE_SPENDABLE);
+                BOOST_CHECK(wallet->FindAddressBookEntry(dest) == nullptr);
+            }
             CheckQuantumWalletSigning(*wallet, dest);
         }
     }
@@ -1345,13 +1530,13 @@ BOOST_AUTO_TEST_CASE(TieredQuantumStakeAliasesPersistAndListAfterReload)
     }
 }
 
-BOOST_AUTO_TEST_CASE(QuantumWalletKeysEncryptReloadAndSign)
+BOOST_FIXTURE_TEST_CASE(QuantumWalletKeysEncryptReloadAndSign, QuantumWalletSigningTestingSetup)
 {
     for (DatabaseFormat format : DATABASE_FORMATS) {
         const std::string name{strprintf("quantum-wallet-encrypted-keys-%i", format)};
         CTxDestination dest;
         {
-            auto wallet{TestLoadQuantumWallet(name, format)};
+            auto wallet{TestLoadQuantumWallet(name, format, m_node.chain.get())};
             {
                 LOCK(wallet->cs_wallet);
                 auto op_dest = wallet->GetNewQuantumDestination("quantum-encrypted");
@@ -1370,24 +1555,26 @@ BOOST_AUTO_TEST_CASE(QuantumWalletKeysEncryptReloadAndSign)
             BOOST_CHECK(info->encrypted);
         }
         {
-            auto wallet{TestLoadQuantumWallet(name, format)};
-            LOCK(wallet->cs_wallet);
-            BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
-            BOOST_CHECK(wallet->IsLocked());
-            BOOST_CHECK(wallet->IsMine(dest) & ISMINE_SPENDABLE);
-            const auto info = wallet->GetQuantumKeyInfo(dest);
-            BOOST_REQUIRE(info.has_value());
-            BOOST_CHECK(info->encrypted);
+            auto wallet{TestLoadQuantumWallet(name, format, m_node.chain.get())};
+            {
+                LOCK(wallet->cs_wallet);
+                BOOST_CHECK(wallet->IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
+                BOOST_CHECK(wallet->IsLocked());
+                BOOST_CHECK(wallet->IsMine(dest) & ISMINE_SPENDABLE);
+                const auto info = wallet->GetQuantumKeyInfo(dest);
+                BOOST_REQUIRE(info.has_value());
+                BOOST_CHECK(info->encrypted);
 
-            const auto* witness = std::get_if<WitnessUnknown>(&dest);
-            BOOST_REQUIRE(witness != nullptr);
-            std::vector<unsigned char> public_key;
-            CKeyingMaterial private_key;
-            bilingual_str error;
-            BOOST_CHECK(!wallet->GetQuantumKey(witness->GetWitnessProgram(), public_key, private_key, error));
-            BOOST_CHECK_EQUAL(error.original, "Wallet is locked");
+                const auto* witness = std::get_if<WitnessUnknown>(&dest);
+                BOOST_REQUIRE(witness != nullptr);
+                std::vector<unsigned char> public_key;
+                CKeyingMaterial private_key;
+                bilingual_str error;
+                BOOST_CHECK(!wallet->GetQuantumKey(witness->GetWitnessProgram(), public_key, private_key, error));
+                BOOST_CHECK_EQUAL(error.original, "Wallet is locked");
 
-            BOOST_CHECK(wallet->Unlock("pass"));
+                BOOST_CHECK(wallet->Unlock("pass"));
+            }
             CheckQuantumWalletSigning(*wallet, dest);
             BOOST_CHECK(wallet->Lock());
         }
@@ -1476,7 +1663,8 @@ BOOST_AUTO_TEST_CASE(WatchOnlyPubKeys)
 class ListCoinsTestingSetup : public TestChain100Setup
 {
 public:
-    ListCoinsTestingSetup()
+    explicit ListCoinsTestingSetup(const std::vector<const char*>& extra_args = {})
+        : TestChain100Setup{ChainType::REGTEST, extra_args}
     {
         CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
         wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
@@ -1517,7 +1705,22 @@ public:
     std::unique_ptr<CWallet> wallet;
 };
 
-BOOST_FIXTURE_TEST_CASE(DemurrageAttestationBuilderPreservesReplayAnchor, ListCoinsTestingSetup)
+class DemurrageAttestationTestingSetup : public ListCoinsTestingSetup
+{
+public:
+    DemurrageAttestationTestingSetup()
+        : ListCoinsTestingSetup{{
+              "-shadowwhitelistheight=100",
+              "-shadowgoldrushstartheight=101",
+              "-shadowgoldrushendheight=101",
+              "-qqgoldrushendheight=101",
+              "-qqmigrationendheight=102",
+          }}
+    {
+    }
+};
+
+BOOST_FIXTURE_TEST_CASE(DemurrageAttestationBuilderPreservesReplayAnchor, DemurrageAttestationTestingSetup)
 {
     CTxDestination quantum_dest;
     std::vector<unsigned char> witness_program;
@@ -1531,28 +1734,31 @@ BOOST_FIXTURE_TEST_CASE(DemurrageAttestationBuilderPreservesReplayAnchor, ListCo
         witness_program = info->witness_program;
     }
 
-    // Create a valid base-chain transaction, then replace its recipient before
-    // signing and mine it directly. Gold Rush relay policy intentionally
-    // forbids ordinary quantum funding, while consensus remains legacy-v26
-    // compatible; this fixture needs a live quantum target without weakening
-    // that relay policy.
+    DemurrageAttestationTxResult tx_result;
+    bilingual_str error;
+    CCoinControl coin_control;
+    BOOST_CHECK(!CreateDemurrageAttestationTransaction(
+        *wallet, witness_program, coin_control, /*sign=*/true, tx_result, error));
+    BOOST_CHECK_EQUAL(error.original, "Demurrage is not active for the next block");
+
+    // Height 102 is the compressed test schedule's Migration boundary. Fund
+    // two ordinary quantum outputs there: one becomes the attestation target,
+    // and the other is a non-decaying quantum fee input after Final Lockout
+    // begins at height 103.
     CMutableTransaction funding_tx;
     {
-        const CScript placeholder = GetScriptForRawPubKey(coinbaseKey.GetPubKey());
+        const CScript quantum_script = GetScriptForDestination(quantum_dest);
         CCoinControl control;
         constexpr int RANDOM_CHANGE_POSITION = -1;
         auto funding = CreateTransaction(
-            *wallet, {CRecipient{placeholder, COIN, /*subtract_fee=*/false}},
-            RANDOM_CHANGE_POSITION, control, /*sign=*/false);
+            *wallet,
+            {
+                CRecipient{quantum_script, 2 * COIN, /*subtract_fee=*/false},
+                CRecipient{quantum_script, COIN, /*subtract_fee=*/false},
+            },
+            RANDOM_CHANGE_POSITION, control, /*sign=*/true);
         BOOST_REQUIRE_MESSAGE(funding, util::ErrorString(funding).original);
         funding_tx = CMutableTransaction(*funding->tx);
-        const auto recipient = std::find_if(funding_tx.vout.begin(), funding_tx.vout.end(), [&](const CTxOut& out) {
-            return out.nValue == COIN && out.scriptPubKey == placeholder;
-        });
-        BOOST_REQUIRE(recipient != funding_tx.vout.end());
-        recipient->scriptPubKey = GetScriptForDestination(quantum_dest);
-        LOCK(wallet->cs_wallet);
-        BOOST_REQUIRE(wallet->SignTransaction(funding_tx));
     }
     CreateAndProcessBlock({funding_tx}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
     const CBlockIndex* funding_index = WITH_LOCK(
@@ -1570,9 +1776,8 @@ BOOST_FIXTURE_TEST_CASE(DemurrageAttestationBuilderPreservesReplayAnchor, ListCo
         wallet->SetLastBlockProcessed(funding_index->nHeight, funding_index->GetBlockHash());
     }
 
-    DemurrageAttestationTxResult tx_result;
-    bilingual_str error;
-    CCoinControl coin_control;
+    tx_result = {};
+    error.clear();
     BOOST_REQUIRE_MESSAGE(CreateDemurrageAttestationTransaction(*wallet, witness_program, coin_control, /*sign=*/true, tx_result, error), error.original);
     BOOST_REQUIRE(tx_result.tx);
     BOOST_REQUIRE(!tx_result.tx->vin.empty());
