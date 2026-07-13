@@ -1576,6 +1576,10 @@ static RPCHelpMan getgoldrushinfo()
                         {RPCResult::Type::NUM, "pow_count", "Alias for pow_claim_count."},
                         {RPCResult::Type::NUM, "last_pos_height", "Most recent accepted PoS-side Shadow payout height, or 0 if none."},
                         {RPCResult::Type::NUM, "last_pow_height", "Most recent accepted PoW-side Shadow claim height, or 0 if none."},
+                        {RPCResult::Type::NUM, "competing_claim_rule_activation_height", "First block using canonical order-independent competing-claim allocation."},
+                        {RPCResult::Type::BOOL, "competing_claim_rule_active", "Whether the active tip uses canonical competing-claim allocation."},
+                        {RPCResult::Type::BOOL, "competing_claim_rule_active_next_block", "Whether the next block uses canonical competing-claim allocation."},
+                        {RPCResult::Type::NUM, "blocks_until_competing_claim_rule", "Blocks from the active tip through the activation block; zero once active."},
                         {RPCResult::Type::BOOL, "wallet_recent_solve_qualified", "Whether this wallet has at least one known whitelisted script with a recent solver marker."},
                         {RPCResult::Type::ARR, "wallet_scripts", "Bounded wallet-known scripts relevant to Gold Rush signaling; transaction construction performs the final spendability check.",
                         {
@@ -1626,6 +1630,9 @@ static RPCHelpMan getgoldrushinfo()
     bool active{false};
     bool wallet_recent_solve_qualified{false};
     uint64_t active_signalers{0};
+    int competing_claim_rule_activation_height{std::numeric_limits<int>::max()};
+    bool competing_claim_rule_active{false};
+    bool competing_claim_rule_active_next_block{false};
     {
         ChainstateManager& chainman = pwallet->chain().chainman();
         LOCK(cs_main);
@@ -1640,6 +1647,12 @@ static RPCHelpMan getgoldrushinfo()
         tip_time = tip->GetBlockTime();
         mtp = tip->GetMedianTimePast();
         active = IsShadowGoldRushRewardActive(consensus, mtp, tip->nHeight + 1);
+        competing_claim_rule_activation_height =
+            consensus.nShadowCompetingClaimsActivationHeight;
+        competing_claim_rule_active =
+            consensus.IsShadowCompetingClaimsActive(tip->nHeight);
+        competing_claim_rule_active_next_block =
+            consensus.IsShadowCompetingClaimsActive(tip->nHeight + 1);
         shadow_info = GetShadowGoldRushInfo(active_chainstate.CoinsTip(), tip);
         active_signalers = GetActiveShadowSignalCount(active_chainstate.CoinsTip(), tip);
 
@@ -1721,6 +1734,13 @@ static RPCHelpMan getgoldrushinfo()
     result.pushKV("pow_count", shadow_info.pow_count);
     result.pushKV("last_pos_height", shadow_info.last_pos_height);
     result.pushKV("last_pow_height", shadow_info.last_pow_height);
+    result.pushKV("competing_claim_rule_activation_height",
+                  competing_claim_rule_activation_height);
+    result.pushKV("competing_claim_rule_active", competing_claim_rule_active);
+    result.pushKV("competing_claim_rule_active_next_block",
+                  competing_claim_rule_active_next_block);
+    result.pushKV("blocks_until_competing_claim_rule",
+                  std::max(0, competing_claim_rule_activation_height - tip_height));
     result.pushKV("wallet_recent_solve_qualified", wallet_recent_solve_qualified);
     result.pushKV("wallet_scripts", std::move(wallet_entries));
     return result;

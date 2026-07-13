@@ -166,7 +166,8 @@ public:
         consensus.nDemurrageMinActivationHeight = consensus.nDemurrageActivationHeight;
         consensus.nStakeTierActivationHeight = consensus.nGoldRushEndHeight + 1;
         consensus.nStakeRewardSplitActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
-        consensus.nShadowCompetingClaimsActivationHeight = MAINNET_SHADOW_REWARD_START_HEIGHT;
+        consensus.nShadowCompetingClaimsActivationHeight =
+            MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
         consensus.nLastPOWBlock = 10000;
         consensus.nStakeTimestampMask = 0xf; // 15
         consensus.nCoinbaseMaturity = 500;

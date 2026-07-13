@@ -142,10 +142,13 @@ BOOST_AUTO_TEST_CASE(mainnet_lifecycle_is_height_coherent_and_demurrage_is_autom
     BOOST_CHECK_EQUAL(consensus.nStakeTierActivationHeight, gold_rush_end + 1);
     BOOST_CHECK_EQUAL(consensus.nStakeRewardSplitActivationHeight, migration_end + 1);
     BOOST_CHECK_EQUAL(consensus.nShadowCompetingClaimsActivationHeight,
-                      MAINNET_SHADOW_REWARD_START_HEIGHT);
+                      MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT);
     BOOST_CHECK(consensus.m_demurrage_exempt_scripts.empty());
-    BOOST_CHECK(consensus.IsShadowCompetingClaimsActive(MAINNET_SHADOW_REWARD_START_HEIGHT));
-    BOOST_CHECK(!consensus.IsShadowCompetingClaimsActive(MAINNET_SHADOW_REWARD_START_HEIGHT - 1));
+    BOOST_CHECK_EQUAL(MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT, 5993200);
+    BOOST_CHECK(!consensus.IsShadowCompetingClaimsActive(
+        MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT - 1));
+    BOOST_CHECK(consensus.IsShadowCompetingClaimsActive(
+        MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT));
     BOOST_CHECK_EQUAL(SHADOW_HALVING_INTERVAL_BLOCKS, MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS);
 
     // Mainnet phase transitions are height-exact and ignore both fast and

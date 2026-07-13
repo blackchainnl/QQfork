@@ -193,6 +193,10 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert "last_pos_height" in info
         assert "recent_count" in info
         assert "pow_target_bits" in info
+        assert_equal(info["competing_claim_rule_activation_height"], 2)
+        assert_equal(info["competing_claim_rule_active"], info["height"] >= 2)
+        assert_equal(info["competing_claim_rule_active_next_block"], info["height"] + 1 >= 2)
+        assert_equal(info["blocks_until_competing_claim_rule"], max(0, 2 - info["height"]))
 
         # Verify pow_target_bits is a valid positive integer
         assert isinstance(info["pow_target_bits"], int)
@@ -206,6 +210,10 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert "wallet_scripts" in wallet_info
             assert "pow_amount" in wallet_info
             assert "pos_amount" in wallet_info
+            assert_equal(wallet_info["competing_claim_rule_activation_height"], 2)
+            assert_equal(wallet_info["competing_claim_rule_active"], wallet_info["height"] >= 2)
+            assert_equal(wallet_info["competing_claim_rule_active_next_block"], wallet_info["height"] + 1 >= 2)
+            assert_equal(wallet_info["blocks_until_competing_claim_rule"], max(0, 2 - wallet_info["height"]))
 
         self._assert_pow_claim_from_non_whitelisted_address()
 

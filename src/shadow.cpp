@@ -3662,7 +3662,7 @@ bool GetShadowPosDirectPayouts(const CCoinsViewCache& view, const CBlock& block,
     return BuildPosPayouts(pool, current_solver, active_signals, /*require_quantum_payouts=*/true, payouts_out, total_out);
 }
 
-bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, std::map<CScript, CAmount>& payouts_out, CAmount& total_out)
+bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, const Consensus::Params& consensus, std::map<CScript, CAmount>& payouts_out, CAmount& total_out)
 {
     payouts_out.clear();
     total_out = 0;
@@ -3678,7 +3678,7 @@ bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block,
     pool.pow_amount = *next_pow_amount;
 
     ShadowClaimResult pow_claim = FindPowShadowClaims(
-        block, pindex, blockundo, pool, Params().GetConsensus());
+        block, pindex, blockundo, pool, consensus);
     if (pow_claim.internal_error) return false;
     for (const ShadowClaim& claim : pow_claim.claims) {
         if (!claim.direct || !IsDirectQuantumMigrationScript(claim.target)) return false;
@@ -3691,8 +3691,16 @@ bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block,
     return MoneyRange(total_out);
 }
 
+bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, std::map<CScript, CAmount>& payouts_out, CAmount& total_out)
+{
+    return GetShadowPowDirectPayouts(view, block, pindex, blockundo,
+                                     Params().GetConsensus(), payouts_out,
+                                     total_out);
+}
+
 ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
     const CCoinsViewCache& view, const CBlockIndex* pindex,
+    const Consensus::Params& consensus,
     ShadowPowAccountingContext& context_out)
 {
     context_out = {};
@@ -3756,10 +3764,19 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
     context_out.credited_pow_pool = pool.pow_amount;
     context_out.target_bits = RetargetedBits(ShadowProofMode::POW, pool,
                                              pindex->nHeight);
-    context_out.canonical_rule_active = Params().GetConsensus()
-        .IsShadowCompetingClaimsActive(pindex->nHeight);
+    context_out.canonical_rule_active =
+        consensus.IsShadowCompetingClaimsActive(pindex->nHeight);
     context_out.valid = true;
     return ShadowPowAccountingResult::OK;
+}
+
+ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
+    const CCoinsViewCache& view, const CBlockIndex* pindex,
+    ShadowPowAccountingContext& context_out)
+{
+    return PrepareShadowPowClaimAccounting(view, pindex,
+                                            Params().GetConsensus(),
+                                            context_out);
 }
 
 ShadowPowAccountingResult EvaluateShadowPowClaimAccounting(
@@ -3780,18 +3797,27 @@ ShadowPowAccountingResult EvaluateShadowPowClaimAccounting(
 
 ShadowPowAccountingResult GetShadowPowClaimAccounting(
     const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
-    const CBlockUndo* blockundo,
+    const CBlockUndo* blockundo, const Consensus::Params& consensus,
     std::vector<ShadowPowClaimAccounting>& accounting_out)
 {
     ShadowPowAccountingContext context;
     const ShadowPowAccountingResult prepare_result =
-        PrepareShadowPowClaimAccounting(view, pindex, context);
+        PrepareShadowPowClaimAccounting(view, pindex, consensus, context);
     if (prepare_result != ShadowPowAccountingResult::OK) {
         accounting_out.clear();
         return prepare_result;
     }
     return EvaluateShadowPowClaimAccounting(context, block, blockundo,
                                              accounting_out);
+}
+
+ShadowPowAccountingResult GetShadowPowClaimAccounting(
+    const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
+    const CBlockUndo* blockundo,
+    std::vector<ShadowPowClaimAccounting>& accounting_out)
+{
+    return GetShadowPowClaimAccounting(view, block, pindex, blockundo,
+                                       Params().GetConsensus(), accounting_out);
 }
 
 bool CheckShadowDirectPayoutOutputs(const CTransaction& tx, const std::map<CScript, CAmount>& expected_payouts, std::string& reject_reason)

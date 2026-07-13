@@ -57,6 +57,7 @@
 
 #include <stdint.h>
 
+#include <algorithm>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -2017,6 +2018,10 @@ static RPCHelpMan getgoldrushstate()
                         {RPCResult::Type::NUM, "pow_target_bits", "Current PoW target bits"},
                         {RPCResult::Type::NUM, "height", "Active chainstate height"},
                         {RPCResult::Type::STR_HEX, "bestblock", "Active chainstate tip hash"},
+                        {RPCResult::Type::NUM, "competing_claim_rule_activation_height", "First block using canonical order-independent competing-claim allocation"},
+                        {RPCResult::Type::BOOL, "competing_claim_rule_active", "Whether the active tip uses canonical competing-claim allocation"},
+                        {RPCResult::Type::BOOL, "competing_claim_rule_active_next_block", "Whether the next block uses canonical competing-claim allocation"},
+                        {RPCResult::Type::NUM, "blocks_until_competing_claim_rule", "Blocks from the active tip through the activation block; zero once active"},
                         {RPCResult::Type::OBJ, "replay_state", "Authenticated auxiliary-state rebuild commitment",
                             {
                                 {RPCResult::Type::NUM, "schema", "Required replay schema version"},
@@ -2059,9 +2064,18 @@ static RPCHelpMan getgoldrushstate()
     obj.pushKV("pow_target_bits", (uint64_t)info.pow_target_bits);
     obj.pushKV("height", pindex->nHeight);
     obj.pushKV("bestblock", pindex->GetBlockHash().GetHex());
+    const Consensus::Params& consensus = chainman.GetConsensus();
+    const int competing_claim_height = consensus.nShadowCompetingClaimsActivationHeight;
+    obj.pushKV("competing_claim_rule_activation_height", competing_claim_height);
+    obj.pushKV("competing_claim_rule_active",
+               consensus.IsShadowCompetingClaimsActive(pindex->nHeight));
+    obj.pushKV("competing_claim_rule_active_next_block",
+               consensus.IsShadowCompetingClaimsActive(pindex->nHeight + 1));
+    obj.pushKV("blocks_until_competing_claim_rule",
+               std::max(0, competing_claim_height - pindex->nHeight));
 
     const ShadowReplayStateInfo replay = GetShadowReplayStateInfo(
-        active_chainstate.CoinsTip(), chainman.GetConsensus(), pindex);
+        active_chainstate.CoinsTip(), consensus, pindex);
     UniValue replay_obj(UniValue::VOBJ);
     replay_obj.pushKV("schema", replay.schema);
     replay_obj.pushKV("required_for_tip", replay.required_for_tip);

@@ -116,11 +116,19 @@ struct ShadowSyntheticPayoutTransaction {
 static constexpr int MAINNET_SHADOW_WHITELIST_HEIGHT = 5945000;
 static constexpr int MAINNET_SHADOW_REWARD_START_HEIGHT = 5950000;
 static constexpr int MAINNET_SHADOW_GOLD_RUSH_BLOCKS = (180 * 24 * 60 * 60) / 64;
+static constexpr int MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS = 43200;
+// v30.1.0 assigned the first valid in-block QQSPROOF the whole PoW pool. Keep
+// that already-mined history immutable. The order-independent, emission-neutral
+// competing-claim rule begins at the first pre-announced Gold Rush halving.
+static constexpr int MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT =
+    MAINNET_SHADOW_REWARD_START_HEIGHT + MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS;
 static constexpr int MAINNET_SHADOW_REWARD_END_HEIGHT = MAINNET_SHADOW_REWARD_START_HEIGHT + MAINNET_SHADOW_GOLD_RUSH_BLOCKS - 1;
 static constexpr int MAINNET_QUANTUM_MIGRATION_BLOCKS = (540 * 24 * 60 * 60) / 64;
 static constexpr int MAINNET_QUANTUM_MIGRATION_END_HEIGHT = MAINNET_SHADOW_REWARD_END_HEIGHT + MAINNET_QUANTUM_MIGRATION_BLOCKS;
 static constexpr int MAINNET_QUANTUM_FINAL_START_HEIGHT = MAINNET_QUANTUM_MIGRATION_END_HEIGHT + 1;
 static_assert(MAINNET_SHADOW_REWARD_START_HEIGHT == 5950000);
+static_assert(MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT == 5993200);
+static_assert(MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT <= MAINNET_SHADOW_REWARD_END_HEIGHT);
 static_assert(MAINNET_SHADOW_REWARD_END_HEIGHT == 6192999);
 static_assert(MAINNET_QUANTUM_MIGRATION_END_HEIGHT == 6921999);
 static_assert(MAINNET_QUANTUM_FINAL_START_HEIGHT == 6922000);
@@ -137,7 +145,6 @@ extern int SHADOW_GOLD_RUSH_BLOCKS;
 extern int SHADOW_PHASE1_END_HEIGHT;
 extern int SHADOW_REWARD_END_HEIGHT;
 extern int SHADOW_HALVING_INTERVAL_BLOCKS;
-static constexpr int MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS = 43200;
 
 /** Test-only: shift the Gold Rush schedule to a small, reachable window. */
 void SetShadowTestSchedule(int whitelist_height, int reward_start_height, int gold_rush_blocks);
@@ -297,6 +304,7 @@ bool ShadowActiveSignalPoolPairValidForTesting(const Consensus::Params& consensu
 
 /** Compute PoW Gold Rush shadow-ledger credits implied by a candidate block. */
 bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, std::map<CScript, CAmount>& payouts_out, CAmount& total_out);
+bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, const Consensus::Params& consensus, std::map<CScript, CAmount>& payouts_out, CAmount& total_out);
 
 /** Deterministically classify every QQSPROOF note in a block. This is the
  *  bounded accounting engine used by ApplyShadowBlock itself and is exposed
@@ -305,10 +313,18 @@ bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block,
 ShadowPowAccountingResult GetShadowPowClaimAccounting(
     const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
     const CBlockUndo* blockundo, std::vector<ShadowPowClaimAccounting>& accounting_out);
+ShadowPowAccountingResult GetShadowPowClaimAccounting(
+    const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
+    const CBlockUndo* blockundo, const Consensus::Params& consensus,
+    std::vector<ShadowPowClaimAccounting>& accounting_out);
 /** Copy and authenticate the small historical pool context while the caller
  *  holds its chain/view lock. This performs no Argon2 work. */
 ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
     const CCoinsViewCache& view, const CBlockIndex* pindex,
+    ShadowPowAccountingContext& context_out);
+ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
+    const CCoinsViewCache& view, const CBlockIndex* pindex,
+    const Consensus::Params& consensus,
     ShadowPowAccountingContext& context_out);
 /** Evaluate the immutable context, base block, and undo without reading
  *  chainstate. The caller may release cs_main before invoking this function. */
