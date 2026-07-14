@@ -21,6 +21,7 @@ from test_framework.util import assert_equal
 GOLD_RUSH_END_TIME = 2_000_000_000
 QUANTUM_SPEND_FEE = Decimal("0.01")
 WALLET_NAME = "goldrush_value"
+WATCH_WALLET_NAME = "goldrush_value_watch"
 
 
 class GoldRushValuePathTest(BitcoinTestFramework):
@@ -103,6 +104,16 @@ class GoldRushValuePathTest(BitcoinTestFramework):
     def _wait_for_quantum_utxo(self, wallet, address):
         self.wait_until(lambda: len(self._get_quantum_utxos(wallet, address)) == 1, timeout=30)
         return self._get_quantum_utxos(wallet, address)[0]
+
+    def _import_watch_script(self, source_wallet, watch_wallet, address):
+        script = source_wallet.getaddressinfo(address)["scriptPubKey"]
+        descriptor = self.nodes[0].getdescriptorinfo(f"raw({script})")["descriptor"]
+        result = watch_wallet.importdescriptors([{
+            "desc": descriptor,
+            "timestamp": 0,
+            "active": False,
+        }])
+        assert_equal(result, [{"success": True}])
 
     def _assert_no_quantum_utxo(self, wallet, address):
         assert_equal(self._get_quantum_utxos(wallet, address), [])
@@ -207,6 +218,15 @@ class GoldRushValuePathTest(BitcoinTestFramework):
 
         self.log.info("Broadcasting a fee-paying QQSPROOF claim to a wallet-backed quantum address")
         payout_address = wallet.getnewquantumaddress()["address"]
+        node.createwallet(
+            wallet_name=WATCH_WALLET_NAME,
+            disable_private_keys=True,
+            blank=True,
+            descriptors=True,
+            load_on_startup=True,
+        )
+        watch_wallet = node.get_wallet_rpc(WATCH_WALLET_NAME)
+        self._import_watch_script(wallet, watch_wallet, payout_address)
         claim = wallet.sendshadowpowclaim(claim_address, payout_address, 500000)
         assert claim["txid"] in node.getrawmempool()
 
@@ -218,6 +238,9 @@ class GoldRushValuePathTest(BitcoinTestFramework):
 
         self.log.info("Verifying the synthetic quantum payout coin is wallet-visible and in chainstate")
         payout_utxo = self._wait_for_quantum_utxo(wallet, payout_address)
+        watch_payout_utxo = self._wait_for_quantum_utxo(watch_wallet, payout_address)
+        assert_equal(watch_payout_utxo["txid"], payout_utxo["txid"])
+        assert_equal(watch_payout_utxo["vout"], payout_utxo["vout"])
         assert_equal(payout_utxo["confirmations"], 1)
         assert node.gettxout(payout_utxo["txid"], payout_utxo["vout"], False) is not None
         goldrush_info = wallet.getgoldrushinfo()
@@ -227,10 +250,13 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         self.log.info("Disconnecting and reconnecting the claim block removes and restores the companion coin")
         node.invalidateblock(claim_block_hash)
         self._assert_no_quantum_utxo(wallet, payout_address)
+        self._assert_no_quantum_utxo(watch_wallet, payout_address)
         assert node.gettxout(payout_utxo["txid"], payout_utxo["vout"], False) is None
         node.reconsiderblock(claim_block_hash)
         self.wait_until(lambda: node.getbestblockhash() == claim_block_hash)
         payout_utxo = self._wait_for_quantum_utxo(wallet, payout_address)
+        watch_payout_utxo = self._wait_for_quantum_utxo(watch_wallet, payout_address)
+        assert_equal(watch_payout_utxo["txid"], payout_utxo["txid"])
 
         self.log.info("Gold Rush payout spends are disabled during Gold Rush")
         next_quantum = wallet.getnewquantumaddress()["address"]
@@ -245,11 +271,17 @@ class GoldRushValuePathTest(BitcoinTestFramework):
 
         self.log.info("Reloading, rescanning, and restarting preserves the synthetic payout")
         wallet.unloadwallet()
+        watch_wallet.unloadwallet()
         node.loadwallet(WALLET_NAME)
+        node.loadwallet(WATCH_WALLET_NAME)
         wallet = node.get_wallet_rpc(WALLET_NAME)
+        watch_wallet = node.get_wallet_rpc(WATCH_WALLET_NAME)
         wallet.rescanblockchain(0)
+        watch_wallet.rescanblockchain(0)
         node.syncwithvalidationinterfacequeue()
         matured_utxo = self._wait_for_quantum_utxo(wallet, payout_address)
+        watch_matured_utxo = self._wait_for_quantum_utxo(watch_wallet, payout_address)
+        assert_equal(watch_matured_utxo["txid"], matured_utxo["txid"])
         assert matured_utxo["confirmations"] > COINBASE_MATURITY
 
         self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={self.mock_time}"])
@@ -257,9 +289,14 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         node.setmocktime(self.mock_time)
         if WALLET_NAME not in node.listwallets():
             node.loadwallet(WALLET_NAME)
+        if WATCH_WALLET_NAME not in node.listwallets():
+            node.loadwallet(WATCH_WALLET_NAME)
         wallet = node.get_wallet_rpc(WALLET_NAME)
+        watch_wallet = node.get_wallet_rpc(WATCH_WALLET_NAME)
         node.syncwithvalidationinterfacequeue()
         matured_utxo = self._wait_for_quantum_utxo(wallet, payout_address)
+        watch_matured_utxo = self._wait_for_quantum_utxo(watch_wallet, payout_address)
+        assert_equal(watch_matured_utxo["txid"], matured_utxo["txid"])
         assert matured_utxo["confirmations"] > COINBASE_MATURITY
 
         self.log.info("Advancing to migration before spending the matured payout to a new quantum address")
@@ -274,6 +311,8 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         spend_block = node.getblock(spend_block_hash)
         assert spend_txid in spend_block["tx"]
         assert node.gettxout(matured_utxo["txid"], matured_utxo["vout"], False) is None
+        self._assert_no_quantum_utxo(watch_wallet, payout_address)
+        assert watch_wallet.gettransaction(matured_utxo["txid"])["confirmations"] > 0
         migrated_utxo = self._wait_for_quantum_utxo(wallet, next_quantum)
 
         self.log.info("Disconnecting the spend block restores the matured synthetic payout coin")
@@ -286,11 +325,33 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         node.reconsiderblock(spend_block_hash)
         self.wait_until(lambda: node.getbestblockhash() == spend_block_hash)
         assert node.gettxout(matured_utxo["txid"], matured_utxo["vout"], False) is None
+        self._assert_no_quantum_utxo(watch_wallet, payout_address)
+        migrated_utxo = self._wait_for_quantum_utxo(wallet, next_quantum)
+
+        self.log.info("A full reindex preserves the spent canonical payout without recreating watch-only credit")
+        self.restart_node(
+            0,
+            extra_args=self.extra_args[0] + ["-reindex", f"-mocktime={self.mock_time}"],
+        )
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        if WALLET_NAME not in node.listwallets():
+            node.loadwallet(WALLET_NAME)
+        if WATCH_WALLET_NAME not in node.listwallets():
+            node.loadwallet(WATCH_WALLET_NAME)
+        wallet = node.get_wallet_rpc(WALLET_NAME)
+        watch_wallet = node.get_wallet_rpc(WATCH_WALLET_NAME)
+        node.syncwithvalidationinterfacequeue()
+        assert wallet.gettransaction(matured_utxo["txid"])["confirmations"] > 0
+        assert watch_wallet.gettransaction(matured_utxo["txid"])["confirmations"] > 0
+        self._assert_no_quantum_utxo(wallet, payout_address)
+        self._assert_no_quantum_utxo(watch_wallet, payout_address)
         migrated_utxo = self._wait_for_quantum_utxo(wallet, next_quantum)
 
         self.log.info("Reorging below the claim block after spend removes both payout generations")
         node.invalidateblock(claim_block_hash)
         self._assert_no_quantum_utxo(wallet, payout_address)
+        self._assert_no_quantum_utxo(watch_wallet, payout_address)
         self._assert_no_quantum_utxo(wallet, next_quantum)
         assert node.gettxout(matured_utxo["txid"], matured_utxo["vout"], False) is None
         assert node.gettxout(migrated_utxo["txid"], migrated_utxo["vout"], False) is None

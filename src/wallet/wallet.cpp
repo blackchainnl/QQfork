@@ -147,6 +147,9 @@ static bool IsQuantumProtectedScript(const CScript& script_pubkey)
 }
 
 static constexpr const char* SYNTHETIC_GOLD_RUSH_PAYOUT_KEY{"qq_synthetic_goldrush_payout"};
+static constexpr const char* SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_KEY{"qq_synthetic_goldrush_payout_stale"};
+static constexpr const char* SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_BLOCK_KEY{"qq_synthetic_goldrush_payout_stale_block"};
+static constexpr const char* SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_HEIGHT_KEY{"qq_synthetic_goldrush_payout_stale_height"};
 
 /**
  * Recognize the deterministic synthetic payout envelope without consulting
@@ -159,7 +162,6 @@ static bool IsSyntheticGoldRushPayoutEnvelope(const CWalletTx& wtx)
     static const std::vector<unsigned char> marker{'Q', 'Q', 'C', 'P', 'A', 'Y'};
     const TxStateConfirmed* confirmed = wtx.state<TxStateConfirmed>();
     if (!confirmed || confirmed->position_in_block <= 0 ||
-        !IsShadowGoldRushRewardHeight(confirmed->confirmed_block_height) ||
         wtx.tx->nVersion != 1 || wtx.tx->nLockTime != 0 ||
         wtx.tx->vin.size() != 1 || !wtx.tx->vin[0].prevout.IsNull() ||
         wtx.tx->vout.size() != 1 || wtx.tx->vout[0].nValue <= 0 ||
@@ -178,7 +180,15 @@ static bool IsSyntheticGoldRushPayoutEnvelope(const CWalletTx& wtx)
         return false;
     }
 
-    if (ReadLE32(anchor.data()) != static_cast<uint32_t>(confirmed->confirmed_block_height)) {
+    const uint32_t embedded_height = ReadLE32(anchor.data());
+    // Database loading initially restores a confirmed block hash with height
+    // -1, then LoadWallet fills the active-chain height from one chainstate
+    // snapshot. At that intermediate point the authenticated envelope anchor
+    // is the only available height; any nonnegative stored height must match.
+    if (embedded_height > static_cast<uint32_t>(std::numeric_limits<int>::max()) ||
+        !IsShadowGoldRushRewardHeight(static_cast<int>(embedded_height)) ||
+        (confirmed->confirmed_block_height >= 0 &&
+         embedded_height != static_cast<uint32_t>(confirmed->confirmed_block_height))) {
         return false;
     }
     uint256 embedded_block_hash;
@@ -186,6 +196,13 @@ static bool IsSyntheticGoldRushPayoutEnvelope(const CWalletTx& wtx)
               anchor.begin() + sizeof(uint32_t) + uint256::size(),
               embedded_block_hash.begin());
     return embedded_block_hash == confirmed->confirmed_block_hash;
+}
+
+static bool IsSyntheticGoldRushPayoutRecord(const CWalletTx& wtx)
+{
+    const auto marker = wtx.mapValue.find(SYNTHETIC_GOLD_RUSH_PAYOUT_KEY);
+    return (marker != wtx.mapValue.end() && marker->second == "1") ||
+           IsSyntheticGoldRushPayoutEnvelope(wtx);
 }
 
 static std::optional<std::string> QuantumCommitOutputError(const CTransaction& tx, unsigned int script_verify_flags)
@@ -339,12 +356,106 @@ static void AnnotateWalletShadowPayout(CWallet& wallet, const ShadowSyntheticPay
     set_value("comment", comment);
     if (!address.empty()) set_value("to", address);
     set_value(SYNTHETIC_GOLD_RUSH_PAYOUT_KEY, "1");
+    changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_KEY) != 0 || changed;
+    changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_BLOCK_KEY) != 0 || changed;
+    changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_HEIGHT_KEY) != 0 || changed;
 
     if (changed) {
         batch.WriteTx(wtx);
         wtx.MarkDirty();
         wallet.NotifyTransactionChanged(txid, CT_UPDATED);
     }
+}
+
+void CWallet::UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet);
+    const uint256 txid = wtx.GetHash();
+    const auto previous = m_confirmed_synthetic_payout_block_by_txid.find(txid);
+    if (previous != m_confirmed_synthetic_payout_block_by_txid.end()) {
+        const auto block = m_confirmed_synthetic_payouts_by_block.find(previous->second);
+        if (block != m_confirmed_synthetic_payouts_by_block.end()) {
+            block->second.erase(txid);
+            if (block->second.empty()) m_confirmed_synthetic_payouts_by_block.erase(block);
+        }
+        m_confirmed_synthetic_payout_block_by_txid.erase(previous);
+    }
+
+    const auto* confirmed = wtx.state<TxStateConfirmed>();
+    if (!confirmed || !IsSyntheticGoldRushPayoutRecord(wtx)) return;
+    m_confirmed_synthetic_payouts_by_block[confirmed->confirmed_block_hash].insert(txid);
+    m_confirmed_synthetic_payout_block_by_txid.emplace(txid, confirmed->confirmed_block_hash);
+}
+
+void CWallet::RecomputeConfirmedSyntheticPayoutIndex()
+{
+    AssertLockHeld(cs_wallet);
+    m_confirmed_synthetic_payouts_by_block.clear();
+    m_confirmed_synthetic_payout_block_by_txid.clear();
+    for (const auto& [_, wtx] : mapWallet) {
+        UpdateConfirmedSyntheticPayoutIndex(wtx);
+    }
+}
+
+/**
+ * Reconcile only synthetic records already attributed to one active block.
+ * The caller derives authenticated_outpoints from chainstate without holding
+ * cs_wallet. A record remains confirmed only when its exact synthetic
+ * transaction outpoint is reproduced by the block's authenticated claim
+ * markers. Stale records stay in mapWallet and on disk for audit, but their
+ * inactive state prevents them from contributing to any wallet balance.
+ */
+bool CWallet::ReconcileWalletShadowPayoutsForBlock(
+    const uint256& block_hash,
+    int block_height,
+    const std::set<COutPoint>& authenticated_outpoints,
+    WalletBatch& batch)
+{
+    AssertLockHeld(cs_wallet);
+    bool write_ok{true};
+    const auto indexed = m_confirmed_synthetic_payouts_by_block.find(block_hash);
+    if (indexed == m_confirmed_synthetic_payouts_by_block.end()) return true;
+    const std::vector<uint256> candidates{indexed->second.begin(), indexed->second.end()};
+    for (const uint256& txid : candidates) {
+        auto wallet_tx = mapWallet.find(txid);
+        if (wallet_tx == mapWallet.end()) continue;
+        CWalletTx& wtx = wallet_tx->second;
+        const auto* confirmed = wtx.state<TxStateConfirmed>();
+        if (!confirmed || confirmed->confirmed_block_hash != block_hash ||
+            confirmed->confirmed_block_height != block_height ||
+            !IsSyntheticGoldRushPayoutRecord(wtx)) {
+            continue;
+        }
+        if (authenticated_outpoints.count(COutPoint{txid, 0}) != 0) {
+            bool changed{false};
+            changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_KEY) != 0 || changed;
+            changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_BLOCK_KEY) != 0 || changed;
+            changed = wtx.mapValue.erase(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_HEIGHT_KEY) != 0 || changed;
+            if (changed) {
+                wtx.MarkDirty();
+                write_ok = batch.WriteTx(wtx) && write_ok;
+                NotifyTransactionChanged(txid, CT_UPDATED);
+            }
+            continue;
+        }
+
+        // Preserve both the transaction and its former location as explicit
+        // audit metadata. Do not erase ownership data, keys, comments, or the
+        // synthetic marker used by v30.1.1 intermediates.
+        wtx.mapValue[SYNTHETIC_GOLD_RUSH_PAYOUT_KEY] = "1";
+        wtx.mapValue[SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_KEY] = "1";
+        wtx.mapValue[SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_BLOCK_KEY] = block_hash.GetHex();
+        wtx.mapValue[SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_HEIGHT_KEY] = ToString(block_height);
+        wtx.m_state = TxStateInactive{};
+        UpdateConfirmedSyntheticPayoutIndex(wtx);
+        wtx.MarkDirty();
+        write_ok = batch.WriteTx(wtx) && write_ok;
+        NotifyTransactionChanged(txid, CT_UPDATED);
+        WalletLogPrintf(
+            "Deactivated unauthenticated synthetic Gold Rush payout %s formerly attributed to block %s at height %d\n",
+            txid.ToString(), block_hash.ToString(), block_height);
+    }
+    return write_ok;
 }
 
 static bool IsValidQuantumColdStakeSelector(const std::vector<unsigned char>& selector)
@@ -1641,6 +1752,7 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
     }
     UpdatePendingShadowSignalIndex(wtx);
     IndexOwnedLegacyShadowScripts(wtx);
+    UpdateConfirmedSyntheticPayoutIndex(wtx);
     RefreshLiveUnspentStakeOutpoints(wtx);
 
     //// debug print
@@ -1729,6 +1841,7 @@ bool CWallet::LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx
     MaybeUpdateBirthTime(wtx.GetTxTime());
     UpdatePendingShadowSignalIndex(wtx);
     IndexOwnedLegacyShadowScripts(wtx);
+    UpdateConfirmedSyntheticPayoutIndex(wtx);
     RefreshLiveUnspentStakeOutpoints(wtx);
 
     return true;
@@ -2101,11 +2214,24 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     assert(block.data);
     const WalletBlockTime block_time{block.data->GetBlockTime(), block.chain_time_max};
     const std::vector<ShadowSyntheticPayoutTransaction> shadow_payout_txs = GetWalletShadowPayoutTransactions(*this, block);
+    std::set<COutPoint> authenticated_shadow_payouts;
+    for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
+        if (payout.tx && !payout.tx->vout.empty()) {
+            authenticated_shadow_payouts.emplace(payout.tx->GetHash(), 0);
+        }
+    }
     {
     LOCK(cs_wallet);
 
     m_last_block_processed_height = block.height;
     m_last_block_processed = block.hash;
+
+    WalletBatch batch(GetDatabase());
+    if (!ReconcileWalletShadowPayoutsForBlock(
+            block.hash, block.height, authenticated_shadow_payouts, batch)) {
+        WalletLogPrintf("Failed to persist one or more synthetic Gold Rush payout reconciliation updates for block %s\n",
+                        block.hash.ToString());
+    }
 
     // No need to scan block if it was created before the wallet birthday.
     // Uses chain max time and twice the grace period to adjust time for block time variability.
@@ -2132,7 +2258,6 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
                         TxStateConfirmed{block.hash, block.height, static_cast<int>(block.data->vtx.size() + index)},
                         /*update_tx=*/true, /*rescanning_old_block=*/false, block_time);
     }
-    WalletBatch batch(GetDatabase());
     for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
         AnnotateWalletShadowPayout(*this, payout, batch);
     }
@@ -2700,6 +2825,12 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                     LOCK(cs_main);
                     shadow_payout_txs = GetAppliedShadowClaimPayoutTransactionRecords(chain().getCoinsTip(), block_height, block_hash, block.GetBlockTime());
                 }
+                std::set<COutPoint> authenticated_shadow_payouts;
+                for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
+                    if (payout.tx && !payout.tx->vout.empty()) {
+                        authenticated_shadow_payouts.emplace(payout.tx->GetHash(), 0);
+                    }
+                }
                 std::optional<CBlockLocator> progress_locator;
                 if (save_progress && next_interval) {
                     CBlockLocator locator = m_chain->getActiveChainLocator(block_hash);
@@ -2713,6 +2844,12 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                     result.status = ScanResult::FAILURE;
                     break;
                 }
+                WalletBatch batch(GetDatabase());
+                if (!ReconcileWalletShadowPayoutsForBlock(
+                        block_hash, block_height, authenticated_shadow_payouts, batch)) {
+                    WalletLogPrintf("Failed to persist one or more synthetic Gold Rush payout reconciliation updates while rescanning block %s\n",
+                                    block_hash.ToString());
+                }
                 for (size_t posInBlock = 0; posInBlock < block.vtx.size(); ++posInBlock) {
                     SyncTransaction(block.vtx[posInBlock], TxStateConfirmed{block_hash, block_height, static_cast<int>(posInBlock)},
                                     fUpdate, /*rescanning_old_block=*/true,
@@ -2725,7 +2862,6 @@ CWallet::ScanResult CWallet::ScanForWalletTransactions(const uint256& start_bloc
                                     WalletBlockTime{block.GetBlockTime(), block_max_time});
                 }
                 if (!shadow_payout_txs.empty() || fUpdate) {
-                    WalletBatch batch(GetDatabase());
                     for (const ShadowSyntheticPayoutTransaction& payout : shadow_payout_txs) {
                         AnnotateWalletShadowPayout(*this, payout, batch);
                     }
@@ -4128,6 +4264,7 @@ DBErrors CWallet::LoadWallet()
 {
     DBErrors nLoadWalletRet;
     std::set<uint256> referenced_blocks;
+    std::set<uint256> synthetic_payout_blocks;
     {
         LOCK(cs_wallet);
         nLoadWalletRet = WalletBatch(GetDatabase()).LoadWallet(this);
@@ -4135,6 +4272,9 @@ DBErrors CWallet::LoadWallet()
             for (const auto& [_, wtx] : mapWallet) {
                 if (const auto* conf = wtx.state<TxStateConfirmed>()) {
                     referenced_blocks.insert(conf->confirmed_block_hash);
+                    if (IsSyntheticGoldRushPayoutRecord(wtx)) {
+                        synthetic_payout_blocks.insert(conf->confirmed_block_hash);
+                    }
                 } else if (const auto* conf = wtx.state<TxStateConflicted>()) {
                     referenced_blocks.insert(conf->conflicting_block_hash);
                 }
@@ -4146,6 +4286,7 @@ DBErrors CWallet::LoadWallet()
     // holding cs_wallet. Keeping database loading, chain lookup, and wallet
     // reconciliation in separate phases avoids nested chain/wallet locks.
     std::map<uint256, std::optional<int>> active_block_heights;
+    std::map<uint256, std::set<COutPoint>> authenticated_shadow_payouts;
     if (HaveChain() && !referenced_blocks.empty()) {
         LOCK(::cs_main);
         ChainstateManager& chainman = chain().chainman();
@@ -4153,6 +4294,20 @@ DBErrors CWallet::LoadWallet()
             const CBlockIndex* block_index = chainman.m_blockman.LookupBlockIndex(block_hash);
             if (block_index && chainman.ActiveChain().Contains(block_index)) {
                 active_block_heights.emplace(block_hash, block_index->nHeight);
+                if (synthetic_payout_blocks.count(block_hash) != 0) {
+                    std::set<COutPoint> block_payouts;
+                    for (const ShadowSyntheticPayoutTransaction& payout :
+                         GetAppliedShadowClaimPayoutTransactionRecords(
+                             chainman.ActiveChainstate().CoinsTip(),
+                             block_index->nHeight,
+                             block_hash,
+                             block_index->GetBlockTime())) {
+                        if (payout.tx && !payout.tx->vout.empty()) {
+                            block_payouts.emplace(payout.tx->GetHash(), 0);
+                        }
+                    }
+                    authenticated_shadow_payouts.emplace(block_hash, std::move(block_payouts));
+                }
             } else {
                 active_block_heights.emplace(block_hash, std::nullopt);
             }
@@ -4160,6 +4315,7 @@ DBErrors CWallet::LoadWallet()
     }
 
     LOCK(cs_wallet);
+    bool reconciliation_write_ok{true};
     if (HaveChain()) {
         for (auto& entry : mapWallet) {
             CWalletTx& wtx = entry.second;
@@ -4180,8 +4336,23 @@ DBErrors CWallet::LoadWallet()
                 reconcile_block(conf->conflicting_block_hash, conf->conflicting_block_height);
             }
         }
+        WalletBatch batch(GetDatabase());
+        for (const auto& [block_hash, block_payouts] : authenticated_shadow_payouts) {
+            const auto height = active_block_heights.find(block_hash);
+            if (height == active_block_heights.end() || !height->second) continue;
+            reconciliation_write_ok = ReconcileWalletShadowPayoutsForBlock(
+                block_hash, *height->second, block_payouts, batch) &&
+                reconciliation_write_ok;
+        }
+    }
+    if (!reconciliation_write_ok) {
+        WalletLogPrintf("Failed to persist one or more synthetic Gold Rush payout reconciliation updates while loading the wallet\n");
+        if (static_cast<int>(nLoadWalletRet) < static_cast<int>(DBErrors::NONCRITICAL_ERROR)) {
+            nLoadWalletRet = DBErrors::NONCRITICAL_ERROR;
+        }
     }
     RecomputeShadowSolveIndex();
+    RecomputeConfirmedSyntheticPayoutIndex();
     RecomputeLiveUnspentStakeOutpoints();
     if (nLoadWalletRet == DBErrors::NEED_REWRITE)
     {
@@ -4226,6 +4397,15 @@ DBErrors CWallet::ZapSelectTx(std::vector<uint256>& vHashIn, std::vector<uint256
         }
         RemoveIndexedShadowSolve(hash);
         m_pending_shadow_signal_txids.erase(hash);
+        const auto synthetic_block = m_confirmed_synthetic_payout_block_by_txid.find(hash);
+        if (synthetic_block != m_confirmed_synthetic_payout_block_by_txid.end()) {
+            const auto block = m_confirmed_synthetic_payouts_by_block.find(synthetic_block->second);
+            if (block != m_confirmed_synthetic_payouts_by_block.end()) {
+                block->second.erase(hash);
+                if (block->second.empty()) m_confirmed_synthetic_payouts_by_block.erase(block);
+            }
+            m_confirmed_synthetic_payout_block_by_txid.erase(synthetic_block);
+        }
         mapWallet.erase(it);
         for (const COutPoint& input : spent_inputs) {
             RefreshLiveUnspentStakeOutpoint(input);
@@ -6999,9 +7179,11 @@ int CWallet::GetTxBlocksToMaturity(const CWalletTx& wtx) const
         assert(chain_depth >= 0); // coinbase tx should not be conflicted
     const Consensus::Params& consensus = Params().GetConsensus();
     const auto synthetic = wtx.mapValue.find(SYNTHETIC_GOLD_RUSH_PAYOUT_KEY);
+    const auto stale = wtx.mapValue.find(SYNTHETIC_GOLD_RUSH_PAYOUT_STALE_KEY);
     const bool synthetic_payout =
-        (synthetic != wtx.mapValue.end() && synthetic->second == "1") ||
-        IsSyntheticGoldRushPayoutEnvelope(wtx);
+        (stale == wtx.mapValue.end() || stale->second != "1") &&
+        ((synthetic != wtx.mapValue.end() && synthetic->second == "1") ||
+         IsSyntheticGoldRushPayoutEnvelope(wtx));
     const auto next_lifecycle = consensus.GetQuantumLifecycleState(
         /*nTime=*/0, GetLastBlockHeight() + 1);
     if (synthetic_payout &&

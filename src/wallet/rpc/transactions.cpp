@@ -456,6 +456,9 @@ static std::vector<RPCResult> TransactionDescriptionString()
            {RPCResult::Type::STR, "qq_manual_shadow_abandon", /*optional=*/true, "Set to \"1\" when the transaction was manually abandoned and must not be reopened automatically after a reorganization."},
            {RPCResult::Type::STR, "qq_reorg_shadow_resubmit", /*optional=*/true, "Set to \"1\" while an automatically restored Gold Rush proof is awaiting immediate resubmission after a reorganization."},
            {RPCResult::Type::STR, "qq_synthetic_goldrush_payout", /*optional=*/true, "Set to \"1\" for a wallet-recognized synthetic Gold Rush payout transaction."},
+           {RPCResult::Type::STR, "qq_synthetic_goldrush_payout_stale", /*optional=*/true, "Set to \"1\" when the stored synthetic payout is not authenticated by its active block's current claim markers."},
+           {RPCResult::Type::STR_HEX, "qq_synthetic_goldrush_payout_stale_block", /*optional=*/true, "Former active block attribution retained for an unauthenticated synthetic payout audit record."},
+           {RPCResult::Type::STR, "qq_synthetic_goldrush_payout_stale_height", /*optional=*/true, "Former active block height retained for an unauthenticated synthetic payout audit record."},
            {RPCResult::Type::ARR, "parent_descs", /*optional=*/true, "Only if 'category' is 'received'. List of parent descriptors for the scriptPubKey of this coin.", {
                {RPCResult::Type::STR, "desc", "The descriptor string."},
            }},

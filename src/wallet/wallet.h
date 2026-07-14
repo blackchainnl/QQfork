@@ -627,12 +627,19 @@ private:
     std::map<int, std::set<CScript, ShadowSolveScriptDescending>, std::greater<int>> m_shadow_solve_latest_by_height GUARDED_BY(cs_wallet);
     std::set<uint256> m_pending_shadow_signal_txids GUARDED_BY(cs_wallet);
     std::set<CScript> m_owned_legacy_shadow_scripts GUARDED_BY(cs_wallet);
+    std::map<uint256, std::set<uint256>> m_confirmed_synthetic_payouts_by_block GUARDED_BY(cs_wallet);
+    std::map<uint256, uint256> m_confirmed_synthetic_payout_block_by_txid GUARDED_BY(cs_wallet);
     void RefreshLatestShadowSolve(const CScript& target) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RemoveIndexedShadowSolve(const uint256& txid) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void IndexConfirmedShadowSolve(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RecomputeShadowSolveIndex() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void UpdatePendingShadowSignalIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void IndexOwnedLegacyShadowScripts(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RecomputeConfirmedSyntheticPayoutIndex() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool ReconcileWalletShadowPayoutsForBlock(const uint256& block_hash, int block_height,
+                                              const std::set<COutPoint>& authenticated_outpoints,
+                                              WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     // First created key time. Used to skip blocks prior to this time.
     // 'std::numeric_limits<int64_t>::max()' if wallet is blank.

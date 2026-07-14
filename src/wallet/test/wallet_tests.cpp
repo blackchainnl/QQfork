@@ -44,6 +44,7 @@
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
 #include <wallet/receive.h>
+#include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
 #include <wallet/staking.h>
 #include <wallet/test/util.h>
@@ -1005,6 +1006,159 @@ BOOST_FIXTURE_TEST_CASE(goldrush_shadow_payouts_sync_on_connect_disconnect_and_r
         BOOST_CHECK_EQUAL(GetBalance(rescan_wallet).m_mine_immature, 580 * COIN);
         BOOST_CHECK_EQUAL(wtx->mapValue.at("comment"), "PoS - Quantum Stake");
         BOOST_CHECK_EQUAL(wtx->mapValue.at("to"), EncodeDestination(quantum_dest));
+    }
+
+    // Model an unpublished intermediate wallet that persisted a payout with
+    // the right QQCPAY block anchor but a txid no longer authenticated by the
+    // block's current claim markers. Also cover the explicit metadata path
+    // and prove an ordinary coinbase-shaped record is outside reconciliation.
+    CMutableTransaction stale_mutable{*synthetic_payout_tx};
+    stale_mutable.vout[0].nValue -= COIN;
+    const CTransactionRef stale_payout_tx = MakeTransactionRef(std::move(stale_mutable));
+
+    CMutableTransaction marked_mutable{*synthetic_payout_tx};
+    marked_mutable.vin[0].scriptSig = CScript{} << OP_1;
+    marked_mutable.vout[0].nValue -= 2 * COIN;
+    const CTransactionRef marked_stale_tx = MakeTransactionRef(std::move(marked_mutable));
+
+    CMutableTransaction ordinary_mutable{*synthetic_payout_tx};
+    ordinary_mutable.vin[0].scriptSig = CScript{} << OP_2;
+    ordinary_mutable.vout[0].nValue -= 3 * COIN;
+    const CTransactionRef ordinary_coinbase_tx = MakeTransactionRef(std::move(ordinary_mutable));
+
+    const int synthetic_position = static_cast<int>(reward_real_block.vtx.size());
+    BOOST_REQUIRE(rescan_wallet.AddToWallet(
+        stale_payout_tx,
+        TxStateConfirmed{reward_index->GetBlockHash(), reward_index->nHeight, synthetic_position + 10},
+        [](CWalletTx& wtx, bool) {
+            wtx.mapValue["intermediate-audit"] = "preserve-stale-envelope";
+            return true;
+        }));
+    BOOST_REQUIRE(rescan_wallet.AddToWallet(
+        marked_stale_tx,
+        TxStateConfirmed{reward_index->GetBlockHash(), reward_index->nHeight, synthetic_position + 11},
+        [](CWalletTx& wtx, bool) {
+            wtx.mapValue["qq_synthetic_goldrush_payout"] = "1";
+            wtx.mapValue["intermediate-audit"] = "preserve-stale-marker";
+            return true;
+        }));
+    BOOST_REQUIRE(rescan_wallet.AddToWallet(
+        ordinary_coinbase_tx,
+        TxStateConfirmed{reward_index->GetBlockHash(), reward_index->nHeight, synthetic_position + 12}));
+
+    // A valid payout may already have been spent by a wallet transaction. Its
+    // authenticated source record must remain confirmed for debit and history
+    // accounting even though its outpoint contributes no balance.
+    CMutableTransaction payout_spend_mutable;
+    payout_spend_mutable.nTime = reward_index->GetBlockTime();
+    payout_spend_mutable.vin.emplace_back(COutPoint{synthetic_payout_tx->GetHash(), 0});
+    payout_spend_mutable.vout.emplace_back(synthetic_payout_tx->vout[0].nValue - COIN, CScript{} << OP_TRUE);
+    const CTransactionRef payout_spend_tx = MakeTransactionRef(std::move(payout_spend_mutable));
+    BOOST_REQUIRE(rescan_wallet.AddToWallet(
+        payout_spend_tx,
+        TxStateConfirmed{reward_index->GetBlockHash(), reward_index->nHeight, synthetic_position + 13}));
+
+    CWallet reconciled_wallet(m_node.chain.get(), "", DuplicateMockDatabase(rescan_wallet.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reconciled_wallet.LoadWallet(), DBErrors::LOAD_OK);
+    WITH_LOCK(reconciled_wallet.cs_wallet,
+              reconciled_wallet.SetLastBlockProcessed(reward_index->nHeight, reward_index->GetBlockHash()));
+    {
+        LOCK(reconciled_wallet.cs_wallet);
+        const CWalletTx& stale = reconciled_wallet.mapWallet.at(stale_payout_tx->GetHash());
+        BOOST_CHECK(stale.isInactive());
+        BOOST_CHECK_EQUAL(stale.mapValue.at("qq_synthetic_goldrush_payout"), "1");
+        BOOST_CHECK_EQUAL(stale.mapValue.at("qq_synthetic_goldrush_payout_stale"), "1");
+        BOOST_CHECK_EQUAL(stale.mapValue.at("qq_synthetic_goldrush_payout_stale_block"), reward_index->GetBlockHash().GetHex());
+        BOOST_CHECK_EQUAL(stale.mapValue.at("qq_synthetic_goldrush_payout_stale_height"), ToString(reward_index->nHeight));
+        BOOST_CHECK_EQUAL(stale.mapValue.at("intermediate-audit"), "preserve-stale-envelope");
+        BOOST_CHECK_EQUAL(CachedTxGetImmatureCredit(reconciled_wallet, stale, ISMINE_SPENDABLE), 0);
+        BOOST_CHECK(reconciled_wallet.GetTxBlocksToMaturity(stale) > 0);
+
+        const CWalletTx& marked = reconciled_wallet.mapWallet.at(marked_stale_tx->GetHash());
+        BOOST_CHECK(marked.isInactive());
+        BOOST_CHECK_EQUAL(marked.mapValue.at("qq_synthetic_goldrush_payout_stale"), "1");
+        BOOST_CHECK_EQUAL(marked.mapValue.at("intermediate-audit"), "preserve-stale-marker");
+
+        const CWalletTx& ordinary = reconciled_wallet.mapWallet.at(ordinary_coinbase_tx->GetHash());
+        BOOST_CHECK(ordinary.isConfirmed());
+        BOOST_CHECK(ordinary.mapValue.count("qq_synthetic_goldrush_payout_stale") == 0);
+
+        const CWalletTx& canonical = reconciled_wallet.mapWallet.at(synthetic_payout_tx->GetHash());
+        BOOST_CHECK(canonical.isConfirmed());
+        BOOST_CHECK(reconciled_wallet.IsSpent(COutPoint{synthetic_payout_tx->GetHash(), 0}));
+        BOOST_CHECK_EQUAL(CachedTxGetAvailableCredit(reconciled_wallet, canonical, ISMINE_SPENDABLE), 0);
+        BOOST_CHECK_EQUAL(
+            GetBalance(reconciled_wallet).m_mine_immature,
+            synthetic_payout_tx->vout[0].nValue + ordinary_coinbase_tx->vout[0].nValue);
+    }
+
+    // A second database load proves stale state, audit metadata, and the
+    // canonical spent record were persisted rather than repaired in memory.
+    CWallet persisted_wallet(m_node.chain.get(), "", DuplicateMockDatabase(reconciled_wallet.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(persisted_wallet.LoadWallet(), DBErrors::LOAD_OK);
+    WITH_LOCK(persisted_wallet.cs_wallet,
+              persisted_wallet.SetLastBlockProcessed(reward_index->nHeight, reward_index->GetBlockHash()));
+    {
+        LOCK(persisted_wallet.cs_wallet);
+        BOOST_CHECK(persisted_wallet.mapWallet.at(stale_payout_tx->GetHash()).isInactive());
+        BOOST_CHECK(persisted_wallet.mapWallet.at(marked_stale_tx->GetHash()).isInactive());
+        BOOST_CHECK(persisted_wallet.mapWallet.at(ordinary_coinbase_tx->GetHash()).isConfirmed());
+        BOOST_CHECK(persisted_wallet.mapWallet.at(synthetic_payout_tx->GetHash()).isConfirmed());
+        BOOST_CHECK(persisted_wallet.IsSpent(COutPoint{synthetic_payout_tx->GetHash(), 0}));
+    }
+
+    WalletRescanReserver persisted_reserver(persisted_wallet);
+    BOOST_REQUIRE(persisted_reserver.reserve());
+    const CWallet::ScanResult persisted_scan = persisted_wallet.ScanForWalletTransactions(
+        reward_index->GetBlockHash(), reward_index->nHeight, reward_index->nHeight,
+        persisted_reserver, /*fUpdate=*/true, /*save_progress=*/false);
+    BOOST_CHECK_EQUAL(persisted_scan.status, CWallet::ScanResult::SUCCESS);
+    {
+        LOCK(persisted_wallet.cs_wallet);
+        BOOST_CHECK(persisted_wallet.mapWallet.at(stale_payout_tx->GetHash()).isInactive());
+        BOOST_CHECK(persisted_wallet.mapWallet.at(marked_stale_tx->GetHash()).isInactive());
+        BOOST_CHECK(persisted_wallet.mapWallet.at(synthetic_payout_tx->GetHash()).isConfirmed());
+    }
+
+    // Watch-only ownership follows the same path: an authenticated payout is
+    // counted, while a persisted stale intermediate record is retained but
+    // cannot inflate watch-only immature credit after restart or rescan.
+    CWallet watch_wallet(m_node.chain.get(), "watch-shadow", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(watch_wallet.LoadWallet(), DBErrors::LOAD_OK);
+    {
+        LOCK(watch_wallet.cs_wallet);
+        watch_wallet.SetupLegacyScriptPubKeyMan();
+        LegacyScriptPubKeyMan* spkm = watch_wallet.GetLegacyScriptPubKeyMan();
+        BOOST_REQUIRE(spkm);
+        LOCK(spkm->cs_KeyStore);
+        BOOST_REQUIRE(spkm->AddWatchOnly(quantum_script, reward_index->GetBlockTime()));
+        watch_wallet.SetLastBlockProcessed(reward_index->nHeight, reward_index->GetBlockHash());
+    }
+    WalletRescanReserver watch_reserver(watch_wallet);
+    BOOST_REQUIRE(watch_reserver.reserve());
+    const CWallet::ScanResult watch_scan = watch_wallet.ScanForWalletTransactions(
+        reward_index->GetBlockHash(), reward_index->nHeight, reward_index->nHeight,
+        watch_reserver, /*fUpdate=*/true, /*save_progress=*/false);
+    BOOST_CHECK_EQUAL(watch_scan.status, CWallet::ScanResult::SUCCESS);
+    BOOST_REQUIRE(watch_wallet.AddToWallet(
+        stale_payout_tx,
+        TxStateConfirmed{reward_index->GetBlockHash(), reward_index->nHeight, synthetic_position + 10}));
+
+    CWallet watch_reloaded(m_node.chain.get(), "watch-shadow", DuplicateMockDatabase(watch_wallet.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(watch_reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    WITH_LOCK(watch_reloaded.cs_wallet,
+              watch_reloaded.SetLastBlockProcessed(reward_index->nHeight, reward_index->GetBlockHash()));
+    {
+        LOCK(watch_reloaded.cs_wallet);
+        const CWalletTx& canonical = watch_reloaded.mapWallet.at(synthetic_payout_tx->GetHash());
+        const CWalletTx& stale = watch_reloaded.mapWallet.at(stale_payout_tx->GetHash());
+        BOOST_CHECK(canonical.isConfirmed());
+        BOOST_CHECK(stale.isInactive());
+        BOOST_CHECK_EQUAL(CachedTxGetImmatureCredit(watch_reloaded, canonical, ISMINE_WATCH_ONLY), 580 * COIN);
+        BOOST_CHECK_EQUAL(CachedTxGetImmatureCredit(watch_reloaded, stale, ISMINE_WATCH_ONLY), 0);
+        const Balance watch_balance = GetBalance(watch_reloaded);
+        BOOST_CHECK_EQUAL(watch_balance.m_watchonly_immature, 580 * COIN);
+        BOOST_CHECK_EQUAL(watch_balance.m_mine_immature, 0);
     }
 
     {
