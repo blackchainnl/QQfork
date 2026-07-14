@@ -146,7 +146,11 @@ class RpcCreateMultiSigTest(BitcoinTestFramework):
 
         height = node0.getblockchaininfo()["blocks"]
         assert 150 < height < 350
-        total = 149 * 50 + (height - 149 - 100) * 25
+        # Assert wallet accounting against this chain's actual emission
+        # schedule. The inherited Bitcoin subsidy constants do not describe
+        # Blackcoin regtest rewards. The last COINBASE_MATURITY blocks were
+        # mined by node0, so exclude only its immature balance from supply.
+        total = node0.gettxoutsetinfo()["total_amount"] - node0.getbalances()["mine"]["immature"]
         assert bal1 == 0
         assert bal2 == self.moved
         assert_equal(bal0 + bal1 + bal2 + balw, total)
