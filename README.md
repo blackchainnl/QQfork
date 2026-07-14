@@ -64,6 +64,15 @@ phase table's quantum column refers only to the authenticated v14 and v16 paths.
 The 10,000 BLK Gold Rush whitelist snapshot is taken at height **5,945,000**. Full schedule
 and constants are in the [white paper](doc/whitepaper-quantum-quasar.md).
 
+Height **5,993,200** is also an operator upgrade boundary. v30.1.0 and
+v30.1.1 continue to accept the same Gold Rush base chain, but v30.1.1 begins
+the emission-neutral competing-claim reimbursement rule and therefore derives
+different shadow recipients and balances from that height. Wallets, staking
+and mining nodes, explorers, and indexers that consume the shadow ledger must
+upgrade before the boundary. Do not reopen a wallet/datadir that has processed
+post-boundary v30.1.1 state in v30.1.0; use the cold pre-upgrade copy for
+rollback. Base-chain compatibility does not imply identical shadow state.
+
 ## Required v30.1.0 chainstate rebuild
 
 v30.1.1 uses authenticated auxiliary-state schema 11 and normalizes historical

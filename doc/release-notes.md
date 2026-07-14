@@ -125,6 +125,13 @@ Notable changes
   recover their actual base fee up to 0.01 BLK from the fixed pool, the canonical
   winner receives the remainder, and authenticated shadow replay commits to the
   activation boundary under schema 11.
+- Height 5,993,200 is an upgrade deadline for wallets, staking and mining
+  nodes, explorers, and indexers that consume shadow state. v30.1.0 and
+  v30.1.1 accept the same Gold Rush base blocks but intentionally derive
+  different shadow recipients and balances from that boundary. Do not reopen a
+  post-boundary v30.1.1 wallet/datadir in v30.1.0; restore the cold pre-upgrade
+  copy for rollback. Base-chain compatibility does not imply identical shadow
+  state.
 - Optional shadowindex schema 7 and coinstatsindex schema 3 automatically
   invalidate and rebuild incompatible prerelease records derived with the
   superseded height-5,950,000 competing-claim boundary or incomplete

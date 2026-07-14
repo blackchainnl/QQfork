@@ -67,6 +67,14 @@ evaluated valid loser receives its actual fee capped at 0.01 BLK, and the winner
 receives the fixed pool remainder. Malformed and over-limit claims receive
 nothing; the total credit never exceeds the existing pool.
 
+This makes height 5,993,200 an upgrade deadline for every wallet, staking or
+mining node, explorer, and indexer that consumes shadow state. v30.1.0 and
+v30.1.1 remain compatible with the same Gold Rush base blocks, but their shadow
+recipients and balances intentionally diverge from this height. Do not switch a
+wallet/datadir that has processed post-boundary v30.1.1 state back to v30.1.0;
+restore the cold pre-upgrade copy for rollback. “No base-chain fork” does not
+mean “identical shadow ledger.”
+
 The wallet exposes helper RPCs for both paths, including `getgoldrushstate`,
 `getgoldrushinfo`, `sendshadowsignal`, `getshadowpowwork`,
 `sendshadowpowclaim`, `setpowmining`, and `getpowmininginfo`.
