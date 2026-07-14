@@ -1269,5 +1269,195 @@ class ReleaseToolTests(unittest.TestCase):
                 verifier.verify(repository, mutated)
 
 
+class WitnessInventoryAcceptanceTests(unittest.TestCase):
+    def setUp(self):
+        self.audit = load_path(
+            "quantum_witness_inventory_audit",
+            TOOLS.parents[1] / "contrib" / "devtools" /
+            "quantum_witness_inventory_audit.py",
+        )
+        self.bestblock = "a" * 64
+        self.muhash = "b" * 64
+
+    def record(self, number, version, handling):
+        version_class = {14: "v14", 15: "v15", 16: "v16"}.get(
+            version, "unknown"
+        )
+        return {
+            "txid": f"{number:064x}",
+            "vout": number,
+            "amount": "1.00000000",
+            "scriptPubKey": "5120" + "11" * 32,
+            "witness_version": version,
+            "version_class": version_class,
+            "bridge_handling": handling,
+            "origin_height": 100,
+            "origin_blockhash": "c" * 64,
+            "origin_phase": "gold_rush",
+            "origin_group": "pre_migration_window",
+        }
+
+    def rpc(self, records, *, moving_page=False, truncate=False):
+        def call(method, *params):
+            if method == "getblockchaininfo":
+                return {
+                    "chain": "regtest",
+                    "blocks": 120,
+                    "bestblockhash": self.bestblock,
+                    "initialblockdownload": False,
+                }
+            if method == "getnetworkinfo":
+                return {"protocolversion": 70016, "subversion": "/Blackcoin:30.1.1/"}
+            if method == "getquantumquasarinfo":
+                return {
+                    "phase": "migration",
+                    "active_tip_phase": "gold_rush",
+                    "next_block_phase": "migration",
+                    "active_tip_height": 120,
+                    "next_block_height": 121,
+                    "gold_rush_end_height": 120,
+                    "quantum_migration_end_height": 220,
+                    "height_boundaries_authoritative": True,
+                    "quantum_spend_enforcement_active": True,
+                    "legacy_addresses_accepted": True,
+                    "quantum_address_required": False,
+                }
+            if method == "getblockhash":
+                return "d" * 64
+            if method == "getblockheader":
+                return {
+                    "hash": self.bestblock,
+                    "height": 120,
+                    "time": 2_000_000_000,
+                    "confirmations": 1,
+                }
+            if method == "gettxoutsetinfo":
+                return {
+                    "height": 120,
+                    "bestblock": self.bestblock,
+                    "txouts": 50,
+                    "muhash": self.muhash,
+                }
+            if method != "getquantumwitnessinventory":
+                raise AssertionError(method)
+            _, offset, count, _ = params
+            page_records = records[offset:offset + count]
+            if truncate and offset:
+                page_records = []
+            page_end = offset + len(page_records)
+            next_offset = page_end if page_end < len(records) else None
+            page_bestblock = "e" * 64 if moving_page and offset else self.bestblock
+            return {
+                "schema": "blackcoin.quantum.witness_inventory.v1",
+                "height": 120,
+                "bestblock": page_bestblock,
+                "view": "utxos",
+                "offset": offset,
+                "count": len(page_records),
+                "total_records": len(records),
+                "next_offset": next_offset,
+                "classification": "native value-bearing witness versions >1",
+                "utxo_snapshot": {
+                    "algorithm": "muhash3072",
+                    "commitment": self.muhash,
+                    "txouts": 50,
+                    "excludes_authenticated_zero_value_protocol_markers": True,
+                },
+                "current_utxos": {
+                    "total": {"count": len(records), "amount": "1.00000000", "amount_atomic": "100000000"},
+                },
+                "coverage": {
+                    "snapshot_current_utxos_exact": True,
+                    "snapshot_tip_still_active": True,
+                    "snapshot_utxo_commitment_exact": True,
+                    "snapshot_includes_mempool": False,
+                },
+                "records": page_records,
+            }
+        return call
+
+    def test_zero_result_is_explicit_and_source_bound(self):
+        records = [self.record(1, 16, "recognized_direct_quantum")]
+        evidence = self.audit.generate_evidence(
+            self.rpc(records),
+            source={"repository": "https://github.com/Blackcoin-Dev/Blackcoin.git",
+                    "commit": SOURCE_SHA, "clean": True},
+            binaries={"blackcoind": {"sha256": "1" * 64},
+                      "blackcoin_cli": {"sha256": "2" * 64}},
+            source_sha=SOURCE_SHA,
+            page_size=1,
+        )
+        self.assertEqual(evidence["source"]["commit"], SOURCE_SHA)
+        self.assertEqual(evidence["snapshot"]["utxo_muhash"], self.muhash)
+        self.assertEqual(
+            evidence["bridge_review"]["result"], "zero_relevant_outpoints"
+        )
+        self.assertEqual(evidence["native_quantum_formats"]["count"], 1)
+        self.assertRegex(evidence["evidence_payload_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_every_relevant_outpoint_requires_snapshot_bound_disposition(self):
+        records = [
+            self.record(1, 2, "unknown_or_malformed_witness_program_requires_explicit_review"),
+            self.record(2, 15, "recognized_eutxo"),
+            self.record(3, 14, "unknown_or_malformed_witness_program_requires_explicit_review"),
+            self.record(4, 16, "unknown_or_malformed_witness_program_requires_explicit_review"),
+        ]
+        inventory = self.audit.collect_inventory(self.rpc(records), page_size=2)
+        with self.assertRaisesRegex(self.audit.AuditError, "dispositions file is required"):
+            self.audit.apply_dispositions(
+                inventory["records"], dispositions=None, source_sha=SOURCE_SHA,
+                network="regtest", snapshot=inventory["snapshot"],
+            )
+
+        dispositions = {
+            "schema": "blackcoin.quantum.witness_bridge_dispositions.v1",
+            "source_commit": SOURCE_SHA,
+            "network": "regtest",
+            "snapshot": {
+                "height": 120,
+                "bestblock": self.bestblock,
+                "utxo_muhash": self.muhash,
+            },
+            "outpoints": {
+                f"{record['txid']}:{record['vout']}": {
+                    "action": "preserve_locked_pending_protocol_review",
+                    "rationale": "Fixture disposition for exact-snapshot acceptance coverage.",
+                    "approval_ref": "test-review-1",
+                }
+                for record in records
+            },
+        }
+        review, native = self.audit.apply_dispositions(
+            inventory["records"], dispositions=dispositions,
+            source_sha=SOURCE_SHA, network="regtest",
+            snapshot=inventory["snapshot"],
+        )
+        self.assertEqual(review["result"], "explicit_per_outpoint_dispositions")
+        self.assertEqual(review["count"], 4)
+        self.assertEqual(native, [])
+
+        dispositions["snapshot"]["bestblock"] = "f" * 64
+        with self.assertRaisesRegex(self.audit.AuditError, "stale"):
+            self.audit.apply_dispositions(
+                inventory["records"], dispositions=dispositions,
+                source_sha=SOURCE_SHA, network="regtest",
+                snapshot=inventory["snapshot"],
+            )
+
+    def test_moving_tip_and_incomplete_pagination_fail_closed(self):
+        records = [
+            self.record(1, 16, "recognized_direct_quantum"),
+            self.record(2, 14, "recognized_quantum_cold_stake"),
+        ]
+        with self.assertRaisesRegex(self.audit.AuditError, "snapshot changed"):
+            self.audit.collect_inventory(
+                self.rpc(records, moving_page=True), page_size=1
+            )
+        with self.assertRaisesRegex(self.audit.AuditError, "non-contiguous|non-progressing"):
+            self.audit.collect_inventory(
+                self.rpc(records, truncate=True), page_size=1
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

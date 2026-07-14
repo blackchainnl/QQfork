@@ -219,6 +219,16 @@ recognized direct-quantum, EUTXO, quantum-cold-stake, or unknown bridge
 handling. Authenticated synthetic Gold Rush payouts are reported separately
 and are not misclassified as base-chain witness creations.
 
+Every response also includes `utxo_snapshot`, a MuHash3072 commitment and UTXO
+count computed from the same immutable cursor used for the witness inventory.
+It uses the same authenticated zero-value protocol-marker exclusion as
+`gettxoutsetinfo "muhash"`. Cursor read errors and active-tip movement during
+the call are fatal. `coverage.snapshot_tip_still_active` and
+`coverage.snapshot_utxo_commitment_exact` are therefore true only on a
+completed, unchanged-tip result. Callers paging the inventory must still
+require the height, block hash, MuHash, UTXO count, aggregates, and total record
+count to remain identical across every page.
+
 `recognized_eutxo` identifies only the exact reserved v15 script shape. It does
 not mean the output is enabled or spendable. v30.1.1 provides no supported v15
 funding or spending workflow, and consensus rejects v15 outputs and spends from
@@ -240,6 +250,13 @@ labels the scanned prefix as complete history. Inventory buckets include both
 an exact decimal-BLK JSON number and an `amount_atomic` decimal string, so
 cumulative historical flow remains exact even when it exceeds the live money
 supply.
+
+The release acceptance procedure is defined in
+`doc/quantum-witness-inventory-acceptance.md`. The bundled
+`contrib/devtools/quantum_witness_inventory_audit.py` tool paginates every
+current record, independently reconciles `gettxoutsetinfo "muhash"`, rejects a
+moving tip or incomplete page set, and produces either an explicit zero review
+result or snapshot-bound per-outpoint dispositions.
 
 ## Reference ingestion and event contract
 

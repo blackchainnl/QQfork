@@ -12,6 +12,7 @@
 #include <consensus/params.h>
 #include <core_io.h>
 #include <index/shadowindex.h>
+#include <kernel/coinstats.h>
 #include <key_io.h>
 #include <node/context.h>
 #include <rpc/server.h>
@@ -1024,8 +1025,13 @@ RPCHelpMan getquantumwitnessinventory()
             Coin marker_coin;
             while (marker_cursor->Valid()) {
                 node.rpc_interruption_point();
-                if (marker_cursor->GetKey(marker_outpoint) &&
-                    marker_cursor->GetValue(marker_coin) && !marker_coin.IsSpent() &&
+                if (!marker_cursor->GetKey(marker_outpoint) ||
+                    !marker_cursor->GetValue(marker_coin)) {
+                    throw JSONRPCError(
+                        RPC_INTERNAL_ERROR,
+                        "Unable to read the immutable witness-inventory marker snapshot");
+                }
+                if (!marker_coin.IsSpent() &&
                     marker_coin.out.nValue == 0 &&
                     IsGoldRushPayoutMarkerScript(marker_coin.out.scriptPubKey) &&
                     IsAuthenticatedShadowMarkerOutpoint(marker_outpoint, marker_coin, snapshot_tip)) {
@@ -1043,13 +1049,32 @@ RPCHelpMan getquantumwitnessinventory()
             std::map<std::string, WitnessInventoryBucket> current_handling;
             UniValue current_page(UniValue::VARR);
             uint64_t current_position{0};
+            MuHash3072 utxo_muhash;
+            uint64_t utxo_count{0};
 
             COutPoint outpoint;
             Coin coin;
             while (cursor->Valid()) {
                 node.rpc_interruption_point();
-                if (cursor->GetKey(outpoint) && cursor->GetValue(coin) &&
-                    !coin.IsSpent() && coin.out.nValue > 0) {
+                if (!cursor->GetKey(outpoint) || !cursor->GetValue(coin)) {
+                    throw JSONRPCError(
+                        RPC_INTERNAL_ERROR,
+                        "Unable to read the immutable witness-inventory UTXO snapshot");
+                }
+                const bool authenticated_internal_marker = coin.out.nValue == 0 &&
+                    (IsAuthenticatedShadowMarkerOutpoint(outpoint, coin, snapshot_tip) ||
+                     Consensus::IsAuthenticatedDemurrageStateOutpoint(outpoint, coin, snapshot_tip));
+                if (!authenticated_internal_marker) {
+                    if (utxo_count == std::numeric_limits<uint64_t>::max()) {
+                        throw JSONRPCError(RPC_INTERNAL_ERROR, "Witness inventory UTXO count overflow");
+                    }
+                    // Match gettxoutsetinfo("muhash") exactly so an external
+                    // acceptance run can independently authenticate this same
+                    // immutable cursor snapshot.
+                    kernel::ApplyCoinHash(utxo_muhash, outpoint, coin);
+                    ++utxo_count;
+                }
+                if (!coin.IsSpent() && coin.out.nValue > 0) {
                     int witness_version{0};
                     std::vector<unsigned char> witness_program;
                     if (coin.out.scriptPubKey.IsWitnessProgram(witness_version, witness_program) &&
@@ -1128,6 +1153,8 @@ RPCHelpMan getquantumwitnessinventory()
                 }
                 cursor->Next();
             }
+            uint256 utxo_muhash_commitment;
+            utxo_muhash.Finalize(utxo_muhash_commitment);
 
             const bool history_index_enabled = g_shadow_index != nullptr;
             const bool history_index_synced = history_index_enabled &&
@@ -1250,6 +1277,20 @@ RPCHelpMan getquantumwitnessinventory()
                 }
             }
 
+            bool snapshot_tip_still_active{false};
+            {
+                LOCK(cs_main);
+                const CBlockIndex* active_tip = chainman.ActiveChain().Tip();
+                snapshot_tip_still_active = active_tip &&
+                    active_tip->nHeight == snapshot_tip->nHeight &&
+                    active_tip->GetBlockHash() == snapshot_tip->GetBlockHash();
+            }
+            if (!snapshot_tip_still_active) {
+                throw JSONRPCError(
+                    RPC_MISC_ERROR,
+                    "Active chain changed during the witness-inventory snapshot; retry the request");
+            }
+
             if (history_snapshot_covered) {
                 const uint64_t revision_before = g_shadow_index->GetRevision();
                 const IndexSummary current_summary = g_shadow_index->GetSummary();
@@ -1275,6 +1316,8 @@ RPCHelpMan getquantumwitnessinventory()
 
             UniValue coverage(UniValue::VOBJ);
             coverage.pushKV("snapshot_current_utxos_exact", true);
+            coverage.pushKV("snapshot_tip_still_active", true);
+            coverage.pushKV("snapshot_utxo_commitment_exact", true);
             coverage.pushKV("snapshot_includes_mempool", false);
             coverage.pushKV("snapshot_includes_synthetic_shadow_outputs", false);
             coverage.pushKV("history_index_enabled", history_index_enabled);
@@ -1334,6 +1377,12 @@ RPCHelpMan getquantumwitnessinventory()
                     (!history_complete || page_end < history_active_position);
             result.pushKV("next_offset", has_next ? UniValue(page_end) : UniValue{});
             result.pushKV("classification", "native value-bearing witness versions >1; exact v14/v15/v16/unknown and active-chain origin phase");
+            UniValue utxo_snapshot(UniValue::VOBJ);
+            utxo_snapshot.pushKV("algorithm", "muhash3072");
+            utxo_snapshot.pushKV("commitment", utxo_muhash_commitment.GetHex());
+            utxo_snapshot.pushKV("txouts", utxo_count);
+            utxo_snapshot.pushKV("excludes_authenticated_zero_value_protocol_markers", true);
+            result.pushKV("utxo_snapshot", std::move(utxo_snapshot));
             result.pushKV("current_utxos", std::move(current));
             result.pushKV("history", std::move(history));
             result.pushKV("coverage", std::move(coverage));
