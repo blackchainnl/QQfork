@@ -41,6 +41,9 @@
 
 #include <fcntl.h>
 #include <sys/resource.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #else
 #include <io.h> /* For _get_osfhandle, _chsize */
@@ -289,6 +292,39 @@ bool RenameOver(fs::path src, fs::path dest)
     std::error_code error;
     fs::rename(src, dest, error);
     return !error;
+#endif
+}
+
+bool RenameNoReplace(fs::path src, fs::path dest)
+{
+#ifdef WIN32
+    // Omitting MOVEFILE_REPLACE_EXISTING is part of the recovery contract.
+    // MOVEFILE_WRITE_THROUGH is the Windows durability barrier because
+    // DirectoryCommit() cannot flush a directory handle on this platform.
+    return MoveFileExW(src.wstring().c_str(), dest.wstring().c_str(),
+                       MOVEFILE_WRITE_THROUGH) != 0;
+#elif defined(MAC_OSX)
+    return ::renamex_np(src.c_str(), dest.c_str(), RENAME_EXCL) == 0;
+#elif defined(__linux__) && defined(SYS_renameat2)
+    // RENAME_NOREPLACE is Linux renameat2 flag bit 0. Fail closed when the
+    // running kernel or filesystem does not implement the operation.
+    constexpr unsigned int RENAME_NOREPLACE_FLAG{1U};
+    return ::syscall(SYS_renameat2, AT_FDCWD, src.c_str(), AT_FDCWD,
+                     dest.c_str(), RENAME_NOREPLACE_FLAG) == 0;
+#else
+    // Some less common POSIX targets lack an atomic exclusive-rename API.
+    // Preserve their existing rename behavior, but reject every observable
+    // destination first, including dangling symlinks.
+    std::error_code exists_error;
+    const fs::file_status destination_status =
+        fs::symlink_status(dest, exists_error);
+    if ((!exists_error && destination_status.type() != fs::file_type::not_found) ||
+        (exists_error && exists_error != std::errc::no_such_file_or_directory)) {
+        return false;
+    }
+    std::error_code rename_error;
+    fs::rename(src, dest, rename_error);
+    return !rename_error;
 #endif
 }
 

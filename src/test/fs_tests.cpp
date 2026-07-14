@@ -13,6 +13,7 @@
 
 #include <fstream>
 #include <ios>
+#include <iterator>
 #include <string>
 
 BOOST_FIXTURE_TEST_SUITE(fs_tests, BasicTestingSetup)
@@ -152,6 +153,58 @@ BOOST_AUTO_TEST_CASE(rename)
         BOOST_CHECK_EQUAL(contents, path1_contents);
     }
     fs::remove(path2);
+}
+
+BOOST_AUTO_TEST_CASE(rename_no_replace_preserves_destination)
+{
+    const fs::path tmpfolder{m_args.GetDataDirBase()};
+    const fs::path source{GetUniquePath(tmpfolder)};
+    const fs::path destination{GetUniquePath(tmpfolder)};
+    const std::string source_bytes{"new chainstate source"};
+    const std::string destination_bytes{"preserved recovery destination"};
+
+    auto write_all = [](const fs::path& path, const std::string& bytes) {
+        std::ofstream file{path, std::ios::binary};
+        file.write(bytes.data(), bytes.size());
+        BOOST_REQUIRE(file.good());
+    };
+    auto read_all = [](const fs::path& path) {
+        std::ifstream file{path, std::ios::binary};
+        return std::string{std::istreambuf_iterator<char>{file},
+                           std::istreambuf_iterator<char>{}};
+    };
+
+    write_all(source, source_bytes);
+    write_all(destination, destination_bytes);
+
+    BOOST_CHECK(!RenameNoReplace(source, destination));
+    BOOST_CHECK(fs::exists(source));
+    BOOST_CHECK(fs::exists(destination));
+    BOOST_CHECK_EQUAL(read_all(source), source_bytes);
+    BOOST_CHECK_EQUAL(read_all(destination), destination_bytes);
+
+    BOOST_REQUIRE(fs::remove(destination));
+    BOOST_CHECK(RenameNoReplace(source, destination));
+    BOOST_CHECK(!fs::exists(source));
+    BOOST_CHECK_EQUAL(read_all(destination), source_bytes);
+    BOOST_CHECK(fs::remove(destination));
+
+    const fs::path source_dir{GetUniquePath(tmpfolder)};
+    const fs::path destination_dir{GetUniquePath(tmpfolder)};
+    BOOST_REQUIRE(fs::create_directory(source_dir));
+    BOOST_REQUIRE(fs::create_directory(destination_dir));
+    write_all(source_dir / "state", source_bytes);
+    write_all(destination_dir / "state", destination_bytes);
+
+    BOOST_CHECK(!RenameNoReplace(source_dir, destination_dir));
+    BOOST_CHECK_EQUAL(read_all(source_dir / "state"), source_bytes);
+    BOOST_CHECK_EQUAL(read_all(destination_dir / "state"), destination_bytes);
+
+    BOOST_REQUIRE_EQUAL(fs::remove_all(destination_dir), 2U);
+    BOOST_CHECK(RenameNoReplace(source_dir, destination_dir));
+    BOOST_CHECK(!fs::exists(source_dir));
+    BOOST_CHECK_EQUAL(read_all(destination_dir / "state"), source_bytes);
+    BOOST_CHECK_EQUAL(fs::remove_all(destination_dir), 2U);
 }
 
 #ifndef __MINGW64__ // no symlinks on mingw

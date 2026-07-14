@@ -309,7 +309,28 @@ class GoldRushShadowReplayTest(BitcoinTestFramework):
         assert rebuild_backup.is_dir()
         rebuild_journal.write_text(original_journal)
 
-        self.log.info("Confirming the rebuilt state survives a clean restart")
+        self.log.info("Retaining the source backup when reopened verification fails")
+        backup_fingerprint = self.stable_chainstate_fingerprint(rebuild_backup)
+        block_file.write_bytes(corrupt_block_file)
+        try:
+            node.assert_start_raises_init_error(
+                extra_args=BASE_ARGS + ["-checkblocks=0", "-checklevel=4"],
+                expected_msg=r"Corrupted block database detected",
+                match=ErrorMatch.PARTIAL_REGEX,
+            )
+        finally:
+            block_file.write_bytes(original_block_file)
+        assert_equal(rebuild_journal.read_text(), original_journal)
+        assert rebuild_backup.is_dir()
+        assert_equal(
+            self.stable_chainstate_fingerprint(rebuild_backup),
+            backup_fingerprint,
+        )
+
+        self.log.info("Recovering cleanup after a crash in CLEANUP_READY")
+        rebuild_journal.write_text(
+            original_journal.replace("phase=commit-ready\n", "phase=cleanup-ready\n")
+        )
         self.start_node(0, extra_args=BASE_ARGS)
         self.wait_until(
             lambda: not rebuild_journal.exists() and not rebuild_backup.exists(),
@@ -327,6 +348,18 @@ class GoldRushShadowReplayTest(BitcoinTestFramework):
         self.restart_node(0, BASE_ARGS)
         self.wait_until(
             lambda: not rebuild_journal.exists() and not rebuild_backup.exists(),
+            timeout=60,
+        )
+        assert_equal(self.state_fingerprint(self.nodes[0]), rebuilt_fingerprint)
+
+        self.log.info("Confirming shadow state survives disconnect and reconnect")
+        restored_tip = self.nodes[0].getbestblockhash()
+        restored_height = self.nodes[0].getblockcount()
+        self.nodes[0].invalidateblock(restored_tip)
+        assert_equal(self.nodes[0].getblockcount(), restored_height - 1)
+        self.nodes[0].reconsiderblock(restored_tip)
+        self.wait_until(
+            lambda: self.nodes[0].getbestblockhash() == restored_tip,
             timeout=60,
         )
         assert_equal(self.state_fingerprint(self.nodes[0]), rebuilt_fingerprint)

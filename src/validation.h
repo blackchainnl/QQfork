@@ -1027,6 +1027,10 @@ public:
     //! Prevents a second finalizer call in the building process from treating
     //! COMMIT_READY as proof that a separate process reopened the replacement.
     std::atomic<bool> m_chainstate_rebuild_committed_this_process{false};
+    //! Set only after VerifyLoadedChainstate completes successfully for the
+    //! current load. A COMMIT_READY replacement may not retire preserved
+    //! backups without this explicit same-process verification proof.
+    std::atomic<bool> m_chainstate_rebuild_verified_this_process{false};
     const Options m_options;
     std::thread m_thread_load;
     //! A single BlockManager instance is shared across each constructed

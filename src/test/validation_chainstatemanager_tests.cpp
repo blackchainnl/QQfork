@@ -22,6 +22,7 @@
 #include <test/util/validation.h>
 #include <timedata.h>
 #include <uint256.h>
+#include <util/time.h>
 #include <validation.h>
 #include <validationinterface.h>
 
@@ -659,6 +660,101 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_staged_rebuild_crash_rolls_back, Snaps
                 recovered.GetAll().front()->CoinsDB().GetBestBlock(), base_tip);
         }
     });
+}
+
+//! COMMIT_READY is only a durable build marker. A fresh manager must complete
+//! VerifyLoadedChainstate successfully before it can retire source backups,
+//! and a later failed or interrupted verification must clear stale success.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_commit_ready_requires_current_verification, SnapshotTestSetup)
+{
+    ChainstateManager& original = *Assert(m_node.chainman);
+    const fs::path datadir = original.m_options.datadir;
+    const uint256 source_tip = WITH_LOCK(
+        ::cs_main, return original.ActiveTip()->GetBlockHash());
+
+    ChainstateManager& rebuilding = this->SimulateNodeRestart();
+    node::ChainstateLoadOptions rebuild;
+    rebuild.mempool = Assert(m_node.mempool.get());
+    rebuild.reindex_chainstate = true;
+    auto [status, error] = node::LoadChainstate(
+        rebuilding, m_cache_sizes, rebuild);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    std::tie(status, error) = node::VerifyLoadedChainstate(rebuilding, rebuild);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+
+    BlockValidationState rebuild_state;
+    BOOST_REQUIRE(rebuilding.ActiveChainstate().ActivateBestChain(
+        rebuild_state, nullptr));
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        ::cs_main, return rebuilding.ActiveTip()->GetBlockHash()), source_tip);
+
+    bilingual_str finalize_error;
+    BOOST_REQUIRE(node::FinalizeChainstateRebuild(rebuilding, finalize_error));
+    const fs::path journal = datadir / "chainstate-rebuild.journal";
+    const fs::path backup = datadir / "chainstate.rebuild-backup";
+    BOOST_REQUIRE(fs::exists(journal));
+    BOOST_REQUIRE(fs::exists(backup));
+
+    // A repeated finalizer call from the building manager remains valid but
+    // cannot interpret its own COMMIT_READY write as a verification restart.
+    BOOST_CHECK(node::FinalizeChainstateRebuild(rebuilding, finalize_error));
+    BOOST_CHECK(fs::exists(journal));
+    BOOST_CHECK(fs::exists(backup));
+
+    ChainstateManager& reopened = this->SimulateNodeRestart();
+    node::ChainstateLoadOptions normal;
+    normal.mempool = Assert(m_node.mempool.get());
+    std::tie(status, error) = node::LoadChainstate(
+        reopened, m_cache_sizes, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+
+    finalize_error = {};
+    BOOST_CHECK(!node::FinalizeChainstateRebuild(reopened, finalize_error));
+    BOOST_CHECK(finalize_error.original.find("has not completed verification") !=
+                std::string::npos);
+    BOOST_CHECK(fs::exists(journal));
+    BOOST_CHECK(fs::exists(backup));
+
+    std::tie(status, error) = node::VerifyLoadedChainstate(reopened, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    BOOST_CHECK(reopened.m_chainstate_rebuild_verified_this_process);
+
+    CBlockIndex* const tip = WITH_LOCK(
+        ::cs_main, return reopened.ActiveTip());
+    BOOST_REQUIRE(tip);
+    const uint32_t saved_time = WITH_LOCK(
+        ::cs_main, return tip->nTime);
+    WITH_LOCK(::cs_main, tip->nTime = static_cast<uint32_t>(
+        GetTime() + MAX_FUTURE_BLOCK_TIME + 1));
+    std::tie(status, error) = node::VerifyLoadedChainstate(reopened, normal);
+    WITH_LOCK(::cs_main, tip->nTime = saved_time);
+    BOOST_CHECK(status == node::ChainstateLoadStatus::FAILURE);
+    BOOST_CHECK(!reopened.m_chainstate_rebuild_verified_this_process);
+    finalize_error = {};
+    BOOST_CHECK(!node::FinalizeChainstateRebuild(reopened, finalize_error));
+    BOOST_CHECK(fs::exists(journal));
+    BOOST_CHECK(fs::exists(backup));
+
+    std::tie(status, error) = node::VerifyLoadedChainstate(reopened, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    BOOST_CHECK(reopened.m_chainstate_rebuild_verified_this_process);
+    m_node.kernel->interrupt();
+    std::tie(status, error) = node::VerifyLoadedChainstate(reopened, normal);
+    m_node.kernel->interrupt.reset();
+    BOOST_CHECK(status == node::ChainstateLoadStatus::INTERRUPTED);
+    BOOST_CHECK(!reopened.m_chainstate_rebuild_verified_this_process);
+    finalize_error = {};
+    BOOST_CHECK(!node::FinalizeChainstateRebuild(reopened, finalize_error));
+    BOOST_CHECK(fs::exists(journal));
+    BOOST_CHECK(fs::exists(backup));
+
+    std::tie(status, error) = node::VerifyLoadedChainstate(reopened, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    BOOST_REQUIRE(node::FinalizeChainstateRebuild(reopened, finalize_error));
+    BOOST_CHECK(!fs::exists(journal));
+    BOOST_CHECK(!fs::exists(backup));
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        ::cs_main, return reopened.ActiveTip()->GetBlockHash()), source_tip);
 }
 
 //! Shutdown between the base and snapshot renames must remain rollback-safe.

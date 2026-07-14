@@ -195,11 +195,9 @@ bool RemoveJournal(const fs::path& datadir)
 
 bool CommitRename(const fs::path& from, const fs::path& to, const fs::path& datadir)
 {
-    try {
-        fs::rename(from, to);
-    } catch (const fs::filesystem_error& e) {
-        LogPrintf("Chainstate rebuild rename %s -> %s failed: %s\n",
-                  fs::PathToString(from), fs::PathToString(to), e.what());
+    if (!RenameNoReplace(from, to)) {
+        LogPrintf("Chainstate rebuild no-replace rename %s -> %s failed\n",
+                  fs::PathToString(from), fs::PathToString(to));
         return false;
     }
     return DirectoryCommit(datadir);
@@ -464,6 +462,7 @@ static ChainstateLoadResult BeginStagedChainstateRebuild(
     const fs::path& datadir = chainman.m_options.datadir;
     chainman.m_chainstate_rebuild_interrupted = false;
     chainman.m_chainstate_rebuild_committed_this_process = false;
+    chainman.m_chainstate_rebuild_verified_this_process = false;
     RebuildJournal journal{
         RebuildPhase::PREPARED,
         PathExists(BasePath(datadir)),
@@ -717,6 +716,10 @@ static ChainstateLoadResult CompleteChainstateInitialization(
 ChainstateLoadResult LoadChainstate(ChainstateManager& chainman, const CacheSizes& cache_sizes,
                                     const ChainstateLoadOptions& options)
 {
+    // A load invalidates any verification result previously obtained through
+    // this manager. COMMIT_READY cleanup requires verification of the state
+    // produced by this exact load operation.
+    chainman.m_chainstate_rebuild_verified_this_process = false;
     if (!chainman.AssumedValidBlock().IsNull()) {
         LogPrintf("Assuming ancestors of block %s have valid signatures.\n", chainman.AssumedValidBlock().GetHex());
     } else {
@@ -904,6 +907,12 @@ bool FinalizeChainstateRebuild(ChainstateManager& chainman, bilingual_str& error
         return true;
     }
 
+    if (journal->phase == RebuildPhase::COMMIT_READY &&
+        !chainman.m_chainstate_rebuild_verified_this_process) {
+        error = _("The rebuilt chainstate has not completed verification in this process. Preserved backups were not removed.");
+        return false;
+    }
+
     if (chainman.m_chainstate_rebuild_interrupted || chainman.m_interrupt) {
         chainman.m_chainstate_rebuild_interrupted = true;
         error = _("Chainstate reconstruction was interrupted. The preserved database will be restored on restart.");
@@ -959,6 +968,9 @@ bool FinalizeChainstateRebuild(ChainstateManager& chainman, bilingual_str& error
 
 ChainstateLoadResult VerifyLoadedChainstate(ChainstateManager& chainman, const ChainstateLoadOptions& options)
 {
+    // Clear first so a failed, interrupted, or repeated verification cannot
+    // inherit a successful result from an earlier call on the same manager.
+    chainman.m_chainstate_rebuild_verified_this_process = false;
     const bool rebuild_chainstate =
         options.reindex_chainstate &&
         !ReopeningCommittedRebuild(chainman.m_options.datadir);
@@ -998,6 +1010,7 @@ ChainstateLoadResult VerifyLoadedChainstate(ChainstateManager& chainman, const C
         }
     }
 
+    chainman.m_chainstate_rebuild_verified_this_process = true;
     return {ChainstateLoadStatus::SUCCESS, {}};
 }
 } // namespace node
