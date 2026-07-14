@@ -23,13 +23,14 @@ SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 
 def run(command, *, cwd=None, capture=False):
     print("+", " ".join(str(part) for part in command), flush=True)
-    return subprocess.run(
+    completed = subprocess.run(
         [str(part) for part in command],
         cwd=cwd,
         check=True,
         text=True,
         stdout=subprocess.PIPE if capture else None,
-    ).stdout if capture else None
+    )
+    return completed.stdout if capture else None
 
 
 def file_sha256(path):

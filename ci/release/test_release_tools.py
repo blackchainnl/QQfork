@@ -16,6 +16,7 @@ import zipfile
 
 
 TOOLS = Path(__file__).resolve().parent
+MIXED_VERSION_TOOLS = TOOLS.parent / "mixed-version"
 SOURCE_SHA = "d161e279be86b3bc20a8c59d3e08e66cbacbeeaa"
 FINGERPRINT = "A" * 40
 
@@ -27,7 +28,47 @@ def load_module(name):
     return module
 
 
+def load_mixed_version_module(name):
+    spec = importlib.util.spec_from_file_location(
+        name, MIXED_VERSION_TOOLS / f"{name}.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class ReleaseToolTests(unittest.TestCase):
+    def test_mixed_version_command_runner_executes_all_commands(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "noncaptured-command-ran"
+            self.assertIsNone(
+                builder.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        "from pathlib import Path; "
+                        "Path('noncaptured-command-ran').touch()",
+                    ],
+                    cwd=root,
+                )
+            )
+            self.assertTrue(marker.is_file())
+            self.assertEqual(
+                builder.run(
+                    [sys.executable, "-c", "print('captured-command-ran')"],
+                    cwd=root,
+                    capture=True,
+                ).strip(),
+                "captured-command-ran",
+            )
+            with self.assertRaises(subprocess.CalledProcessError):
+                builder.run(
+                    [sys.executable, "-c", "raise SystemExit(9)"],
+                    cwd=root,
+                )
+
     def test_reproducibility_requires_identical_bytes(self):
         verifier = load_module("verify_reproducible")
         with tempfile.TemporaryDirectory() as temporary:
