@@ -11,6 +11,7 @@
 #include <crypto/mldsa_kat.h>
 #include <crypto/sha256.h>
 #include <node/kernel_notifications.h>
+#include <pow.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <shadow.h>
@@ -45,8 +46,44 @@ public:
 class ShadowArgon2FailureGuard
 {
 public:
-    ShadowArgon2FailureGuard() { ClearShadowArgon2FailuresForTesting(); }
-    ~ShadowArgon2FailureGuard() { ClearShadowArgon2FailuresForTesting(); }
+    ShadowArgon2FailureGuard()
+    {
+        ClearShadowArgon2FailuresForTesting();
+        ClearShadowAllocationFailureForTesting();
+    }
+    ~ShadowArgon2FailureGuard()
+    {
+        ClearShadowArgon2FailuresForTesting();
+        ClearShadowAllocationFailureForTesting();
+    }
+};
+
+class ShadowScheduleTestGuard
+{
+public:
+    ShadowScheduleTestGuard(int whitelist_height, int reward_start_height,
+                            int gold_rush_blocks)
+        : m_whitelist_height{SHADOW_WHITELIST_HEIGHT},
+          m_reward_start_height{SHADOW_REWARD_START_HEIGHT},
+          m_gold_rush_blocks{SHADOW_GOLD_RUSH_BLOCKS},
+          m_halving_interval{SHADOW_HALVING_INTERVAL_BLOCKS}
+    {
+        SetShadowTestSchedule(whitelist_height, reward_start_height,
+                              gold_rush_blocks);
+    }
+
+    ~ShadowScheduleTestGuard()
+    {
+        SetShadowTestSchedule(m_whitelist_height, m_reward_start_height,
+                              m_gold_rush_blocks);
+        SetShadowTestHalvingInterval(m_halving_interval);
+    }
+
+private:
+    const int m_whitelist_height;
+    const int m_reward_start_height;
+    const int m_gold_rush_blocks;
+    const int m_halving_interval;
 };
 
 class FatalErrorTestGuard
@@ -156,6 +193,100 @@ CBlock ReplayBlockBytes(const CBlock& block)
     CBlock replay;
     stream >> TX_WITH_WITNESS(replay);
     return replay;
+}
+
+struct LegacyShadowClaimCandidate
+{
+    CBlock block;
+    std::unique_ptr<CBlockIndex> index;
+    uint256 block_hash;
+    COutPoint stake_outpoint{uint256{0x71}, 0};
+    COutPoint claim_outpoint{uint256{0x72}, 0};
+    CScript legacy_script{CScript{} << OP_TRUE};
+    CScript payout_script;
+    CAmount stake_amount{20'000 * COIN};
+    CAmount claim_amount{2 * COIN};
+};
+
+void SeedLegacyShadowClaimView(CCoinsViewCache& view,
+                               const CBlockIndex* parent,
+                               const LegacyShadowClaimCandidate& candidate)
+{
+    BOOST_REQUIRE(parent != nullptr);
+    Coin stake_coin{CTxOut{candidate.stake_amount, candidate.legacy_script},
+                    std::max(1, parent->nHeight - 20), false, false,
+                    /*nTime=*/1};
+    Coin claim_coin{CTxOut{candidate.claim_amount, candidate.legacy_script},
+                    std::max(1, parent->nHeight - 20), false, false,
+                    /*nTime=*/1};
+    view.AddCoin(candidate.stake_outpoint, std::move(stake_coin), false);
+    view.AddCoin(candidate.claim_outpoint, std::move(claim_coin), false);
+    BOOST_REQUIRE(ApplyLegacyWhitelistSnapshot(view, parent));
+}
+
+LegacyShadowClaimCandidate BuildLegacyShadowClaimCandidate(
+    const CBlockIndex* parent, CCoinsViewCache& view,
+    const Consensus::Params& consensus)
+{
+    BOOST_REQUIRE(parent != nullptr);
+    LegacyShadowClaimCandidate candidate;
+    candidate.payout_script = GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION,
+        std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x5a)});
+
+    std::vector<unsigned char> proof;
+    BOOST_REQUIRE(MineShadowProofData(candidate.legacy_script,
+                                      candidate.payout_script, parent, view,
+                                      100'000, proof));
+
+    // The exact Protocol-V3 boundary retains the designated historical
+    // behavior and lets this test isolate ConnectBlock's shadow path without
+    // manufacturing an unrelated stake-kernel solution.
+    const uint32_t block_time = static_cast<uint32_t>(consensus.nProtocolV3Time);
+
+    CMutableTransaction coinbase;
+    coinbase.nVersion = 1;
+    coinbase.nTime = block_time;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript{} << parent->nHeight + 1 << OP_0;
+    coinbase.vout.emplace_back(0, CScript{});
+
+    CMutableTransaction coinstake;
+    coinstake.nVersion = 1;
+    coinstake.nTime = block_time;
+    coinstake.vin.emplace_back(candidate.stake_outpoint);
+    coinstake.vout.emplace_back(0, CScript{});
+    coinstake.vout.emplace_back(candidate.stake_amount,
+                                candidate.legacy_script);
+
+    CMutableTransaction claim;
+    claim.nVersion = 1;
+    claim.nTime = block_time;
+    claim.vin.emplace_back(candidate.claim_outpoint);
+    claim.vout.emplace_back(candidate.claim_amount - COIN,
+                            candidate.legacy_script);
+    claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+
+    candidate.block.nVersion = 7;
+    candidate.block.hashPrevBlock = parent->GetBlockHash();
+    candidate.block.nTime = block_time;
+    candidate.block.nBits = GetNextTargetRequired(parent, consensus,
+                                                  /*fProofOfStake=*/true);
+    candidate.block.vtx = {
+        MakeTransactionRef(std::move(coinbase)),
+        MakeTransactionRef(std::move(coinstake)),
+        MakeTransactionRef(std::move(claim)),
+    };
+    candidate.block.hashMerkleRoot = BlockMerkleRoot(candidate.block);
+    candidate.block_hash = candidate.block.GetHash();
+    candidate.index =
+        std::make_unique<CBlockIndex>(candidate.block.GetBlockHeader());
+    candidate.index->phashBlock = &candidate.block_hash;
+    candidate.index->pprev = const_cast<CBlockIndex*>(parent);
+    candidate.index->nHeight = parent->nHeight + 1;
+    candidate.index->SetProofOfStake();
+    return candidate;
 }
 
 void CheckShadowInfoEqual(const ShadowGoldRushInfo& expected, const ShadowGoldRushInfo& actual)
@@ -558,6 +689,170 @@ BOOST_FIXTURE_TEST_CASE(script_internal_failure_is_not_consensus_invalid_or_cach
             /*cacheSigStore=*/true, /*cacheFullScriptStore=*/true, txdata));
         BOOST_CHECK(state.IsValid());
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(shadow_proof_internal_failure_preserves_base_validity_and_retries,
+                        TestChain100Setup)
+{
+    ShadowArgon2FailureGuard shadow_failure_guard;
+    FatalErrorTestGuard fatal_guard{m_node};
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+
+    CBlockIndex* parent{nullptr};
+    uint256 active_tip_hash;
+    uint256 active_coins_hash;
+    {
+        LOCK(cs_main);
+        parent = chainstate.m_chain.Tip();
+        BOOST_REQUIRE(parent != nullptr);
+        active_tip_hash = parent->GetBlockHash();
+        active_coins_hash = chainstate.CoinsTip().GetBestBlock();
+    }
+
+    ShadowScheduleTestGuard schedule_guard{
+        parent->nHeight, parent->nHeight + 1, /*gold_rush_blocks=*/4};
+
+    LegacyShadowClaimCandidate candidate;
+    {
+        LOCK(cs_main);
+        CCoinsViewCache construction_view{&chainstate.CoinsTip()};
+        SeedLegacyShadowClaimView(construction_view, parent, candidate);
+        candidate = BuildLegacyShadowClaimCandidate(
+            parent, construction_view, chainman.GetConsensus());
+        candidate.index->phashBlock = &candidate.block_hash;
+        // The helper's fixed input identities and scripts are unchanged by
+        // construction, so reseeding before construction supplied the exact
+        // coins consumed by this candidate.
+    }
+
+    // Establish context-free base validity independently of the injected
+    // shadow-library fault. Block-signature verification is irrelevant here:
+    // the historical ECDSA carrier is empty because this synthetic block uses
+    // OP_TRUE solely to reach the shadow integration boundary.
+    BlockValidationState base_state;
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(CheckBlock(candidate.block, base_state,
+                                 chainman.GetConsensus(), chainstate,
+                                 /*fCheckPOW=*/true,
+                                 /*fCheckMerkleRoot=*/true,
+                                 /*fCheckSig=*/false));
+    }
+    BOOST_CHECK(base_state.IsValid());
+
+    // Exercise both the linked proof-library boundary and a host allocation
+    // failure at the transactional apply boundary. Each attempt starts from a
+    // fresh outer cache, matching ConnectTip's discard-and-retry contract.
+    for (const bool allocation_failure : {false, true}) {
+        fatal_guard.ClearExpectedFatal();
+        std::unique_ptr<CCoinsViewCache> failed_view;
+        ShadowGoldRushInfo shadow_before;
+        {
+            LOCK(cs_main);
+            failed_view =
+                std::make_unique<CCoinsViewCache>(&chainstate.CoinsTip());
+            SeedLegacyShadowClaimView(*failed_view, parent, candidate);
+            shadow_before = GetShadowGoldRushInfo(*failed_view, parent);
+        }
+        if (allocation_failure) {
+            SetShadowAllocationFailureForTesting(
+                ShadowAllocationFailurePoint::APPLY);
+        } else {
+            SetShadowArgon2FailuresForTesting();
+        }
+
+        BlockValidationState local_failure_state;
+        {
+            LOCK(cs_main);
+            BOOST_CHECK_MESSAGE(!chainstate.ConnectBlock(
+                                    candidate.block, local_failure_state,
+                                    candidate.index.get(), *failed_view,
+                                    /*fJustCheck=*/true,
+                                    /*fCheckBlockSig=*/false),
+                                local_failure_state.ToString());
+        }
+        BOOST_CHECK_MESSAGE(local_failure_state.IsError(),
+                            local_failure_state.ToString());
+        BOOST_CHECK(!local_failure_state.IsInvalid());
+        BOOST_CHECK_EQUAL(local_failure_state.GetResult(),
+                          BlockValidationResult::BLOCK_RESULT_UNSET);
+        BOOST_CHECK(local_failure_state.GetRejectReason().find(
+                        "shadow-state evaluation failed") != std::string::npos);
+        BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_FAILURE);
+
+        {
+            LOCK(cs_main);
+            BOOST_CHECK((candidate.index->nStatus & BLOCK_FAILED_MASK) == 0);
+            BOOST_REQUIRE(chainstate.m_chain.Tip() != nullptr);
+            BOOST_CHECK(chainstate.m_chain.Tip()->GetBlockHash() ==
+                        active_tip_hash);
+            BOOST_CHECK(chainstate.CoinsTip().GetBestBlock() ==
+                        active_coins_hash);
+            BOOST_CHECK(failed_view->GetBestBlock() == active_coins_hash);
+            const ShadowGoldRushInfo shadow_after =
+                GetShadowGoldRushInfo(*failed_view, parent);
+            CheckShadowInfoEqual(shadow_before, shadow_after);
+        }
+    }
+
+    // A clean process rebuilds the per-block cache from its durable parent.
+    // Retrying the identical block must run Argon2 again, accept the base
+    // block, and derive the same credit without any invalid-cache residue.
+    fatal_guard.ClearExpectedFatal();
+    std::unique_ptr<CCoinsViewCache> retry_view;
+    ShadowGoldRushInfo retry_shadow;
+    std::vector<ShadowSyntheticPayoutTransaction> retry_payouts;
+    BlockValidationState retry_state;
+    {
+        LOCK(cs_main);
+        retry_view = std::make_unique<CCoinsViewCache>(&chainstate.CoinsTip());
+        SeedLegacyShadowClaimView(*retry_view, parent, candidate);
+        const bool retry_connected = chainstate.ConnectBlock(
+            candidate.block, retry_state, candidate.index.get(), *retry_view,
+            /*fJustCheck=*/true, /*fCheckBlockSig=*/false);
+        BOOST_REQUIRE_MESSAGE(retry_connected, retry_state.ToString());
+        retry_shadow = GetShadowGoldRushInfo(*retry_view,
+                                             candidate.index.get());
+        retry_payouts = GetAppliedShadowClaimPayoutTransactionRecords(
+            *retry_view, candidate.index->nHeight, candidate.block_hash,
+            candidate.index->GetBlockTime());
+    }
+    BOOST_CHECK(retry_state.IsValid());
+    BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_SUCCESS);
+    BOOST_CHECK_EQUAL(retry_shadow.pow_amount, 0);
+    BOOST_CHECK_EQUAL(retry_shadow.pow_count, 1U);
+    BOOST_REQUIRE_EQUAL(retry_payouts.size(), 1U);
+    BOOST_CHECK(retry_payouts.front().proof_of_work);
+    BOOST_CHECK(retry_payouts.front().target == candidate.payout_script);
+
+    // Replaying from the same durable parent reproduces the exact synthetic
+    // transaction identity and accounting, which is the restart/reindex
+    // contract used by ConnectBlock and RollforwardBlock callers.
+    CCoinsViewCache replay_view{&chainstate.CoinsTip()};
+    BlockValidationState replay_state;
+    std::vector<ShadowSyntheticPayoutTransaction> replay_payouts;
+    ShadowGoldRushInfo replay_shadow;
+    {
+        LOCK(cs_main);
+        SeedLegacyShadowClaimView(replay_view, parent, candidate);
+        BOOST_REQUIRE(chainstate.ConnectBlock(
+            candidate.block, replay_state, candidate.index.get(), replay_view,
+            /*fJustCheck=*/true, /*fCheckBlockSig=*/false));
+        replay_shadow = GetShadowGoldRushInfo(replay_view,
+                                              candidate.index.get());
+        replay_payouts = GetAppliedShadowClaimPayoutTransactionRecords(
+            replay_view, candidate.index->nHeight, candidate.block_hash,
+            candidate.index->GetBlockTime());
+    }
+    BOOST_CHECK(replay_state.IsValid());
+    CheckShadowInfoEqual(retry_shadow, replay_shadow);
+    BOOST_REQUIRE_EQUAL(replay_payouts.size(), retry_payouts.size());
+    BOOST_CHECK(replay_payouts.front().tx->GetHash() ==
+                retry_payouts.front().tx->GetHash());
+    BOOST_CHECK_EQUAL(replay_payouts.front().amount,
+                      retry_payouts.front().amount);
+    BOOST_CHECK((candidate.index->nStatus & BLOCK_FAILED_MASK) == 0);
 }
 
 BOOST_FIXTURE_TEST_CASE(block_signature_internal_failure_is_fail_stop_retryable_and_not_cached, RegTestingSetup)

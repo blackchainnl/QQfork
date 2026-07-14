@@ -79,6 +79,8 @@ static_assert(static_cast<CAmount>(MAX_SHADOW_POW_EVALS_PER_BLOCK - 1) * CENT <
               (463 * COIN) / 2,
               "Gold Rush POW pool must exceed all capped loser reimbursements");
 std::atomic<uint64_t> g_shadow_argon2_test_failures{0};
+std::atomic<ShadowAllocationFailurePoint> g_shadow_allocation_test_failure{
+    ShadowAllocationFailurePoint::NONE};
 // Increment whenever an auxiliary namespace or its authentication semantics
 // changes. This prevents a checkpoint produced by a prerelease schema from
 // authenticating merely because the affected inventory is currently empty.
@@ -2736,6 +2738,13 @@ ShadowPowClaimResult FindCanonicalPowShadowClaims(
     const ShadowPowAccountingContext& context)
 {
     try {
+        ShadowAllocationFailurePoint expected{
+            ShadowAllocationFailurePoint::ACCOUNTING};
+        if (g_shadow_allocation_test_failure.compare_exchange_strong(
+                expected, ShadowAllocationFailurePoint::NONE,
+                std::memory_order_relaxed)) {
+            throw std::bad_alloc{};
+        }
         return FindCanonicalPowShadowClaimsImpl(block, blockundo, context);
     } catch (const std::bad_alloc&) {
         LogPrintf("ERROR: Quantum Quasar canonical claim accounting allocation failed at height %d\n",
@@ -3831,9 +3840,14 @@ ShadowPowAccountingResult EvaluateShadowPowClaimAccounting(
     }
     ShadowPowClaimResult result = FindCanonicalPowShadowClaims(
         block, blockundo, context);
+    if (result.internal_error) {
+        // Index and RPC callers must not mistake a prefix produced before a
+        // local failure for durable classification. The identical block is
+        // evaluated from scratch after restart/retry.
+        return ShadowPowAccountingResult::LOCAL_INTERNAL_ERROR;
+    }
     accounting_out = std::move(result.accounting);
-    return result.internal_error ? ShadowPowAccountingResult::LOCAL_INTERNAL_ERROR
-                                 : ShadowPowAccountingResult::OK;
+    return ShadowPowAccountingResult::OK;
 }
 
 ShadowPowAccountingResult GetShadowPowClaimAccounting(
@@ -4455,6 +4469,17 @@ void SetShadowArgon2FailuresForTesting(uint64_t count)
 void ClearShadowArgon2FailuresForTesting()
 {
     g_shadow_argon2_test_failures.store(0, std::memory_order_relaxed);
+}
+
+void SetShadowAllocationFailureForTesting(ShadowAllocationFailurePoint point)
+{
+    g_shadow_allocation_test_failure.store(point, std::memory_order_relaxed);
+}
+
+void ClearShadowAllocationFailureForTesting()
+{
+    g_shadow_allocation_test_failure.store(ShadowAllocationFailurePoint::NONE,
+                                           std::memory_order_relaxed);
 }
 
 COutPoint ShadowReplayStateOutpointForTesting()
@@ -5325,7 +5350,7 @@ bool MineShadowProofDataRange(const CScript& target, const CScript& quantum_payo
     return GrindShadowPowWork(work, start_nonce, nonce_step, max_tries, data_out, tries_done);
 }
 
-ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, bool gold_rush_active)
+static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, bool gold_rush_active)
 {
     if (!gold_rush_active) return ShadowApplyResult::OK;
     if (!pindex || pindex->nHeight < SHADOW_REWARD_START_HEIGHT || pindex->nHeight > SHADOW_REWARD_END_HEIGHT) return ShadowApplyResult::OK;
@@ -5501,6 +5526,50 @@ ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& bl
         return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
     }
     return ShadowApplyResult::OK;
+}
+
+ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, bool gold_rush_active)
+{
+    if (!gold_rush_active || !pindex ||
+        pindex->nHeight < SHADOW_REWARD_START_HEIGHT ||
+        pindex->nHeight > SHADOW_REWARD_END_HEIGHT) {
+        return ShadowApplyResult::OK;
+    }
+    try {
+        ShadowAllocationFailurePoint expected{ShadowAllocationFailurePoint::APPLY};
+        if (g_shadow_allocation_test_failure.compare_exchange_strong(
+                expected, ShadowAllocationFailurePoint::NONE,
+                std::memory_order_relaxed)) {
+            throw std::bad_alloc{};
+        }
+
+        // A shadow-layer failure may occur after several authenticated marker
+        // writes have been prepared. Keep them isolated until every check and
+        // write succeeds. ConnectTip and replay add an outer cache transaction,
+        // so even a host allocation failure while publishing this child is
+        // discarded rather than persisted or associated with block invalidity.
+        CCoinsViewCache staged{&view};
+        // An empty child cache has no lazy best-block value of its own. Preserve
+        // the caller's anchor explicitly so publishing shadow-only writes can
+        // never clear or advance the base-chain tip.
+        staged.SetBestBlock(view.GetBestBlock());
+        const ShadowApplyResult result = ApplyShadowBlockToCache(
+            staged, block, pindex, blockundo, gold_rush_active);
+        if (result != ShadowApplyResult::OK) return result;
+        if (!staged.Flush()) {
+            LogPrintf("ERROR: Quantum Quasar shadow-state staging flush failed at height %d\n",
+                      pindex ? pindex->nHeight : -1);
+            return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+        }
+        return ShadowApplyResult::OK;
+    } catch (const std::bad_alloc&) {
+        LogPrintf("ERROR: Quantum Quasar shadow-state allocation failed at height %d\n",
+                  pindex ? pindex->nHeight : -1);
+    } catch (const std::length_error&) {
+        LogPrintf("ERROR: Quantum Quasar shadow-state container bound failed at height %d\n",
+                  pindex ? pindex->nHeight : -1);
+    }
+    return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
 }
 
 bool ApplyShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, bool gold_rush_active)

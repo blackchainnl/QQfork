@@ -57,6 +57,22 @@ private:
     const int m_halving_interval;
 };
 
+class ShadowFailureGuard
+{
+public:
+    ShadowFailureGuard()
+    {
+        ClearShadowArgon2FailuresForTesting();
+        ClearShadowAllocationFailureForTesting();
+    }
+
+    ~ShadowFailureGuard()
+    {
+        ClearShadowArgon2FailuresForTesting();
+        ClearShadowAllocationFailureForTesting();
+    }
+};
+
 void AddCoinForScript(CCoinsViewCache& view, const COutPoint& outpoint, CAmount amount, const CScript& script)
 {
     Coin coin;
@@ -1661,6 +1677,7 @@ BOOST_AUTO_TEST_CASE(pow_shadow_competing_claim_activation_preserves_history_the
 
 BOOST_AUTO_TEST_CASE(pow_shadow_canonical_winner_is_order_independent_and_replay_safe)
 {
+    ShadowFailureGuard failure_guard;
     CCoinsView base;
     const CScript staker_target = CScript{} << OP_TRUE;
     uint256 whitelist_hash;
@@ -1751,6 +1768,23 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_winner_is_order_independent_and_replay
                                                   context_a) ==
                   ShadowPowAccountingResult::OK);
     BOOST_CHECK(context_a.valid);
+
+    // Explorer/index evaluation is all-or-nothing. Neither a simulated
+    // allocation failure nor an Argon2 library failure may expose a partial
+    // classification prefix to a caller, and the exact bytes must be
+    // retryable after the local condition clears.
+    accounting_a.push_back(ShadowPowClaimAccounting{});
+    SetShadowAllocationFailureForTesting(
+        ShadowAllocationFailurePoint::ACCOUNTING);
+    BOOST_CHECK(EvaluateShadowPowClaimAccounting(context_a, block_a, &undo_a,
+                                                  accounting_a) ==
+                ShadowPowAccountingResult::LOCAL_INTERNAL_ERROR);
+    BOOST_CHECK(accounting_a.empty());
+    SetShadowArgon2FailuresForTesting();
+    BOOST_CHECK(EvaluateShadowPowClaimAccounting(context_a, block_a, &undo_a,
+                                                  accounting_a) ==
+                ShadowPowAccountingResult::LOCAL_INTERNAL_ERROR);
+    BOOST_CHECK(accounting_a.empty());
     BOOST_REQUIRE(EvaluateShadowPowClaimAccounting(context_a, block_a, &undo_a,
                                                    accounting_a) ==
                   ShadowPowAccountingResult::OK);
@@ -1765,6 +1799,35 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_winner_is_order_independent_and_replay
         BOOST_CHECK_EQUAL(accounting_a[i].base_fee, actual_fee);
         BOOST_CHECK_EQUAL(accounting_a[i].credited_amount, accounting_b[i].credited_amount);
     }
+
+    const ShadowGoldRushInfo before_local_failures =
+        GetShadowGoldRushInfo(view, &activation_parent);
+    const uint256 best_block_before_local_failures = view.GetBestBlock();
+
+    SetShadowAllocationFailureForTesting(ShadowAllocationFailurePoint::APPLY);
+    BOOST_CHECK(ApplyShadowBlockResult(view, block_a, &claim_index_a, &undo_a) ==
+                ShadowApplyResult::LOCAL_INTERNAL_ERROR);
+    SetShadowAllocationFailureForTesting(
+        ShadowAllocationFailurePoint::ACCOUNTING);
+    BOOST_CHECK(ApplyShadowBlockResult(view, block_a, &claim_index_a, &undo_a) ==
+                ShadowApplyResult::LOCAL_INTERNAL_ERROR);
+    SetShadowArgon2FailuresForTesting();
+    BOOST_CHECK(ApplyShadowBlockResult(view, block_a, &claim_index_a, &undo_a) ==
+                ShadowApplyResult::LOCAL_INTERNAL_ERROR);
+
+    const ShadowGoldRushInfo after_local_failures =
+        GetShadowGoldRushInfo(view, &activation_parent);
+    BOOST_CHECK_EQUAL(after_local_failures.pow_amount,
+                      before_local_failures.pow_amount);
+    BOOST_CHECK_EQUAL(after_local_failures.pos_amount,
+                      before_local_failures.pos_amount);
+    BOOST_CHECK_EQUAL(after_local_failures.claimed_amount,
+                      before_local_failures.claimed_amount);
+    BOOST_CHECK_EQUAL(after_local_failures.pow_count,
+                      before_local_failures.pow_count);
+    BOOST_CHECK_EQUAL(after_local_failures.pos_count,
+                      before_local_failures.pos_count);
+    BOOST_CHECK(view.GetBestBlock() == best_block_before_local_failures);
 
     BOOST_REQUIRE(ApplyShadowBlock(view, block_a, &claim_index_a, &undo_a));
     ShadowPowAccountingContext historical_context_a;

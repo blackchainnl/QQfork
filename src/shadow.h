@@ -321,6 +321,17 @@ bool ValidateShadowPowProofForWork(const ShadowPowWork& work, const std::vector<
  *  No configuration, RPC, or network path can arm this hook. */
 void SetShadowArgon2FailuresForTesting(uint64_t count = 1);
 void ClearShadowArgon2FailuresForTesting();
+/** Test-only allocation-failure injection. APPLY fails the transactional
+ *  shadow-state evaluator before it mutates the staging cache. ACCOUNTING
+ *  throws from the canonical explorer/credit accounting engine and exercises
+ *  its typed bad_alloc boundary. */
+enum class ShadowAllocationFailurePoint : uint8_t {
+    NONE,
+    APPLY,
+    ACCOUNTING,
+};
+void SetShadowAllocationFailureForTesting(ShadowAllocationFailurePoint point);
+void ClearShadowAllocationFailureForTesting();
 COutPoint ShadowReplayStateOutpointForTesting();
 /** Test-only oracle for the authenticated pool/active-signal pair invariant. */
 bool ShadowActiveSignalPoolPairValidForTesting(const Consensus::Params& consensus,
@@ -469,7 +480,9 @@ enum class ShadowApplyResult {
     LOCAL_INTERNAL_ERROR,
 };
 
-/** Apply/remove deterministic shadow claim state for one shadow-epoch block. */
+/** Apply/remove deterministic shadow claim state for one shadow-epoch block.
+ *  ApplyShadowBlockResult stages every shadow mutation in a child cache and
+ *  publishes that cache only after the complete evaluation succeeds. */
 ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
 bool ApplyShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
 bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
