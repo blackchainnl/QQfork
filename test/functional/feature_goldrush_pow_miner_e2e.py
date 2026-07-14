@@ -158,6 +158,40 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
     def _is_abandoned(wallet, txid):
         return any(detail.get("abandoned", False) for detail in wallet.gettransaction(txid)["details"])
 
+    def _load_wallet(self, name):
+        node = self.nodes[0]
+        if name not in node.listwallets():
+            node.loadwallet(name)
+        return node.get_wallet_rpc(name)
+
+    def _assert_confirmed_claim(self, wallet, txid, block_hash):
+        record = wallet.gettransaction(txid)
+        assert record["confirmations"] > 0
+        assert_equal(record["blockhash"], block_hash)
+        assert_equal(self._is_abandoned(wallet, txid), False)
+        assert "qq_auto_shadow_stale" not in record
+        assert "qq_manual_shadow_abandon" not in record
+        assert "qq_reorg_shadow_resubmit" not in record
+        return record
+
+    def _assert_legacy_stake_weight(self, wallet, expected_weight):
+        """Run one staking scan without allowing a test block to hide the result."""
+        node = self.nodes[0]
+        start_height = node.getblockcount()
+        wallet.staking(True)
+        try:
+            self._bump_mocktime(16)
+            self.wait_until(
+                lambda: (
+                    wallet.getstakinginfo()["weight_cache_height"] == start_height
+                    and wallet.getstakinginfo()["weight"] == expected_weight
+                ),
+                timeout=10,
+            )
+        finally:
+            wallet.staking(False)
+        assert_equal(node.getblockcount(), start_height)
+
     def _build_quantum_spend(self, wallet, utxo, destination):
         node = self.nodes[0]
         spend_amount = Decimal(str(utxo["amount"])) - QUANTUM_SPEND_FEE
@@ -266,6 +300,8 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         self._fund_miner_wallet(staker, stale_miner, staker_address, stale_address)
         self._fund_miner_wallet(staker, age_miner, staker_address, age_address)
         self._fund_miner_wallet(staker, repair_miner, staker_address, repair_address)
+        self.generatetoaddress(node, COINBASE_MATURITY, staker_address, sync_fun=self.no_op)
+        self._sync_mocktime_to_tip()
 
         miner_entry = [entry for entry in miner.getgoldrushinfo()["wallet_scripts"] if entry["address"] == miner_address]
         assert miner_entry, "miner fee UTXO must be visible in Gold Rush wallet status"
@@ -276,6 +312,11 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         assert stale_txid in node.getrawmempool()
         stale_hex = node.getrawtransaction(stale_txid)
         stale_decoded = node.decoderawtransaction(stale_hex)
+        assert_equal(len(stale_decoded["vin"]), 1)
+        stale_input = {
+            "txid": stale_decoded["vin"][0]["txid"],
+            "vout": stale_decoded["vin"][0]["vout"],
+        }
         stale_change = next(vout for vout in stale_decoded["vout"] if Decimal(str(vout["value"])) > 0)
         child_address = stale_miner.getnewaddress("stale-child", "legacy")
         child_amount = Decimal(str(stale_change["value"])) - Decimal("0.01")
@@ -287,6 +328,7 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         assert_equal(child_signed["complete"], True)
         child_txid = node.sendrawtransaction(child_signed["hex"])
         assert child_txid in node.getrawmempool()
+        self._assert_legacy_stake_weight(stale_miner, 0)
         empty_block = self.generateblock(node, output=staker_address, transactions=[])["hash"]
         assert stale_txid not in node.getblock(empty_block)["tx"]
         self.wait_until(lambda: stale_txid not in node.getrawmempool(), timeout=10)
@@ -298,8 +340,15 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         stale_accept = node.testmempoolaccept([stale_hex])[0]
         assert_equal(stale_accept["allowed"], False)
         assert_equal(stale_accept["reject-reason"], "shadow-proof-invalid")
-        assert_equal(len(stale_miner.listunspent(1, 9999999, [stale_address])), 1)
+        released = stale_miner.listunspent(1, 9999999, [stale_address])
+        assert_equal(len(released), 1)
+        assert_equal(
+            {"txid": released[0]["txid"], "vout": released[0]["vout"]},
+            stale_input,
+        )
+        assert_equal(stale_miner.listunspent(0, 9999999, [child_address]), [])
         assert_equal(Decimal(str(stale_miner.getbalances()["mine"]["trusted"])), MINER_FUNDING)
+        self._assert_legacy_stake_weight(stale_miner, int(MINER_FUNDING * 100_000_000))
         self._sync_mocktime_to_tip()
 
         self.log.info("Restoring a claim package when a reorg restores its bound parent")
@@ -321,13 +370,20 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         self._sync_mocktime_to_tip()
 
         self.log.info("Reusing the released input and confirming that block inclusion is never abandoned")
-        reused_txid, _ = self._start_miner_until_claim(stale_miner)
+        reused_txid, reused_payout_address = self._start_miner_until_claim(stale_miner)
+        reused_decoded = node.decoderawtransaction(node.getrawtransaction(reused_txid))
+        assert_equal(len(reused_decoded["vin"]), 1)
+        assert_equal(
+            {
+                "txid": reused_decoded["vin"][0]["txid"],
+                "vout": reused_decoded["vin"][0]["vout"],
+            },
+            stale_input,
+        )
         reused_block_hash = self._mine_pos_block_with_claim(staker, reused_txid)
         assert reused_txid in node.getblock(reused_block_hash)["tx"]
-        assert_equal(self._is_abandoned(stale_miner, reused_txid), False)
-        reused_record = stale_miner.gettransaction(reused_txid)
-        assert "qq_auto_shadow_stale" not in reused_record
-        assert "qq_reorg_shadow_resubmit" not in reused_record
+        self._assert_confirmed_claim(stale_miner, reused_txid, reused_block_hash)
+        reused_payout = self._wait_for_quantum_utxo(stale_miner, reused_payout_address)
 
         self.log.info("Ordinary mempool age expiry must not abandon a still tip-valid claim")
         age_txid, _ = self._start_miner_until_claim(age_miner)
@@ -337,10 +393,11 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         self.wait_until(lambda: age_txid not in node.getrawmempool(), timeout=10)
         self.wait_until(lambda: not age_miner.gettransaction(age_txid)["trusted"], timeout=10)
         assert_equal(self._is_abandoned(age_miner, age_txid), False)
+        assert "qq_auto_shadow_stale" not in age_miner.gettransaction(age_txid)
         assert_equal(node.sendrawtransaction(age_hex), age_txid)
         age_block_hash = self._mine_pos_block_with_claim(staker, age_txid)
         assert age_txid in node.getblock(age_block_hash)["tx"]
-        assert_equal(self._is_abandoned(age_miner, age_txid), False)
+        self._assert_confirmed_claim(age_miner, age_txid, age_block_hash)
 
         self.log.info("Repairing an already-stale v30.1.0-style claim when its wallet is loaded")
         repair_txid, _ = self._start_miner_until_claim(repair_miner)
@@ -349,8 +406,22 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         repair_block = self.generateblock(node, output=staker_address, transactions=[])["hash"]
         assert repair_txid not in node.getblock(repair_block)["tx"]
         self.wait_until(lambda: repair_txid not in node.getrawmempool(), timeout=10)
-        node.loadwallet("goldrush_pow_repair")
-        repair_miner = node.get_wallet_rpc("goldrush_pow_repair")
+
+        self.log.info("Restarting before wallet load exercises persisted stale-claim repair")
+        self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        staker = self._load_wallet("goldrush_pow_staker")
+        miner = self._load_wallet("goldrush_pow_miner")
+        stale_miner = self._load_wallet("goldrush_pow_stale")
+        age_miner = self._load_wallet("goldrush_pow_age")
+        self._assert_confirmed_claim(stale_miner, reused_txid, reused_block_hash)
+        self._assert_confirmed_claim(age_miner, age_txid, age_block_hash)
+        restarted_reused_payout = self._wait_for_quantum_utxo(stale_miner, reused_payout_address)
+        for field in ("txid", "vout", "amount"):
+            assert_equal(restarted_reused_payout[field], reused_payout[field])
+
+        repair_miner = self._load_wallet("goldrush_pow_repair")
         self.wait_until(lambda: self._is_abandoned(repair_miner, repair_txid), timeout=10)
         assert_equal(len(repair_miner.listunspent(1, 9999999, [repair_address])), 1)
         assert_equal(Decimal(str(repair_miner.getbalances()["mine"]["trusted"])), MINER_FUNDING)
@@ -366,6 +437,32 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         payout_utxo = self._wait_for_quantum_utxo(miner, payout_address)
         assert_equal(payout_utxo["confirmations"], 1)
         assert node.gettxout(payout_utxo["txid"], payout_utxo["vout"], False) is not None
+        self._assert_confirmed_claim(miner, claim_txid, claim_block_hash)
+
+        self.log.info("Disconnecting and reconsidering a confirmed claim preserves its audit record and credit")
+        node.invalidateblock(claim_block_hash)
+        self.wait_until(lambda: node.getbestblockhash() != claim_block_hash)
+        self.wait_until(lambda: claim_txid in node.getrawmempool(), timeout=20)
+        assert_equal(self._is_abandoned(miner, claim_txid), False)
+        assert_equal(self._get_quantum_utxos(miner, payout_address), [])
+        node.reconsiderblock(claim_block_hash)
+        self.wait_until(lambda: node.getbestblockhash() == claim_block_hash)
+        restored_payout = self._wait_for_quantum_utxo(miner, payout_address)
+        for field in ("txid", "vout", "amount"):
+            assert_equal(restored_payout[field], payout_utxo[field])
+        self._assert_confirmed_claim(miner, claim_txid, claim_block_hash)
+
+        self.log.info("Restart preserves the reconsidered confirmed claim and synthetic credit")
+        self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        staker = self._load_wallet("goldrush_pow_staker")
+        miner = self._load_wallet("goldrush_pow_miner")
+        self._assert_confirmed_claim(miner, claim_txid, claim_block_hash)
+        restarted_payout = self._wait_for_quantum_utxo(miner, payout_address)
+        for field in ("txid", "vout", "amount"):
+            assert_equal(restarted_payout[field], payout_utxo[field])
+        payout_utxo = restarted_payout
 
         self.log.info("Maturing the built-in miner payout and spending it during migration")
         self.generatetoaddress(node, COINBASE_MATURITY, staker_address, sync_fun=self.no_op)
