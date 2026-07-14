@@ -97,7 +97,7 @@ class GoldRushLegacyCompatTest(BitcoinTestFramework):
         for version, witness_hex in witness_transactions.items():
             block_hash = self.generateblock(node, mining_address, [witness_hex])["hash"]
             block = node.getblock(block_hash, 2)
-            assert_equal(witness_transactions[version], node.getrawtransaction(block["tx"][1]))
+            assert_equal(witness_transactions[version], node.getrawtransaction(block["tx"][1]["txid"]))
 
         change = Decimal(str(marker_utxo["amount"])) - Decimal("0.01")
         raw = node.createrawtransaction(
