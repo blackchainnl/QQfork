@@ -2,7 +2,12 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Exercise Gold Rush payout locking, ordinary maturity, and optional consolidation."""
+"""Exercise Gold Rush payout locking and the post-Gold-Rush migration RPC.
+
+The positive ``migratetoquantum`` path supplies lifecycle evidence for roadmap
+issues #11 (Gold Rush payout lifecycle), #14 (phase funding gates), and #16
+(monotonic lifecycle).
+"""
 
 from decimal import Decimal
 import time
@@ -16,6 +21,8 @@ GOLD_RUSH_END_HEIGHT = 501
 MIGRATION_END_HEIGHT = 700
 QUANTUM_SPEND_FEE = Decimal("0.01")
 WALLET_NAME = "goldrush_migration_rpc"
+MIGRATION_WALLET_NAME = "legacy_to_quantum_rpc"
+MIGRATION_PASSPHRASE = "migration-test-passphrase"
 
 
 class GoldRushMigrationRpcTest(BitcoinTestFramework):
@@ -89,15 +96,15 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
             self._bump_mocktime(16)
         raise last_error or AssertionError("failed to mine deterministic PoS block")
 
-    def _mine_until_phase(self, phase, address):
+    def _mine_to_height(self, height, address):
         node = self.nodes[0]
         for _ in range(1000):
+            if node.getblockcount() == height:
+                return
+            assert node.getblockcount() < height
             self.generatetoaddress(node, 1, address, sync_fun=self.no_op)
             self._bump_mocktime(16)
-            info = node.getquantumquasarinfo()
-            if info["phase"] == phase and (phase != "migration" or info["quantum_spend_enforcement_active"]):
-                return
-        raise AssertionError(f"timed out waiting for phase {phase}")
+        raise AssertionError(f"timed out mining to height {height}")
 
     def _get_quantum_utxos(self, wallet, address, *, min_conf=0):
         options = {"include_immature_coinbase": True}
@@ -138,14 +145,22 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         node.createwallet(wallet_name=WALLET_NAME)
         wallet = node.get_wallet_rpc(WALLET_NAME)
         wallet.staking(False)
+        node.createwallet(wallet_name=MIGRATION_WALLET_NAME)
+        migration_wallet = node.get_wallet_rpc(MIGRATION_WALLET_NAME)
+        migration_wallet.staking(False)
 
         staking_address = wallet.getnewaddress("", "legacy")
         claim_address = wallet.getnewaddress("", "legacy")
+        migration_legacy_address = migration_wallet.getnewaddress("migration-source", "legacy")
         self.generatetoaddress(node, 1, staking_address, sync_fun=self.no_op)
+        migration_funding_block = self.generatetoaddress(
+            node, 1, migration_legacy_address, sync_fun=self.no_op
+        )[0]
         self.generatetoaddress(node, COINBASE_MATURITY + 2, staking_address, sync_fun=self.no_op)
         self.generatetoaddress(node, COINBASE_MATURITY + 2, claim_address, sync_fun=self.no_op)
         self._sync_mocktime_to_tip()
         assert_equal(node.getquantumquasarinfo()["phase"], "gold_rush")
+        migration_wallet.encryptwallet(MIGRATION_PASSPHRASE)
 
         self.log.info("migratetoquantum dry-runs require an existing wallet-backed destination and do not create keys")
         assert_raises_rpc_error(
@@ -212,7 +227,177 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         # The bridge blocks are still validated under the preceding Gold Rush
         # MTP context, so mine them to a legacy script until G+1 is active.
         mining_address = wallet.getnewaddress("", "legacy")
-        self._mine_until_phase("migration", mining_address)
+        self._mine_to_height(GOLD_RUSH_END_HEIGHT - 1, mining_address)
+
+        self.log.info("The last Gold Rush candidate block still rejects legacy migration funding")
+        before_boundary = node.getquantumquasarinfo()
+        assert_equal(before_boundary["active_tip_height"], GOLD_RUSH_END_HEIGHT - 1)
+        assert_equal(before_boundary["active_tip_phase"], "gold_rush")
+        assert_equal(before_boundary["next_block_height"], GOLD_RUSH_END_HEIGHT)
+        assert_equal(before_boundary["next_block_phase"], "gold_rush")
+        assert_equal(before_boundary["quantum_spend_enforcement_active"], False)
+        migration_wallet.walletpassphrase(MIGRATION_PASSPHRASE, 600)
+        migration_inputs = migration_wallet.listunspent(1, 9999999, [migration_legacy_address])
+        assert_equal(len(migration_inputs), 1)
+        migration_input = migration_inputs[0]
+        migration_input_amount = Decimal(str(migration_input["amount"]))
+        assert_equal(
+            node.getblock(migration_funding_block)["height"],
+            2,
+        )
+        migration_status_before = migration_wallet.getmigrationstatus()
+        assert_equal(migration_status_before["phase"], "gold_rush")
+        assert_equal(migration_status_before["eligible_legacy_inputs"], 1)
+        assert_equal(Decimal(migration_status_before["eligible_legacy_amount"]), migration_input_amount)
+        assert_equal(migration_status_before["migrated_quantum_outputs"], 0)
+        quantum_keys_before = len(migration_wallet.listquantumaddresses())
+        assert_raises_rpc_error(
+            -4,
+            "Quantum funding is disabled during Gold Rush",
+            migration_wallet.migratetoquantum,
+            {},
+        )
+        assert_equal(len(migration_wallet.listquantumaddresses()), quantum_keys_before)
+
+        self.log.info("Height G validates under Gold Rush while height G+1 opens Migration")
+        last_goldrush_block = self.generatetoaddress(
+            node, 1, mining_address, sync_fun=self.no_op
+        )[0]
+        self._bump_mocktime(16)
+        assert_equal(node.getblock(last_goldrush_block)["height"], GOLD_RUSH_END_HEIGHT)
+        boundary = node.getquantumquasarinfo()
+        assert_equal(boundary["active_tip_height"], GOLD_RUSH_END_HEIGHT)
+        assert_equal(boundary["active_tip_phase"], "gold_rush")
+        assert_equal(boundary["next_block_height"], GOLD_RUSH_END_HEIGHT + 1)
+        assert_equal(boundary["next_block_phase"], "migration")
+        assert_equal(boundary["phase"], "migration")
+        assert_equal(boundary["quantum_spend_enforcement_active"], True)
+
+        self.log.info("migratetoquantum sweeps the funded legacy anchor into one durable v16 output")
+        quantum_keys_before = len(migration_wallet.listquantumaddresses())
+        migration = migration_wallet.migratetoquantum({"label": "lifecycle-migration"})
+        migration_fee = Decimal(str(migration["fee"]))
+        migration_amount = Decimal(str(migration["amount"]))
+        assert_equal(migration["phase"], "migration")
+        assert_equal(migration["eligible_inputs"], 1)
+        assert_equal(Decimal(str(migration["eligible_amount"])), migration_input_amount)
+        assert_equal(migration["newly_generated"], True)
+        assert_equal(migration["stored_in_wallet"], True)
+        assert migration_fee > 0
+        assert_equal(migration_amount, migration_input_amount - migration_fee)
+        assert migration["vsize"] > 0
+        assert "Back up the wallet" in migration["warning"]
+        assert migration["txid"] in node.getrawmempool()
+        assert_equal(len(migration_wallet.listquantumaddresses()), quantum_keys_before + 1)
+
+        migration_keys = migration_wallet.listquantumaddresses()
+        assert_equal(len(migration_keys), 1)
+        assert_equal(migration_keys[0]["address"], migration["destination"])
+        assert_equal(migration_keys[0]["stored_in_wallet"], True)
+        assert_equal(migration_keys[0]["encrypted"], True)
+        assert_equal(migration_keys[0]["label"], "lifecycle-migration")
+
+        decoded_migration = node.getrawtransaction(migration["txid"], True)
+        assert_equal(len(decoded_migration["vin"]), 1)
+        assert_equal(decoded_migration["vin"][0]["txid"], migration_input["txid"])
+        assert_equal(decoded_migration["vin"][0]["vout"], migration_input["vout"])
+        assert_equal(len(decoded_migration["vout"]), 1)
+        assert_equal(
+            decoded_migration["vout"][0]["scriptPubKey"]["hex"],
+            node.validateaddress(migration["destination"])["scriptPubKey"],
+        )
+        assert_equal(Decimal(str(decoded_migration["vout"][0]["value"])), migration_amount)
+
+        node.syncwithvalidationinterfacequeue()
+        migration_status_mempool = migration_wallet.getmigrationstatus()
+        assert_equal(migration_status_mempool["phase"], "migration")
+        assert_equal(migration_status_mempool["eligible_legacy_inputs"], 0)
+        assert_equal(Decimal(migration_status_mempool["eligible_legacy_amount"]), Decimal("0"))
+        assert_equal(migration_status_mempool["direct_quantum_outputs"], 1)
+        assert_equal(Decimal(migration_status_mempool["direct_quantum_amount"]), migration_amount)
+
+        migration_block = self.generatetoaddress(
+            node, 1, mining_address, sync_fun=self.no_op
+        )[0]
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(node.getblock(migration_block)["height"], GOLD_RUSH_END_HEIGHT + 1)
+        assert migration["txid"] in node.getblock(migration_block)["tx"]
+        assert node.gettxout(migration_input["txid"], migration_input["vout"], False) is None
+        migrated_utxo = self._wait_for_quantum_utxo(
+            migration_wallet, migration["destination"], min_conf=1
+        )
+        assert_equal(Decimal(str(migrated_utxo["amount"])), migration_amount)
+        assert_equal(Decimal(str(migration_wallet.getwalletinfo()["balance"])), migration_amount)
+        migration_wallet_tx = migration_wallet.gettransaction(migration["txid"])
+        assert_equal(migration_wallet_tx["confirmations"], 1)
+        assert_equal(Decimal(str(migration_wallet_tx["fee"])), -migration_fee)
+
+        migration_status_confirmed = migration_wallet.getmigrationstatus()
+        assert_equal(migration_status_confirmed["eligible_legacy_inputs"], 0)
+        assert_equal(migration_status_confirmed["migrated_quantum_outputs"], 1)
+        assert_equal(Decimal(migration_status_confirmed["migrated_quantum_amount"]), migration_amount)
+        assert_equal(migration_status_confirmed["direct_quantum_outputs"], 1)
+        assert_equal(Decimal(migration_status_confirmed["direct_quantum_amount"]), migration_amount)
+
+        self.log.info("Migration permits ML-DSA spends but forbids quantum-to-legacy downgrade")
+        _, downgrade_signed = self._build_quantum_spend(
+            migration_wallet,
+            migrated_utxo,
+            wallet.getnewaddress("migration-downgrade", "legacy"),
+        )
+        assert_equal(downgrade_signed["complete"], False)
+        assert_equal(len(downgrade_signed["errors"]), 1)
+        assert "Quantum-protected spends may only create quantum outputs" in downgrade_signed["errors"][0]["error"]
+        _, quantum_signed = self._build_quantum_spend(
+            migration_wallet,
+            migrated_utxo,
+            migration["destination"],
+        )
+        assert_equal(quantum_signed["complete"], True)
+        quantum_accept = node.testmempoolaccept([quantum_signed["hex"]])[0]
+        if not quantum_accept["allowed"]:
+            raise AssertionError(f"migration-window quantum spend rejected: {quantum_accept}")
+
+        self.log.info("Restart preserves the migration key, output, and exact wallet accounting")
+        self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        loaded_wallets = set(node.listwallets())
+        for wallet_name in (WALLET_NAME, MIGRATION_WALLET_NAME):
+            if wallet_name not in loaded_wallets:
+                node.loadwallet(wallet_name)
+        wallet = node.get_wallet_rpc(WALLET_NAME)
+        migration_wallet = node.get_wallet_rpc(MIGRATION_WALLET_NAME)
+        wallet.walletpassphrase("test-passphrase", 600)
+        migration_wallet.walletpassphrase(MIGRATION_PASSPHRASE, 600)
+        migration_keys = migration_wallet.listquantumaddresses()
+        assert_equal(len(migration_keys), 1)
+        assert_equal(migration_keys[0]["address"], migration["destination"])
+        assert_equal(migration_keys[0]["stored_in_wallet"], True)
+        migrated_utxo = self._wait_for_quantum_utxo(
+            migration_wallet, migration["destination"], min_conf=1
+        )
+        assert_equal(Decimal(str(migrated_utxo["amount"])), migration_amount)
+        restart_status = migration_wallet.getmigrationstatus()
+        assert_equal(restart_status["eligible_legacy_inputs"], 0)
+        assert_equal(restart_status["direct_quantum_outputs"], 1)
+        assert_equal(Decimal(restart_status["direct_quantum_amount"]), migration_amount)
+
+        self.log.info("A one-block reorg returns the migration to the mempool without losing accounting")
+        node.invalidateblock(migration_block)
+        self.wait_until(lambda: migration["txid"] in node.getrawmempool(), timeout=20)
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(migration_wallet.gettransaction(migration["txid"])["confirmations"], 0)
+        reorg_status = migration_wallet.getmigrationstatus()
+        assert_equal(reorg_status["phase"], "migration")
+        assert_equal(reorg_status["eligible_legacy_inputs"], 0)
+        assert_equal(reorg_status["direct_quantum_outputs"], 1)
+        assert_equal(Decimal(reorg_status["direct_quantum_amount"]), migration_amount)
+        node.reconsiderblock(migration_block)
+        self.wait_until(lambda: node.getbestblockhash() == migration_block, timeout=20)
+        node.syncwithvalidationinterfacequeue()
+        assert migration["txid"] not in node.getrawmempool()
+        assert_equal(migration_wallet.gettransaction(migration["txid"])["confirmations"], 1)
+
         status = wallet.getmigrationstatus()
         assert_equal(status["phase"], "migration")
         assert_equal(status["goldrush_remigration_active"], True)
