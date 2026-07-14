@@ -404,7 +404,7 @@ void StakingMiningPage::setupUi()
         tr("System"),
         tr("Staking & Mining system guide"),
         tr("<h3>What this page controls</h3>"
-           "<p>This page brings together the new V30 staking, Gold Rush, quantum migration, cold-staking, RGB, and EUTXO controls. The dashboard shows the current state first. The tabs below contain actions.</p>"
+           "<p>This page brings together the new V30 staking, Gold Rush, quantum migration, cold-staking, RGB, and EUTXO inspection surfaces. The dashboard shows the current state first. The tabs below contain actions.</p>"
            "<h3>The safe order</h3>"
            "<ol>"
            "<li><b>Keep legacy staking online</b> while Gold Rush runs. Legacy staking secures the base chain and can also produce PoS Gold Rush eligibility.</li>"
@@ -1100,7 +1100,7 @@ void StakingMiningPage::setupUi()
         tr("<h3>What migration means</h3>"
            "<p>Migration moves value from legacy spend paths into quantum witness outputs. During the transition, upgraded nodes track both the legacy ledger and the quantum ledger rules.</p>"
            "<h3>Legacy to quantum</h3>"
-           "<p>Use Move legacy to quantum to sweep spendable legacy wallet funds to a fresh wallet-backed quantum address. Back up the wallet after creating new quantum addresses.</p>"
+           "<p>During Gold Rush, create and back up quantum addresses or use dry-run planning only. Ordinary v14/v16 funding and spending begin at Migration height 6,193,000. Then use Move legacy to quantum to sweep spendable legacy wallet funds to a fresh wallet-backed quantum address before Final height 6,922,000.</p>"
            "<h3>Gold Rush rewards</h3>"
            "<p>Gold Rush reward outputs remain locked throughout Gold Rush. After normal maturity and the Gold Rush boundary, the original outputs become ordinary direct quantum funds. Optional consolidation can organize outputs or rotate keys, but it is not required.</p>"
            "<h3>What to watch</h3>"
@@ -1114,11 +1114,11 @@ void StakingMiningPage::setupUi()
         tr("Demurrage"),
         tr("Demurrage and liveness attestations"),
         tr("<h3>Purpose</h3>"
-           "<p>Demurrage is a post-migration inactivity rule for quantum outputs. It is not active during Gold Rush and does not replace the migration deadline.</p>"
+           "<p>Demurrage is a post-migration inactivity rule for eligible quantum outputs. It is inactive during Gold Rush and Migration, then starts automatically with Final Lockout at height 6,922,000.</p>"
            "<h3>Attestations</h3>"
            "<p>A liveness attestation is a small fee-paying transaction for a selected quantum address. It proves the key is still being actively maintained and resets the inactivity clock for that key.</p>"
-           "<h3>Exemptions</h3>"
-           "<p>Cold-stake contract outputs, treasury outputs, young outputs, and recently attested keys are guarded according to the consensus rules. The panel shows the current exposure, effective value, and guard state.</p>"),
+           "<h3>Scope and burn</h3>"
+           "<p>Direct, tiered, and cold-stake quantum outputs are subject to the inactivity schedule; delegation alone is not exempt, and mainnet configures no exempt scripts. Any decay realized by a valid spend is permanently burned and is not paid to a miner, staker, treasury, reward pool, or claim participant. The panel shows current exposure, effective value, and guard state.</p>"),
         migrationBox);
     auto* assetHelp = makeHelpButton(
         tr("Assets"),
@@ -1126,11 +1126,11 @@ void StakingMiningPage::setupUi()
         tr("<h3>RGB assets</h3>"
            "<p>RGB records wallet-known client-side asset state. The table shows assets, balances, supply, assignments, and contract identifiers known to this wallet.</p>"
            "<h3>EUTXO states</h3>"
-           "<p>EUTXO records extended UTXO metadata such as datum and validator commitments. This is advanced state data for contract-like flows.</p>"
+           "<p>EUTXO records persisted metadata for the reserved witness-v15 datum/validator commitment shape.</p>"
            "<h3>Current workflow status</h3>"
-           "<p>The wallet can display known RGB and EUTXO state. Guided creation, transfer, import, and export flows remain advanced console workflows until those screens are built out further.</p>"
+           "<p>The wallet can display known RGB state and EUTXO metadata. EUTXO v15 is frozen in v30.1.1: funding and spending are disabled, creation RPCs intentionally fail, and this table is inspection-only. Do not send BLK to a v15 address. RGB consignment workflows remain advanced console operations until guided screens are built.</p>"
            "<h3>Safe use</h3>"
-           "<p>Use the tables for inspection. Do not assume an asset or state transition is complete until the corresponding wallet or RPC workflow reports the transition as accepted and confirmed.</p>"),
+           "<p>Use the tables for inspection. Do not assume an RGB asset transfer is complete until the corresponding wallet or RPC workflow reports it as accepted and confirmed.</p>"),
         migrationBox);
 
     r = 0;
@@ -2663,8 +2663,8 @@ void StakingMiningPage::updateStatus()
         }
     }
     m_eutxo_status->setText(eutxo_states.empty()
-        ? tr("No EUTXO state metadata is stored in this wallet yet.")
-        : tr("%1 EUTXO state record(s) loaded. Use the RPC console for create/verify transition tooling until the guided EUTXO workflow is complete.")
+        ? tr("No EUTXO inspection metadata is stored in this wallet. Witness v15 remains frozen in v30.1.1.")
+        : tr("%1 EUTXO metadata record(s) loaded for inspection only. Witness-v15 funding and spending are disabled in v30.1.1; do not send BLK to these addresses.")
               .arg(static_cast<int>(eutxo_states.size())));
 
     const std::vector<interfaces::WalletQuantumAddressInfo> quantum_addresses = w.listQuantumAddresses();

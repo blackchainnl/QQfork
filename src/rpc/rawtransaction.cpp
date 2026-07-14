@@ -307,7 +307,7 @@ static std::vector<RPCArg> CreateTxDoc()
                     {
                         {"data", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "A key-value pair. The key must be \"data\", the value is hex-encoded data"},
                         {"rgb_commitment", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "A key-value pair. The key must be \"rgb_commitment\", the value is a 32-byte RGB state commitment"},
-                        {"eutxo", RPCArg::Type::OBJ, RPCArg::Optional::NO, "A key-value pair. The key must be \"eutxo\", the value describes a V4 EUTXO commitment",
+                        {"eutxo", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Reserved witness-v15 output shape. Disabled in v30.1.1; supplying this key always fails. Do not fund EUTXO addresses.",
                             {
                                 {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The amount in " + CURRENCY_UNIT},
                                 {"datum", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Hex-encoded datum committed by the EUTXO output"},
@@ -976,7 +976,8 @@ static RPCHelpMan decodeeutxospend()
     return RPCHelpMan{"decodeeutxospend",
                 "Decode EUTXO witness spend candidates from a hex-encoded transaction.\n"
                 "WARNING: This matches ANY input with >=3 witness items (e.g. P2WSH multisig or tapscript spends). "
-                "The extracted elements are unverified candidates; tooling should not treat this as authoritative.\n",
+                "The extracted elements are unverified candidates; tooling should not treat this as authoritative. "
+                "This RPC is inspection-only. v30.1.1 disables witness-v15 funding and spending.\n",
                 {
                     {"hexstring", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The transaction hex string"},
                 },
@@ -2992,7 +2993,8 @@ static RPCHelpMan verifyeutxospend()
         "Authoritatively decode EUTXO (witness-v15) spends in a transaction by resolving each\n"
         "input's prevout from the UTXO set and mempool. Unlike decodeeutxospend, this only\n"
         "reports inputs whose prevout is a real EUTXO commitment, and verifies that the witness\n"
-        "[datum, redeemer, validator] reproduces the committed 32-byte program.\n",
+        "[datum, redeemer, validator] reproduces the committed 32-byte program. This is an\n"
+        "inspection result, not spend authorization: v30.1.1 rejects v15 funding and spending.\n",
         {
             {"tx", RPCArg::Type::STR_HEX, RPCArg::Optional::NO,
              "Transaction hex, or a txid known to the node (raw mempool/index or confirmed)"},
@@ -3000,7 +3002,7 @@ static RPCHelpMan verifyeutxospend()
         RPCResult{RPCResult::Type::OBJ, "", "",
             {
                 {RPCResult::Type::STR, "validity", "Always \"disabled\" in v30.1.1; decoded details are inspection-only"},
-                {RPCResult::Type::ARR, "spends", "Confirmed EUTXO spends in this transaction",
+                {RPCResult::Type::ARR, "spends", "Matched EUTXO-shaped inputs in this inspected transaction; not authorization to spend",
                  {
                      {RPCResult::Type::OBJ, "", "",
                       {
@@ -3162,12 +3164,9 @@ static RPCHelpMan verifyeutxospend()
 static RPCHelpMan createeutxospend()
 {
     return RPCHelpMan{"createeutxospend",
-        "Build an unsigned transaction that spends a Blackcoin EUTXO (witness-v15)\n"
-        "commitment output. The commitment input's witness is fully populated as\n"
-        "[datum, redeemer, validator]; the surrounding transaction is NOT funded or signed.\n"
-        "Fund it with fundrawtransaction and sign any added inputs with\n"
-        "signrawtransactionwithwallet. The EUTXO input itself needs no signature unless the\n"
-        "validator script requires one inside the redeemer.\n",
+        "Disabled in v30.1.1. Witness v15 has no quantum ownership authorization, so this\n"
+        "command always fails and cannot create an EUTXO spend. Use decodeeutxospend or\n"
+        "verifyeutxospend only to inspect existing transaction data. Do not fund v15 outputs.\n",
         {
             {"eutxo_commitment", RPCArg::Type::OBJ, RPCArg::Optional::NO,
              "The EUTXO commitment output being spent",
@@ -3186,16 +3185,8 @@ static RPCHelpMan createeutxospend()
              }},
             {"locktime", RPCArg::Type::NUM, RPCArg::Default{0}, "Raw locktime."},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "",
-            {
-                {RPCResult::Type::STR_HEX, "hex", "Unsigned transaction hex, EUTXO input witness populated"},
-                {RPCResult::Type::STR_HEX, "expected_program", "The 32-byte program recomputed from datum+validator"},
-                {RPCResult::Type::STR, "address", "The expected eutxo_commitment address of the spent output"},
-            }},
-        RPCExamples{
-            HelpExampleCli("createeutxospend",
-                "'{\"txid\":\"...\",\"vout\":0,\"datum\":\"01\",\"validator\":\"51\",\"redeemer\":\"\"}' '[{\"bcrt1...\":0.5}]'")
-        },
+        RPCResult{RPCResult::Type::NONE, "", "No result; v30.1.1 always returns the EUTXO-disabled error"},
+        RPCExamples{""},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     throw JSONRPCError(RPC_INVALID_PARAMETER,
@@ -3257,10 +3248,9 @@ static RPCHelpMan createeutxospend()
 static RPCHelpMan createeutxotransition()
 {
     return RPCHelpMan{"createeutxotransition",
-        "Build an unsigned transaction that spends a Blackcoin EUTXO commitment\n"
-        "into a committed successor EUTXO state. The structured redeemer is enforced by\n"
-        "consensus: if a redeemer begins with QQEUTXO1, the transaction must create the\n"
-        "exact successor output encoded in that redeemer.\n",
+        "Disabled in v30.1.1. Witness v15 has no quantum ownership authorization, so this\n"
+        "command always fails and cannot create a successor EUTXO state. Decode and verify\n"
+        "RPCs remain inspection-only. Do not fund v15 outputs.\n",
         {
             {"eutxo_commitment", RPCArg::Type::OBJ, RPCArg::Optional::NO,
              "The EUTXO commitment output being spent",
@@ -3280,19 +3270,8 @@ static RPCHelpMan createeutxotransition()
              }},
             {"locktime", RPCArg::Type::NUM, RPCArg::Default{0}, "Raw locktime."},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "",
-            {
-                {RPCResult::Type::STR_HEX, "hex", "Unsigned transaction hex, EUTXO input witness populated"},
-                {RPCResult::Type::STR_HEX, "redeemer", "Structured transition redeemer placed in the input witness"},
-                {RPCResult::Type::STR_HEX, "spent_program", "The 32-byte program recomputed from the spent datum+validator"},
-                {RPCResult::Type::STR_HEX, "successor_program", "The 32-byte program committed by the successor EUTXO output"},
-                {RPCResult::Type::NUM, "successor_vout", "The successor output index encoded in the redeemer"},
-                {RPCResult::Type::STR, "successor_address", "The successor eutxo_commitment address"},
-            }},
-        RPCExamples{
-            HelpExampleCli("createeutxotransition",
-                "'{\"txid\":\"...\",\"vout\":0,\"datum\":\"01\",\"validator\":\"51\"}' '{\"amount\":0.5,\"datum\":\"02\",\"validator\":\"51\"}'")
-        },
+        RPCResult{RPCResult::Type::NONE, "", "No result; v30.1.1 always returns the EUTXO-disabled error"},
+        RPCExamples{""},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     throw JSONRPCError(RPC_INVALID_PARAMETER,

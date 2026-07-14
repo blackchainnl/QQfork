@@ -1,5 +1,21 @@
 # Changelog
 
+## v30.1.1 candidate
+
+- Mainnet lifecycle decisions are height-authoritative: Gold Rush is
+  5,950,000-6,192,999, Migration is 6,193,000-6,921,999, and Final Lockout
+  begins at 6,922,000. During Gold Rush, quantum address generation and dry-run
+  planning are available, but ordinary v14/v16 funding and spending are not.
+- Demurrage activates automatically with the first Final block. Any
+  nominal-minus-effective principal realized by a valid spend is permanently
+  burned; it is not paid to a miner, staker, treasury, shadow pool, or claim
+  participant. Cold-stake outputs are subject to the inactivity schedule, and
+  mainnet configures no exempt scripts.
+- Witness-v15 EUTXO funding and spending are frozen because the commitment does
+  not authenticate a quantum owner. The creation RPCs intentionally fail.
+  Decode/verify RPCs and persisted wallet metadata remain available only for
+  inspection; users must not send BLK to v15 addresses.
+
 ## v30.1.0, Quantum Quasar production release
 
 Protocol V4 (Quantum Quasar) hardening release. This is the intended mainnet
@@ -18,7 +34,7 @@ upgrade steps.
 
 - **Staking & Mining tab now opens instantly.** The first time the tab is shown it
   performs only a cheap, cached status update; the expensive Gold Rush, migration,
-  cold-staking, RGB, and EUTXO detail panels load on demand behind a new
+  cold-staking, RGB, and EUTXO-metadata detail panels load on demand behind a new
   **"Refresh details"** button (or automatically after a wallet-changing action).
   Removed the per-show full-wallet sweep and the live `GetStakeWeight()` coin scan
   from the first-show path, which lagged large wallets.
@@ -61,9 +77,12 @@ Highlights (full detail in the white paper):
 
 - **Post-quantum cryptography.** ML-DSA-44 (FIPS 204) signatures via liboqs as a
   consensus-verified spending path, with a startup Known-Answer-Test. New SegWit
-  witness versions: v16 quantum migration, v15 EUTXO, v14 quantum cold-stake.
-- **V4 phase schedule.** Time-gated (MTP) activation into Legacy → Gold Rush (180
-  days) → Migration (540 days) → Final Lockout (V4 + 24 months), after which legacy
+  witness versions: v16 quantum migration and v14 quantum cold-stake. Witness
+  v15 was reserved for EUTXO work and is frozen in v30.1.1 pending a
+  quantum-authenticated ownership design.
+- **V4 phase schedule.** The original time anchors define nominal durations.
+  v30.1.1 makes the mainnet Legacy -> Gold Rush (180 days) -> Migration (540
+  days) -> Final Lockout schedule height-authoritative, after which legacy
   ECDSA spends are permanently disabled.
 - **Gold Rush epoch.** Deterministic whitelist snapshot of ≥10,000 BLK accounts; a
   180-day bonus emission (580 BLK/block halving every 43,200 blocks, then a 463
@@ -72,16 +91,18 @@ Highlights (full detail in the white paper):
 - **Quantum migration.** `migratetoquantum` sweeps legacy coins into ML-DSA
   migration addresses; keys are stored before funds move. `migrategoldrushrewards`,
   `getmigrationstatus`, and full quantum-address RPCs.
-- **Demurrage.** Liveness mechanism on directly-held quantum outputs: a 6-month
-  grace period, then quadratic decay to zero over 18 months, with reclaimed value
-  flowing to active stakers. Kept at 100% by automatic ML-DSA liveness attestations
-  (auto-sent every 3 months), by cold-stake delegation (exempt), or by any use.
+- **Demurrage.** Liveness mechanism on eligible quantum outputs: a 6-month
+  grace period, then quadratic decay to zero over 18 months. v30.1.1's approved
+  rule permanently burns realized decay. Automatic ML-DSA liveness
+  attestations keep eligible direct quantum outputs current; cold-stake
+  delegation alone is not exempt, while a successful coinstake refreshes the
+  recreated output.
 - **Quantum staking.** Tiered self-staking with consensus-visible bonding/unbonding;
   cold staking with owner/staker key separation; 30-day operator bonds; a 20%
   per-pool policy cap; and autonomous, rate-limited redelegation.
-- **Advanced primitives.** EUTXO (witness v15) datum+validator smart-contract
-  outputs and RGB client-side-validated asset commitments, with raw and wallet
-  tooling.
+- **Advanced primitives.** RGB client-side-validated asset commitments. The
+  EUTXO witness-v15 datum/validator encoding and inspection metadata remain in
+  the source, but v30.1.1 disables its creation, funding, and spending paths.
 - **First-run data migration.** Copy-only import of a legacy `~/.blackmore` data
   directory into `~/.blackcoin`, leaving the original intact.
 - **Rebranding** to Blackcoin daemon/CLI/wallet/Qt binaries with preserved

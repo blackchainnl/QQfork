@@ -1257,7 +1257,7 @@ static std::vector<RPCArg> OutputsDoc()
             {
                 {"data", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "A key-value pair. The key must be \"data\", the value is hex-encoded data"},
                 {"rgb_commitment", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "A key-value pair. The key must be \"rgb_commitment\", the value is a 32-byte RGB state commitment"},
-                {"eutxo", RPCArg::Type::OBJ, RPCArg::Optional::NO, "A key-value pair. The key must be \"eutxo\", the value describes a V4 EUTXO commitment",
+                {"eutxo", RPCArg::Type::OBJ, RPCArg::Optional::NO, "Reserved witness-v15 output shape. Disabled in v30.1.1; supplying this key always fails. Do not fund EUTXO addresses.",
                     {
                         {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The amount in " + CURRENCY_UNIT},
                         {"datum", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Hex-encoded datum committed by the EUTXO output"},
@@ -1841,6 +1841,8 @@ RPCHelpMan migratetoquantum()
     return RPCHelpMan{"migratetoquantum",
         "\nSweep all spendable legacy (non-quantum) coins in this wallet into a single\n"
         "wallet-backed Blackcoin ML-DSA migration (witness-v16) address.\n"
+        "\nOn mainnet, Gold Rush permits address preparation and dry-run planning only.\n"
+        "Funding begins at Migration height 6,193,000 and ends after height 6,921,999.\n"
         "\nThe destination ML-DSA key is generated and written to the wallet database BEFORE\n"
         "any funds are moved; the call refuses to proceed unless the key is confirmed stored.\n"
         "Because ML-DSA keys are NOT derived from the wallet seed, you MUST back up the wallet\n"
@@ -1860,7 +1862,7 @@ RPCHelpMan migratetoquantum()
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::STR, "phase", "current Blackcoin phase"},
-            {RPCResult::Type::NUM_TIME, "deadline_mtp", "final migration deadline MTP (0 if unscheduled)"},
+            {RPCResult::Type::NUM_TIME, "deadline_mtp", "forecast final migration time (0 if unscheduled; non-authoritative for the mainnet height schedule)"},
             {RPCResult::Type::NUM, "eligible_inputs", "count of legacy UTXOs swept"},
             {RPCResult::Type::STR_AMOUNT, "eligible_amount", "total legacy value selected"},
             {RPCResult::Type::STR, "destination", "quantum address funds were sent to"},
@@ -2036,7 +2038,7 @@ RPCHelpMan migrategoldrushrewards()
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::STR, "phase", "current Blackcoin phase"},
-            {RPCResult::Type::NUM_TIME, "deadline_mtp", "final migration deadline MTP"},
+            {RPCResult::Type::NUM_TIME, "deadline_mtp", "forecast final migration time (non-authoritative for the mainnet height schedule)"},
             {RPCResult::Type::NUM, "eligible_inputs", "count of Gold Rush reward UTXOs moved"},
             {RPCResult::Type::STR_AMOUNT, "eligible_amount", "nominal Gold Rush reward value selected (compatibility field)"},
             {RPCResult::Type::STR_AMOUNT, "effective_eligible_amount", "spendable value after scheduled demurrage"},
@@ -3576,8 +3578,9 @@ static UniValue EUTXOStateToJSON(const COutPoint& outpoint, const EUTXOStateReco
 RPCHelpMan importeutxostate()
 {
     return RPCHelpMan{"importeutxostate",
-        "\nPersist EUTXO datum/validator metadata for a wallet-known state output.\n"
-        "If the outpoint is currently unspent, the live UTXO must match the supplied EUTXO commitment.\n",
+        "\nPersist inspection-only EUTXO datum/validator metadata for a wallet-known output.\n"
+        "If the outpoint is currently unspent, the live UTXO must match the supplied EUTXO commitment.\n"
+        "This does not authorize or enable v15 funding or spending; both are disabled in v30.1.1.\n",
         {
             {"state", RPCArg::Type::OBJ, RPCArg::Optional::NO, "EUTXO state metadata",
              {
@@ -3643,7 +3646,8 @@ RPCHelpMan importeutxostate()
 RPCHelpMan listeutxostates()
 {
     return RPCHelpMan{"listeutxostates",
-        "\nList wallet-persisted EUTXO state metadata.\n",
+        "\nList inspection-only wallet-persisted EUTXO state metadata. v30.1.1 disables\n"
+        "witness-v15 funding and spending; listed records are not spendability claims.\n",
         {
             {"include_spent", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include state metadata whose on-chain UTXO is already spent."},
         },
@@ -3697,7 +3701,7 @@ RPCHelpMan getmigrationstatus()
         {},
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::STR, "phase", "legacy | gold_rush | migration | final_lockout"},
-            {RPCResult::Type::NUM_TIME, "mediantime", "tip median-time-past driving the schedule"},
+            {RPCResult::Type::NUM_TIME, "mediantime", "tip median-time-past used for forecasts and time-only test schedules; not mainnet phase authority"},
             {RPCResult::Type::NUM_TIME, "deadline_mtp", "forecast final migration deadline time (0 if unscheduled; non-authoritative when height boundaries are enabled)"},
             {RPCResult::Type::NUM, "deadline_height", "authoritative final Migration block height (0 for a time-only test schedule)"},
             {RPCResult::Type::BOOL, "deadline_scheduled", "whether a deadline is configured"},

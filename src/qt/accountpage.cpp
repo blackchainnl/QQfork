@@ -223,7 +223,7 @@ OutputRowDetail describeOutput(const CTxDestination& dest,
     if (detail.family == QObject::tr("Legacy")) {
         detail.notes = QObject::tr("Legacy spend path. Use for current-chain fees, sends, and legacy staking.");
     } else if (detail.family == QObject::tr("EUTXO")) {
-        detail.notes = QObject::tr("Extended UTXO state. Do not spend as ordinary BLK unless a guided workflow says to.");
+        detail.notes = QObject::tr("EUTXO v15 is frozen in v30.1.1. This row is inspection-only; funding and spending are disabled. Do not send BLK to it.");
     }
     return detail;
 }
@@ -247,7 +247,7 @@ QString addressNote(const QString& family)
     if (family == QObject::tr("Legacy")) return QObject::tr("Legacy spend path. Use for current-chain fees, sends, and legacy staking.");
     if (family == QObject::tr("Quantum")) return QObject::tr("Direct quantum spend path. Gold Rush rewards remain locked until Gold Rush ends, then require no preliminary move after maturity.");
     if (family == QObject::tr("Cold stake")) return QObject::tr("Cold-stake contract path. Owner and staker authority are separated.");
-    if (family == QObject::tr("EUTXO")) return QObject::tr("Extended UTXO state. Do not spend as ordinary BLK unless a guided workflow says to.");
+    if (family == QObject::tr("EUTXO")) return QObject::tr("EUTXO v15 is frozen in v30.1.1. This row is inspection-only; funding and spending are disabled. Do not send BLK to it.");
     return QObject::tr("Nonstandard or wallet-internal script group.");
 }
 

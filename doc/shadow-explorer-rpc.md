@@ -209,6 +209,11 @@ recognized direct-quantum, EUTXO, quantum-cold-stake, or unknown bridge
 handling. Authenticated synthetic Gold Rush payouts are reported separately
 and are not misclassified as base-chain witness creations.
 
+`recognized_eutxo` identifies only the exact reserved v15 script shape. It does
+not mean the output is enabled or spendable. v30.1.1 provides no supported v15
+funding or spending workflow, and consensus rejects v15 outputs and spends from
+Migration onward because that commitment has no quantum ownership authorization.
+
 The default `utxos` view works without `-shadowindex`. With a synchronized
 index, the response also reconciles current UTXOs against all base-block
 witness-version >1 creations since genesis, including creations that were

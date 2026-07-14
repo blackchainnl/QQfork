@@ -109,7 +109,7 @@ QString UnlockGuide()
     return QObject::tr(R"HTML(
 <h2>Unlock modes in practical terms</h2>
 <p><b>Locked</b> means the wallet cannot sign transactions. It can display balances and receive funds, but it cannot stake or create claim/migration transactions.</p>
-<p><b>Legacy staking-only unlock</b> is the conservative mode for ordinary PoS staking. It is useful when the user wants this node to stake without leaving the wallet able to spend. It does not sign quantum migration, PoW claim, PoS signal, cold-stake setup, or RGB/EUTXO transactions.</p>
+<p><b>Legacy staking-only unlock</b> is the conservative mode for ordinary PoS staking. It is useful when the user wants this node to stake without leaving the wallet able to spend. It does not sign quantum migration, PoW claim, PoS signal, cold-stake setup, or RGB transactions. EUTXO v15 has no enabled signing path in v30.1.1.</p>
 <p><b>Quantum and Legacy Staking unlock</b> is a normal unlock. Use it when the wallet needs to sign active transition transactions. This includes Gold Rush PoS signal publication, PoW claim submission, optional reward consolidation, migration, cold-stake delegation, node bonding, and demurrage attestations.</p>
 <p><b>Rule:</b> if the action changes where coins are spendable, creates a new quantum state, or anchors a claim, it needs normal unlock.</p>
 )HTML");
@@ -148,6 +148,7 @@ QString MigrationGuide()
 <h2>Migration and final lockout</h2>
 <p>Migration is the process of moving control from legacy spend paths to quantum-resistant witness programs. During the transition, upgraded wallets track both legacy ledger activity and quantum state so users can prepare without abruptly breaking ordinary chain use.</p>
 <p><b>Legacy left</b> means value is still controlled by old signatures. <b>Quantum held</b> means value is already controlled by quantum keys. <b>Gold Rush locked</b> means reward outputs are recorded but cannot be spent until Gold Rush has ended and normal maturity is satisfied.</p>
+<p>During Gold Rush, create and back up quantum addresses or use dry-run planning only. Ordinary v14/v16 funding and spending begin at Migration height 6,193,000. Final Lockout and automatic demurrage begin at height 6,922,000.</p>
 
 <h3>Simple migration example</h3>
 <ol>
@@ -172,10 +173,10 @@ QString DemurrageGuide()
 {
     return QObject::tr(R"HTML(
 <h2>Demurrage and liveness attestations</h2>
-<p>Demurrage is a post-migration inactivity rule for direct quantum outputs. It is not intended to surprise users during Gold Rush. It becomes relevant after the quantum migration schedule has reached the phase where inactive quantum keys need periodic proof of maintenance.</p>
+<p>Demurrage is an inactivity rule for eligible direct, tiered, and cold-stake quantum outputs. It is inactive throughout Gold Rush and Migration, then activates automatically with Final Lockout at height 6,922,000.</p>
 <p>A liveness attestation is a small fee-paying transaction that proves the controlling quantum key is still actively managed. The wallet can create attestations for wallet-backed quantum addresses.</p>
 <p><b>Example:</b> a user has a direct quantum output that has not moved for many months. Before it begins to lose effective value, the wallet can send an attestation for that key. The Account tab shows whether outputs are decaying, locked, or protected by a recent attestation.</p>
-<p>Cold-stake outputs are treated differently because they are already in an active staking commitment. Treasury and other protected categories follow their own consensus exemptions.</p>
+<p>Cold-stake delegation alone is not exempt; a successful coinstake spends and recreates the output and refreshes its activity. Mainnet configures no exempt scripts. Any nominal-minus-effective principal realized by a spend is permanently burned and is never paid to a miner, staker, treasury, reward pool, or claim participant.</p>
 )HTML");
 }
 
@@ -183,12 +184,12 @@ QString AssetsGuide()
 {
     return QObject::tr(R"HTML(
 <h2>RGB and EUTXO state</h2>
-<p>RGB and EUTXO features add advanced wallet-visible state beyond ordinary BLK balances.</p>
+<p>RGB features and EUTXO inspection metadata add wallet-visible state beyond ordinary BLK balances.</p>
 <ul>
 <li><b>RGB</b> tracks client-side asset contracts, assignments, and proofs. The wallet can show known assets, balances, contracts, and assignment counts.</li>
-<li><b>EUTXO</b> tracks extended UTXO commitments such as datum and validator data. It is a foundation for contract-like state transitions.</li>
+<li><b>EUTXO</b> tracks persisted metadata for the reserved witness-v15 datum/validator commitment shape.</li>
 </ul>
-<p><b>Important:</b> seeing an RGB asset or EUTXO state in the wallet is not the same thing as completing a transfer. Advanced state transitions need the matching proof/consignment/validator workflow. Until a guided flow says the transfer is accepted and confirmed, treat the table as inspection data.</p>
+<p><b>Important:</b> EUTXO v15 is frozen in v30.1.1 because it has no quantum ownership authorization. Funding and spending are disabled, creation RPCs intentionally fail, and the table is inspection-only. Do not send BLK to a v15 address. Seeing RGB state is likewise not proof that a transfer is complete; use the validated consignment workflow.</p>
 <p><b>Example:</b> an RGB asset may show a balance and a contract id. The contract id identifies the asset. The assignments show where wallet-known units are anchored. A future guided transfer flow should build and verify the consignment before the sender considers the transfer complete.</p>
 )HTML");
 }
@@ -210,7 +211,7 @@ QString AccountSpecificGuide()
 <p><b>Finding spendable legacy BLK:</b> choose the Legacy filter. These are the coins the wallet can use for ordinary legacy sends, control transaction fees, and legacy staking.</p>
 <p><b>Finding quantum reward coins:</b> choose the Quantum filter. During Gold Rush, reward outputs are phase-locked. After Gold Rush and maturity, the original outputs are ordinary direct quantum funds; optional consolidation is not a spendability requirement.</p>
 <p><b>Checking cold-stake deposits:</b> choose Cold stake. Those rows represent funds in cold-staking contracts. They may be owner-spendable by this wallet, stakable by a selected node, or both, depending on the contract.</p>
-<p><b>Auditing advanced assets:</b> use the RGB/EUTXO summary cards and filters to see whether this wallet has contract state attached to specific outputs. Avoid spending protected asset/state outputs as ordinary BLK unless the wallet's guided workflow says that is intended.</p>
+<p><b>Auditing advanced assets:</b> use the RGB/EUTXO summary cards and filters to inspect wallet-known metadata. EUTXO v15 funding and spending are disabled in v30.1.1; an EUTXO row is a warning, not an available contract workflow.</p>
 )HTML");
 }
 

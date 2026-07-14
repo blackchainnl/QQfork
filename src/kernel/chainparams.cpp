@@ -142,8 +142,9 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_QUANTUM_QUASAR].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_QUANTUM_QUASAR].min_activation_height = 0;
 
-        // Post-quantum migration readiness signalling. The final lockout deadline is the
-        // deterministic 24-month deadline, not the versionbits state.
+        // Post-quantum migration readiness signalling. The mainnet lifecycle
+        // heights below, not versionbits state or nominal time anchors, decide
+        // Final Lockout.
         consensus.vDeployments[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].bit = 4;
         consensus.vDeployments[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].nStartTime = 1713938400;
         consensus.vDeployments[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
@@ -153,7 +154,7 @@ public:
         consensus.nProtocolV2Time = 1407053625;
         consensus.nProtocolV3Time = 1444028400;
         consensus.nProtocolV3_1Time = 1713938400;
-        consensus.nProtocolV4Time = Consensus::QUANTUM_QUASAR_MAINNET_V4_TIME; // Future date for mainnet
+        consensus.nProtocolV4Time = Consensus::QUANTUM_QUASAR_MAINNET_V4_TIME; // Nominal forecast anchor; mainnet phases are height-authoritative.
         consensus.nGoldRushEndTime = consensus.nProtocolV4Time + Consensus::QUANTUM_QUASAR_GOLD_RUSH_SECONDS;
         consensus.nQuantumMigrationDeadlineTime = consensus.nGoldRushEndTime + Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS;
         consensus.nQuantumLifecycleStartHeight = MAINNET_SHADOW_REWARD_START_HEIGHT;

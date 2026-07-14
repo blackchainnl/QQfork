@@ -130,9 +130,15 @@ Notable changes
   superseded height-5,950,000 competing-claim boundary or incomplete
   proof-mode and spend-anchor classification. Shadowindex schema 7 persists
   ordered spend anchors for bounded event construction.
-- ML-DSA quantum spends, EUTXO spends, larger post-quantum script elements, and
-  expanded block limits are deferred until after the Gold Rush reward-height
-  window, during the migration/final-lockout phases.
+- Ordinary v14/v16 quantum funding, ML-DSA spends, and larger post-quantum
+  script elements remain disabled throughout Gold Rush and activate at
+  Migration height 6,193,000. Gold Rush credits remain phase-locked until that
+  boundary. Witness-v15 EUTXO funding and spending stay disabled in Migration
+  and Final because v15 has no quantum ownership authorization.
+- Mainnet phase changes are height-authoritative: Gold Rush ends at 6,192,999,
+  Migration ends at 6,921,999, and Final Lockout plus permanent-burn demurrage
+  begin automatically at 6,922,000. Readiness signalling does not vote these
+  transitions into effect.
 - Legacy data-directory migration remains in place so existing Blackcoin users
   can move to Blackcoin without manually relocating wallet or chain data.
 - Version-2 transactions omit their legacy transaction-time field from the
@@ -143,8 +149,13 @@ Notable changes
 
 ### Wallet and RPC
 
-- Quantum address, Gold Rush, PoW miner, cold-staking, RGB, and EUTXO RPC
-  surfaces are present for testnet validation.
+- Quantum address, Gold Rush, PoW miner, cold-staking, and RGB RPC surfaces are
+  present for validation. EUTXO decode/verify and persisted-metadata RPCs remain
+  available for inspection, while EUTXO creation, funding, and spending RPCs
+  intentionally fail in v30.1.1.
+- Demurrage removes nominal-minus-effective principal by permanent burn. The
+  removed value is not paid to a miner, staker, treasury, shadow pool, or claim
+  participant.
 - The optional shadow index exposes versioned block, transaction, original
   outpoint, address, and exact-script history. `getshadowsupply` adds an
   explicitly synthetic lifecycle contract for scheduled, pooled, issued,

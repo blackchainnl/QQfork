@@ -31,7 +31,7 @@ RULE = colors.HexColor("#c8b273")
 SUBS = {
     "✅": "Yes", "❌": "No", "→": "->", "≤": "<=", "≥": ">=",
     "≈": "~", "−": "-", "×": "x", "…": "...", "‑": "-",
-    "​": "", "️": "", "–": "–", "—": "—",
+    "​": "", "️": "", "–": "-", "—": "-",
 }
 def sanitize(s):
     for k, v in SUBS.items():
@@ -122,7 +122,7 @@ def cover(canv, doc):
     canv.drawCentredString(w/2, 1.95*inch, "Quantum Quasar Developers")
     canv.setFillColor(colors.HexColor("#bbbbbb"))
     canv.setFont("Helvetica", 9.5)
-    canv.drawCentredString(w/2, 1.65*inch, "Version 30.1.0  •  July 2026")
+    canv.drawCentredString(w/2, 1.65*inch, "Version 30.1.1 Candidate - July 2026")
     canv.drawCentredString(w/2, 1.42*inch, "https://github.com/Blackcoin-Dev/Blackcoin")
     canv.restoreState()
 
@@ -134,8 +134,8 @@ def furniture(canv, doc):
     canv.line(0.9*inch, h-0.62*inch, w-0.9*inch, h-0.62*inch)
     canv.setFont("Helvetica", 7.6)
     canv.setFillColor(GREY)
-    canv.drawString(0.9*inch, h-0.55*inch, "Blackcoin Quantum Quasar — Protocol V4")
-    canv.drawRightString(w-0.9*inch, h-0.55*inch, "Technical White Paper • v30.1.0")
+    canv.drawString(0.9*inch, h-0.55*inch, "Blackcoin Quantum Quasar - Protocol V4")
+    canv.drawRightString(w-0.9*inch, h-0.55*inch, "Technical White Paper - v30.1.1 Candidate")
     canv.line(0.9*inch, 0.72*inch, w-0.9*inch, 0.72*inch)
     canv.setFont("Helvetica", 8)
     canv.drawCentredString(w/2, 0.5*inch, str(canv.getPageNumber()))
@@ -282,7 +282,7 @@ def parse(md_lines):
                 i += 1
             flow.append(Paragraph(inline(" ".join(buf)), BULLET, bulletText=m.group(1)+"."))
             continue
-        if s.startswith("**Version 30.1.0"):
+        if s.startswith("**Version "):
             i += 1
             continue
         # normal paragraph: join soft-wrapped lines
@@ -308,9 +308,9 @@ DOC_KEYWORDS = ("Blackcoin, Quantum Quasar, Protocol V4, ML-DSA-44, post-quantum
 DOC_CREATOR = "Adobe Acrobat Pro 24.2.20933"
 DOC_PRODUCER = "Adobe PDF Library 24.2.159"
 # Fixed authoring/revision timestamps (America/Denver, UTC-06) for a reproducible build.
-PDF_DATE = "D:20260705120000-06'00'"
-XMP_CREATE = "2026-07-05T12:00:00-06:00"
-XMP_MODIFY = "2026-07-05T12:00:00-06:00"
+PDF_DATE = "D:20260714120000-06'00'"
+XMP_CREATE = "2026-07-14T12:00:00-06:00"
+XMP_MODIFY = "2026-07-14T12:00:00-06:00"
 
 def _xmp_packet(doc_id, inst_id):
     return ("<?xpacket begin=\"\\ufeff\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n"

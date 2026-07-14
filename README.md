@@ -15,23 +15,32 @@ helping secure the chain**.
 
 ## What Quantum Quasar delivers
 
-- **Quantum-safe signatures.** ML-DSA-44 (FIPS 204) via liboqs as a consensus-verified
-  spending path, with new SegWit witness versions for quantum migration (v16), EUTXO smart
-  contracts (v15), and quantum cold-staking (v14).
-- **A bounded, one-click migration.** A generous **24-month** window to move legacy
-  elliptic-curve coins into quantum-safe addresses with `migratetoquantum`, after which the
-  legacy spending path closes, converting a permanent, network-wide vulnerability into a
-  finite, individually-avoidable one.
+- **Quantum-safe signatures.** ML-DSA-44 (FIPS 204) via liboqs as the
+  consensus-verified spending path for quantum migration (witness v16) and
+  quantum cold-staking (v14). Witness v15 is reserved for a future EUTXO
+  design, but v30.1.1 provides no supported v15 funding or spending workflow
+  because it has no quantum ownership authorization. Consensus rejects v15
+  funding and spending from Migration onward.
+- **A bounded, one-click migration.** Gold Rush is followed by a scheduled
+  **18-month** Migration phase in which holders can move legacy elliptic-curve
+  coins into quantum-safe addresses with `migratetoquantum`. Legacy coins
+  remain spendable during Gold Rush, but ordinary quantum funding does not
+  activate until Migration. Final Lockout then closes the legacy spending path.
 - **The Gold Rush.** A 180-day bonus-emission epoch (up to 51,437,700 BLK) paid to holders
   **through staking and mining**, split 50/50 between native PoS and a light, CPU-friendly
   Argon2id PoW lane.
-- **Liveness demurrage.** Quantum coins that remain inactive for more than six months
-  slowly decay. Decayed principal is burned when spent and is never paid to a miner or
-  staker. A timely liveness attestation, ordinary spend, or successful cold-stake refresh
-  keeps the activity clock current.
+- **Liveness demurrage.** Demurrage activates automatically at the first Final
+  block. Eligible quantum coins that then remain inactive for more than six
+  months slowly decay. Decayed principal is permanently burned when spent and
+  is never paid to a miner, staker, treasury, or reward pool. A timely liveness
+  attestation, ordinary spend, or successful cold-stake refresh keeps the
+  activity clock current.
 - **Rich quantum staking.** Tiered self-staking, cold staking with owner/staker key
   separation, operator bonds, a per-pool decentralization cap, and autonomous redelegation.
-- **Advanced primitives.** EUTXO smart-contract outputs and RGB client-side asset commitments.
+- **Advanced primitives.** RGB client-side asset commitments plus
+  inspection-only EUTXO commitment decoding and wallet metadata. Do not fund a
+  witness-v15 address in v30.1.1; its creation and spend RPCs intentionally
+  fail.
 
 ## The V4 timeline (mainnet)
 
@@ -40,12 +49,16 @@ delay, or reverse a production phase transition. Durations below are estimates
 based on Blackcoin's 64-second target spacing; the listed heights are the
 consensus boundaries.
 
-| Phase | Mainnet heights | Approximate duration | Legacy spend? | Quantum spend? | Gold Rush? |
+| Phase | Mainnet heights | Approximate duration | Legacy spend? | v14/v16 funding and spending? | Gold Rush? |
 |-------|-----------------|----------------------|:---:|:---:|:---:|
-| Legacy | through 5,949,999 | — | ✅ | ❌ | ❌ |
-| Gold Rush | 5,950,000–6,192,999 | 180 days | ✅ | fundable, locked | ✅ |
-| Migration | 6,193,000–6,921,999 | 540 days | ✅ | ✅ | ❌ |
-| Final Lockout | from 6,922,000 | permanent | ❌ | ✅ | ❌ |
+| Legacy | through 5,949,999 | - | Yes | No | No |
+| Gold Rush | 5,950,000-6,192,999 | 180 days | Yes | No; shadow credits are locked | Yes |
+| Migration | 6,193,000-6,921,999 | 540 days | Yes | Yes | No |
+| Final Lockout | from 6,922,000 | permanent | No | Yes | No |
+
+Witness v15 has no supported funding or spending workflow in any v30.1.1 phase.
+From Migration onward, consensus rejects both v15 outputs and v15 spends. The
+phase table's quantum column refers only to the authenticated v14 and v16 paths.
 
 The 10,000 BLK Gold Rush whitelist snapshot is taken at height **5,945,000**. Full schedule
 and constants are in the [white paper](doc/whitepaper-quantum-quasar.md).
@@ -114,7 +127,7 @@ supplied. Migration failures abort startup rather than loading the wrong wallet.
 is enough free disk for a full copy of the selected legacy directory and its backup.
 
 > **Important:** ML-DSA quantum keys are **not** derived from your HD seed. **Back up your
-> wallet again after creating any quantum address** (migration, staking, or cold-stake), or a
+> wallet again after creating any quantum address** (migration, staking, operator, or cold-stake), or a
 > restore from an older backup will not recover those funds.
 
 ## Build
@@ -159,9 +172,10 @@ Blackcoin Quantum Quasar is a fork of, and an advancement of,
 [CoinBlack/blackcoin-more](https://github.com/CoinBlack/blackcoin-more). It targets the **same
 Blackcoin network**, Quantum Quasar is a consensus upgrade for the existing chain, not a new
 coin. All code here is MIT-licensed and **free to be re-incorporated upstream**; contributions
-in either direction are welcome. Because the V4 activation time, whitelist height, Gold Rush
-schedule, and migration deadline are consensus rules, any node that wishes to remain on the
-same chain must run identical values.
+in either direction are welcome. Mainnet phase membership is height-authoritative. The
+whitelist height, Gold Rush and Migration boundaries, and Final Lockout height are consensus
+rules, so every node that wishes to remain on the same chain must use identical height values.
+The retained timestamp anchors are nominal forecasts, not mainnet phase boundaries.
 
 ## Development notes
 

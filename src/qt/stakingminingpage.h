@@ -35,8 +35,8 @@ QT_END_NAMESPACE
  *                Wired to the existing interfaces::Wallet staking enable.
  * Bottom section - Gold Rush Proof-of-Work: a separate opt-in for the in-process (fully integrated,
  *                no external miner) Argon2id solver, with CPU-core and CPU-% throttle controls,
- *                an auto-created quantum payout address, live status, and the 18-month
- *                lock-or-forfeit warning. Wired to interfaces::Wallet PoW-mining methods.
+ *                an auto-created quantum payout address, live status, and the Gold Rush
+ *                phase-lock warning. Wired to interfaces::Wallet PoW-mining methods.
  */
 class StakingMiningPage : public QWidget
 {

@@ -1324,11 +1324,12 @@ DemurrageEvaluation EvaluateDemurrage(
         return eval;
     }
 
-    // Value-bearing EUTXO and quantum cold-stake state are permitted after
-    // Final activation and must not become permanent demurrage shelters. Their
-    // activity is expressed by spending/recreating the state output (including
-    // an actual coinstake); unlike a direct quantum key they have no separate
-    // liveness-attestation identity.
+    // Quantum cold-stake state is permitted after Final activation and must not
+    // become a permanent demurrage shelter. Its activity is expressed by an
+    // actual spend/recreation (including a coinstake), not a direct-key
+    // attestation. Historical v15-shaped outputs remain classified here for
+    // complete accounting, but v30.1.1 independently rejects their funding and
+    // spending because they have no quantum ownership authorization.
     if (!IsQuantumMigrationScript(coin.out.scriptPubKey) &&
         !IsQuantumColdStakeScript(coin.out.scriptPubKey) &&
         !IsEUTXOScript(coin.out.scriptPubKey)) {

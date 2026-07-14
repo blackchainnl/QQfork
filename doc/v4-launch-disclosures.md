@@ -44,14 +44,20 @@ Wallet code treats several outputs as protected by default:
 - Gold Rush quantum rewards while their phase lock is active;
 - bonded or still-unbonding tiered quantum staking outputs;
 - fully locked demurrage outputs;
-- RGB/EUTXO seal outputs.
+- RGB seal outputs and any historical EUTXO-shaped outputs.
 
 These wallet exclusions are not the security boundary. Consensus rules also
 reject invalid raw spends for the critical cases:
 
 - bonded tiered principal cannot be redirected outside the allowed covenant;
 - fully locked demurrage outputs cannot be spent;
-- phase-locked Gold Rush rewards cannot be spent before the Gold Rush boundary.
+- phase-locked Gold Rush rewards cannot be spent before the Gold Rush boundary;
+- witness-v15 EUTXO funding and spending are rejected after quantum activation.
+
+The EUTXO wallet metadata and decode/verify RPCs are inspection-only in
+v30.1.1. The create/fund/spend paths intentionally fail because the v15
+commitment has no quantum ownership authorization. Users must not send BLK to a
+v15 address.
 
 The wallet also uses demurrage-adjusted effective input value for partially
 decayed outputs during automatic and manual coin selection, so transaction
@@ -68,10 +74,13 @@ and weak-subjectivity checkpoints.
 
 ## Demurrage scope
 
-Demurrage is post-migration and quantum-only. It does not decay legacy coins
-during Gold Rush, and it does not activate before the migration deadline even if
-a lower activation height is configured for a test network. Cold-stake contract
-outputs and treasury outputs are exempt according to the consensus rules.
+Demurrage is post-migration and quantum-only. Mainnet activates it
+automatically on the first Final block, height 6,922,000. It does not decay
+legacy coins during Gold Rush or Migration. Direct, tiered, and cold-stake
+quantum outputs are subject to the inactivity schedule; delegation alone is
+not an exemption. Mainnet configures no exempt scripts. Realized decay is
+permanently burned and cannot become a fee, subsidy, staking reward, treasury
+transfer, shadow credit, or claim reimbursement.
 
 ## Closeout findings addressed
 

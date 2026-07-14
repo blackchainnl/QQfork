@@ -2,9 +2,11 @@
 
 Blackcoin V4 is the Quantum Quasar protocol upgrade line for Blackcoin. It keeps
 the existing chain history and wallet continuity while adding quantum migration
-addresses, Gold Rush reward participation, staking changes, RGB/EUTXO
-commitment tooling, and first-run migration from older Blackcoin data
-directories.
+addresses, Gold Rush reward participation, staking changes, RGB tooling,
+inspection-only EUTXO metadata, and first-run migration from older Blackcoin
+data directories. Witness-v15 EUTXO has no supported funding or spending
+workflow in v30.1.1, and consensus rejects v15 outputs and spends from Migration
+onward.
 
 This document describes the intended transition model for testing and operator
 review. It is not a public-network activation notice.
@@ -34,7 +36,9 @@ The V4 transition is designed to run in phases.
 
 4. Final lockout.
    After the migration deadline, non-migrated legacy spends are disabled on the
-   upgraded chain. Quantum outputs remain spendable under the new rules.
+   upgraded chain. Authenticated v14/v16 quantum outputs remain spendable under
+   the new rules. Demurrage activates automatically on this same first Final
+   block. Witness v15 remains frozen.
 
 The full planned transition is approximately twenty-four months from the start
 of Gold Rush through final lockout.
@@ -70,8 +74,10 @@ The wallet exposes helper RPCs for both paths, including `getgoldrushstate`,
 ## Quantum Addresses And Migration
 
 Quantum migration addresses use ML-DSA keys and are distinct from legacy
-addresses. Users should create quantum addresses with the wallet RPCs and move
-funds before the migration deadline.
+addresses. During Gold Rush, users may create and back up quantum addresses and
+use dry-run planning, but ordinary quantum funding and spending remain
+disabled. Users should move funds during Migration, from height 6,193,000
+through 6,921,999, before Final Lockout.
 
 The primary wallet flow is:
 
@@ -115,10 +121,18 @@ principal safety while improving operator distribution.
 ## Demurrage And Liveness
 
 Demurrage activates automatically at the first Final height after the
-migration deadline and applies only to direct quantum outputs that are not
-exempt. It is inactive during Gold Rush and Migration. Wallet-backed liveness
-attestations can refresh inactive quantum keys, and staking wallets can create
-periodic attestations while staking.
+migration deadline. It applies to eligible direct, tiered, and cold-stake
+quantum outputs; mainnet configures no exempt scripts. It is inactive during
+Gold Rush and Migration. Wallet-backed liveness attestations can refresh
+eligible direct quantum keys, and successful cold-stake coinstakes refresh
+their recreated outputs. Any realized decay is permanently burned, not paid to
+a miner, staker, treasury, or reward pool.
+
+Witness-v15 EUTXO commitments are not a usable activity path. v30.1.1 provides
+no supported funding or spending workflow, and consensus rejects v15 outputs
+and spends from Migration onward because the design lacks quantum ownership
+authorization. Its decode, verification, and wallet-metadata surfaces are
+inspection-only.
 
 ## Existing-node upgrade and chainstate rebuild
 

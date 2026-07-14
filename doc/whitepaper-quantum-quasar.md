@@ -2,7 +2,7 @@
 
 ## A Post-Quantum, Participation-First Evolution of Blackcoin
 
-**Version 30.1.0, Technical White Paper**
+**Version 30.1.1 Candidate, Technical White Paper**
 
 ---
 
@@ -29,7 +29,7 @@ participate**.
 This paper documents the V4 protocol in exhaustive detail: every consensus constant,
 every phase boundary, every reward formula, and the exact wallet workflows and RPC
 commands a user needs. All numbers in this document are taken directly from the
-consensus source of version 30.1.0 and are annotated with the file that defines them.
+v30.1.1 candidate source and are annotated with the file that defines them.
 
 ---
 
@@ -42,7 +42,7 @@ consensus source of version 30.1.0 and are annotated with the file that defines 
 5. [Quantum Migration and the Legacy Lockout](#5-quantum-migration-and-the-legacy-lockout)
 6. [Demurrage: Liveness as a Public Good](#6-demurrage-liveness-as-a-public-good)
 7. [Quantum Staking: Tiered, Cold, and Pooled](#7-quantum-staking-tiered-cold-and-pooled)
-8. [Advanced Primitives: EUTXO and RGB](#8-advanced-primitives-eutxo-and-rgb)
+8. [Reserved v15 EUTXO Design and RGB](#8-reserved-v15-eutxo-design-and-rgb)
 9. [Full Wallet and RPC Reference](#9-full-wallet-and-rpc-reference)
 10. [Worked Examples and Community Playbook](#10-worked-examples-and-community-playbook)
 11. [Economic Analysis: Why This Increases Participation](#11-economic-analysis-why-this-increases-participation)
@@ -84,11 +84,12 @@ pillars below all serve that goal.
   activity clock; a successful coinstake spends and recreates it, resetting that clock.
 
 - **A bounded, well-signposted quantum migration.** Legacy elliptic-curve outputs are the
-  network's quantum attack surface. Rather than leaving that surface open indefinitely,
-  V4 gives every holder a generous **24-month** window to move coins into quantum-safe
-  addresses, with wallet tooling that makes the move a one-click operation, and only then
-  closes the legacy spending path. This converts an unbounded, permanent vulnerability
-  into a finite, scheduled, individually-avoidable one.
+  network's quantum attack surface. Gold Rush keeps ordinary quantum funding disabled so
+  the base chain remains legacy-compatible. It is followed by an **18-month Migration
+  phase** in which every holder can move coins into quantum-safe addresses with a one-click
+  wallet operation. Final Lockout then closes the legacy spending path. Legacy value stays
+  spendable for the full Gold Rush-plus-Migration schedule, but the migration transaction
+  itself must be made during Migration.
 
 The result is a network that trends toward *more* active nodes, *more* distributed
 security, and *more* engaged holders over time, the opposite of the slow ossification
@@ -98,43 +99,49 @@ that afflicts passive-holding chains.
 
 ## 2. The V4 Timeline: Four Phases
 
-Protocol V4 activates on the existing Blackcoin mainnet at a fixed wall-clock time,
-enforced by Median-Time-Past (MTP) so that no single miner's timestamp can move the
-boundary. From activation, the network passes deterministically through four phases.
+Protocol V4 uses a complete, height-authoritative lifecycle on Blackcoin mainnet. MTP
+anchors remain as nominal forecasts and for isolated compatibility tests, but timestamp
+movement cannot advance, delay, skip, or reverse a mainnet phase boundary.
 
-| Phase | Starts | Duration | Legacy spend? | Quantum spend? | Gold Rush rewards? |
-|-------|--------|----------|:---:|:---:|:---:|
-| **Legacy** | (before V4) | — | ✅ | ❌ | ❌ |
-| **Gold Rush** | V4 activation | 180 days | ✅ | fundable, not yet spendable | ✅ |
-| **Migration** | V4 + 180 days | 540 days | ✅ | ✅ | ❌ |
-| **Final Lockout** | V4 + 720 days | permanent | ❌ | ✅ | ❌ |
+| Phase | Mainnet heights | Target duration | Legacy spend? | v14/v16 funding and spending? | Gold Rush rewards? |
+|-------|-----------------|-----------------|:---:|:---:|:---:|
+| **Legacy** | through 5,949,999 | - | Yes | No | No |
+| **Gold Rush** | 5,950,000-6,192,999 | 243,000 blocks (~180 days) | Yes | No; shadow credits are locked | Yes |
+| **Migration** | 6,193,000-6,921,999 | 729,000 blocks (~540 days) | Yes | Yes | No |
+| **Final Lockout** | from 6,922,000 | permanent | No | Yes | No |
+
+The quantum column refers only to authenticated witness-v14 and witness-v16 paths.
+Witness v15 has no supported funding or spending workflow in any v30.1.1 phase;
+consensus rejects v15 outputs and spends from Migration onward.
 
 ### Exact schedule (mainnet)
 
-All times are Unix epoch seconds; defined in `src/consensus/params.h` and applied in
-`src/kernel/chainparams.cpp`.
+The consensus boundaries are defined in `src/shadow_schedule.cpp`, `src/shadow.h`,
+`src/consensus/params.h`, and `src/kernel/chainparams.cpp`.
 
-- **V4 activation:** `QUANTUM_QUASAR_MAINNET_V4_TIME = 1783835299`
-  → **2026-07-12 05:48:19 UTC**, at approximately block **5,950,000**.
-- **Gold Rush duration:** `QUANTUM_QUASAR_GOLD_RUSH_SECONDS = 180 × 24 × 60 × 60 =
-  15,552,000 s` → **180 days**.
-  Gold Rush ends **2026-12-29 05:48:19 UTC**.
-- **Migration window:** `QUANTUM_QUASAR_MIGRATION_SECONDS = 540 × 24 × 60 × 60 =
-  46,656,000 s` → **540 days (18 months)**.
-- **Final lockout / migration deadline:** Gold-Rush-end + migration-window
-  = `1783835299 + 15,552,000 + 46,656,000 = 1846043299`
-  → **2028-07-09 05:48:19 UTC**, exactly **24 months** after V4 activation.
+- **V4 and Gold Rush begin:** height **5,950,000**.
+- **Last Gold Rush block:** height **6,192,999**. Migration begins at **6,193,000**.
+- **Last Migration block:** height **6,921,999**. Final Lockout and automatic demurrage
+  begin together at **6,922,000**.
 
-Phase membership is computed by `GetQuantumQuasarPhase(nTime, nHeight)`
-(`src/consensus/params.h`). Because Blackcoin mainnet targets a **64-second block time**,
-the schedule can equivalently be read in block heights:
+The retained time anchors are non-authoritative mainnet forecasts:
+
+- `QUANTUM_QUASAR_MAINNET_V4_TIME = 1783835299` is
+  **2026-07-12 05:48:19 UTC**.
+- Adding the 180-day nominal Gold Rush duration gives `1799387299`,
+  **2027-01-08 05:48:19 UTC**.
+- Adding the 540-day nominal Migration duration gives `1846043299`,
+  **2028-07-01 05:48:19 UTC**.
+
+Phase membership is computed by `GetQuantumLifecycleState(nTime, nHeight)`
+(`src/consensus/params.h`). Because Blackcoin mainnet targets a **64-second block time**:
 
 - **1,350 blocks/day**, **40,500 blocks/month** (30-day month), **~493,000 blocks/year**.
 
-Legacy elliptic-curve coins remain fully spendable for the entire Gold Rush *and*
-Migration phases, a full **24 months** after V4. Only at Final Lockout, two years after
-activation, does the legacy path close. The schedule is fixed and public in advance, and
-any holder who acts within two years retains full access to their coins.
+Legacy elliptic-curve coins remain spendable for Gold Rush and Migration, approximately
+720 target days in total. Ordinary quantum funding is deliberately off during the first
+180 target days, so holders perform `migratetoquantum` during the following 540-day
+Migration phase. Final Lockout closes the legacy path at height 6,922,000.
 
 ---
 
@@ -177,12 +184,13 @@ human-readable prefix **`blk`** (`src/kernel/chainparams.cpp`).
 | Witness v | Program | Purpose |
 |:---:|:---:|---------|
 | **v16** | 32-byte commitment | **Quantum migration** output: the ML-DSA-protected home for migrated coins. Subject to demurrage. |
-| **v15** | 32-byte commitment | **EUTXO**: Extended UTXO smart-contract output (datum + validator). |
+| **v15** | 32-byte commitment | **Reserved EUTXO shape**: disabled/frozen in v30.1.1 because it has no quantum ownership authorization. |
 | **v14** | 32-byte commitment | **Quantum cold-stake**: owner/staker-separated delegation output, subject to inactivity demurrage. |
 
-Because the on-chain address is only a 32-byte commitment, the bulky ML-DSA public key
-and signature are supplied in the witness at spend time and are never stored in the UTXO
-set until needed.
+For the authenticated v14 and v16 paths, the on-chain address is a 32-byte commitment and
+the bulky ML-DSA public key and signature are supplied in the witness at spend time. The
+reserved v15 commitment does not commit to an ML-DSA owner; this is why v30.1.1 must not
+fund or spend it.
 
 ### 3.4 Self-test on startup
 
@@ -228,7 +236,7 @@ Each Gold Rush block accrues a base reward, `ShadowBaseReward(height)`
 **6,192,999** (`SHADOW_REWARD_END_HEIGHT`), a span of
 `SHADOW_GOLD_RUSH_BLOCKS = (180 × 24 × 60 × 60) / 64 = 243,000` blocks.
 
-**Phase 1 (heights 5,950,000 – 6,187,599): a halving curve.**
+**Phase 1 (heights 5,950,000-6,187,599): a halving curve.**
 
 ```
 reward = (580 BLK) >> (blocks_since_start / 43,200)
@@ -239,14 +247,14 @@ The reward starts at **580 BLK/block** and halves every
 
 | Month | Height range | Reward/block |
 |:---:|---|:---:|
-| 1 | 5,950,000 – 5,993,199 | 580 BLK |
-| 2 | 5,993,200 – 6,036,399 | 290 BLK |
-| 3 | 6,036,400 – 6,079,599 | 145 BLK |
-| 4 | 6,079,600 – 6,122,799 | 72 BLK |
-| 5 | 6,122,800 – 6,165,999 | 36 BLK |
-| 6 (part) | 6,166,000 – 6,187,599 | 18 BLK |
+| 1 | 5,950,000-5,993,199 | 580 BLK |
+| 2 | 5,993,200-6,036,399 | 290 BLK |
+| 3 | 6,036,400-6,079,599 | 145 BLK |
+| 4 | 6,079,600-6,122,799 | 72 BLK |
+| 5 | 6,122,800-6,165,999 | 36 BLK |
+| 6 (part) | 6,166,000-6,187,599 | 18 BLK |
 
-**Phase 2 (heights 6,187,600 – 6,192,999): a fixed tail.**
+**Phase 2 (heights 6,187,600-6,192,999): a fixed tail.**
 
 ```
 reward = 463 BLK/block
@@ -334,28 +342,33 @@ send coins to a key the wallet does not hold.
 > older backup will not recover the migrated funds. The wallet and this paper both flag
 > this at every step.
 
-Quantum outputs become **fundable during Gold Rush** (you can migrate immediately at V4)
-and **spendable from the Migration phase onward**, so coins moved early are safe and fully
-usable well before the deadline.
+During Gold Rush, wallets can create and back up quantum addresses and can dry-run
+migration planning with an existing wallet-backed address. They cannot fund or spend
+ordinary v14/v16 outputs. `migratetoquantum` becomes actionable at Migration height
+6,193,000 and remains available through height 6,921,999. Gold Rush reward credits are
+separate authenticated synthetic outputs that remain phase-locked until Gold Rush ends
+and normal maturity is satisfied.
 
 ### 5.3 The lockout, and why it is a feature
 
-At Final Lockout, **V4 + 24 months, 2028-07-09**, the consensus rule
+At Final Lockout, **height 6,922,000**, the consensus rule
 `IsQuantumFinalLockout(nTime, nHeight)` (`src/consensus/params.h`, enforced in
 `src/validation.cpp`) becomes true, and the script flag
 `SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT` (`src/script/interpreter.cpp`) causes **all legacy
-ECDSA-signed spends to be permanently rejected** with `legacy-spend-disabled`. Quantum
-(v16) and EUTXO (v15) spends are unaffected.
+ECDSA-signed spends to be permanently rejected** with `legacy-spend-disabled`. Exact
+authenticated v14 and v16 paths remain enabled. Witness-v15 funding and spending remain
+rejected with the dedicated EUTXO-disabled rules.
 
 This is deliberately framed as a positive:
 
 - It converts an **unbounded, permanent, network-wide** quantum vulnerability into a
   **finite, scheduled, individually-avoidable** one. After the deadline, the set of
   quantum-vulnerable coins can only shrink, never grow.
-- The window is **generous and loud:** 24 months, announced years in advance, with the
-  deadline visible in the wallet, on the network status RPCs, and in this document.
-- It is **individually avoidable in one click.** Nobody who takes any action within two
-  years is affected.
+- The schedule is **generous and loud:** about six months of Gold Rush preparation plus
+  an 18-month Migration phase, with the exact height deadline visible in the wallet,
+  network status RPCs, and this document.
+- It is **individually avoidable in one click.** A holder who migrates during the
+  540-day Migration phase retains spendable control.
 - It **strengthens every remaining coin.** Once legacy spends are closed, the entire
   active supply is quantum-safe, which raises the security floor for everyone who
   participated.
@@ -385,9 +398,12 @@ The classification, in order:
 2. **Explicitly configured exempt scripts** → exempt. Mainnet currently configures none.
 3. **Non-quantum (legacy and everything else) outputs** → exempt (`"non_quantum"`). Legacy
    coins are governed by the lockout, not demurrage.
-4. **Quantum migration/tiered (v16), EUTXO (v15), and cold-stake (v14) outputs** →
-   **subject**, but only if inactive beyond the grace period. Direct and tiered v16 keys can
-   use attestations. EUTXO and cold-stake state refreshes through a spend/recreation.
+4. **Quantum migration/tiered (v16) and cold-stake (v14) outputs** are subject, but only
+   if inactive beyond the grace period. Eligible direct/tiered v16 keys can use
+   attestations; cold-stake state refreshes through a successful spend/recreation.
+5. **Historical v15-shaped outputs** can be classified by the accounting evaluator, but
+   v30.1.1 independently rejects their funding and spending. They have no supported
+   liveness or recreation path, and their metadata is inspection-only.
 
 Thus cold delegation is not a permanent-value shelter. A cold-stake output that never
 successfully stakes or moves follows the same inactivity curve.
@@ -429,7 +445,7 @@ only the effective value as input principal. The transaction fee is then
 block producer. A coinstake is governed by the same rule: only effective principal is
 returned, and its reward remains limited to the ordinary PoS subsidy plus explicit fees.
 
-**Decay table (a quantum coin that is never attested, never moved, never delegated):**
+**Decay table (a quantum coin that is never attested, moved, or successfully staked):**
 
 | Months inactive | Value retained |
 |:---:|:---:|
@@ -549,23 +565,26 @@ healthy, with no manual intervention.
 
 ---
 
-## 8. Advanced Primitives: EUTXO and RGB
+## 8. Reserved v15 EUTXO Design and RGB
 
-V4 ships two forward-looking primitives that expand what can be built on Blackcoin without
-compromising the base layer.
+V4 includes an operational RGB commitment path and retains a reserved EUTXO encoding for
+inspection and future design work. Those two states must not be treated as equally enabled.
 
-### 8.1 EUTXO, Extended UTXO smart contracts
+### 8.1 EUTXO witness v15 is frozen in v30.1.1
 
-An **EUTXO output** (witness v15, `src/addresstype.h`) locks funds behind a *datum* (the
-contract's state) and a *validator script* (the redemption rule), committed as
+The reserved **EUTXO-shaped output** (witness v15, `src/addresstype.h`) commits to a
+*datum* and *validator script* as
 `SHA256("Quantum Quasar EUTXO v1" || SHA256(datum) || SHA256(validator))`
-(`src/script/solver.cpp`). Spending requires revealing the datum and a witness that
-satisfies the validator, checked under a dedicated consensus flag. This brings a
-Cardano-style, deterministic, stateful contract model to a Bitcoin-derived UTXO chain,
-enabling timelocks, multi-condition escrows, and ML-DSA-guarded contracts.
+(`src/script/solver.cpp`). That commitment does not authenticate a quantum owner. A
+validator-only spend design would therefore permit value movement without the ML-DSA
+ownership guarantee required by the migration.
 
-- **Raw tooling:** `createeutxospend`, `createeutxotransition`, `decodeeutxospend`,
-  `verifyeutxospend`; wallet state via `importeutxostate` / `listeutxostates`.
+v30.1.1 sets `EUTXO_ENABLED` to false. Wallet and raw-transaction construction reject v15
+outputs, the `createeutxospend` and `createeutxotransition` RPCs intentionally return a
+disabled error, and post-Gold-Rush consensus rejects both v15 funding and v15 spends.
+`decodeeutxospend` and `verifyeutxospend` remain inspection tools only;
+`importeutxostate` and `listeutxostates` only persist or report metadata and cannot make a
+v15 output spendable. **Do not send BLK to a witness-v15 address in v30.1.1.**
 
 ### 8.2 RGB, client-side fixed-supply assets
 
@@ -644,12 +663,13 @@ RPC set.
 | `getdemurragewalletinfo` | Per-output decay state, effective value, attestation-due flag |
 | `sweepdemurragedecay` | Realize decay on still-spendable outputs and move the effective remainder |
 
-### 9.6 EUTXO and RGB
+### 9.6 EUTXO inspection and RGB
 
 | RPC | Purpose |
 |-----|---------|
-| `createeutxospend` / `createeutxotransition` / `decodeeutxospend` / `verifyeutxospend` | Build/decode/verify EUTXO spends |
-| `importeutxostate` / `listeutxostates` | Persist / list EUTXO state metadata |
+| `createeutxospend` / `createeutxotransition` | Disabled in v30.1.1; always return the v15 ownership-authorization error |
+| `decodeeutxospend` / `verifyeutxospend` | Inspect candidate or known v15-shaped records; never authorize or enable a spend |
+| `importeutxostate` / `listeutxostates` | Persist / list inspection-only EUTXO metadata; does not make an output spendable |
 | `creatergbtransfer` / `acceptrgbconsignment` / `exportrgbconsignment` | RGB transfer lifecycle |
 | `importrgbcontract` / `importrgbassignment` / `listrgbassets` | RGB asset management |
 | `decodergbcommitment` / `verifyrgbconsignment` | Raw RGB inspection |
@@ -666,12 +686,14 @@ RPC set.
 The Qt wallet adds two dedicated pages:
 
 - **Staking & Mining**, one place for PoS staking, Gold Rush status, the in-process PoW
-  miner, quantum migration, tiered/cold staking, operator bonds, demurrage, and RGB/EUTXO.
+  miner, quantum migration, tiered/cold staking, operator bonds, demurrage, RGB, and
+  inspection-only EUTXO metadata.
   Expensive detail panels load on demand behind a **Refresh details** button so the tab
   opens instantly even on very large wallets.
 - **Account**, a per-family (Legacy / Quantum / Cold-stake / EUTXO) breakdown of every
   output, its state (bonded / unbonding / withdrawable), and demurrage exposure, with CSV
-  export.
+  export. An EUTXO row is a frozen-output warning and inspection surface, not a funding or
+  spend workflow.
 
 The **Unlock Wallet** dialog offers two explicit, mutually-exclusive modes: **For Legacy
 Staking Only** (mint PoS blocks, no spending or quantum actions) and **Legacy and Quantum
@@ -687,16 +709,20 @@ transaction, and for the automatic demurrage attestations that keep holdings at 
 Alice holds 250,000 BLK and wants zero maintenance.
 
 1. **Before V4:** nothing to do. Keep the coins.
-2. **At V4 (2026-07-12):** she runs `migratetoquantum` once. Her coins move to a quantum
-   (v16) address. **She backs up her wallet** (ML-DSA keys are not in the seed).
-3. **Optional:** she runs `fundquantumcoldstakeaddress` to delegate to a cold-staking
+2. **During Gold Rush:** she creates and backs up a wallet-backed quantum address. She can
+   dry-run migration planning, but does not fund it yet.
+3. **At Migration height 6,193,000 or later:** she runs `migratetoquantum` once. Her coins
+   move to the quantum (v16) address. **She backs up her wallet again** because ML-DSA keys
+   are not in the seed.
+4. **Optional:** she runs `fundquantumcoldstakeaddress` to delegate to a cold-staking
    operator (or her own hot node). Her principal stays owner-controlled and can earn
    staking rewards. Successful coinstakes refresh the output's activity clock.
-4. **Afterward:** if she leaves coins in a direct quantum address, her wallet auto-attests
+5. **Afterward:** if she leaves coins in a direct quantum address, her wallet auto-attests
    every 3 months while online. If she delegates, she monitors successful staking or moves
    the output before prolonged inactivity; delegation alone is not an exemption.
 
-Alice never loses value, earns rewards, and is quantum-safe. Total effort: two clicks.
+Alice prepares during Gold Rush, completes one migration action during Migration, and can
+optionally add a staking workflow.
 
 ### Example B, The active staker during Gold Rush
 
@@ -709,13 +735,13 @@ Bob holds 40,000 BLK (above the 10,000 whitelist threshold) and runs a node.
 3. If he wants to also work the PoW lane, he enables `setpowmining`; the light 1-MiB
    Argon2id puzzle lets his ordinary CPU submit `sendshadowpowclaim` proofs for a share of
    the PoW pool.
-4. He migrates to quantum at his convenience within the 24-month window.
+4. He migrates during the 18-month Migration phase, before Final height 6,922,000.
 
 Bob is rewarded precisely for the participation he is already doing.
 
 ### Example C, The forgotten wallet
 
-Carol migrated to a quantum address in 2026 and then lost interest, wallet offline.
+Carol migrated to a quantum address during Migration and then lost interest, wallet offline.
 
 - For **six months** after demurrage activates: no effect. 100% retained.
 - At **12 months** of total inactivity: 88.9% retained, still barely touched.
@@ -781,10 +807,11 @@ that help nearly effortless, and burns realized decay rather than redistributing
 ## 12. Security Considerations
 
 - **Quantum resistance is opt-in-by-deadline, not instant.** During Gold Rush and Migration
-  (the first 24 months), legacy ECDSA coins remain spendable and therefore quantum-exposed.
-  Holders should migrate as early as is convenient; the network only becomes fully
-  quantum-safe at Final Lockout. This is an explicit, bounded trade-off in favor of a fair,
-  no-surprises migration.
+  (approximately 720 target days), legacy ECDSA coins remain spendable and therefore
+  quantum-exposed. Holders can prepare addresses and backups during Gold Rush, then should
+  migrate during the 540-day Migration phase. At Final Lockout the spendable path becomes
+  quantum-only. This is an explicit, bounded trade-off in favor of a fair, no-surprises
+  migration.
 
 - **ML-DSA keys are outside the HD seed.** The single most important operational rule:
   **back up the wallet after every new quantum address.** A seed phrase alone does not
@@ -796,10 +823,17 @@ that help nearly effortless, and burns realized decay rather than redistributing
   every node computes identical effective values and no attestation can be replayed onto a
   different coin.
 
-- **Consensus compatibility is paramount.** V4's activation time, whitelist height
-  (5,945,000), Gold Rush schedule, and migration deadline are consensus rules. Every node
-  that wishes to remain on the same chain must run identical values. Operators upgrading or
-  building alternative clients must match these exactly to avoid a chain split.
+- **Witness v15 is not an enabled smart-contract path.** Its datum/validator commitment
+  lacks ML-DSA owner authorization. v30.1.1 disables supported v15 construction in every
+  phase, and consensus rejects v15 outputs and spends from Migration onward. Its decode,
+  verification, and wallet-metadata surfaces are inspection-only.
+
+- **Consensus compatibility is paramount.** Mainnet's whitelist height (5,945,000), Gold
+  Rush boundaries (5,950,000 through 6,192,999), Migration boundaries (6,193,000 through
+  6,921,999), and Final Lockout height (6,922,000) are consensus rules. The retained
+  timestamp anchors are nominal forecasts, not mainnet phase boundaries. Every node that
+  wishes to remain on the same chain must use identical height values. Operators upgrading
+  or building alternative clients must match them exactly to avoid a chain split.
 
 - **The per-pool cap is policy, not consensus.** It cannot by itself prevent a determined
   operator from accumulating stake; it only steers the default wallet behavior. Genuine
@@ -820,7 +854,7 @@ the competing-claim boundary shown below.
 | `QUANTUM_QUASAR_MAINNET_V4_TIME` | 1783835299 (2026-07-12 05:48:19 UTC) | Nominal V4 time anchor; v30.1.1 mainnet lifecycle is height-authoritative | `consensus/params.h` |
 | `QUANTUM_QUASAR_GOLD_RUSH_SECONDS` | 15,552,000 (180 days) | Gold Rush duration | `consensus/params.h` |
 | `QUANTUM_QUASAR_MIGRATION_SECONDS` | 46,656,000 (540 days) | Migration window | `consensus/params.h` |
-| Nominal final-lockout time | 1846043299 (2028-07-09 05:48:19 UTC) | Time-schedule reference (V4 + 24 mo) | derived |
+| Nominal final-lockout time | 1846043299 (2028-07-01 05:48:19 UTC) | Non-authoritative time-schedule reference (V4 + 720 days) | derived |
 | `SHADOW_WHITELIST_HEIGHT` | 5,945,000 | Balance snapshot height | `shadow_schedule.cpp` |
 | `SHADOW_WHITELIST_MIN_BALANCE` | 10,000 BLK | Whitelist eligibility threshold | `shadow.h` |
 | `SHADOW_REWARD_START_HEIGHT` | 5,950,000 | Gold Rush rewards begin | `shadow_schedule.cpp` |
@@ -845,7 +879,7 @@ the competing-claim boundary shown below.
 | ML-DSA public key | 1,312 bytes | Quantum public key size | `crypto/mldsa.h` |
 | ML-DSA signature | 2,420 bytes | Quantum signature size | `crypto/mldsa.h` |
 | Quantum migration witness | v16, 32-byte program | Migrated-coin output | `consensus/quantum_witness.h` |
-| EUTXO witness | v15, 32-byte program | Smart-contract output | `addresstype.h` |
+| EUTXO witness | v15, 32-byte program | Reserved shape; funding and spending disabled in v30.1.1 | `addresstype.h` |
 | Cold-stake witness | v14, 32-byte program | Delegation output (subject to inactivity demurrage) | `consensus/quantum_witness.h` |
 | `QUANTUM_POOL_CAP_BPS` | 2000 (20%) | Per-pool delegation cap (policy) | `node/quantum_pool.h` |
 | Operator bond period | 40,500 blocks (30 days) | Verified operator commitment | `wallet/rpc/staking.cpp` |
@@ -863,8 +897,8 @@ the competing-claim boundary shown below.
 - **QQSIGNAL / QQSPROOF**, the OP_RETURN control transactions that claim Gold Rush PoS and
   PoW rewards respectively.
 - **Migration**, moving legacy ECDSA coins into quantum (v16) outputs via `migratetoquantum`.
-- **Final Lockout**, the point (V4 + 24 months) after which legacy ECDSA spends are
-  permanently rejected.
+- **Final Lockout**, mainnet height 6,922,000, after which legacy ECDSA spends are
+  permanently rejected and demurrage begins automatically.
 - **Demurrage**, the liveness mechanism by which inactive quantum outputs slowly lose
   effective value. Realized decay is burned, never paid to a miner or staker. Timely
   attestation or a spend/recreation refreshes activity; cold delegation alone does not.
@@ -874,11 +908,12 @@ the competing-claim boundary shown below.
   staking while retaining principal control; subject to the inactivity schedule.
 - **Tiered staking**, self-staking with a consensus-visible bonding/unbonding lock schedule.
 - **Operator bond**, a 30-day verified commitment posted by a staking-pool operator.
-- **EUTXO**, Extended-UTXO smart-contract output (witness v15): datum + validator.
+- **EUTXO**, a reserved witness-v15 datum/validator commitment shape. v30.1.1 freezes its
+  funding and spending pending a quantum-authenticated ownership design.
 - **RGB**, client-side-validated, fixed-supply asset commitments anchored on-chain.
 
 ---
 
-*This document describes Blackcoin Quantum Quasar (Protocol V4), version 30.1.0. All
-constants are drawn from the consensus source and are authoritative as of that release.
-Blackcoin is free/open-source software under the MIT license.*
+*This document describes the Blackcoin Quantum Quasar (Protocol V4) v30.1.1 candidate.
+All consensus boundaries are drawn from that candidate source. Blackcoin is
+free/open-source software under the MIT license.*
