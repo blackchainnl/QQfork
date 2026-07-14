@@ -47,44 +47,63 @@ def make_package(name, package_id, version, download_location, checksums=None, l
     return package
 
 
-def parse_depends_package(path):
-    values = {}
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+def load_dependency_manifest(path, depends_packages):
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError(f"cannot load dependency manifest: {error}") from error
+    if document.get("schema") != 1:
+        raise RuntimeError("dependency manifest schema must be 1")
+    dependencies = document.get("dependencies")
+    if not isinstance(dependencies, list) or not dependencies:
+        raise RuntimeError("dependency manifest has no dependency records")
+
+    by_name = {}
+    expected_recipes = set()
+    for dependency in dependencies:
+        name = dependency.get("package")
+        version = dependency.get("version")
+        recipe = dependency.get("recipe")
+        if not isinstance(name, str) or not name or name in by_name:
+            raise RuntimeError("dependency manifest package names must be unique")
+        if not isinstance(version, str) or not version or "$" in version:
+            raise RuntimeError(f"dependency {name} has an unresolved version")
+        if not isinstance(recipe, str) or Path(recipe).parent.name != "packages":
+            raise RuntimeError(f"dependency {name} has an invalid recipe path")
+        if not (depends_packages / Path(recipe).name).is_file():
+            raise RuntimeError(f"dependency {name} recipe does not exist")
+        sources = dependency.get("sources")
+        if not isinstance(sources, list):
+            raise RuntimeError(f"dependency {name} sources must be a list")
+        for source in sources:
+            if not isinstance(source.get("url"), str) or not source["url"].startswith("https://"):
+                raise RuntimeError(f"dependency {name} source URL must use HTTPS")
+            if not SHA256_RE.fullmatch(source.get("sha256", "")):
+                raise RuntimeError(f"dependency {name} source checksum is invalid")
+        by_name[name] = dependency
+        expected_recipes.add(Path(recipe).name)
+
+    actual_recipes = {path.name for path in depends_packages.glob("*.mk") if path.name != "packages.mk"}
+    if actual_recipes != expected_recipes:
+        raise RuntimeError("dependency manifest recipe inventory is incomplete")
+    for name, dependency in by_name.items():
+        alias = dependency.get("source_alias")
+        if alias is None:
+            if not dependency["sources"]:
+                raise RuntimeError(f"dependency {name} has no source archive")
             continue
-        match = re.fullmatch(r"package\s*=\s*([^\s#]+)", line)
-        if match:
-            values["name"] = match.group(1)
-            continue
-        match = re.fullmatch(r"\$\(package\)_version\s*=\s*([^\s#]+)", line)
-        if match:
-            values["version"] = match.group(1)
-            continue
-        match = re.fullmatch(r"\$\(package\)_sha256_hash\s*=\s*([0-9a-fA-F]{64})", line)
-        if match:
-            values["sha256"] = match.group(1).lower()
-    if "name" not in values:
-        return None
-    version = values.get("version", "NOASSERTION")
-    if "$" in version:
-        version = "NOASSERTION"
-    checksum = values.get("sha256")
-    checksums = [{"algorithm": "SHA256", "checksumValue": checksum}] if checksum else None
-    package_id = spdx_id("Dependency", f"{values['name']}@{version}")
-    return make_package(
-        name=values["name"],
-        package_id=package_id,
-        version=version,
-        download_location="NOASSERTION",
-        checksums=checksums,
-    )
+        if alias not in by_name or by_name[alias].get("source_alias") is not None:
+            raise RuntimeError(f"dependency {name} has an invalid source alias")
+        if dependency["version"] != by_name[alias]["version"]:
+            raise RuntimeError(f"dependency {name} alias version differs from {alias}")
+    return dependencies, by_name
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", required=True, type=Path)
     parser.add_argument("--depends-packages", required=True, type=Path)
+    parser.add_argument("--dependency-manifest", required=True, type=Path)
     parser.add_argument("--version", required=True)
     parser.add_argument("--source-sha", required=True)
     parser.add_argument("--source-date-epoch", required=True, type=int)
@@ -149,20 +168,50 @@ def main():
             {"spdxElementId": root_id, "relationshipType": "CONTAINS", "relatedSpdxElement": artifact_id}
         )
 
-    seen_dependencies = set()
-    for path in sorted(args.depends_packages.glob("*.mk")):
-        package = parse_depends_package(path)
-        if package is None or package["SPDXID"] in seen_dependencies:
-            continue
-        seen_dependencies.add(package["SPDXID"])
+    dependencies, dependencies_by_name = load_dependency_manifest(
+        args.dependency_manifest, args.depends_packages
+    )
+    for dependency in sorted(dependencies, key=lambda record: record["package"]):
+        name = dependency["package"]
+        version = dependency["version"]
+        source_owner = dependencies_by_name[dependency.get("source_alias", name)]
+        sources = source_owner["sources"]
+        primary = sources[0]
+        package_id = spdx_id("Dependency", f"{name}@{version}")
+        package = make_package(
+            name=name,
+            package_id=package_id,
+            version=version,
+            download_location=primary["url"],
+            checksums=[{"algorithm": "SHA256", "checksumValue": primary["sha256"]}],
+        )
         packages.append(package)
         relationships.append(
             {
                 "spdxElementId": root_id,
                 "relationshipType": "DEPENDS_ON",
-                "relatedSpdxElement": package["SPDXID"],
+                "relatedSpdxElement": package_id,
             }
         )
+        for position, source in enumerate(sources[1:], start=2):
+            source_name = f"{name} source archive {position}: {Path(source['url']).name}"
+            source_id = spdx_id("DependencySource", f"{name}@{version}:{source['url']}")
+            packages.append(
+                make_package(
+                    name=source_name,
+                    package_id=source_id,
+                    version=version,
+                    download_location=source["url"],
+                    checksums=[{"algorithm": "SHA256", "checksumValue": source["sha256"]}],
+                )
+            )
+            relationships.append(
+                {
+                    "spdxElementId": package_id,
+                    "relationshipType": "DEPENDS_ON",
+                    "relatedSpdxElement": source_id,
+                }
+            )
 
     document = {
         "spdxVersion": "SPDX-2.3",

@@ -1,0 +1,443 @@
+{
+  "schema": 1,
+  "status_date": "2026-07-13",
+  "baselines": {
+    "v30_1_0": "f647dc75c9479c03e81414f145a8d233b60959c7",
+    "v30_1_1_audit_base": "7fde566f5f564e43f4c2d76502bd7e43c819e35f",
+    "legacy_v26_2_0": "b54edb619b0d42df4b3a73a29b02d9eb885516d5",
+    "active_legacy_v28_4_0": "5c1a4a5efc3886a69f01d50109c251d153ed092e"
+  },
+  "package_index_recipe": {
+    "path": "depends/packages/packages.mk",
+    "sha256": "1cfa8f7fd8a23a35b55ee0b2fd4ed0ed7852a2c9e34bc2ff60d837efa0436e1c"
+  },
+  "dependencies": [
+    {
+      "package": "bdb",
+      "recipe": "depends/packages/bdb.mk",
+      "recipe_sha256": "751c767c7d0b7fc8ad2be07267867c8e1be5cf94dc18ad467ec2561bc8eb6041",
+      "version": "6.2.38",
+      "sources": [
+        {"url": "https://source.ipfire.org/source-2.x/db-6.2.38.tar.gz", "sha256": "99ccd944ffcccc88c0f404b4f3d8cb10747e1e3dfe9ec566f518725f986ca2fd"}
+      ]
+    },
+    {
+      "package": "boost",
+      "recipe": "depends/packages/boost.mk",
+      "recipe_sha256": "ac58cc64a97668259942118b1b048bda7ba3ddc66c23f906fc6008076b869338",
+      "version": "1.81.0",
+      "sources": [
+        {"url": "https://archives.boost.io/release/1.81.0/source/boost_1_81_0.tar.bz2", "sha256": "71feeed900fbccca04a3b4f2f84a7c217186f28a940ed8b7ed4725986baf99fa"}
+      ]
+    },
+    {
+      "package": "capnp",
+      "recipe": "depends/packages/capnp.mk",
+      "recipe_sha256": "d8f3a78fda49066222d8c3678b83f1f54c09bd19b6a995469cc26a2b2cbf820e",
+      "version": "0.7.1",
+      "source_alias": "native_capnp",
+      "sources": []
+    },
+    {
+      "package": "expat",
+      "recipe": "depends/packages/expat.mk",
+      "recipe_sha256": "730fe4eaa1ee2f10f543bf4fb31daca388907de28804a362e1a3dd30a33de862",
+      "version": "2.8.2",
+      "sources": [
+        {"url": "https://github.com/libexpat/libexpat/releases/download/R_2_8_2/expat-2.8.2.tar.xz", "sha256": "3ad89b8588e6644bd4e49981480d48b21289eebbcd4f0a1a4afb1c29f99b6ab4"}
+      ]
+    },
+    {
+      "package": "fontconfig",
+      "recipe": "depends/packages/fontconfig.mk",
+      "recipe_sha256": "cf36c92e2457e361b93a268d0cfacc2d139642cd516f8f5cfc653fffc6debe51",
+      "version": "2.12.6",
+      "sources": [
+        {"url": "https://www.freedesktop.org/software/fontconfig/release/fontconfig-2.12.6.tar.bz2", "sha256": "cf0c30807d08f6a28ab46c61b8dbd55c97d2f292cf88f3a07d3384687f31f017"}
+      ]
+    },
+    {
+      "package": "freetype",
+      "recipe": "depends/packages/freetype.mk",
+      "recipe_sha256": "8fb1d7b76e499d0a37d0e28a6a245454682aec63b069da257a60448407dab6f0",
+      "version": "2.14.3",
+      "sources": [
+        {"url": "https://download.savannah.gnu.org/releases/freetype/freetype-2.14.3.tar.xz", "sha256": "36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f"}
+      ]
+    },
+    {
+      "package": "libXau",
+      "recipe": "depends/packages/libXau.mk",
+      "recipe_sha256": "ed6a2c89905434978b331ed7946374fb637eefd63f8c90db0ba7a0fb4b54686d",
+      "version": "1.0.9",
+      "sources": [
+        {"url": "https://xorg.freedesktop.org/releases/individual/lib/libXau-1.0.9.tar.bz2", "sha256": "ccf8cbf0dbf676faa2ea0a6d64bcc3b6746064722b606c8c52917ed00dcb73ec"}
+      ]
+    },
+    {
+      "package": "libevent",
+      "recipe": "depends/packages/libevent.mk",
+      "recipe_sha256": "16a3428d04cb06e1a467845d4ea2ab380e9e1c94660cb81035a0e5b4c41773f1",
+      "version": "2.1.12-stable",
+      "sources": [
+        {"url": "https://github.com/libevent/libevent/releases/download/release-2.1.12-stable/libevent-2.1.12-stable.tar.gz", "sha256": "92e6de1be9ec176428fd2367677e61ceffc2ee1cb119035037a27d346b0403bb"}
+      ]
+    },
+    {
+      "package": "libmultiprocess",
+      "recipe": "depends/packages/libmultiprocess.mk",
+      "recipe_sha256": "0a9fc76c7eb856cdaf3b2f22c2a98963c4eb46c085f82de76571706ad4b307e2",
+      "version": "1af83d15239ccfa7e47b8764029320953dd7fdf1",
+      "source_alias": "native_libmultiprocess",
+      "sources": []
+    },
+    {
+      "package": "libnatpmp",
+      "recipe": "depends/packages/libnatpmp.mk",
+      "recipe_sha256": "4df6e0f3e0e0444cbfe40f84bc50f65e8b4a0e81bdbcb7e19277a9395465ffb3",
+      "version": "07004b97cf691774efebe70404cf22201e4d330d",
+      "sources": [
+        {"url": "https://github.com/miniupnp/libnatpmp/archive/07004b97cf691774efebe70404cf22201e4d330d.tar.gz", "sha256": "9321953ceb39d07c25463e266e50d0ae7b64676bb3a986d932b18881ed94f1fb"}
+      ]
+    },
+    {
+      "package": "liboqs",
+      "recipe": "depends/packages/liboqs.mk",
+      "recipe_sha256": "95a4e49a180e7c4a916e098b986579492f72cb834ef7cc076cdcbff65449c98d",
+      "version": "0.15.0",
+      "sources": [
+        {"url": "https://github.com/open-quantum-safe/liboqs/archive/refs/tags/0.15.0.tar.gz", "sha256": "3983f7cd1247f37fb76a040e6fd684894d44a84cecdcfbdb90559b3216684b5c"}
+      ]
+    },
+    {
+      "package": "libxcb",
+      "recipe": "depends/packages/libxcb.mk",
+      "recipe_sha256": "661b8e41e4200313ef93334de48b884cd7800a1727cac17497121294b02ad5ca",
+      "version": "1.14",
+      "sources": [
+        {"url": "https://xcb.freedesktop.org/dist/libxcb-1.14.tar.xz", "sha256": "a55ed6db98d43469801262d81dc2572ed124edc3db31059d4e9916eb9f844c34"}
+      ]
+    },
+    {
+      "package": "libxcb_util",
+      "recipe": "depends/packages/libxcb_util.mk",
+      "recipe_sha256": "43b3fc3669a0ee8c13c6c12f5e7ad7598acb560499ed11bea89299203009ce24",
+      "version": "0.4.0",
+      "sources": [
+        {"url": "https://xcb.freedesktop.org/dist/xcb-util-0.4.0.tar.bz2", "sha256": "46e49469cb3b594af1d33176cd7565def2be3fa8be4371d62271fabb5eae50e9"}
+      ]
+    },
+    {
+      "package": "libxcb_util_image",
+      "recipe": "depends/packages/libxcb_util_image.mk",
+      "recipe_sha256": "da213d912a1426d73b106a6956aee3973e099103627e92056d58823b4fe764e5",
+      "version": "0.4.0",
+      "sources": [
+        {"url": "https://xcb.freedesktop.org/dist/xcb-util-image-0.4.0.tar.bz2", "sha256": "2db96a37d78831d643538dd1b595d7d712e04bdccf8896a5e18ce0f398ea2ffc"}
+      ]
+    },
+    {
+      "package": "libxcb_util_keysyms",
+      "recipe": "depends/packages/libxcb_util_keysyms.mk",
+      "recipe_sha256": "78fbe8ee1c1d728fd9661e62d4c38a9cdb540efcc969589edcdc290b85a5e73e",
+      "version": "0.4.0",
+      "sources": [
+        {"url": "https://xcb.freedesktop.org/dist/xcb-util-keysyms-0.4.0.tar.bz2", "sha256": "0ef8490ff1dede52b7de533158547f8b454b241aa3e4dcca369507f66f216dd9"}
+      ]
+    },
+    {
+      "package": "libxcb_util_render",
+      "recipe": "depends/packages/libxcb_util_render.mk",
+      "recipe_sha256": "24ee0bee17db96b46c4c06b6832fe2755bda9dd34b5b9d5195933d2474e48e4a",
+      "version": "0.3.9",
+      "sources": [
+        {"url": "https://xcb.freedesktop.org/dist/xcb-util-renderutil-0.3.9.tar.bz2", "sha256": "c6e97e48fb1286d6394dddb1c1732f00227c70bd1bedb7d1acabefdd340bea5b"}
+      ]
+    },
+    {
+      "package": "libxcb_util_wm",
+      "recipe": "depends/packages/libxcb_util_wm.mk",
+      "recipe_sha256": "cee3302320bcfe031c16f3a310786110df3877a7259279e30acf6c9e8b92d35f",
+      "version": "0.4.1",
+      "sources": [
+        {"url": "https://xcb.freedesktop.org/dist/xcb-util-wm-0.4.1.tar.bz2", "sha256": "28bf8179640eaa89276d2b0f1ce4285103d136be6c98262b6151aaee1d3c2a3f"}
+      ]
+    },
+    {
+      "package": "libxkbcommon",
+      "recipe": "depends/packages/libxkbcommon.mk",
+      "recipe_sha256": "8fcfbd164443ee620ce24b82f6e409ac93e7f3a26bcf3f62b10bed77a3acf346",
+      "version": "0.8.4",
+      "sources": [
+        {"url": "https://xkbcommon.org/download/libxkbcommon-0.8.4.tar.xz", "sha256": "60ddcff932b7fd352752d51a5c4f04f3d0403230a584df9a2e0d5ed87c486c8b"}
+      ]
+    },
+    {
+      "package": "miniupnpc",
+      "recipe": "depends/packages/miniupnpc.mk",
+      "recipe_sha256": "315bd3b5a7144ad770345b3e164466c0bbc6c2f08c589192f9e883272b701c8f",
+      "version": "2.3.3",
+      "sources": [
+        {"url": "https://miniupnp.tuxfamily.org/files/miniupnpc-2.3.3.tar.gz", "sha256": "d52a0afa614ad6c088cc9ddff1ae7d29c8c595ac5fdd321170a05f41e634bd1a"}
+      ]
+    },
+    {
+      "package": "native_capnp",
+      "recipe": "depends/packages/native_capnp.mk",
+      "recipe_sha256": "8885ff0a8024a14e7e0d4b07baea65e8ac948f5d10a3b2dbf329d4ae81d33e3f",
+      "version": "0.7.1",
+      "sources": [
+        {"url": "https://capnproto.org/capnproto-c++-0.7.1.tar.gz", "sha256": "c510f93e40206dbf34133e1766aec04b98c3c54db53b243f15e1712d1b1352cd"}
+      ]
+    },
+    {
+      "package": "native_cctools",
+      "recipe": "depends/packages/native_cctools.mk",
+      "recipe_sha256": "2dfcaa395544f65007cbe67bb8ced23fa1051c22c5184c2a15086e886a09d07e",
+      "version": "c74fafe86076713cb8e6f937af43b6df6da1f42d",
+      "sources": [
+        {"url": "https://github.com/tpoechtrager/cctools-port/archive/c74fafe86076713cb8e6f937af43b6df6da1f42d.tar.gz", "sha256": "e2c1588d505a69c32e079f4e616e0f117d5478429040e394f624f43f2796e6bc"}
+      ]
+    },
+    {
+      "package": "native_clang",
+      "recipe": "depends/packages/native_clang.mk",
+      "recipe_sha256": "de4dca84030510c1c9e59e1a042dfab9ba69e57b40fd90a4458c75cd068c8461",
+      "version": "15.0.6",
+      "sources": [
+        {"url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-15.0.6/clang+llvm-15.0.6-aarch64-linux-gnu.tar.xz", "sha256": "8ca4d68cf103da8331ca3f35fe23d940c1b78fb7f0d4763c1c059e352f5d1bec"},
+        {"url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-15.0.6/clang+llvm-15.0.6-x86_64-linux-gnu-ubuntu-18.04.tar.xz", "sha256": "38bc7f5563642e73e69ac5626724e206d6d539fbef653541b34cae0ba9c3f036"}
+      ]
+    },
+    {
+      "package": "native_libmultiprocess",
+      "recipe": "depends/packages/native_libmultiprocess.mk",
+      "recipe_sha256": "da323cdc4604e77d1ec4b3108f3d9ce105dc840e9c46a81d7496c0ecbf6e0f74",
+      "version": "1af83d15239ccfa7e47b8764029320953dd7fdf1",
+      "sources": [
+        {"url": "https://github.com/bitcoin-core/libmultiprocess/archive/1af83d15239ccfa7e47b8764029320953dd7fdf1.tar.gz", "sha256": "e5587d3feedc7f8473f178a89b94163a11076629825d664964799bbbd5844da5"}
+      ]
+    },
+    {
+      "package": "native_libtapi",
+      "recipe": "depends/packages/native_libtapi.mk",
+      "recipe_sha256": "2037e579f404214bc5846673264c3b7003c34c1664e8dd15fa79193beccec315",
+      "version": "eb33a59f2e30ff9724dc1ea8bee8b5229b0557c9",
+      "sources": [
+        {"url": "https://github.com/tpoechtrager/apple-libtapi/archive/eb33a59f2e30ff9724dc1ea8bee8b5229b0557c9.tar.gz", "sha256": "d4d46c64622f13d6938cecf989046d9561011bb59e8ee835f8f39825d67f578f"}
+      ]
+    },
+    {
+      "package": "qrencode",
+      "recipe": "depends/packages/qrencode.mk",
+      "recipe_sha256": "1b76774b7d7691e2980068c624f0c3ece82c0af2b29d507a49d59901a596d7b3",
+      "version": "4.1.1",
+      "sources": [
+        {"url": "https://bitcoincore.org/depends-sources/qrencode-4.1.1.tar.bz2", "sha256": "e455d9732f8041cf5b9c388e345a641fd15707860f928e94507b1961256a6923"}
+      ]
+    },
+    {
+      "package": "qt",
+      "recipe": "depends/packages/qt.mk",
+      "recipe_sha256": "93170cc6733add26a5513048b3fb779951c6a24e85123efc8947d5fbb2fbf9ca",
+      "version": "5.15.19",
+      "sources": [
+        {"url": "https://download.qt.io/archive/qt/5.15/5.15.19/submodules/qtbase-everywhere-opensource-src-5.15.19.tar.xz", "sha256": "51e91c73abacab81e64efd01bf95794e79c0e605ad80947a024769f0dd620a32"},
+        {"url": "https://download.qt.io/archive/qt/5.15/5.15.19/submodules/qttranslations-everywhere-opensource-src-5.15.19.tar.xz", "sha256": "967e0d259af13f47e853f183cffc9671cc054380188fee28402f6425132a2c7b"},
+        {"url": "https://download.qt.io/archive/qt/5.15/5.15.19/submodules/qttools-everywhere-opensource-src-5.15.19.tar.xz", "sha256": "2694af886130d63b8a42bcd138f4035fd8108273ebd16781f87300da352f1aa6"}
+      ]
+    },
+    {
+      "package": "sqlite",
+      "recipe": "depends/packages/sqlite.mk",
+      "recipe_sha256": "eb2dc511c12487c1d9a55083513a55cb5f22a1d381cb368ae7c0704e17c13987",
+      "version": "3530300",
+      "sources": [
+        {"url": "https://sqlite.org/2026/sqlite-autoconf-3530300.tar.gz", "sha256": "c917d7db16648ec95f714974ace5e5dcf46b7dc70e26600a0a102a3141125db0"}
+      ]
+    },
+    {
+      "package": "systemtap",
+      "recipe": "depends/packages/systemtap.mk",
+      "recipe_sha256": "d1849e04fbc39a1a87441942d3474c85c51ce13194102bbd820615b0fd928378",
+      "version": "4.8",
+      "sources": [
+        {"url": "https://sourceware.org/ftp/systemtap/releases/systemtap-4.8.tar.gz", "sha256": "cbd50a4eba5b261394dc454c12448ddec73e55e6742fda7f508f9fbc1331c223"}
+      ]
+    },
+    {
+      "package": "xcb_proto",
+      "recipe": "depends/packages/xcb_proto.mk",
+      "recipe_sha256": "d6e6d3dd379f3f4f814bd1a7dab9bd909521a3fbaf89bce948a04380d287c3c0",
+      "version": "1.15.2",
+      "sources": [
+        {"url": "https://xorg.freedesktop.org/archive/individual/proto/xcb-proto-1.15.2.tar.xz", "sha256": "7072beb1f680a2fe3f9e535b797c146d22528990c72f63ddb49d2f350a3653ed"}
+      ]
+    },
+    {
+      "package": "xproto",
+      "recipe": "depends/packages/xproto.mk",
+      "recipe_sha256": "1b4221dbf05d49f472c4c5907ca7e18c4a8fe085e3fd51e23047c0570cc56a67",
+      "version": "7.0.31",
+      "sources": [
+        {"url": "https://xorg.freedesktop.org/releases/individual/proto/xproto-7.0.31.tar.bz2", "sha256": "c6f9747da0bd3a95f86b17fb8dd5e717c8f3ab7f0ece3ba1b247899ec1ef7747"}
+      ]
+    },
+    {
+      "package": "zeromq",
+      "recipe": "depends/packages/zeromq.mk",
+      "recipe_sha256": "9d7d44c1c971042f88b2368617d49bf1a95cc41d7f7b77fe516531bee7b31134",
+      "version": "4.3.5",
+      "sources": [
+        {"url": "https://github.com/zeromq/libzmq/releases/download/v4.3.5/zeromq-4.3.5.tar.gz", "sha256": "6653ef5910f17954861fe72332e68b03ca6e4d9c7160eb3a8de5a5a913bfab43"}
+      ]
+    }
+  ],
+  "dependency_delta": [
+    {"package": "bdb", "v30_1_0": "6.2.38", "active_legacy": "6.2.38", "candidate": "6.2.38"},
+    {"package": "boost", "v30_1_0": "1.81.0", "active_legacy": "1.81.0", "candidate": "1.81.0"},
+    {"package": "capnp", "v30_1_0": "0.7.0", "active_legacy": "1.0.1", "candidate": "0.7.1"},
+    {"package": "expat", "v30_1_0": "2.4.8", "active_legacy": "2.4.8", "candidate": "2.8.2"},
+    {"package": "fontconfig", "v30_1_0": "2.12.6", "active_legacy": "2.12.6", "candidate": "2.12.6"},
+    {"package": "freetype", "v30_1_0": "2.11.0", "active_legacy": "2.11.0", "candidate": "2.14.3"},
+    {"package": "libXau", "v30_1_0": "1.0.9", "active_legacy": "1.0.9", "candidate": "1.0.9"},
+    {"package": "libevent", "v30_1_0": "2.1.12-stable", "active_legacy": "2.1.12-stable", "candidate": "2.1.12-stable"},
+    {"package": "libmultiprocess", "v30_1_0": "1af83d15239ccfa7e47b8764029320953dd7fdf1", "active_legacy": "6aca5f389bacf2942394b8738bbe15d6c9edfb9b", "candidate": "1af83d15239ccfa7e47b8764029320953dd7fdf1"},
+    {"package": "libnatpmp", "v30_1_0": "07004b97cf691774efebe70404cf22201e4d330d", "active_legacy": "f2433bec24ca3d3f22a8a7840728a3ac177f94ba", "candidate": "07004b97cf691774efebe70404cf22201e4d330d"},
+    {"package": "liboqs", "v30_1_0": "0.15.0", "active_legacy": null, "candidate": "0.15.0"},
+    {"package": "libxcb", "v30_1_0": "1.14", "active_legacy": "1.14", "candidate": "1.14"},
+    {"package": "libxcb_util", "v30_1_0": "0.4.0", "active_legacy": "0.4.0", "candidate": "0.4.0"},
+    {"package": "libxcb_util_image", "v30_1_0": "0.4.0", "active_legacy": "0.4.0", "candidate": "0.4.0"},
+    {"package": "libxcb_util_keysyms", "v30_1_0": "0.4.0", "active_legacy": "0.4.0", "candidate": "0.4.0"},
+    {"package": "libxcb_util_render", "v30_1_0": "0.3.9", "active_legacy": "0.3.9", "candidate": "0.3.9"},
+    {"package": "libxcb_util_wm", "v30_1_0": "0.4.1", "active_legacy": "0.4.1", "candidate": "0.4.1"},
+    {"package": "libxkbcommon", "v30_1_0": "0.8.4", "active_legacy": "0.8.4", "candidate": "0.8.4"},
+    {"package": "miniupnpc", "v30_1_0": "2.2.2", "active_legacy": "2.2.7", "candidate": "2.3.3"},
+    {"package": "native_capnp", "v30_1_0": "0.7.0", "active_legacy": "1.0.1", "candidate": "0.7.1"},
+    {"package": "native_cctools", "v30_1_0": "c74fafe86076713cb8e6f937af43b6df6da1f42d", "active_legacy": null, "candidate": "c74fafe86076713cb8e6f937af43b6df6da1f42d"},
+    {"package": "native_clang", "v30_1_0": "15.0.6", "active_legacy": null, "candidate": "15.0.6"},
+    {"package": "native_libmultiprocess", "v30_1_0": "1af83d15239ccfa7e47b8764029320953dd7fdf1", "active_legacy": "6aca5f389bacf2942394b8738bbe15d6c9edfb9b", "candidate": "1af83d15239ccfa7e47b8764029320953dd7fdf1"},
+    {"package": "native_libtapi", "v30_1_0": "eb33a59f2e30ff9724dc1ea8bee8b5229b0557c9", "active_legacy": null, "candidate": "eb33a59f2e30ff9724dc1ea8bee8b5229b0557c9"},
+    {"package": "qrencode", "v30_1_0": "4.1.1", "active_legacy": "4.1.1", "candidate": "4.1.1"},
+    {"package": "qt", "v30_1_0": "5.15.10", "active_legacy": "5.15.14", "candidate": "5.15.19"},
+    {"package": "sqlite", "v30_1_0": "3380500", "active_legacy": "3380500", "candidate": "3530300"},
+    {"package": "systemtap", "v30_1_0": "4.8", "active_legacy": "4.8", "candidate": "4.8"},
+    {"package": "xcb_proto", "v30_1_0": "1.15.2", "active_legacy": "1.15.2", "candidate": "1.15.2"},
+    {"package": "xproto", "v30_1_0": "7.0.31", "active_legacy": "7.0.31", "candidate": "7.0.31"},
+    {"package": "zeromq", "v30_1_0": "4.3.4", "active_legacy": "4.3.5", "candidate": "4.3.5"}
+  ],
+  "dependency_update_dispositions": [
+    {
+      "package": "libnatpmp",
+      "covers": [],
+      "disposition": "deferred",
+      "risk": "The active-legacy pin adds response-type retry handling and replaces the depends Makefile build with CMake. NAT-PMP is optional and non-consensus, but changing its build path without the release platform matrix could break networking support on one target.",
+      "owner": "networking",
+      "target": "post-beta NAT-PMP platform matrix",
+      "source": "https://github.com/miniupnp/libnatpmp/compare/07004b97cf691774efebe70404cf22201e4d330d...f2433bec24ca3d3f22a8a7840728a3ac177f94ba"
+    },
+    {
+      "package": "native_libmultiprocess",
+      "covers": ["libmultiprocess"],
+      "disposition": "deferred",
+      "risk": "The active-legacy pin is coupled to Cap'n Proto 1.0.1 and changes generated IPC code and cleanup ordering. Multiprocess binaries are experimental and disabled by default; a partial update could create ABI or shutdown deadlocks.",
+      "owner": "build",
+      "target": "post-beta multiprocess compatibility matrix",
+      "source": "https://github.com/bitcoin-core/libmultiprocess/compare/1af83d15239ccfa7e47b8764029320953dd7fdf1...6aca5f389bacf2942394b8738bbe15d6c9edfb9b"
+    }
+  ],
+  "vendored_components": [
+    {
+      "package": "secp256k1",
+      "candidate": "0.4.0",
+      "active_legacy": "0.5.1",
+      "tracked_tree_sha256": "b44da48e11dcae04eb7cb5701bf1910fcbb2e2cf29019c3b19ddd4cc3870a833",
+      "disposition": "deferred",
+      "risk": "Replacing the consensus-adjacent vendored cryptographic subtree for performance and API changes is higher beta risk than retaining 0.4.0, which already contains the 0.3.1 and 0.3.2 compiler timing fixes.",
+      "owner": "cryptography",
+      "target": "post-beta isolated secp256k1 update"
+    }
+  ],
+  "build_constraints": {
+    "liboqs": {
+      "required": [
+        "-DBUILD_SHARED_LIBS=OFF",
+        "-DOQS_BUILD_ONLY_LIB=ON",
+        "-DOQS_USE_OPENSSL=OFF",
+        "-DOQS_DIST_BUILD=OFF",
+        "-DOQS_OPT_TARGET=generic",
+        "-DOQS_MINIMAL_BUILD=SIG_ml_dsa_44"
+      ],
+      "forbidden": ["SIG_xmss", "KEM_hqc", "KEM_kyber"]
+    },
+    "qt": {
+      "required": [
+        "-no-openssl",
+        "-no-schannel",
+        "-no-securetransport",
+        "-no-feature-http",
+        "-no-feature-xml",
+        "-no-feature-sql",
+        "-no-feature-networkproxy"
+      ],
+      "allowed_source_modules": ["qtbase", "qttools", "qttranslations"],
+      "forbidden_source_modules": ["qtdeclarative", "qtsvg"]
+    }
+  },
+  "dependency_advisories": [
+    {"id": "CVE-2022-46149", "package": "native_capnp", "disposition": "mitigated", "reason": "0.7.1 is the fixed 0.7-series release.", "source": "https://capnproto.org/news/2022-11-30-CVE-2022-46149-security-advisory.html"},
+    {"id": "CVE-2024-52917", "package": "miniupnpc", "disposition": "mitigated", "reason": "The infinite-loop fix predates pinned 2.3.3.", "source": "https://bitcoincore.org/en/2024/07/31/disclose-upnp-oom/"},
+    {"id": "GHSA-qq65-x72m-9wr8,GHSA-4p5v-h92w-6wxw,GHSA-wfr2-29gj-5w87,GHSA-25wp-cf8g-938m,GHSA-fc3w-qxf5-7hp6", "package": "zeromq", "disposition": "mitigated", "reason": "All five upstream advisories list 4.3.3 as patched; the pin is 4.3.5.", "source": "https://github.com/zeromq/libzmq/security/advisories"},
+    {"id": "CVE-2026-11822", "package": "sqlite", "disposition": "mitigated", "reason": "Fixed in 3.53.2; the pin is 3.53.3.", "source": "https://sqlite.org/cves.html"},
+    {"id": "CVE-2025-5455,CVE-2025-4211", "package": "qt", "disposition": "mitigated", "reason": "Both fixes are included in 5.15.19.", "source": "https://wiki.qt.io/List_of_known_vulnerabilities_in_Qt_products"},
+    {"id": "CVE-2025-14575", "package": "qt", "disposition": "not-built", "reason": "The affected Qt 5 OpenSSL TLS backend is disabled by the pinned recipe.", "source": "https://wiki.qt.io/List_of_known_vulnerabilities_in_Qt_products"},
+    {"id": "CVE-2025-6338", "package": "qt", "disposition": "not-built", "reason": "The affected Schannel backend is disabled by the pinned recipe.", "source": "https://wiki.qt.io/List_of_known_vulnerabilities_in_Qt_products"},
+    {"id": "CVE-2025-12385", "package": "qt", "disposition": "not-built", "reason": "The affected Qt Quick/qdeclarative module is not fetched.", "source": "https://wiki.qt.io/List_of_known_vulnerabilities_in_Qt_products"},
+    {"id": "CVE-2024-54137,CVE-2025-48946,CVE-2025-52473", "package": "liboqs", "disposition": "not-built", "reason": "The affected HQC implementations are excluded by OQS_MINIMAL_BUILD=SIG_ml_dsa_44.", "source": "https://github.com/open-quantum-safe/liboqs/security/advisories"},
+    {"id": "CVE-2024-36405", "package": "liboqs", "disposition": "not-built", "reason": "The affected Kyber implementation is excluded by OQS_MINIMAL_BUILD=SIG_ml_dsa_44.", "source": "https://github.com/open-quantum-safe/liboqs/security/advisories"},
+    {"id": "CVE-2026-44518,CVE-2026-46344", "package": "liboqs", "disposition": "not-built", "reason": "The affected XMSS implementation is excluded by OQS_MINIMAL_BUILD=SIG_ml_dsa_44.", "source": "https://github.com/open-quantum-safe/liboqs/security/advisories"},
+    {"id": "EXPAT-R-2-8-2", "package": "expat", "disposition": "mitigated", "reason": "The upstream 2.8.2 release states that it fixes thirteen vulnerabilities.", "source": "https://github.com/libexpat/libexpat/releases/tag/R_2_8_2"},
+    {"id": "FREETYPE-2-14-3", "package": "freetype", "disposition": "mitigated", "reason": "Upstream directs users to 2.14.3 for potential security issues.", "source": "https://freetype.org/"}
+  ],
+  "bitcoin_core_advisories": [
+    {"id": "CVE-2024-52911", "severity": "high", "disposition": "mitigated", "reason": "ConnectBlock constructs the fully sized PrecomputedTransactionData vector before CCheckQueueControl. Reverse destruction therefore waits for queued checks before freeing their pointed-to data.", "source": "https://bitcoincore.org/en/2026/05/05/disclose-cve-2024-52911/"},
+    {"id": "CVE-2024-52919-part-2", "severity": "low", "disposition": "deferred", "reason": "The long-duration addr-spam crash fix first shipped in Bitcoin Core 29 and is absent from both active legacy 28.x and the candidate lineage.", "risk": "A remote peer must sustain addr-message spam for a very long time; porting the addrman/net-processing series requires isolated resource-limit tests.", "owner": "p2p", "target": "post-beta P2P hardening", "source": "https://bitcoincore.org/en/2025/04/28/disclose-cve-2024-52919/"},
+    {"id": "CVE-2025-46597", "severity": "low", "disposition": "not-applicable", "reason": "Official candidate artifacts support 64-bit Linux, Windows, and macOS only; no 32-bit release artifact is permitted.", "source": "https://bitcoincore.org/en/2025/10/24/disclose-cve-2025-46597/"},
+    {"id": "CVE-2025-46598", "severity": "low", "disposition": "deferred", "reason": "The mitigation spans multiple Bitcoin Core 30 script-interpreter changes and postdates both compared branches.", "risk": "A remote peer can spend seconds validating specially crafted non-standard unconfirmed transactions; a narrow backport requires dedicated policy and consensus-result differential tests.", "owner": "validation", "target": "post-beta script resource hardening", "source": "https://bitcoincore.org/en/2025/10/24/disclose-cve-2025-46598/"},
+    {"id": "CVE-2025-54604", "severity": "low", "disposition": "deferred", "reason": "Global log rate limiting first shipped in Bitcoin Core 29.1/30 and postdates both compared branches.", "risk": "Spoofed self-connections can fill logs only over a long period; the broad logging subsystem port needs focused retention and observability tests.", "owner": "p2p", "target": "post-beta log rate limiting", "source": "https://bitcoincore.org/en/2025/10/24/disclose-cve-2025-54604/"},
+    {"id": "CVE-2025-54605", "severity": "low", "disposition": "deferred", "reason": "Global log rate limiting first shipped in Bitcoin Core 29.1/30 and postdates both compared branches.", "risk": "Repeated invalid blocks can fill logs only over a long period; the broad logging subsystem port needs focused retention and invalid-block diagnostics tests.", "owner": "validation", "target": "post-beta log rate limiting", "source": "https://bitcoincore.org/en/2025/10/24/disclose-cve-2025-54605/"}
+  ],
+  "legacy_delta_dispositions": [
+    {"commit": "beaaa0601f06ee36a8dbd449f821aed9f111c788", "category": "p2p", "disposition": "equivalent", "risk": "none identified", "evidence": ["src/net_processing.cpp"]},
+    {"commit": "a86700192f0525e33dc84b7b2fda51450ce4c5e6", "category": "validation", "disposition": "ported", "risk": "deterministic malformed signature only", "evidence": ["src/validation.cpp", "src/test/crypto_hardening_tests.cpp"]},
+    {"commit": "84f03daed8d1a001af7ead05966423bd09624349", "category": "p2p", "disposition": "ported", "risk": "wire-compatible BIP152 differential indexes", "evidence": ["src/blockencodings.cpp", "src/test/blockencodings_tests.cpp"]},
+    {"commit": "5b3b6e793692d36d3927c89961c5b7cde5b1b246", "category": "consensus", "disposition": "deferred", "risk": "Mechanical port would alter Gold Rush mixed-version script consensus.", "owner": "consensus", "target": "phase-boundary differential suite", "evidence": ["doc/v30.1.1-dependency-security-audit.md"]},
+    {"commit": "286b97dd6091079806f5e1a82b8105ce376af10f", "category": "consensus", "disposition": "incompatible", "risk": "The legacy rule rejects witness version 16 reserved for Quantum Quasar.", "evidence": ["src/consensus/quantum_witness.cpp"]},
+    {"commit": "9e04008f9069b636ae75f353ab95c3c0193ba482", "category": "staking", "disposition": "deferred", "risk": "Staking liveness changes overlap phase-aware wallet code and require the staking workstream matrix.", "owner": "staking", "target": "staking liveness gate", "evidence": ["doc/v30.1.1-release-gate.md"]},
+    {"commit": "96bdf1d5ea7839fe88df49eefe5958c7348065fc", "category": "staking", "disposition": "deferred", "risk": "Status changes overlap the v30 phase-aware staking RPC.", "owner": "staking", "target": "staking liveness gate", "evidence": ["doc/v30.1.1-release-gate.md"]},
+    {"commit": "57d605d4154f52860b2059f6c390829400f68db9", "category": "staking", "disposition": "deferred", "risk": "Restart behavior requires daemon and GUI lifecycle tests.", "owner": "staking", "target": "staking liveness gate", "evidence": ["doc/v30.1.1-release-gate.md"]},
+    {"commit": "e9de06fca613833337d1c857a331c2498ae53991", "category": "staking", "disposition": "deferred", "risk": "Restart behavior requires daemon and GUI lifecycle tests.", "owner": "staking", "target": "staking liveness gate", "evidence": ["doc/v30.1.1-release-gate.md"]},
+    {"commit": "d63a057d88d31176ca4dc2e99d39e6adf0aeeba8", "category": "wallet", "disposition": "deferred", "risk": "Coinstake conflict handling overlaps shadow signal records.", "owner": "staking", "target": "staking liveness gate", "evidence": ["doc/v30.1.1-release-gate.md"]},
+    {"commit": "2db83bdaaa228fc07e877b0dad9801c43ce1678a", "category": "staking", "disposition": "deferred", "risk": "Stake cache replacement requires phase-aware differential tests.", "owner": "staking", "target": "staking liveness gate", "evidence": ["doc/v30.1.1-release-gate.md"]},
+    {"commit": "5473901c52b9e57953b813b0f96ed94e8e2cb12f", "category": "p2p", "disposition": "deferred", "risk": "Peer selection changes can affect mixed-version reachability.", "owner": "staking", "target": "staking liveness gate", "evidence": ["doc/v30.1.1-release-gate.md"]},
+    {"commit": "c5d9f75c4b4a9f43e1f47f70367741c62da557b8", "category": "wallet", "disposition": "deferred", "risk": "Migration backup path changes require failure-injection coverage.", "owner": "wallet", "target": "wallet migration hardening", "evidence": ["doc/v30.1.1-dependency-security-audit.md"]},
+    {"commit": "6494072295154fdf3e896e892f0051afd3d1e677", "category": "wallet", "disposition": "deferred", "risk": "Migration backup movement changes require failure-injection coverage.", "owner": "wallet", "target": "wallet migration hardening", "evidence": ["doc/v30.1.1-dependency-security-audit.md"]},
+    {"commit": "619480bd785e28b3fa251c629c7527e49edf53e6", "category": "wallet", "disposition": "deferred", "risk": "Logging-only delta is subordinate to migration failure correctness.", "owner": "wallet", "target": "wallet migration hardening", "evidence": ["doc/v30.1.1-dependency-security-audit.md"]},
+    {"commit": "29abedc97b9ca9e4ff4b9abb47ab90ea8586b327", "category": "wallet", "disposition": "deferred", "risk": "BDB file enumeration changes require cross-format wallet tests.", "owner": "wallet", "target": "wallet migration hardening", "evidence": ["doc/v30.1.1-dependency-security-audit.md"]},
+    {"commit": "86eaf71e609121c7306442b5a5e3636d70532abb", "category": "wallet", "disposition": "deferred", "risk": "Migration naming changes require multiwallet tests.", "owner": "wallet", "target": "wallet migration hardening", "evidence": ["doc/v30.1.1-dependency-security-audit.md"]},
+    {"commit": "fb4406e63aac558c4eec2b03ef6b2f8a6f13523b", "category": "wallet", "disposition": "deferred", "risk": "Logging-only delta is subordinate to migration failure correctness.", "owner": "wallet", "target": "wallet migration hardening", "evidence": ["doc/v30.1.1-dependency-security-audit.md"]},
+    {"commit": "e47af692223238f7ea36bc644c1a2a6417ef745b", "category": "wallet", "disposition": "deferred", "risk": "Unnamed wallet failure cleanup can delete data if ported incorrectly.", "owner": "wallet", "target": "wallet migration hardening", "evidence": ["doc/v30.1.1-dependency-security-audit.md"]},
+    {"commit": "e1e9d71da939a33fdd98019856f5c4411df95214", "category": "wallet", "disposition": "deferred", "risk": "Restore cleanup must prove it removes only newly created paths.", "owner": "wallet", "target": "wallet migration hardening", "evidence": ["doc/v30.1.1-dependency-security-audit.md"]},
+    {"commit": "b54cdfc61792a47cb685c2fbc8aa9200c3415515", "category": "wallet", "disposition": "deferred", "risk": "Create-from-dump cleanup must prove it cannot recursively delete pre-existing paths.", "owner": "wallet", "target": "wallet migration hardening", "evidence": ["doc/v30.1.1-dependency-security-audit.md"]}
+  ],
+  "provenance": {
+    "manifest": "contrib/devtools/copyright-provenance-v30.1.1.json",
+    "sha256": "56615c5f33b052e2f88495b029ef2ad0e1ecc180f2f8161bb49dba0374d5753b",
+    "schema": 1,
+    "current_revision": "d161e279be86b3bc20a8c59d3e08e66cbacbeeaa",
+    "legacy_revision": "5c1a4a5efc3886a69f01d50109c251d153ed092e",
+    "restored_count": 664,
+    "excluded_count": 11,
+    "ambiguous_count": 641
+  }
+}

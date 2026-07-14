@@ -80,6 +80,9 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || 'f647dc75c9479c03e81414f145a8d233b60959c7' }}
         run: git diff --check "$BASE_SHA...$TARGET_SHA"
 
+      - name: Verify dependency, advisory, capability, and provenance evidence
+        run: python3 ci/release/verify_dependency_security.py
+
       - name: Install lint dependencies
         run: |
           sudo apt-get update

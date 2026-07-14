@@ -912,6 +912,35 @@ class ReleaseToolTests(unittest.TestCase):
                 "$(package)_sha256_hash=" + "1" * 64 + "\n",
                 encoding="utf-8",
             )
+            dependency_manifest = root / "dependency-security-manifest.json"
+            dependency_manifest.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "dependencies": [
+                            {
+                                "package": "example",
+                                "recipe": "depends/packages/example.mk",
+                                "recipe_sha256": hashlib.sha256(
+                                    (packages / "example.mk").read_bytes()
+                                ).hexdigest(),
+                                "version": "1.2.3",
+                                "sources": [
+                                    {
+                                        "url": "https://example.test/example-1.2.3.tar.gz",
+                                        "sha256": "1" * 64,
+                                    },
+                                    {
+                                        "url": "https://example.test/example-data-1.2.3.tar.gz",
+                                        "sha256": "2" * 64,
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
             sbom = artifacts / "Blackcoin-30.1.1-SBOM.spdx.json"
             provenance = artifacts / "Blackcoin-30.1.1-provenance.intoto.json"
             subprocess.run(
@@ -922,6 +951,8 @@ class ReleaseToolTests(unittest.TestCase):
                     str(artifacts),
                     "--depends-packages",
                     str(packages),
+                    "--dependency-manifest",
+                    str(dependency_manifest),
                     "--version",
                     "30.1.1",
                     "--source-sha",
@@ -961,6 +992,22 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertTrue(
                 any(relationship["relationshipType"] == "DEPENDS_ON" for relationship in sbom_document["relationships"])
             )
+            dependency_packages = [
+                package for package in sbom_document["packages"]
+                if package["name"] == "example"
+            ]
+            self.assertEqual(len(dependency_packages), 1)
+            self.assertEqual(
+                dependency_packages[0]["downloadLocation"],
+                "https://example.test/example-1.2.3.tar.gz",
+            )
+            self.assertTrue(
+                any(
+                    package["downloadLocation"] ==
+                    "https://example.test/example-data-1.2.3.tar.gz"
+                    for package in sbom_document["packages"]
+                )
+            )
             self.assertEqual(provenance_document["_type"], "https://in-toto.io/Statement/v1")
             self.assertEqual(
                 provenance_document["predicate"]["buildDefinition"]["externalParameters"]["source"]["digest"]["gitCommit"],
@@ -970,6 +1017,44 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertIn("Blackcoin-30.1.1-test.bin", subject_names)
             self.assertIn(sbom.name, subject_names)
             self.assertNotIn(provenance.name, subject_names)
+
+    def test_dependency_security_manifest_is_fail_closed(self):
+        verifier = load_module("verify_dependency_security")
+        repository = TOOLS.parents[1]
+        manifest_path = TOOLS / "dependency-security-manifest.json"
+        verifier.verify(repository, manifest_path)
+
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        document["baselines"]["v30_1_0"] = "0" * 40
+        with tempfile.TemporaryDirectory() as temporary:
+            mutated = Path(temporary) / "dependency-security-manifest.json"
+            mutated.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "immutable review revisions"):
+                verifier.verify(repository, mutated)
+
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        document["dependencies"][0]["recipe_sha256"] = "0" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            mutated = Path(temporary) / "dependency-security-manifest.json"
+            mutated.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "recipe changed without a manifest review"):
+                verifier.verify(repository, mutated)
+
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        document["dependency_delta"].pop()
+        with tempfile.TemporaryDirectory() as temporary:
+            mutated = Path(temporary) / "dependency-security-manifest.json"
+            mutated.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "compare every candidate dependency"):
+                verifier.verify(repository, mutated)
+
+        document = json.loads(manifest_path.read_text(encoding="utf-8"))
+        document["dependency_update_dispositions"].pop()
+        with tempfile.TemporaryDirectory() as temporary:
+            mutated = Path(temporary) / "dependency-security-manifest.json"
+            mutated.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "lack exact dispositions"):
+                verifier.verify(repository, mutated)
 
 
 if __name__ == "__main__":

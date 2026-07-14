@@ -156,3 +156,6 @@ Notable changes
 - The v30.1.1 dependency, inherited-code provenance, P2P capability, and
   active-legacy delta review is recorded in the
   [dependency and security audit](v30.1.1-dependency-security-audit.md).
+- Release SBOMs consume the fail-closed dependency security manifest, including
+  resolved native/target aliases and every Qt source archive, so reviewed
+  dependency sources are emitted with HTTPS provenance and SHA-256 values.

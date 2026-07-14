@@ -1056,8 +1056,10 @@ jobs:
           gpg --batch --armor --export "$RELEASE_GPG_FINGERPRINT" > \
             "dist/Blackcoin-$VERSION-RELEASE-KEY.asc"
 
+          python3 ci/release/verify_dependency_security.py
           python3 ci/release/generate_spdx_sbom.py \
             --artifacts dist --depends-packages depends/packages \
+            --dependency-manifest ci/release/dependency-security-manifest.json \
             --version "$VERSION" --source-sha "$TARGET_SHA" \
             --source-date-epoch "$SOURCE_DATE_EPOCH" \
             --output "dist/Blackcoin-$VERSION-SBOM.spdx.json"
