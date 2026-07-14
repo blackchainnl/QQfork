@@ -16,6 +16,7 @@
 #include <script/script.h>
 #include <serialize.h>
 #include <shadow.h>
+#include <streams.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
 #include <undo.h>
@@ -438,6 +439,12 @@ BOOST_AUTO_TEST_CASE(shadow_index_record_validation_respects_claim_boundary)
     record.pow_claim_source.base_fee_known = true;
     record.pow_claim_source.base_fee = CENT;
     record.pow_claim_source.disposition = ShadowPowClaimDisposition::WINNER;
+    record.pow_claim_source.origin_bound = true;
+    record.pow_claim_source.origin_height =
+        MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
+    record.pow_claim_source.origin_previous_block_hash = uint256S("07");
+    record.pow_claim_source.inclusion_height =
+        MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
     BOOST_CHECK(!IsValidShadowIndexRecord(record));
 
     record.origin_height = MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
@@ -446,6 +453,28 @@ BOOST_AUTO_TEST_CASE(shadow_index_record_validation_respects_claim_boundary)
     BOOST_CHECK(!IsValidShadowIndexRecord(record));
 
     record.pow_claim_source_present = true;
+    record.pow_claim_source.disposition =
+        ShadowPowClaimDisposition::REIMBURSED_LATE;
+    record.pow_claim_source.origin_height = record.origin_height - 3;
+    record.pow_claim_source.inclusion_height = record.origin_height;
+    record.pow_claim_source.origin_age = 3;
+    BOOST_CHECK(IsValidShadowIndexRecord(record));
+
+    DataStream stream;
+    stream << record.pow_claim_source;
+    ShadowIndexPowClaimSource restored_source;
+    stream >> restored_source;
+    BOOST_CHECK(restored_source.txid == record.pow_claim_source.txid);
+    BOOST_CHECK(restored_source.disposition ==
+                ShadowPowClaimDisposition::REIMBURSED_LATE);
+    BOOST_CHECK(restored_source.origin_bound);
+    BOOST_CHECK_EQUAL(restored_source.origin_height,
+                      record.pow_claim_source.origin_height);
+    BOOST_CHECK(restored_source.origin_previous_block_hash ==
+                record.pow_claim_source.origin_previous_block_hash);
+    BOOST_CHECK_EQUAL(restored_source.inclusion_height, record.origin_height);
+    BOOST_CHECK_EQUAL(restored_source.origin_age, 3U);
+
     record.spent = true;
     record.spend_height = record.origin_height + 1;
     record.spend_block_hash = uint256S("05");
@@ -1015,7 +1044,7 @@ BOOST_AUTO_TEST_CASE(active_signal_and_pool_state_are_atomic_and_fail_closed)
 
     const ShadowReplayStateInfo absent_replay = GetShadowReplayStateInfo(
         view, Params().GetConsensus(), &first_index);
-    BOOST_CHECK_EQUAL(absent_replay.schema, 11U);
+    BOOST_CHECK_EQUAL(absent_replay.schema, 12U);
     BOOST_CHECK(absent_replay.required_for_tip);
     BOOST_CHECK(!absent_replay.present);
     BOOST_CHECK(!absent_replay.valid_for_tip);
@@ -1351,6 +1380,8 @@ BOOST_AUTO_TEST_CASE(pow_shadow_claim_is_reachable_in_pos_era_and_uses_pow_bucke
 
     std::vector<unsigned char> pow_proof;
     BOOST_REQUIRE(MineShadowProofData(pow_target, quantum_payout, &first_index, view, 50'000, pow_proof));
+    BOOST_REQUIRE_GT(pow_proof.size(), GetShadowPrefix().size() + 4);
+    BOOST_CHECK_EQUAL(pow_proof[GetShadowPrefix().size() + 3], '2');
 
     uint256 second_hash;
     CBlockIndex second_index;
@@ -1475,6 +1506,8 @@ BOOST_AUTO_TEST_CASE(pow_shadow_claim_in_proof_of_work_block_is_legacy_visible_b
     BOOST_REQUIRE(MineShadowProofData(pow_target, quantum_payout,
                                       &activation_parent, view, 50'000,
                                       pow_proof));
+    BOOST_REQUIRE_GT(pow_proof.size(), GetShadowPrefix().size() + 4);
+    BOOST_CHECK_EQUAL(pow_proof[GetShadowPrefix().size() + 3], '3');
 
     uint256 claim_hash;
     CBlockIndex claim_index;
@@ -1771,6 +1804,186 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_claim_reimburses_valid_loser_without_i
     const ShadowGoldRushInfo info = GetShadowGoldRushInfo(view, &claim_index);
     BOOST_CHECK_EQUAL(info.pow_amount, 0);
     BOOST_CHECK_EQUAL(info.pow_count, 1U);
+}
+
+BOOST_AUTO_TEST_CASE(pow_shadow_qqp3_late_claims_are_bounded_and_emission_neutral)
+{
+    const int origin_height =
+        Params().GetConsensus().nShadowCompetingClaimsActivationHeight;
+    const uint256 origin_parent = uint256S("1010");
+    const uint256 inclusion_parent = uint256S("2020");
+    const CScript late_target = CScript{} << OP_2;
+    const CScript current_target = CScript{} << OP_3;
+    const CScript late_payout = QuantumScript(0x90);
+    const CScript current_payout = QuantumScript(0x91);
+
+    ShadowPowWork late_work;
+    late_work.valid = true;
+    late_work.origin_bound = true;
+    late_work.height = origin_height;
+    late_work.prev_hash = origin_parent;
+    late_work.bits = 10;
+    late_work.target = late_target;
+    late_work.quantum_payout_script = late_payout;
+    std::vector<unsigned char> late_proof;
+    BOOST_REQUIRE(GrindShadowPowWork(late_work, 0, 1, 100'000, late_proof));
+    BOOST_REQUIRE_GT(late_proof.size(), GetShadowPrefix().size() + 4);
+    BOOST_CHECK_EQUAL(late_proof[GetShadowPrefix().size() + 3], '3');
+
+    ShadowPowWork current_work = late_work;
+    current_work.height = origin_height + 1;
+    current_work.prev_hash = inclusion_parent;
+    current_work.target = current_target;
+    current_work.quantum_payout_script = current_payout;
+    std::vector<unsigned char> current_proof;
+    BOOST_REQUIRE(GrindShadowPowWork(current_work, 0, 1, 100'000,
+                                    current_proof));
+
+    const CAmount late_fee = CENT / 2;
+    const CAmount current_fee = CENT / 4;
+    CBlock mixed_block;
+    mixed_block.vtx = {
+        MakeCoinbaseTx(CScript{} << OP_4),
+        MakeCoinstakeTx(CScript{} << OP_5),
+        MakePowClaimTx(late_target, late_proof, 0),
+        MakePowClaimTx(current_target, current_proof, 1),
+    };
+    CBlockUndo mixed_undo = MakeUndoWithInputScripts(
+        mixed_block, {{1, CScript{} << OP_5}, {2, late_target},
+                      {3, current_target}});
+    SetUndoInputValue(mixed_undo, 2, COIN + late_fee);
+    SetUndoInputValue(mixed_undo, 3, COIN + current_fee);
+
+    ShadowPowAccountingContext context;
+    context.valid = true;
+    context.canonical_rule_active = true;
+    context.height = origin_height + 1;
+    context.previous_block_hash = inclusion_parent;
+    context.credited_pow_pool = 290 * COIN;
+    context.target_bits = current_work.bits;
+    context.late_origins.push_back(ShadowPowOriginContext{
+        static_cast<uint32_t>(origin_height), origin_parent, late_work.bits});
+
+    std::vector<ShadowPowClaimAccounting> accounting;
+    ShadowPowClaimAggregate aggregate;
+    BOOST_REQUIRE(EvaluateShadowPowClaimAccounting(
+        context, mixed_block, &mixed_undo, accounting, &aggregate) ==
+        ShadowPowAccountingResult::OK);
+    BOOST_REQUIRE_EQUAL(accounting.size(), 2U);
+    const auto late = std::find_if(
+        accounting.begin(), accounting.end(),
+        [](const ShadowPowClaimAccounting& entry) {
+            return entry.disposition ==
+                   ShadowPowClaimDisposition::REIMBURSED_LATE;
+        });
+    const auto winner = std::find_if(
+        accounting.begin(), accounting.end(),
+        [](const ShadowPowClaimAccounting& entry) {
+            return entry.disposition == ShadowPowClaimDisposition::WINNER;
+        });
+    BOOST_REQUIRE(late != accounting.end());
+    BOOST_REQUIRE(winner != accounting.end());
+    BOOST_CHECK(late->origin_bound);
+    BOOST_CHECK_EQUAL(late->origin_height,
+                      static_cast<uint32_t>(origin_height));
+    BOOST_CHECK_EQUAL(late->inclusion_height,
+                      static_cast<uint32_t>(origin_height + 1));
+    BOOST_CHECK_EQUAL(late->origin_age, 1U);
+    BOOST_CHECK_EQUAL(late->credited_amount, late_fee);
+    BOOST_CHECK_EQUAL(winner->credited_amount,
+                      context.credited_pow_pool - late_fee);
+    BOOST_CHECK_EQUAL(late->credited_amount + winner->credited_amount,
+                      context.credited_pow_pool);
+    BOOST_CHECK_EQUAL(aggregate.winner_count, 1U);
+    BOOST_CHECK_EQUAL(aggregate.reimbursed_late_count, 1U);
+
+    CBlock late_only_block;
+    late_only_block.vtx = {
+        MakeCoinbaseTx(CScript{} << OP_4),
+        MakeCoinstakeTx(CScript{} << OP_5),
+        MakePowClaimTx(late_target, late_proof, 0),
+    };
+    CBlockUndo late_only_undo = MakeUndoWithInputScripts(
+        late_only_block, {{1, CScript{} << OP_5}, {2, late_target}});
+    SetUndoInputValue(late_only_undo, 2, COIN + late_fee);
+    accounting.clear();
+    aggregate = {};
+    BOOST_REQUIRE(EvaluateShadowPowClaimAccounting(
+        context, late_only_block, &late_only_undo, accounting, &aggregate) ==
+        ShadowPowAccountingResult::OK);
+    BOOST_REQUIRE_EQUAL(accounting.size(), 1U);
+    BOOST_CHECK(accounting[0].disposition ==
+                ShadowPowClaimDisposition::REIMBURSED_LATE);
+    BOOST_CHECK_EQUAL(accounting[0].credited_amount, late_fee);
+    BOOST_CHECK_EQUAL(aggregate.winner_count, 0U);
+    BOOST_CHECK_EQUAL(aggregate.reimbursed_late_count, 1U);
+
+    ShadowPowAccountingContext expired = context;
+    expired.height = origin_height + SHADOW_POW_LATE_ORIGIN_WINDOW + 1;
+    expired.previous_block_hash = uint256S("3030");
+    expired.late_origins.clear();
+    accounting.clear();
+    aggregate = {};
+    BOOST_REQUIRE(EvaluateShadowPowClaimAccounting(
+        expired, late_only_block, &late_only_undo, accounting, &aggregate) ==
+        ShadowPowAccountingResult::OK);
+    BOOST_REQUIRE_EQUAL(accounting.size(), 1U);
+    BOOST_CHECK(accounting[0].disposition ==
+                ShadowPowClaimDisposition::ORIGIN_EXPIRED);
+    BOOST_CHECK_EQUAL(accounting[0].credited_amount, 0);
+    BOOST_CHECK_EQUAL(aggregate.origin_expired_count, 1U);
+
+    ShadowPowAccountingContext off_branch = context;
+    off_branch.late_origins.clear();
+    accounting.clear();
+    aggregate = {};
+    BOOST_REQUIRE(EvaluateShadowPowClaimAccounting(
+        off_branch, late_only_block, &late_only_undo, accounting, &aggregate) ==
+        ShadowPowAccountingResult::OK);
+    BOOST_REQUIRE_EQUAL(accounting.size(), 1U);
+    BOOST_CHECK(accounting[0].disposition ==
+                ShadowPowClaimDisposition::ORIGIN_MISMATCH);
+    BOOST_CHECK_EQUAL(aggregate.origin_mismatch_count, 1U);
+
+    // Mempool policy rejects an attacker-selected off-branch origin without
+    // treating it as node failure, but a matching active ancestor whose
+    // mandatory authenticated QQPUND marker is absent fails closed.
+    CCoinsView base;
+    CCoinsViewCache view{&base, true};
+    AddCoinForScript(view, COutPoint{uint256{2}, 0}, COIN + late_fee,
+                     late_target);
+    CBlockIndex origin_parent_index;
+    origin_parent_index.nHeight = origin_height - 1;
+    origin_parent_index.nTime = 1'900'000'000;
+    origin_parent_index.phashBlock = &origin_parent;
+    uint256 origin_block_hash = uint256S("4040");
+    CBlockIndex origin_block_index;
+    origin_block_index.nHeight = origin_height;
+    origin_block_index.nTime = origin_parent_index.nTime + 64;
+    origin_block_index.pprev = &origin_parent_index;
+    origin_block_index.phashBlock = &origin_block_hash;
+    AddPoolForTest(view, origin_block_index, 290 * COIN, 0, 0);
+
+    std::string reject_reason;
+    const CTransactionRef late_tx =
+        MakePowClaimTx(late_target, late_proof, 0);
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *late_tx, &origin_block_index, view, true,
+                    reject_reason) ==
+                ShadowProofValidationResult::LOCAL_INTERNAL_ERROR);
+    BOOST_CHECK_EQUAL(reject_reason, "local-shadow-proof-origin-state");
+
+    ShadowPowWork off_branch_work = late_work;
+    off_branch_work.prev_hash = uint256S("5050");
+    std::vector<unsigned char> off_branch_proof;
+    BOOST_REQUIRE(GrindShadowPowWork(off_branch_work, 0, 1, 100'000,
+                                    off_branch_proof));
+    reject_reason.clear();
+    BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                    *MakePowClaimTx(late_target, off_branch_proof, 0),
+                    &origin_block_index, view, true, reject_reason) ==
+                ShadowProofValidationResult::INVALID);
+    BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-origin-mismatch");
 }
 
 BOOST_AUTO_TEST_CASE(pow_shadow_competing_claim_activation_preserves_history_then_switches_exactly)

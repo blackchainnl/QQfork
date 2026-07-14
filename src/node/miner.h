@@ -171,7 +171,7 @@ private:
     uint64_t nBlockSigOpsCost;
     CAmount nFees;
     CTxMemPool::setEntries inBlock;
-    bool m_shadow_proof_selected{false};
+    uint32_t m_shadow_proof_selected{0};
     bool m_building_pos_template{false};
     std::set<uint256> m_demurrage_attestation_keys;
     std::set<COutPoint> m_demurrage_attestation_targets;

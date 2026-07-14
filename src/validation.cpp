@@ -306,21 +306,31 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     AssertLockHeld(cs_main);
     AssertLockHeld(m_mempool->cs);
 
-    // QQSPROOF claims commit to one exact parent tip. A disconnect changes
-    // that parent just as surely as a connect does, so every existing proof
-    // and its descendants must leave the mempool before disconnected block
-    // transactions are reconsidered against the restored tip. Ordinary
-    // finality/maturity reorg filtering cannot validate this commitment.
+    // Revalidate every proof against the restored branch. Legacy QQP2 proofs
+    // remain next-block-only; post-boundary QQP3 proofs can remain relayable
+    // when their authenticated origin is on this branch and no more than the
+    // fixed late-origin window behind its next block.
     std::vector<CTransactionRef> stale_shadow_claims;
+    const CBlockIndex* restored_tip = m_chain.Tip();
+    const bool gold_rush_active = restored_tip &&
+        IsShadowGoldRushRewardActive(Params().GetConsensus(),
+                                     restored_tip->GetMedianTimePast(),
+                                     restored_tip->nHeight + 1);
     for (const CTxMemPoolEntryRef& entry : m_mempool->entryAll()) {
         const CTransactionRef tx = entry.get().GetSharedTx();
-        if (TransactionHasShadowProof(*tx)) stale_shadow_claims.push_back(tx);
+        if (!TransactionHasShadowProof(*tx)) continue;
+        std::string reject_reason;
+        if (CheckShadowPowClaimForMempoolDetailed(
+                *tx, restored_tip, CoinsTip(), gold_rush_active,
+                reject_reason) == ShadowProofValidationResult::INVALID) {
+            stale_shadow_claims.push_back(tx);
+        }
     }
     for (const CTransactionRef& tx : stale_shadow_claims) {
         m_mempool->removeRecursive(*tx, MemPoolRemovalReason::SHADOW_STALE);
     }
     if (!stale_shadow_claims.empty()) {
-        LogPrint(BCLog::MEMPOOL, "Expired %u Quantum Quasar shadow PoW claim transaction(s) after chain reorganization\n",
+        LogPrint(BCLog::MEMPOOL, "Removed %u ineligible Quantum Quasar shadow PoW claim transaction(s) after chain reorganization\n",
                  static_cast<unsigned int>(stale_shadow_claims.size()));
     }
 
@@ -983,11 +993,19 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, shadow_reject_reason);
     }
     if (TransactionHasShadowProof(tx)) {
+        const size_t shadow_proof_limit =
+            consensus.IsShadowCompetingClaimsActive(next_height)
+                ? MAX_SHADOW_POW_EVALS_PER_BLOCK
+                : 1;
+        size_t shadow_proof_count{0};
         for (const CTxMemPoolEntryRef& entry : m_pool.entryAll()) {
             const CTransactionRef pool_tx = entry.get().GetSharedTx();
-            if (pool_tx->GetHash() != tx.GetHash() && TransactionHasShadowProof(*pool_tx)) {
-                return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY, "shadow-proof-mempool-conflict");
-            }
+            if (pool_tx->GetHash() != tx.GetHash() &&
+                TransactionHasShadowProof(*pool_tx)) ++shadow_proof_count;
+        }
+        if (shadow_proof_count >= shadow_proof_limit) {
+            return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                 "shadow-proof-mempool-limit");
         }
     }
 
@@ -4584,9 +4602,18 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         m_mempool->removeForBlock(blockConnecting.vtx, pindexNew->nHeight);
         disconnectpool.removeForBlock(blockConnecting.vtx);
         std::vector<CTransactionRef> expired_shadow_claims;
+        const bool next_gold_rush_active = IsShadowGoldRushRewardActive(
+            Params().GetConsensus(), pindexNew->GetMedianTimePast(),
+            pindexNew->nHeight + 1);
         for (const CTxMemPoolEntryRef& entry : m_mempool->entryAll()) {
             const CTransactionRef tx = entry.get().GetSharedTx();
-            if (TransactionHasShadowProof(*tx)) expired_shadow_claims.push_back(tx);
+            if (!TransactionHasShadowProof(*tx)) continue;
+            std::string reject_reason;
+            if (CheckShadowPowClaimForMempoolDetailed(
+                    *tx, pindexNew, CoinsTip(), next_gold_rush_active,
+                    reject_reason) == ShadowProofValidationResult::INVALID) {
+                expired_shadow_claims.push_back(tx);
+            }
         }
         for (const CTransactionRef& tx : expired_shadow_claims) {
             m_mempool->removeRecursive(*tx, MemPoolRemovalReason::SHADOW_STALE);

@@ -43,9 +43,10 @@ static constexpr uint8_t DB_CUSTOM_TIP{'T'};
 // accounting update. Schema 7 persists ordered shadow-spend anchors. Schema 8
 // replaces unbounded per-note/per-transaction claim data with a strict
 // top-64 detail set, fixed aggregates, and an authenticated commitment. The
-// index is auxiliary and fully reconstructible, so a recognized older schema
-// is wiped and rebuilt instead of being interpreted.
-static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{8};
+// schema 9 adds QQP3 origin/inclusion provenance and late-reimbursement
+// classifications. The index is auxiliary and fully reconstructible, so a
+// recognized older schema is wiped and rebuilt instead of being interpreted.
+static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{9};
 static constexpr size_t MAX_SCRIPT_QUERY_RESULTS{1000};
 static constexpr size_t DIRECT_QUANTUM_SCRIPT_SIZE{2 + QUANTUM_MIGRATION_PROGRAM_SIZE};
 
@@ -287,12 +288,33 @@ bool Increment(uint32_t& value)
 bool IsCreditedPowDisposition(ShadowPowClaimDisposition disposition)
 {
     return disposition == ShadowPowClaimDisposition::WINNER ||
-           disposition == ShadowPowClaimDisposition::REIMBURSED_LOSER;
+           disposition == ShadowPowClaimDisposition::REIMBURSED_LOSER ||
+           disposition == ShadowPowClaimDisposition::REIMBURSED_LATE;
 }
 
 bool IsValidShadowPowClaimSource(const ShadowIndexPowClaimSource& source)
 {
-    return !source.txid.IsNull() && !source.canonical_rank.IsNull() &&
+    if (source.txid.IsNull() || source.canonical_rank.IsNull() ||
+        source.inclusion_height == 0 ||
+        (source.origin_bound &&
+         (source.origin_height == 0 ||
+          source.origin_previous_block_hash.IsNull())) ||
+        (!source.origin_bound && source.origin_age != 0)) {
+        return false;
+    }
+    if (source.disposition == ShadowPowClaimDisposition::REIMBURSED_LATE &&
+        (!source.origin_bound || source.origin_height >= source.inclusion_height ||
+         source.origin_age != source.inclusion_height - source.origin_height ||
+         source.origin_age > SHADOW_POW_LATE_ORIGIN_WINDOW)) {
+        return false;
+    }
+    if (source.disposition == ShadowPowClaimDisposition::ORIGIN_EXPIRED &&
+        (!source.origin_bound || source.origin_height > source.inclusion_height ||
+         source.origin_age != source.inclusion_height - source.origin_height ||
+         source.origin_age <= SHADOW_POW_LATE_ORIGIN_WINDOW)) {
+        return false;
+    }
+    return
         (source.base_fee_known
              ? source.base_fee >= 0 && MoneyRange(source.base_fee)
              : source.base_fee == 0);
@@ -305,7 +327,12 @@ bool ShadowPowClaimSourcesEqual(const ShadowIndexPowClaimSource& lhs,
         lhs.canonical_rank == rhs.canonical_rank &&
         lhs.base_fee == rhs.base_fee &&
         lhs.base_fee_known == rhs.base_fee_known &&
-        lhs.disposition == rhs.disposition;
+        lhs.disposition == rhs.disposition &&
+        lhs.origin_bound == rhs.origin_bound &&
+        lhs.origin_height == rhs.origin_height &&
+        lhs.origin_previous_block_hash == rhs.origin_previous_block_hash &&
+        lhs.inclusion_height == rhs.inclusion_height &&
+        lhs.origin_age == rhs.origin_age;
 }
 
 bool IsValidShadowPowClaimRecord(const ShadowIndexPowClaimRecord& record)
@@ -318,11 +345,14 @@ bool IsValidShadowPowClaimRecord(const ShadowIndexPowClaimRecord& record)
     case ShadowPowClaimDisposition::INVALID_PROOF:
     case ShadowPowClaimDisposition::INPUT_MISMATCH:
     case ShadowPowClaimDisposition::INVALID_BASE_FEE:
+    case ShadowPowClaimDisposition::ORIGIN_MISMATCH:
+    case ShadowPowClaimDisposition::ORIGIN_EXPIRED:
     case ShadowPowClaimDisposition::WINNER:
     case ShadowPowClaimDisposition::REIMBURSED_LOSER:
+    case ShadowPowClaimDisposition::REIMBURSED_LATE:
         break;
     default:
-        // Schema 8 represents structural and over-budget outcomes only in
+        // Schema 9 represents structural and over-budget outcomes only in
         // the fixed block aggregate; they can never have detail rows.
         return false;
     }
@@ -370,18 +400,22 @@ bool IsValidShadowIndexBlockRecord(const ShadowIndexBlockRecord& record)
         static_cast<uint64_t>(summary.invalid_location_count) +
         summary.malformed_transaction_count + summary.invalid_proof_count +
         summary.wrong_mode_count + summary.unknown_mode_count +
+        summary.origin_mismatch_count + summary.origin_expired_count +
         summary.input_mismatch_count + summary.invalid_base_fee_count +
         summary.evaluation_limit_count;
     const uint64_t evaluated_breakdown =
         static_cast<uint64_t>(summary.invalid_proof_count) +
+        summary.origin_mismatch_count + summary.origin_expired_count +
         summary.input_mismatch_count + summary.invalid_base_fee_count +
-        summary.winner_count + summary.reimbursed_loser_count;
+        summary.winner_count + summary.reimbursed_loser_count +
+        summary.reimbursed_late_count;
     if (summary.record_count > MAX_SHADOW_POW_EVALS_PER_BLOCK ||
         summary.evaluated_count != summary.record_count ||
         summary.observed_count > MAX_SHADOW_POW_NOTES_PER_BLOCK ||
         summary.winner_count > 1 ||
         static_cast<uint64_t>(summary.winner_count) +
-                summary.reimbursed_loser_count + summary.rejected_count !=
+                summary.reimbursed_loser_count +
+                summary.reimbursed_late_count + summary.rejected_count !=
             summary.observed_count ||
         rejected_breakdown != summary.rejected_count ||
         evaluated_breakdown != summary.evaluated_count ||
@@ -875,7 +909,7 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         if (block.height >= SHADOW_REWARD_START_HEIGHT) {
             payouts = GetAppliedShadowClaimPayoutTransactionRecords(
                 m_chainstate->CoinsTip(), block.height, block.hash, block.data->GetBlockTime());
-            if (PrepareShadowPowClaimAccounting(m_chainstate->CoinsTip(), pindex,
+            if (PrepareShadowPowClaimAccounting(m_chainstate->CoinsTip(), *block.data, pindex,
                                                 pow_accounting_context) !=
                 ShadowPowAccountingResult::OK) {
                 return error("%s: unable to authenticate POW claim context for %s",
@@ -1140,6 +1174,8 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
             pow_accounting_aggregate.winner_count;
         block_record.pow_claims.reimbursed_loser_count =
             pow_accounting_aggregate.reimbursed_loser_count;
+        block_record.pow_claims.reimbursed_late_count =
+            pow_accounting_aggregate.reimbursed_late_count;
         block_record.pow_claims.invalid_location_count =
             pow_accounting_aggregate.invalid_location_count;
         block_record.pow_claims.malformed_transaction_count =
@@ -1154,13 +1190,18 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
             pow_accounting_aggregate.input_mismatch_count;
         block_record.pow_claims.invalid_base_fee_count =
             pow_accounting_aggregate.invalid_base_fee_count;
+        block_record.pow_claims.origin_mismatch_count =
+            pow_accounting_aggregate.origin_mismatch_count;
+        block_record.pow_claims.origin_expired_count =
+            pow_accounting_aggregate.origin_expired_count;
         block_record.pow_claims.evaluation_limit_count =
             pow_accounting_aggregate.evaluation_limit_count;
         block_record.pow_claims.accounting_commitment =
             pow_accounting_aggregate.accounting_commitment;
         const uint64_t credited_claims =
             static_cast<uint64_t>(block_record.pow_claims.winner_count) +
-            block_record.pow_claims.reimbursed_loser_count;
+            block_record.pow_claims.reimbursed_loser_count +
+            block_record.pow_claims.reimbursed_late_count;
         if (credited_claims > block_record.pow_claims.observed_count) {
             return error("%s: invalid bounded POW claim aggregates", __func__);
         }
@@ -1195,6 +1236,12 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         claim_record.source.base_fee = accounting.base_fee;
         claim_record.source.base_fee_known = accounting.base_fee_known;
         claim_record.source.disposition = accounting.disposition;
+        claim_record.source.origin_bound = accounting.origin_bound;
+        claim_record.source.origin_height = accounting.origin_height;
+        claim_record.source.origin_previous_block_hash =
+            accounting.origin_previous_block_hash;
+        claim_record.source.inclusion_height = accounting.inclusion_height;
+        claim_record.source.origin_age = accounting.origin_age;
         claim_record.payout_script = accounting.payout_script;
         claim_record.credited_amount = accounting.credited_amount;
 
@@ -1208,7 +1255,9 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
                 return error("%s: POW winner accounting overflow", __func__);
             }
         } else if (accounting.disposition ==
-                   ShadowPowClaimDisposition::REIMBURSED_LOSER) {
+                       ShadowPowClaimDisposition::REIMBURSED_LOSER ||
+                   accounting.disposition ==
+                       ShadowPowClaimDisposition::REIMBURSED_LATE) {
             if (!AddMoney(block_record.pow_claims.reimbursed_credited_total,
                           accounting.credited_amount)) {
                 return error("%s: POW loser accounting overflow", __func__);
@@ -1240,6 +1289,7 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         block_record.pow_claims.winner_count > 1 ||
         block_record.pow_claims.winner_count +
                 block_record.pow_claims.reimbursed_loser_count +
+                block_record.pow_claims.reimbursed_late_count +
                 block_record.pow_claims.rejected_count !=
             block_record.pow_claims.observed_count ||
         block_record.pow_claims.winner_credited_total +

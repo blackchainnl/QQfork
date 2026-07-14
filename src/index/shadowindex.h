@@ -35,14 +35,21 @@ struct ShadowIndexPowClaimSource {
     CAmount base_fee{0};
     bool base_fee_known{false};
     ShadowPowClaimDisposition disposition{ShadowPowClaimDisposition::INVALID_PROOF};
+    bool origin_bound{false};
+    uint32_t origin_height{0};
+    uint256 origin_previous_block_hash;
+    uint32_t inclusion_height{0};
+    uint32_t origin_age{0};
 
     SERIALIZE_METHODS(ShadowIndexPowClaimSource, obj)
     {
         uint8_t disposition{static_cast<uint8_t>(obj.disposition)};
         READWRITE(obj.txid, obj.vout, obj.canonical_rank, obj.base_fee,
-                  obj.base_fee_known, disposition);
+                  obj.base_fee_known, disposition, obj.origin_bound,
+                  obj.origin_height, obj.origin_previous_block_hash,
+                  obj.inclusion_height, obj.origin_age);
         SER_READ(obj, {
-            if (disposition > static_cast<uint8_t>(ShadowPowClaimDisposition::UNKNOWN_MODE)) {
+            if (disposition > static_cast<uint8_t>(ShadowPowClaimDisposition::REIMBURSED_LATE)) {
                 throw std::ios_base::failure("Invalid shadow POW claim disposition");
             }
             obj.disposition = static_cast<ShadowPowClaimDisposition>(disposition);
@@ -74,6 +81,7 @@ struct ShadowIndexPowClaimSummary {
     uint32_t evaluated_count{0};
     uint32_t winner_count{0};
     uint32_t reimbursed_loser_count{0};
+    uint32_t reimbursed_late_count{0};
     uint32_t rejected_count{0};
     uint32_t invalid_location_count{0};
     uint32_t malformed_transaction_count{0};
@@ -82,6 +90,8 @@ struct ShadowIndexPowClaimSummary {
     uint32_t unknown_mode_count{0};
     uint32_t input_mismatch_count{0};
     uint32_t invalid_base_fee_count{0};
+    uint32_t origin_mismatch_count{0};
+    uint32_t origin_expired_count{0};
     uint32_t evaluation_limit_count{0};
     uint256 accounting_commitment;
     CAmount credited_total{0};
@@ -92,12 +102,14 @@ struct ShadowIndexPowClaimSummary {
     {
         READWRITE(obj.active, obj.record_count, obj.observed_count,
                   obj.evaluated_count, obj.winner_count,
-                  obj.reimbursed_loser_count, obj.rejected_count,
+                  obj.reimbursed_loser_count, obj.reimbursed_late_count,
+                  obj.rejected_count,
                   obj.invalid_location_count,
                   obj.malformed_transaction_count,
                   obj.invalid_proof_count, obj.wrong_mode_count,
                   obj.unknown_mode_count, obj.input_mismatch_count,
-                  obj.invalid_base_fee_count, obj.evaluation_limit_count,
+                  obj.invalid_base_fee_count, obj.origin_mismatch_count,
+                  obj.origin_expired_count, obj.evaluation_limit_count,
                   obj.accounting_commitment,
                   obj.credited_total, obj.winner_credited_total,
                   obj.reimbursed_credited_total);

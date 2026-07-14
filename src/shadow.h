@@ -185,6 +185,9 @@ enum class ShadowPowClaimDisposition : uint8_t {
     REIMBURSED_LOSER = 7,
     WRONG_MODE = 8,
     UNKNOWN_MODE = 9,
+    ORIGIN_MISMATCH = 10,
+    ORIGIN_EXPIRED = 11,
+    REIMBURSED_LATE = 12,
 };
 
 struct ShadowPowClaimAccounting {
@@ -195,6 +198,11 @@ struct ShadowPowClaimAccounting {
     CAmount base_fee{0};
     CAmount credited_amount{0};
     bool base_fee_known{false};
+    bool origin_bound{false};
+    uint32_t origin_height{0};
+    uint256 origin_previous_block_hash;
+    uint32_t inclusion_height{0};
+    uint32_t origin_age{0};
     ShadowPowClaimDisposition disposition{ShadowPowClaimDisposition::INVALID_PROOF};
 };
 
@@ -213,12 +221,21 @@ struct ShadowPowClaimAggregate {
     uint32_t invalid_proof_count{0};
     uint32_t wrong_mode_count{0};
     uint32_t unknown_mode_count{0};
+    uint32_t origin_mismatch_count{0};
+    uint32_t origin_expired_count{0};
     uint32_t input_mismatch_count{0};
     uint32_t invalid_base_fee_count{0};
     uint32_t evaluation_limit_count{0};
     uint32_t winner_count{0};
     uint32_t reimbursed_loser_count{0};
+    uint32_t reimbursed_late_count{0};
     uint256 accounting_commitment;
+};
+
+struct ShadowPowOriginContext {
+    uint32_t height{0};
+    uint256 previous_block_hash;
+    unsigned int target_bits{0};
 };
 
 /** Immutable, lock-free input to the bounded claim-accounting engine. */
@@ -227,6 +244,7 @@ struct ShadowPowAccountingContext {
     uint256 previous_block_hash;
     CAmount credited_pow_pool{0};
     unsigned int target_bits{0};
+    std::vector<ShadowPowOriginContext> late_origins;
     bool canonical_rule_active{false};
     bool valid{false};
 };
@@ -308,6 +326,9 @@ static constexpr CAmount SHADOW_WHITELIST_MIN_BALANCE = 10000 * COIN;
 static constexpr int SHADOW_SOLVER_ACTIVITY_SECONDS = 14 * 24 * 60 * 60;
 static constexpr int SHADOW_SOLVER_ACTIVITY_WINDOW = SHADOW_SOLVER_ACTIVITY_SECONDS / 64;
 static constexpr unsigned int MAX_SHADOW_POW_EVALS_PER_BLOCK = 64;
+/** A QQP3 proof remains relayable and fee-reimbursable through this many
+ *  blocks after its committed origin height. */
+static constexpr uint32_t SHADOW_POW_LATE_ORIGIN_WINDOW = 64;
 /** A serialized CTxOut consumes at least 9 non-witness bytes (36 weight).
  *  This is therefore a conservative consensus-derived ceiling on the number
  *  of QQSPROOF-shaped outputs in any V4-valid block. */
@@ -422,6 +443,7 @@ struct ShadowPowWork {
     int height{0};
     uint256 prev_hash;
     unsigned int bits{0};
+    bool origin_bound{false};
 };
 
 /** Typed validation result used wherever Argon2id evaluation can fail locally.
@@ -499,8 +521,15 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
     const CCoinsViewCache& view, const CBlockIndex* pindex,
     ShadowPowAccountingContext& context_out);
 ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
+    const CCoinsViewCache& view, const CBlock& block,
+    const CBlockIndex* pindex, ShadowPowAccountingContext& context_out);
+ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
     const CCoinsViewCache& view, const CBlockIndex* pindex,
     const Consensus::Params& consensus,
+    ShadowPowAccountingContext& context_out);
+ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
+    const CCoinsViewCache& view, const CBlock& block,
+    const CBlockIndex* pindex, const Consensus::Params& consensus,
     ShadowPowAccountingContext& context_out);
 /** Evaluate the immutable context, base block, and undo without reading
  *  chainstate. The caller may release cs_main before invoking this function. */

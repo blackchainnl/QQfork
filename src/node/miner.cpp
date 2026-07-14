@@ -219,7 +219,7 @@ void BlockAssembler::resetBlock()
     // These counters do not include coinbase tx
     nBlockTx = 0;
     nFees = 0;
-    m_shadow_proof_selected = false;
+    m_shadow_proof_selected = 0;
     m_building_pos_template = false;
     m_demurrage_attestation_keys.clear();
     m_demurrage_attestation_targets.clear();
@@ -769,24 +769,25 @@ void BlockAssembler::addPackageTxs(const CTxMemPool& mempool, int& nPackagesSele
         std::vector<CTxMemPool::txiter> sortedEntries;
         SortForBlock(ancestors, sortedEntries);
 
-        bool package_has_shadow_proof = false;
-        bool package_has_duplicate_shadow_proofs = false;
+        uint32_t package_shadow_proofs{0};
         for (CTxMemPool::txiter entry : sortedEntries) {
             if (!IsShadowProofTx(entry->GetTx())) continue;
-            if (package_has_shadow_proof || m_shadow_proof_selected) {
-                package_has_duplicate_shadow_proofs = true;
-                break;
-            }
-            package_has_shadow_proof = true;
+            ++package_shadow_proofs;
         }
-        if (package_has_shadow_proof && !m_building_pos_template) {
+        if (package_shadow_proofs > 0 && !m_building_pos_template) {
             if (fUsingModified) {
                 mapModifiedTx.get<ancestor_score>().erase(modit);
             }
             failedTx.insert(iter);
             continue;
         }
-        if (package_has_duplicate_shadow_proofs) {
+        const uint32_t shadow_proof_limit =
+            chainparams.GetConsensus().IsShadowCompetingClaimsActive(nHeight)
+                ? MAX_SHADOW_POW_EVALS_PER_BLOCK
+                : 1;
+        if (m_shadow_proof_selected > shadow_proof_limit ||
+            package_shadow_proofs > shadow_proof_limit -
+                                      m_shadow_proof_selected) {
             if (fUsingModified) {
                 mapModifiedTx.get<ancestor_score>().erase(modit);
             }
@@ -799,7 +800,7 @@ void BlockAssembler::addPackageTxs(const CTxMemPool& mempool, int& nPackagesSele
             // Erase from the modified set, if present
             mapModifiedTx.erase(sortedEntries[i]);
         }
-        if (package_has_shadow_proof) m_shadow_proof_selected = true;
+        m_shadow_proof_selected += package_shadow_proofs;
 
         ++nPackagesSelected;
 

@@ -326,6 +326,9 @@ std::string PowClaimDispositionName(ShadowPowClaimDisposition disposition)
     case ShadowPowClaimDisposition::EVALUATION_LIMIT: return "evaluation_limit";
     case ShadowPowClaimDisposition::WINNER: return "winner";
     case ShadowPowClaimDisposition::REIMBURSED_LOSER: return "reimbursed_loser";
+    case ShadowPowClaimDisposition::ORIGIN_MISMATCH: return "origin_mismatch";
+    case ShadowPowClaimDisposition::ORIGIN_EXPIRED: return "origin_expired";
+    case ShadowPowClaimDisposition::REIMBURSED_LATE: return "reimbursed_late";
     }
     throw JSONRPCError(RPC_INTERNAL_ERROR, "Unknown indexed POW claim disposition");
 }
@@ -340,6 +343,14 @@ UniValue PowClaimSourceToJSON(const ShadowIndexPowClaimSource& source)
     result.pushKV("base_fee_known", source.base_fee_known);
     result.pushKV("base_fee", source.base_fee_known
         ? UniValue(ValueFromAmount(source.base_fee)) : UniValue{});
+    result.pushKV("origin_bound", source.origin_bound);
+    result.pushKV("origin_height", source.origin_height);
+    result.pushKV("origin_previous_block_hash",
+                  source.origin_previous_block_hash.IsNull()
+                      ? UniValue{}
+                      : UniValue(source.origin_previous_block_hash.GetHex()));
+    result.pushKV("inclusion_height", source.inclusion_height);
+    result.pushKV("origin_age", source.origin_age);
     return result;
 }
 
@@ -349,8 +360,11 @@ UniValue PowClaimRecordToJSON(const ShadowIndexPowClaimRecord& record,
     UniValue result = PowClaimSourceToJSON(record.source);
     result.pushKV("index", index);
     result.pushKV("credited_amount", ValueFromAmount(record.credited_amount));
-    result.pushKV("rejected", !record.synthetic_payout_present &&
-        record.source.disposition != ShadowPowClaimDisposition::REIMBURSED_LOSER);
+    const bool credited_disposition =
+        record.source.disposition == ShadowPowClaimDisposition::WINNER ||
+        record.source.disposition == ShadowPowClaimDisposition::REIMBURSED_LOSER ||
+        record.source.disposition == ShadowPowClaimDisposition::REIMBURSED_LATE;
+    result.pushKV("rejected", !credited_disposition);
     result.pushKV("payout_scriptPubKey", record.payout_script.empty()
         ? UniValue{} : UniValue(HexStr(record.payout_script)));
     CTxDestination destination;
@@ -651,6 +665,7 @@ RPCHelpMan getshadowblock()
             claim_summary.pushKV("evaluated_count", indexed.pow_claims.evaluated_count);
             claim_summary.pushKV("winner_count", indexed.pow_claims.winner_count);
             claim_summary.pushKV("reimbursed_loser_count", indexed.pow_claims.reimbursed_loser_count);
+            claim_summary.pushKV("reimbursed_late_count", indexed.pow_claims.reimbursed_late_count);
             claim_summary.pushKV("rejected_count", indexed.pow_claims.rejected_count);
             claim_summary.pushKV("invalid_location_count", indexed.pow_claims.invalid_location_count);
             claim_summary.pushKV("malformed_transaction_count", indexed.pow_claims.malformed_transaction_count);
@@ -659,6 +674,8 @@ RPCHelpMan getshadowblock()
             claim_summary.pushKV("unknown_mode_count", indexed.pow_claims.unknown_mode_count);
             claim_summary.pushKV("input_mismatch_count", indexed.pow_claims.input_mismatch_count);
             claim_summary.pushKV("invalid_base_fee_count", indexed.pow_claims.invalid_base_fee_count);
+            claim_summary.pushKV("origin_mismatch_count", indexed.pow_claims.origin_mismatch_count);
+            claim_summary.pushKV("origin_expired_count", indexed.pow_claims.origin_expired_count);
             claim_summary.pushKV("evaluation_limit_count", indexed.pow_claims.evaluation_limit_count);
             claim_summary.pushKV("accounting_commitment", indexed.pow_claims.active
                 ? UniValue(indexed.pow_claims.accounting_commitment.GetHex())

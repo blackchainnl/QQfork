@@ -75,6 +75,9 @@ const char* ShadowPowDispositionName(ShadowPowClaimDisposition disposition)
     // before or after that additive enum change.
     case 8: return "wrong_mode_pos";
     case 9: return "unknown_mode";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::ORIGIN_MISMATCH): return "origin_mismatch";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::ORIGIN_EXPIRED): return "origin_expired";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::REIMBURSED_LATE): return "reimbursed_late";
     }
     return "unknown";
 }
@@ -122,6 +125,14 @@ UniValue ShadowCreditJSON(const ShadowIndexRecord& record)
             ? UniValue(ValueFromAmount(record.pow_claim_source.base_fee)) : UniValue{});
         source.pushKV("base_fee_atomic", record.pow_claim_source.base_fee_known
             ? UniValue(strprintf("%d", record.pow_claim_source.base_fee)) : UniValue{});
+        source.pushKV("origin_bound", record.pow_claim_source.origin_bound);
+        source.pushKV("origin_height", record.pow_claim_source.origin_height);
+        source.pushKV("origin_previous_block_hash",
+                      record.pow_claim_source.origin_previous_block_hash.IsNull()
+                          ? UniValue{}
+                          : UniValue(record.pow_claim_source.origin_previous_block_hash.GetHex()));
+        source.pushKV("inclusion_height", record.pow_claim_source.inclusion_height);
+        source.pushKV("origin_age", record.pow_claim_source.origin_age);
     }
     credit.pushKV("pow_claim_source", std::move(source));
     return credit;
