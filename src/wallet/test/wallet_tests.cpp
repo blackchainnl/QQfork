@@ -317,6 +317,39 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_submission_guard_is_single_flight_and_exce
     BOOST_CHECK(static_cast<bool>(after_exception));
 }
 
+BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_reserves_until_manual_abandon)
+{
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0, 0, 0, 0, 0, 0, 0, 0,
+                               0});
+    CMutableTransaction claim;
+    claim.vin.emplace_back(COutPoint{uint256::ONE, 0});
+    claim.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    claim.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    const CTransactionRef claim_ref = MakeTransactionRef(std::move(claim));
+    BOOST_REQUIRE(TransactionHasShadowProof(*claim_ref));
+    BOOST_REQUIRE(wallet.AddToWallet(claim_ref, TxStateInactive{}));
+
+    BOOST_CHECK_EQUAL(wallet.CountUnresolvedShadowPowClaims(), 1U);
+    BOOST_REQUIRE(wallet.QuarantineShadowPowClaim(claim_ref->GetHash()));
+    BOOST_REQUIRE(wallet.QuarantineShadowPowClaim(claim_ref->GetHash()));
+    {
+        LOCK(wallet.cs_wallet);
+        const CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK(stored.isUnconfirmed());
+        BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_quarantine"), "1");
+    }
+
+    BOOST_REQUIRE(wallet.AbandonTransaction(claim_ref->GetHash()));
+    BOOST_CHECK_EQUAL(wallet.CountUnresolvedShadowPowClaims(), 0U);
+    {
+        LOCK(wallet.cs_wallet);
+        BOOST_CHECK(wallet.mapWallet.at(claim_ref->GetHash()).isAbandoned());
+    }
+}
+
 static CMutableTransaction TestSimpleSpend(const CTransaction& from, uint32_t index, const CKey& key, const CScript& pubkey)
 {
     CMutableTransaction mtx;

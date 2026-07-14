@@ -84,21 +84,18 @@ static void CommitWalletTransactionOrThrow(CWallet& wallet, const CTransactionRe
         if (!TransactionHasShadowProof(*tx)) throw;
         const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
         if (added_to_wallet) {
-            if (wallet.AbandonTransaction(tx->GetHash())) {
-                wallet.WalletLogPrintf("Abandoned %s transaction %s after broadcast exception and released its input\n",
-                                       action, tx->GetHash().ToString());
-            } else {
-                wallet.WalletLogPrintf("%s transaction could not be abandoned after broadcast exception: txid=%s\n",
-                                       action, tx->GetHash().ToString());
-            }
+            wallet.QuarantineShadowPowClaim(tx->GetHash());
+            wallet.WalletLogPrintf("Quarantined %s transaction %s after broadcast exception; its input remains reserved\n",
+                                   action, tx->GetHash().ToString());
         }
         throw JSONRPCError(RPC_WALLET_ERROR,
                            strprintf("%s transaction broadcast raised an exception: %s", action, e.what()));
     } catch (...) {
         if (TransactionHasShadowProof(*tx)) {
             const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
-            if (added_to_wallet && !wallet.AbandonTransaction(tx->GetHash())) {
-                wallet.WalletLogPrintf("%s transaction could not be abandoned after unknown broadcast exception: txid=%s\n",
+            if (added_to_wallet) {
+                wallet.QuarantineShadowPowClaim(tx->GetHash());
+                wallet.WalletLogPrintf("Quarantined %s transaction %s after unknown broadcast exception; its input remains reserved\n",
                                        action, tx->GetHash().ToString());
             }
         }
@@ -107,7 +104,11 @@ static void CommitWalletTransactionOrThrow(CWallet& wallet, const CTransactionRe
     if (!committed) {
         const std::string reason = broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error;
         const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
-        if (added_to_wallet && !wallet.AbandonTransaction(tx->GetHash())) {
+        if (added_to_wallet && TransactionHasShadowProof(*tx)) {
+            wallet.QuarantineShadowPowClaim(tx->GetHash());
+            wallet.WalletLogPrintf("Quarantined %s transaction %s after broadcast failure; its input remains reserved\n",
+                                   action, tx->GetHash().ToString());
+        } else if (added_to_wallet && !wallet.AbandonTransaction(tx->GetHash())) {
             wallet.WalletLogPrintf("%s transaction could not be abandoned after broadcast failure: txid=%s\n", action, tx->GetHash().ToString());
         }
         throw JSONRPCError(RPC_WALLET_ERROR, strprintf("%s transaction was created but could not be broadcast: %s", action, reason));
@@ -1352,6 +1353,14 @@ static RPCHelpMan sendshadowpowclaim()
     if (pwallet->m_wallet_unlock_staking_only) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to create claim transaction");
     }
+    if (!pwallet->chain().isReadyToBroadcast()) {
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                           "Gold Rush PoW claims are paused while the node is reindexing, importing blocks, or in initial block download");
+    }
+    if (pwallet->CountUnresolvedShadowPowClaims() >= MAX_SHADOW_POW_EVALS_PER_BLOCK) {
+        throw JSONRPCError(RPC_WALLET_ERROR,
+                           strprintf("The wallet already has the maximum %u unresolved Gold Rush PoW claims; each input remains quarantined until confirmation or an on-chain conflict", MAX_SHADOW_POW_EVALS_PER_BLOCK));
+    }
 
     ShadowPowClaimSubmissionGuard submission_guard(*pwallet);
     if (!submission_guard) {
@@ -1544,15 +1553,22 @@ static RPCHelpMan sendshadowpowclaim()
     {
         ChainstateManager& chainman = pwallet->chain().chainman();
         LOCK(cs_main);
+        const CBlockIndex* tip = chainman.ActiveChain().Tip();
+        if (!tip || tip->GetBlockHash() != pow_work.prev_hash ||
+            tip->nHeight + 1 != pow_work.height) {
+            throw JSONRPCError(RPC_VERIFY_REJECTED, "Active chain tip changed before the PoW claim could be committed; retry on the new tip");
+        }
         const MempoolAcceptResult accept = chainman.ProcessTransaction(tx, /*test_accept=*/true);
         if (accept.m_result_type != MempoolAcceptResult::ResultType::VALID) {
             throw JSONRPCError(RPC_VERIFY_REJECTED, strprintf("Shadow PoW claim rejected: %s", accept.m_state.ToString()));
         }
+        // Keep the final tip check atomic with wallet persistence and relay.
+        // cs_main is recursive on this codebase, so the commit validation path
+        // may re-enter it without reopening the stale-tip race.
+        mapValue_t map_value;
+        map_value["comment"] = "PoW Claim";
+        CommitWalletTransactionOrThrow(*pwallet, tx, std::move(map_value), "PoW Claim");
     }
-
-    mapValue_t map_value;
-    map_value["comment"] = "PoW Claim";
-    CommitWalletTransactionOrThrow(*pwallet, tx, std::move(map_value), "PoW Claim");
 
     UniValue result(UniValue::VOBJ);
     result.pushKV("txid", tx->GetHash().GetHex());

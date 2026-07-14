@@ -62,6 +62,7 @@ class CKeyID;
 class CPubKey;
 class Coin;
 class SigningProvider;
+struct ShadowPowWork;
 enum class MemPoolRemovalReason;
 enum class SigningResult;
 enum class TransactionError;
@@ -1575,6 +1576,15 @@ public:
     {
         m_shadow_pow_claim_submission_inflight.store(false, std::memory_order_release);
     }
+    /**
+     * Return true while one wallet-created QQSPROOF remains capable of
+     * confirming. Such a transaction must keep its inputs quarantined even
+     * after local mempool eviction because a peer may still retain it.
+     */
+    size_t CountUnresolvedShadowPowClaims() const;
+    /** Persist input quarantine after a claim was added to the wallet but
+     * could not be kept in the local mempool. */
+    bool QuarantineShadowPowClaim(const uint256& txid);
     ShadowPowClaimInputSelectionResult SelectShadowPowClaimInput(
         const std::optional<CScript>& required_target,
         const CScript& quantum_payout_script,
@@ -1583,7 +1593,7 @@ public:
         ShadowPowClaimInput& selected,
         bilingual_str& error) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
     void MaybeDelayShadowPowClaimSubmissionForTest(const COutPoint& selected_outpoint);
-    ShadowPowClaimSubmitResult SubmitShadowPowClaim(const ShadowPowClaimInput& selected_input, const std::vector<unsigned char>& proof, bilingual_str& error);
+    ShadowPowClaimSubmitResult SubmitShadowPowClaim(const ShadowPowClaimInput& selected_input, const ShadowPowWork& work, const std::vector<unsigned char>& proof, bilingual_str& error);
     std::unique_ptr<std::vector<std::thread>> threadPowMinerGroup GUARDED_BY(m_pow_miner_mutex);
 
     //! Whether the (external) signer performs R-value signature grinding
