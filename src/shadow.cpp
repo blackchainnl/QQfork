@@ -2733,6 +2733,7 @@ ShadowPowClaimResult FindLegacyPowShadowClaims(const CBlock& block, const CBlock
                     return result;
                 }
                 result.credits.push_back(ShadowPowCredit{decoded.payout_script, amount});
+                result.current_winner = true;
                 result.valid_claim_count = 1;
             }
         }
