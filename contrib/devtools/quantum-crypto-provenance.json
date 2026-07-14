@@ -80,6 +80,7 @@
   "wycheproof": {
     "commit": "6d7cccd0fcb1917368579adeeac10fe802f1b521",
     "path": "testvectors_v1/mldsa_44_verify_test.json",
+    "source_url": "https://raw.githubusercontent.com/C2SP/wycheproof/6d7cccd0fcb1917368579adeeac10fe802f1b521/testvectors_v1/mldsa_44_verify_test.json",
     "source_sha256": "5ec04790c240c443ca8b662b8fc871834602c7cce87fcd36a193110745b2b9ea",
     "local_files": {
       "contrib/devtools/gen-mldsa44-kat.py": "1c3ffbbb6a4d8c0233151ad21d2171997fd9246dc4be6506c30c0e5922f8bf22",

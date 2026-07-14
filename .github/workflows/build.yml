@@ -966,6 +966,12 @@ jobs:
           path: artifacts
           pattern: release-${{ needs.resolve-target.outputs.package_label }}-*-${{ needs.resolve-target.outputs.target_sha }}
 
+      - name: Download exact-SHA quantum crypto provenance evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: gate-evidence/quantum-crypto
+          name: quantum-crypto-provenance-${{ needs.resolve-target.outputs.target_sha }}
+
       - name: Install release packaging tools
         run: |
           sudo apt-get update
@@ -1013,6 +1019,11 @@ jobs:
           test -s "dist/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64.dmg"
           test -s "dist/$ASSET_PREFIX-macOS-Universal-Qt-apps.zip"
           test -s "dist/$ASSET_PREFIX-REPRODUCIBILITY.txt"
+          test -s gate-evidence/quantum-crypto/quantum-crypto-provenance-evidence.json
+          cp gate-evidence/quantum-crypto/quantum-crypto-provenance-evidence.json \
+            "dist/Blackcoin-$VERSION-quantum-crypto-provenance.json"
+          cp contrib/devtools/quantum-crypto-provenance.json \
+            "dist/Blackcoin-$VERSION-quantum-crypto-manifest.json"
           printf '%s\n' "$TARGET_SHA" > dist/SOURCE_COMMIT.txt
           gpg --batch --armor --export "$RELEASE_GPG_FINGERPRINT" > \
             "dist/Blackcoin-$VERSION-RELEASE-KEY.asc"

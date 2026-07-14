@@ -120,6 +120,35 @@ jobs:
           test/lint/check-doc.py
           test/lint/all-lint.py
 
+  crypto-source-provenance:
+    name: pinned independent quantum crypto provenance
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+
+      - name: Download and verify pinned upstream sources and vectors
+        run: |
+          python3 contrib/devtools/verify-quantum-crypto-sources.py \
+            --fetch-upstream "$RUNNER_TEMP/quantum-crypto-upstream" \
+            --require-upstream \
+            --evidence quantum-crypto-provenance-evidence.json
+
+      - name: Upload exact-source provenance evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: quantum-crypto-provenance-${{ env.TARGET_SHA }}
+          path: quantum-crypto-provenance-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+
   native-build-and-unit:
     name: pinned native build and unit tests
     runs-on: ubuntu-22.04

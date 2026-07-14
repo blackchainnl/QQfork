@@ -4,6 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Regression tests for fail-closed release metadata and identity tooling."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -39,7 +40,70 @@ def load_mixed_version_module(name):
     return module
 
 
+def load_path(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 class ReleaseToolTests(unittest.TestCase):
+    def test_quantum_crypto_provenance_is_mandatory_and_retained(self):
+        root = TOOLS.parent.parent
+        workflow = (root / ".github" / "workflows" / "pr-gate.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("crypto-source-provenance:", workflow)
+        self.assertIn("--fetch-upstream", workflow)
+        self.assertIn("--require-upstream", workflow)
+        self.assertIn("quantum-crypto-provenance-${{ env.TARGET_SHA }}", workflow)
+        release_workflow = (root / ".github" / "workflows" / "build.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            "name: quantum-crypto-provenance-${{ needs.resolve-target.outputs.target_sha }}",
+            release_workflow,
+        )
+        self.assertIn("Blackcoin-$VERSION-quantum-crypto-provenance.json", release_workflow)
+        self.assertIn("Blackcoin-$VERSION-quantum-crypto-manifest.json", release_workflow)
+
+        manifest = json.loads(
+            (root / "contrib" / "devtools" / "quantum-crypto-provenance.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertIn(manifest["wycheproof"]["commit"], manifest["wycheproof"]["source_url"])
+        self.assertTrue(manifest["wycheproof"]["source_url"].startswith("https://"))
+
+    def test_quantum_crypto_downloader_rejects_untrusted_or_wrong_bytes(self):
+        verifier = load_path(
+            "verify_quantum_crypto_sources",
+            TOOLS.parent.parent / "contrib" / "devtools" / "verify-quantum-crypto-sources.py",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            destination = Path(temporary) / "source.bin"
+            with self.assertRaisesRegex(SystemExit, "untrusted upstream URL"):
+                verifier.download_pinned(
+                    "http://raw.githubusercontent.com/example/source",
+                    hashlib.sha256(b"expected").hexdigest(),
+                    destination,
+                )
+
+            response = mock.MagicMock()
+            response.__enter__.return_value = response
+            response.__exit__.return_value = False
+            response.geturl.return_value = "https://raw.githubusercontent.com/example/source"
+            response.headers = {"Content-Length": "5"}
+            response.read.side_effect = [b"wrong", b""]
+            with mock.patch.object(verifier.urllib.request, "urlopen", return_value=response):
+                with self.assertRaisesRegex(SystemExit, "expected"):
+                    verifier.download_pinned(
+                        "https://raw.githubusercontent.com/example/source",
+                        hashlib.sha256(b"expected").hexdigest(),
+                        destination,
+                    )
+            self.assertFalse(destination.exists())
+
     def test_release_runbook_is_blackcoin_specific_and_covers_immutable_rollback(self):
         root = TOOLS.parent.parent
         runbook = (root / "doc" / "release-process.md").read_text(encoding="utf-8")
