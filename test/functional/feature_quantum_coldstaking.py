@@ -17,6 +17,8 @@ COLD_STAKE_AMOUNT = Decimal("9000")
 COLD_SPEND_FEE = Decimal("0.01")
 HALF_POS_SUBSIDY = Decimal("0.75")
 HALF_POS_SUBSIDY_SATS = 75_000_000
+GOLD_RUSH_END_HEIGHT = 2
+MIGRATION_END_HEIGHT = 1000
 
 
 class QuantumColdStakingTest(BitcoinTestFramework):
@@ -33,7 +35,8 @@ class QuantumColdStakingTest(BitcoinTestFramework):
             "-donatetodevfund=0",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=1",
-            "-qqgoldrushendtime=1",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
         ]]
 
     def skip_test_if_missing_module(self):
@@ -219,11 +222,11 @@ class QuantumColdStakingTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
+        node.get_wallet_rpc(self.default_wallet_name).staking(False)
+        self._generate(GOLD_RUSH_END_HEIGHT, node.get_deterministic_priv_key().address)
         assert_equal(node.getquantumquasarinfo()["phase"], "migration")
 
         self.log.info("Creating funder, owner, and staker wallets")
-        default_wallet = node.get_wallet_rpc(self.default_wallet_name)
-        default_wallet.staking(False)
         node.createwallet(wallet_name="cold_funder")
         node.createwallet(wallet_name="cold_owner")
         node.createwallet(wallet_name="cold_staker")

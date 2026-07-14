@@ -12,6 +12,10 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
 
+GOLD_RUSH_END_HEIGHT = 2
+MIGRATION_END_HEIGHT = 1000
+
+
 class QuantumRedelegationAutoTest(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser)
@@ -25,7 +29,9 @@ class QuantumRedelegationAutoTest(BitcoinTestFramework):
             "-staketimio=50",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=1",
-            "-qqgoldrushendtime=1",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
+            f"-qqstaketierheight={GOLD_RUSH_END_HEIGHT + 1}",
             "-qqautoredelegate=1",
             "-qqredelegationtriggermultiplier=1",
             "-qqredelegationmaxpatienceblocks=1",
@@ -152,6 +158,7 @@ class QuantumRedelegationAutoTest(BitcoinTestFramework):
 
         funder_address = funder.getnewaddress("", "legacy")
         self._generate(COINBASE_MATURITY + 2, funder_address)
+        assert_equal(node.getquantumquasarinfo()["phase"], "migration")
 
         current = self._register_operator(funder, funder_address, owner, staker_current, "auto-current", Decimal("100"))
         target = self._register_operator(funder, funder_address, owner, staker_target, "auto-target", Decimal("5000"))

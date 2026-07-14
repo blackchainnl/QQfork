@@ -12,6 +12,10 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
+GOLD_RUSH_END_HEIGHT = 2
+MIGRATION_END_HEIGHT = 1000
+
+
 class QuantumPoolCapTest(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser)
@@ -24,7 +28,9 @@ class QuantumPoolCapTest(BitcoinTestFramework):
             "-donatetodevfund=0",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=1",
-            "-qqgoldrushendtime=1",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
+            f"-qqstaketierheight={GOLD_RUSH_END_HEIGHT + 1}",
         ]]
 
     def skip_test_if_missing_module(self):
@@ -70,6 +76,7 @@ class QuantumPoolCapTest(BitcoinTestFramework):
 
         funder_address = funder.getnewaddress("", "legacy")
         self._generate(COINBASE_MATURITY + 2, funder_address)
+        assert_equal(node.getquantumquasarinfo()["phase"], "migration")
 
         self.log.info("Funding two live QCS outputs for an exact cold-stake denominator")
         staker_a_key = staker_a.dumpquantumkey(staker_a.getnewquantumaddress()["address"])
@@ -178,9 +185,9 @@ class QuantumPoolCapTest(BitcoinTestFramework):
         assert_equal(bootstrap_info["operator_count"], 1)
         assert_equal(bootstrap_info["operators"][0]["operator_commitment_verified"], True)
 
-        self.log.info("Quantum staking funding sends legacy change to quantum change")
-        staker_c_legacy = staker_c.getnewaddress("", "legacy")
-        funder.sendtoaddress(staker_c_legacy, Decimal("10"))
+        self.log.info("Quantum staking funding keeps direct quantum change in the quantum family")
+        staker_c_quantum = staker_c.getnewquantumaddress()["address"]
+        funder.sendtoaddress(staker_c_quantum, Decimal("10"))
         self._generate(1, funder_address)
         stake_change_test = staker_c.getnewquantumstakeaddress("change-test", 0)
         stake_fund = staker_c.fundquantumstakeaddress(stake_change_test["address"], Decimal("1"))

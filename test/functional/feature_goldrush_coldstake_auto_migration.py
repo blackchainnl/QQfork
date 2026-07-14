@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Verify cold-stake funding safely auto-migrates Gold Rush reward outputs."""
+"""Verify cold-stake funding directly consumes mature Gold Rush rewards."""
 
 from decimal import Decimal
 import time
@@ -12,8 +12,8 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
 
-GOLD_RUSH_END_TIME = 2_000_000_000
-MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 40_000
+GOLD_RUSH_END_HEIGHT = 501
+MIGRATION_END_HEIGHT = 700
 WALLET_NAME = "goldrush_coldstake_auto_migration"
 
 
@@ -30,8 +30,8 @@ class GoldRushColdStakeAutoMigrationTest(BitcoinTestFramework):
             "-staketimio=50",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=500",
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
-            f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
         ]]
 
     def skip_test_if_missing_module(self):
@@ -94,7 +94,6 @@ class GoldRushColdStakeAutoMigrationTest(BitcoinTestFramework):
 
     def _mine_until_quantum_spends_active(self, address):
         node = self.nodes[0]
-        self._set_mocktime(GOLD_RUSH_END_TIME + 16)
         for _ in range(1000):
             self.generatetoaddress(node, 1, address, sync_fun=self.no_op)
             self._bump_mocktime(16)
@@ -138,31 +137,17 @@ class GoldRushColdStakeAutoMigrationTest(BitcoinTestFramework):
         self.log.info("Advancing to migration before auto-migrating the Gold Rush reward into cold stake")
         self._mine_until_quantum_spends_active(node.get_deterministic_priv_key().address)
 
-        self.log.info("Default cold-stake funding first migrates the Gold Rush reward")
+        self.log.info("Cold-stake funding directly spends the mature Gold Rush reward")
         staker_key = wallet.dumpquantumkey(wallet.getnewquantumaddress()["address"])
         coldstake_address = wallet.getnewquantumcoldstakingaddress(staker_key["public_key"], "auto-coldstake")["address"]
         result = wallet.fundquantumcoldstakeaddress(coldstake_address, Decimal("1"))
-        assert_equal(result["created_goldrush_migration"], True)
-        assert_equal(result["completed_delegation"], False)
-        assert result["migration_txid"] in node.getrawmempool()
-        assert_equal(result["txid"], result["migration_txid"])
-
-        self.log.info("The migration must confirm before the delegation can spend it")
-        self._bump_mocktime(32)
-        block_hash = self.generatetoaddress(node, 1, node.get_deterministic_priv_key().address, sync_fun=self.no_op)[0]
-        block_txids = node.getblock(block_hash)["tx"]
-        assert result["migration_txid"] in block_txids
-
-        self.log.info("After confirmation, the same RPC funds the cold-stake delegation")
-        self._sync_mocktime_to_tip()
-        delegation = wallet.fundquantumcoldstakeaddress(coldstake_address, Decimal("1"))
-        assert_equal(delegation["created_goldrush_migration"], False)
-        assert_equal(delegation["completed_delegation"], True)
-        assert delegation["txid"] in node.getrawmempool()
+        assert_equal(result["created_goldrush_migration"], False)
+        assert_equal(result["completed_delegation"], True)
+        assert result["txid"] in node.getrawmempool()
 
         self._bump_mocktime(32)
         block_hash = self.generatetoaddress(node, 1, node.get_deterministic_priv_key().address, sync_fun=self.no_op)[0]
-        assert delegation["txid"] in node.getblock(block_hash)["tx"]
+        assert result["txid"] in node.getblock(block_hash)["tx"]
 
 
 if __name__ == "__main__":

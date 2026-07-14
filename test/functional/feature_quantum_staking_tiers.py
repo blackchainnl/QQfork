@@ -27,6 +27,8 @@ CANONICAL_JSON = os.path.join(
 )
 STAKE_AMOUNT = Decimal("12000")
 VAULT_7D_BLOCKS = 9450
+GOLD_RUSH_END_HEIGHT = COINBASE_MATURITY + 2
+MIGRATION_END_HEIGHT = GOLD_RUSH_END_HEIGHT + COINBASE_MATURITY + 1
 
 
 def load_canonical():
@@ -49,10 +51,10 @@ class QuantumStakingTiersTest(BitcoinTestFramework):
             # migration-phase coinstake spends a quantum input.
             "-donatetodevfund=1",
             "-shadowwhitelistheight=1",
-            "-shadowgoldrushblocks=10",
-            "-qqgoldrushendtime=1",
-            "-qqmigrationdeadlinetime=2",
-            "-qqstaketierheight=1",
+            f"-shadowgoldrushblocks={GOLD_RUSH_END_HEIGHT - 1}",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
+            f"-qqstaketierheight={GOLD_RUSH_END_HEIGHT + 1}",
         ]
         self.extra_args = [args, args]
 
@@ -132,7 +134,7 @@ class QuantumStakingTiersTest(BitcoinTestFramework):
             "amount": utxo["amount"],
         }
 
-    def _sign_quantum_tx(self, tx, quantum_key, prevtx):
+    def _sign_invalid_quantum_tx(self, tx, quantum_key, prevtx, expected_error):
         signed = self.nodes[0].signrawtransactionwithquantumkey(
             tx.serialize().hex(),
             [{
@@ -141,8 +143,8 @@ class QuantumStakingTiersTest(BitcoinTestFramework):
             }],
             [prevtx],
         )
-        if not signed["complete"]:
-            raise AssertionError(f"tiered quantum transaction did not verify after signing: {signed}")
+        assert_equal(signed["complete"], False)
+        assert any(expected_error in error["error"] for error in signed["errors"])
         return tx_from_hex(signed["hex"])
 
     def _signed_candidate_block(self, raw_block_hex, signed_coinstake, signing_key):
@@ -189,18 +191,21 @@ class QuantumStakingTiersTest(BitcoinTestFramework):
         redirected.sha256 = None
         redirected.hash = None
 
-        signed_coinstake = self._sign_quantum_tx(redirected, stake_key, self._prevtx_for_utxo(stake_utxo))
+        signed_coinstake = self._sign_invalid_quantum_tx(
+            redirected,
+            stake_key,
+            self._prevtx_for_utxo(stake_utxo),
+            "bad-stake-tier-covenant",
+        )
         invalid_block_hex = self._signed_candidate_block(raw_block_hex, signed_coinstake, stake_key)
         assert_equal(node.getblocktemplate({"mode": "proposal", "data": invalid_block_hex}), "bad-stake-tier-covenant")
 
     def run_test(self):
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
         for node in self.nodes:
-            assert_equal(node.getquantumquasarinfo()["phase"], "final_lockout")
+            node.get_wallet_rpc(self.default_wallet_name).staking(False)
 
         self.log.info("Creating funder and tiered staking wallets")
-        for node in self.nodes:
-            node.get_wallet_rpc(self.default_wallet_name).staking(False)
         self.nodes[0].createwallet(wallet_name="tier_funder")
         self.nodes[0].createwallet(wallet_name="tier_staker")
         funder = self.nodes[0].get_wallet_rpc("tier_funder")
@@ -224,13 +229,19 @@ class QuantumStakingTiersTest(BitcoinTestFramework):
         stake_key = staker.dumpquantumkey(stake_address)
         assert_equal(stake_key["public_key"], stake_info["public_key"])
 
-        self.log.info("Funding and maturing the tiered staking output")
-        mining_address = funder.getnewquantumaddress()["address"]
-        self._generate(COINBASE_MATURITY + 2, mining_address)
+        self.log.info("Crossing Gold Rush and funding the tiered output during Migration")
+        mining_address = funder.getnewaddress("", "legacy")
+        self._generate(GOLD_RUSH_END_HEIGHT, mining_address)
+        for node in self.nodes:
+            assert_equal(node.getquantumquasarinfo()["phase"], "migration")
         funding_txid = funder.sendtoaddress(stake_address, STAKE_AMOUNT)
         self._generate(1, mining_address)
         self.wait_until(lambda: len(staker.listunspent(1, 9999999, [stake_address])) == 1, timeout=30)
+
+        self.log.info("Maturing the tiered output while crossing into Final Lockout")
         self._generate(COINBASE_MATURITY, mining_address)
+        for node in self.nodes:
+            assert_equal(node.getquantumquasarinfo()["phase"], "final_lockout")
         stake_utxo = self._one_tiered_utxo(staker, stake_address)
         assert_equal(stake_utxo["txid"], funding_txid)
         stake_amount = Decimal(str(stake_utxo["amount"]))

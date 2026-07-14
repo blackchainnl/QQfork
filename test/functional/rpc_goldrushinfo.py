@@ -6,6 +6,8 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 
 QQSPROOF_HEX = "51515350524f4f46"
+GOLD_RUSH_END_HEIGHT = 501
+MIGRATION_END_HEIGHT = 700
 
 class GoldRushInfoTest(BitcoinTestFramework):
     def add_options(self, parser):
@@ -14,9 +16,15 @@ class GoldRushInfoTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 2
         self.setup_clean_chain = True
+        args = [
+            "-shadowwhitelistheight=1",
+            "-shadowgoldrushblocks=500",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
+        ]
         self.extra_args = [
-            ["-shadowwhitelistheight=1", "-shadowgoldrushblocks=500"],
-            ["-shadowwhitelistheight=1", "-shadowgoldrushblocks=500"],
+            args,
+            args,
         ]
 
     def _sync_mocktime_to_tip(self):
