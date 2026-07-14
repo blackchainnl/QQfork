@@ -17,10 +17,29 @@ import hashlib
 import json
 from pathlib import Path
 
-from test_framework.address import address_to_scriptpubkey
-from test_framework.blocktools import COINBASE_MATURITY, create_block, create_coinbase
+from test_framework.address import address_to_scriptpubkey, key_to_p2pkh
+from test_framework.blocktools import (
+    COINBASE_MATURITY,
+    WITNESS_COMMITMENT_HEADER,
+    create_block,
+    create_coinbase,
+    get_witness_script,
+)
 from test_framework.key import ECKey
-from test_framework.messages import COIN, CBlockHeader, COutPoint, CTransaction, CTxIn, CTxOut, from_hex
+from test_framework.messages import (
+    COIN,
+    CBlock,
+    CBlockHeader,
+    COutPoint,
+    CTransaction,
+    CTxIn,
+    CTxInWitness,
+    CTxOut,
+    from_hex,
+    ser_uint256,
+    uint256_from_str,
+)
+from test_framework.p2p import NODE_WITNESS, P2P_SERVICES, P2PDataStore
 from test_framework.script import (
     CScript,
     OP_0,
@@ -35,6 +54,7 @@ from test_framework.script import (
 from test_framework.script_util import key_to_p2pk_script, program_to_witness_script, script_to_p2sh_script
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
+from test_framework.wallet_util import bytes_to_wif
 
 
 VERSIONS = [260200, 280400, 300100, None]
@@ -52,16 +72,27 @@ GOLD_RUSH_ARGS = [
     "-qqmigrationendheight=800",
 ]
 FEE = COIN // 100
+POS_SUBSIDY = 3 * COIN // 2
 QQSPROOF = b"QQSPROOF"
 
 
 class GoldRushMixedVersionTest(BitcoinTestFramework):
+    def add_options(self, parser):
+        # The pinned v26.2 build can stake only from a legacy wallet. Keep the
+        # candidate on the same wallet format so both producers use one exact
+        # fixed-key fixture rather than version-specific wallet machinery.
+        self.add_wallet_options(parser, descriptors=False, legacy=True)
+
     def set_test_params(self):
         self.num_nodes = 4
         self.setup_clean_chain = True
         base_args = ["-minimumchainwork=0x00", "-assumevalid=0"]
         self.extra_args = [
-            list(base_args),
+            # v26.2's checkkernel result metadata incorrectly declares fields
+            # that are absent from a normal {"found": false} response as
+            # mandatory. Disable only that historical self-check; the RPC
+            # response and every candidate documentation check remain intact.
+            base_args + ["-rpcdoccheck=0"],
             list(base_args),
             base_args + GOLD_RUSH_ARGS,
             base_args + GOLD_RUSH_ARGS,
@@ -69,11 +100,37 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_previous_releases()
+        self.skip_if_no_wallet()
 
     def setup_nodes(self):
         self.assert_v30_1_0_provenance()
         self.add_nodes(self.num_nodes, extra_args=self.extra_args, versions=VERSIONS)
         self.start_nodes()
+
+        # Use a fixed key funded only after the height-one whitelist snapshot.
+        # Both normative wallets therefore select the same non-whitelisted
+        # staking population, and neither wallet owns the ordinary fee inputs.
+        self.fee_boundary_stake_key = ECKey()
+        self.fee_boundary_stake_key.set(b"\x20" * 32, compressed=True)
+        self.fee_boundary_stake_wif = bytes_to_wif(
+            self.fee_boundary_stake_key.get_bytes(), compressed=True
+        )
+        self.fee_boundary_stake_address = key_to_p2pkh(
+            self.fee_boundary_stake_key.get_pubkey().get_bytes()
+        )
+        for index in (REFERENCE, CANDIDATE):
+            self.nodes[index].createwallet(
+                wallet_name=self.default_wallet_name,
+                descriptors=False,
+                load_on_startup=True,
+            )
+            wallet = self.nodes[index].get_wallet_rpc(self.default_wallet_name)
+            wallet.importprivkey(
+                self.fee_boundary_stake_wif,
+                "gold-rush-fee-boundary-staker",
+                False,
+            )
+            wallet.staking(False)
 
     def setup_network(self):
         self.setup_nodes()
@@ -202,6 +259,415 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         )
         assert_equal(signed["complete"], True)
         return signed["hex"]
+
+    def fund_fee_boundary_stake_inputs(self, coins):
+        """Create mature stake inputs with one serialized time on every node."""
+        tip = self.nodes[CANDIDATE].getbestblockhash()
+        funding_time = self.nodes[CANDIDATE].getblockheader(tip)["time"] + 1
+        for node in self.nodes:
+            node.setmocktime(funding_time)
+
+        stake_script = address_to_scriptpubkey(self.fee_boundary_stake_address)
+        transactions = [
+            self.signed_coin_spend(
+                coin,
+                [CTxOut(coin["value"] - FEE, stake_script)],
+                version=1,
+                tx_time=funding_time,
+            )
+            for coin in coins
+        ]
+        for raw_transaction in transactions:
+            transaction = from_hex(CTransaction(), raw_transaction)
+            assert_equal(transaction.nVersion, 1)
+            assert_equal(transaction.nTime, funding_time)
+
+        funding_block = self.generateblock(
+            self.nodes[REFERENCE],
+            self.nodes[CANDIDATE].get_deterministic_priv_key().address,
+            transactions,
+            sync_fun=self.no_op,
+        )
+        self.sync_blocks(self.nodes, timeout=180)
+        for node in self.nodes:
+            block = from_hex(CBlock(), node.getblock(funding_block["hash"], 0))
+            assert_equal(len(block.vtx), len(transactions) + 1)
+            for transaction in block.vtx[1:]:
+                assert_equal(transaction.nVersion, 1)
+                assert_equal(transaction.nTime, funding_time)
+        self.mine_and_sync(
+            self.nodes[REFERENCE],
+            blocks=COINBASE_MATURITY,
+            nodes=self.nodes,
+        )
+
+    def set_normative_mocktime(self, timestamp):
+        for node in self.normative_nodes:
+            node.setmocktime(timestamp)
+
+    def bump_normative_mocktime(self, seconds=16):
+        current = max(
+            node.mocktime if node.mocktime is not None else 0
+            for node in self.normative_nodes
+        )
+        self.set_normative_mocktime(current + seconds)
+
+    def fee_boundary_staking_inputs(self, wallet):
+        return [
+            {"txid": utxo["txid"], "vout": utxo["vout"]}
+            for utxo in wallet.listunspent(
+                COINBASE_MATURITY,
+                9999999,
+                [self.fee_boundary_stake_address],
+            )
+        ]
+
+    def find_fee_boundary_kernel_time(self, wallet):
+        inputs = self.fee_boundary_staking_inputs(wallet)
+        assert len(inputs) >= 2, "two mixed-version PoS rounds require two mature fixed-key inputs"
+        for _ in range(5000):
+            self.bump_normative_mocktime(16)
+            kernel = wallet.checkkernel(inputs)
+            if kernel["found"]:
+                return kernel["kernel"]["time"]
+        raise AssertionError("timed out searching for the mixed-version PoS fee-boundary kernel")
+
+    def produce_fee_paying_pos_block(self, producer_index, fee_tx_hex):
+        """Capture one real wallet-produced PoS block while its peer is isolated."""
+        producer = self.nodes[producer_index]
+        receiver_index = CANDIDATE if producer_index == REFERENCE else REFERENCE
+        receiver = self.nodes[receiver_index]
+        wallet = producer.get_wallet_rpc(self.default_wallet_name)
+
+        self.disconnect_nodes(CANDIDATE, REFERENCE)
+        parent_hash = producer.getbestblockhash()
+        parent_height = producer.getblockcount()
+        assert_equal(receiver.getbestblockhash(), parent_hash)
+        fee_txid = producer.sendrawtransaction(fee_tx_hex)
+
+        kernel_time = self.find_fee_boundary_kernel_time(wallet)
+        self.set_normative_mocktime(kernel_time - 16)
+        wallet.staking(True)
+        try:
+            self.set_normative_mocktime(kernel_time)
+            self.wait_until(lambda: producer.getblockcount() > parent_height, timeout=30)
+        finally:
+            wallet.staking(False)
+
+        block_hash = producer.getbestblockhash()
+        block_json = producer.getblock(block_hash, 2)
+        assert "proof-of-stake" in block_json["flags"]
+        assert_equal(block_json["previousblockhash"], parent_hash)
+        assert fee_txid in [tx["txid"] for tx in block_json["tx"][2:]]
+        assert_equal(receiver.getbestblockhash(), parent_hash)
+        stripped_raw = producer.getblock(block_hash, 0)
+        witness_nonce = self.coinbase_witness_nonce(block_json)
+        full_block = self.restore_coinbase_witness(stripped_raw, witness_nonce)
+        full_block.rehash()
+        full_raw = full_block.serialize().hex()
+        assert_equal(full_block.hash, block_hash)
+        assert_equal(len(bytes.fromhex(stripped_raw)), block_json["strippedsize"])
+        assert_equal(len(bytes.fromhex(full_raw)), block_json["size"])
+
+        return (
+            full_raw,
+            stripped_raw,
+            block_hash,
+            parent_hash,
+            parent_height,
+            fee_txid,
+        )
+
+    @staticmethod
+    def coinbase_witness_nonce(block_json):
+        coinbase_vin = block_json["tx"][0]["vin"]
+        assert_equal(len(coinbase_vin), 1)
+        nonce_stack = coinbase_vin[0].get("txinwitness", [])
+        assert_equal(len(nonce_stack), 1)
+        witness_nonce = bytes.fromhex(nonce_stack[0])
+        assert_equal(len(witness_nonce), 32)
+
+        # The controlled fee and coinstake transactions use only legacy P2PKH
+        # inputs. This makes the coinbase nonce the complete witness delta
+        # between the stripped RPC bytes and the relayed block serialization.
+        for transaction in block_json["tx"][1:]:
+            for txin in transaction["vin"]:
+                assert "txinwitness" not in txin
+        return witness_nonce
+
+    @staticmethod
+    def restore_coinbase_witness(stripped_raw, witness_nonce):
+        block = from_hex(CBlock(), stripped_raw)
+        coinbase = CTransaction(block.vtx[0])
+        assert_equal(len(coinbase.wit.vtxinwit), 0)
+        coinbase_witness = CTxInWitness()
+        coinbase_witness.scriptWitness.stack = [witness_nonce]
+        coinbase.wit.vtxinwit = [coinbase_witness]
+        block.vtx[0] = coinbase
+        return block
+
+    def relay_and_rewind_wallet_pos_block(
+        self,
+        origin_index,
+        receiver_index,
+        full_raw,
+        stripped_raw,
+        block_hash,
+        parent_hash,
+        parent_height,
+    ):
+        """Relay the unmodified wallet block, then restore both isolated parents."""
+        origin = self.nodes[origin_index]
+        receiver = self.nodes[receiver_index]
+        assert_equal(origin.getbestblockhash(), block_hash)
+        assert_equal(receiver.getbestblockhash(), parent_hash)
+
+        self.connect_nodes(CANDIDATE, REFERENCE)
+        self.sync_blocks(self.normative_nodes, timeout=120)
+        assert_equal(
+            [node.getbestblockhash() for node in self.normative_nodes],
+            [block_hash, block_hash],
+        )
+        assert_equal(
+            [node.getblock(block_hash, 0) for node in self.normative_nodes],
+            [stripped_raw, stripped_raw],
+        )
+        for node in self.normative_nodes:
+            block_json = node.getblock(block_hash, 2)
+            witness_nonce = self.coinbase_witness_nonce(block_json)
+            restored = self.restore_coinbase_witness(stripped_raw, witness_nonce)
+            assert_equal(restored.serialize().hex(), full_raw)
+
+        self.disconnect_nodes(CANDIDATE, REFERENCE)
+        for node in self.normative_nodes:
+            node.invalidateblock(block_hash)
+            assert_equal(node.getbestblockhash(), parent_hash)
+            assert_equal(node.getblockcount(), parent_height)
+
+    def coinstake_reward(self, raw_block):
+        block = from_hex(CBlock(), raw_block)
+        coinstake = block.vtx[1]
+        value_in = 0
+        for txin in coinstake.vin:
+            coin = None
+            for node in self.normative_nodes:
+                coin = node.gettxout(
+                    f"{txin.prevout.hash:064x}", txin.prevout.n, False
+                )
+                if coin is not None:
+                    break
+            assert coin is not None, (
+                "coinstake input must be live on the isolated parent"
+            )
+            value_in += int(Decimal(str(coin["value"])) * COIN)
+        return sum(txout.nValue for txout in coinstake.vout) - value_in
+
+    @staticmethod
+    def refresh_witness_commitment(block):
+        commitment_indices = [
+            index
+            for index, txout in enumerate(block.vtx[0].vout)
+            if bytes(txout.scriptPubKey).startswith(
+                b"\x6a\x24" + WITNESS_COMMITMENT_HEADER
+            )
+        ]
+        if not commitment_indices:
+            return
+
+        coinbase = CTransaction(block.vtx[0])
+        assert_equal(len(coinbase.wit.vtxinwit), 1)
+        nonce_stack = coinbase.wit.vtxinwit[0].scriptWitness.stack
+        assert_equal(len(nonce_stack), 1)
+        assert_equal(len(nonce_stack[0]), 32)
+        witness_nonce = uint256_from_str(nonce_stack[0])
+
+        block.vtx[0] = coinbase
+        witness_root = block.calc_witness_merkle_root()
+        coinbase.vout[commitment_indices[-1]].scriptPubKey = get_witness_script(
+            witness_root, witness_nonce
+        )
+        coinbase.rehash()
+        block.vtx[0] = coinbase
+
+    def fee_boundary_block(self, raw_block, additional_reward):
+        """Re-sign a captured coinstake after increasing its total reward."""
+        block = from_hex(CBlock(), raw_block)
+        coinstake = CTransaction(block.vtx[1])
+        value_outputs = [
+            index for index, txout in enumerate(coinstake.vout)
+            if index > 0 and txout.nValue > 0
+        ]
+        assert value_outputs, "wallet-produced coinstake must return value"
+        coinstake.vout[value_outputs[-1]].nValue += additional_reward
+        for txin in coinstake.vin:
+            txin.scriptSig = b""
+        coinstake.rehash()
+
+        signed = self.nodes[CANDIDATE].signrawtransactionwithkey(
+            coinstake.serialize().hex(),
+            [self.fee_boundary_stake_wif],
+        )
+        assert_equal(signed["complete"], True)
+        block.vtx[1] = from_hex(CTransaction(), signed["hex"])
+        self.refresh_witness_commitment(block)
+        block.hashMerkleRoot = block.calc_merkle_root()
+        block.rehash()
+        block.vchBlockSig = self.fee_boundary_stake_key.sign_ecdsa(
+            ser_uint256(block.sha256),
+            rfc6979=True,
+        )
+        return (
+            block.serialize().hex(),
+            block.serialize(with_witness=False).hex(),
+            block.hash,
+        )
+
+    def accept_fee_boundary_block(
+        self,
+        origin_index,
+        receiver_index,
+        full_raw,
+        stripped_raw,
+        block_hash,
+    ):
+        origin = self.nodes[origin_index]
+        receiver = self.nodes[receiver_index]
+        proposal = {"mode": "proposal", "data": full_raw}
+        for node in self.normative_nodes:
+            assert_equal(node.getblocktemplate(proposal), None)
+
+        # submitblock applies its historical PoW precheck even to a coinstake
+        # body. Deliver the exact candidate through the production P2P path,
+        # including the current protocol's explicit PoS marker, instead.
+        block = from_hex(CBlock(), full_raw)
+        block.nFlags = 1
+        block.rehash()
+        assert_equal(block.hash, block_hash)
+        peer = origin.add_p2p_connection(
+            P2PDataStore(),
+            # Historical binaries may be executed through the provenance-
+            # preserving container wrapper. Its inbound peer address is the
+            # bridge gateway rather than the host socket, so perform the
+            # protocol handshake without TestNode's host-address assertion.
+            wait_for_verack=False,
+            services=P2P_SERVICES | NODE_WITNESS,
+        )
+        try:
+            peer.wait_for_verack()
+            peer.sync_with_ping()
+            peer.send_blocks_and_test(
+                [block],
+                origin,
+                success=True,
+                force_send=True,
+                timeout=120,
+            )
+        finally:
+            origin.disconnect_p2ps()
+
+        assert_equal(origin.getbestblockhash(), block_hash)
+        assert receiver.getbestblockhash() != block_hash
+
+        self.connect_nodes(CANDIDATE, REFERENCE)
+        self.sync_blocks(self.normative_nodes, timeout=120)
+        self.assert_normative_tip()
+        assert_equal(receiver.getbestblockhash(), block_hash)
+        accepted = [node.getblock(block_hash, 0) for node in self.normative_nodes]
+        assert_equal(accepted, [stripped_raw, stripped_raw])
+        for node in self.normative_nodes:
+            block_json = node.getblock(block_hash, 2)
+            witness_nonce = self.coinbase_witness_nonce(block_json)
+            restored = self.restore_coinbase_witness(stripped_raw, witness_nonce)
+            assert_equal(restored.serialize().hex(), full_raw)
+
+    def exercise_gold_rush_pos_fee_boundary(self, fee_coins, change_script):
+        """Prove the deployed v26 PoS two-fee ceiling in both directions."""
+        rounds = (
+            (CANDIDATE, REFERENCE, fee_coins[0]),
+            (REFERENCE, CANDIDATE, fee_coins[1]),
+        )
+        last_hash = None
+        for origin_index, receiver_index, fee_coin in rounds:
+            fee_tx_hex = self.signed_coin_spend(
+                fee_coin,
+                [CTxOut(fee_coin["value"] - FEE, change_script)],
+            )
+            (
+                original_full_raw,
+                original_stripped_raw,
+                original_hash,
+                parent_hash,
+                parent_height,
+                fee_txid,
+            ) = self.produce_fee_paying_pos_block(origin_index, fee_tx_hex)
+            assert_equal(
+                self.coinstake_reward(original_full_raw),
+                POS_SUBSIDY + FEE,
+            )
+            self.relay_and_rewind_wallet_pos_block(
+                origin_index,
+                receiver_index,
+                original_full_raw,
+                original_stripped_raw,
+                original_hash,
+                parent_hash,
+                parent_height,
+            )
+
+            ceiling_full_raw, ceiling_stripped_raw, ceiling_hash = (
+                self.fee_boundary_block(original_full_raw, FEE)
+            )
+            over_full_raw, _, _ = self.fee_boundary_block(
+                original_full_raw,
+                FEE + 1,
+            )
+            assert ceiling_full_raw != over_full_raw
+            assert_equal(
+                self.coinstake_reward(ceiling_full_raw),
+                POS_SUBSIDY + 2 * FEE,
+            )
+
+            # Validate the exact same one-satoshi-over bytes on both isolated
+            # implementations. Each must reach the reward check and give the
+            # deployed legacy rejection reason, not a signature or kernel error.
+            for node in self.normative_nodes:
+                assert_equal(node.getbestblockhash(), parent_hash)
+                assert_equal(node.getblocktemplate({
+                    "mode": "proposal",
+                    "data": over_full_raw,
+                }), "bad-cs-amount")
+                assert_equal(node.getbestblockhash(), parent_hash)
+
+            self.accept_fee_boundary_block(
+                origin_index,
+                receiver_index,
+                ceiling_full_raw,
+                ceiling_stripped_raw,
+                ceiling_hash,
+            )
+            assert fee_txid in self.nodes[CANDIDATE].getblock(ceiling_hash)["tx"]
+            last_hash = ceiling_hash
+
+        # Disable and unload both fixture wallets before restart. v26.2 starts
+        # loaded wallets' staking threads automatically, which would make the
+        # persistence assertion race an unrelated third PoS block.
+        for index in (REFERENCE, CANDIDATE):
+            wallet = self.nodes[index].get_wallet_rpc(self.default_wallet_name)
+            wallet.staking(False)
+            self.nodes[index].unloadwallet(self.default_wallet_name, False)
+
+        for index in (REFERENCE, CANDIDATE):
+            self.restart_node(index)
+            assert_equal(self.nodes[index].getbestblockhash(), last_hash)
+        self.connect_nodes(CANDIDATE, REFERENCE)
+        self.sync_blocks(self.normative_nodes, timeout=120)
+        self.assert_normative_tip()
+
+        # The fee-boundary blocks must not leave either implementation unable
+        # to extend or receive the ordinary base chain after a clean restart.
+        self.mine_and_sync(self.nodes[REFERENCE], nodes=self.normative_nodes)
+        self.mine_and_sync(self.nodes[CANDIDATE], nodes=self.normative_nodes)
+        self.assert_normative_tip()
 
     @staticmethod
     def tx_from_outputs(prev_txid, prev_vout, prev_value, outputs, script_sig=b""):
@@ -533,6 +999,14 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
             sync_fun=self.no_op,
         )
         self.sync_blocks(self.nodes, timeout=180)
+        # Version-2 transactions omit nTime. v26.2 records a local adjusted
+        # time for those outputs, while v30.1.0 and the candidate persist the
+        # containing block time. Use serialized version-1 funding here so this
+        # fee-boundary gate measures fee accounting rather than the separately
+        # covered historical v2 clock seam.
+        self.fund_fee_boundary_stake_inputs(
+            [self.coinbase_utxo(block_hash) for block_hash in mined[1:5]]
+        )
         for legacy_node in self.nodes[:3]:
             self.mine_and_sync(legacy_node, nodes=self.nodes)
         self.mine_and_sync(self.nodes[CANDIDATE], blocks=2, nodes=self.nodes)
@@ -555,7 +1029,14 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         self.log.info("Stopping diagnostic builds before known split-path fixtures")
         self.stop_node(1)
         self.stop_node(2)
-        coins = [self.coinbase_utxo(block_hash) for block_hash in mined[1:21]]
+
+        self.log.info("Crossing the exact Gold Rush PoS two-fee ceiling in both directions")
+        self.exercise_gold_rush_pos_fee_boundary(
+            [self.coinbase_utxo(block_hash) for block_hash in mined[25:27]],
+            change_script,
+        )
+
+        coins = [self.coinbase_utxo(block_hash) for block_hash in mined[5:25]]
 
         self.log.info("Crossing NOP4 discriminator blocks in both directions")
         self.exercise_nop4_both_directions(coins, change_script)

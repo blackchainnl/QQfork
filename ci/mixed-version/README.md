@@ -21,8 +21,19 @@ updated. A proper immutable v28.4.0 tag would remove this provenance gap.
 
 The functional test starts all four real daemons, checks their RPC versions,
 relays blocks produced by every historical generation, then proves reorgs in
-both directions and persistence across restart. It complements rather than
-replaces the synthetic legacy-policy fixtures.
+both directions and persistence across restart. The normative v26.2.0 and
+candidate pair also produce signed proof-of-stake blocks carrying an ordinary
+fee-paying transaction. Each unmodified wallet block relays byte-for-byte to
+the opposite implementation. Both then accept the same re-signed block at the
+deployed Gold Rush two-fee ceiling, reject the same one-satoshi-over block with
+`bad-cs-amount`, reload the common tip, and continue ordinary synchronization.
+It complements rather than replaces the synthetic legacy-policy fixtures.
+
+The fee-ceiling fixture funds its staking inputs with serialized version-1
+transactions so every implementation records the same input timestamp. The
+known version-2 transaction clock seam is intentionally separate: the existing
+clock-regression fixture in this test covers the historical v26/v28 behavior
+and the deployed v30.1.0/candidate agreement.
 
 To build and run locally on x86-64 Linux:
 
