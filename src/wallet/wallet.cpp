@@ -8500,6 +8500,16 @@ QuantumAddressBindingResult CWallet::ResolveConfiguredQuantumAddress(
         return QuantumAddressBindingResult::INVALID;
     }
 
+    const std::optional<QuantumStakeTierProgram> tier =
+        GetQuantumStakeTierProgram(GetScriptForDestination(candidate));
+    if (!tier || tier->tiered || tier->cold_stake) {
+        error = Untranslated(strprintf(
+            "%s for %s must be an ordinary direct (non-tiered, non-cold-stake) "
+            "Quantum Quasar ML-DSA address.",
+            option, purpose));
+        return QuantumAddressBindingResult::INVALID;
+    }
+
     {
         LOCK(cs_wallet);
         const auto key_info = GetQuantumKeyInfo(candidate);
@@ -8533,11 +8543,17 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created)
         "-qqpowpayoutaddress", "Gold Rush PoW payouts", configured_dest, error)) {
     case QuantumAddressBindingResult::RESOLVED: {
         const std::string encoded = EncodeDestination(configured_dest);
+        bool binding_changed{false};
         {
             LOCK(cs_wallet);
-            m_pow_payout_quantum = encoded;
+            if (m_pow_payout_quantum != encoded) {
+                m_pow_payout_quantum = encoded;
+                binding_changed = true;
+            }
         }
-        WalletLogPrintf("Gold Rush PoW miner bound to configured payout address %s.\n", encoded);
+        if (binding_changed) {
+            WalletLogPrintf("Gold Rush PoW miner bound to configured payout address %s.\n", encoded);
+        }
         return true;
     }
     case QuantumAddressBindingResult::INVALID:
@@ -8618,11 +8634,22 @@ bool CWallet::EnsureShadowSignalPayoutAddress(
     CTxDestination configured_dest;
     switch (ResolveConfiguredQuantumAddress(
         "-qqpospayoutaddress", "Gold Rush PoS signal payouts", configured_dest, error)) {
-    case QuantumAddressBindingResult::RESOLVED:
+    case QuantumAddressBindingResult::RESOLVED: {
         payout_address = EncodeDestination(configured_dest);
         payout_script = GetScriptForDestination(configured_dest);
-        WalletLogPrintf("Gold Rush PoS signaler bound to configured payout address %s.\n", payout_address);
+        bool binding_changed{false};
+        {
+            LOCK(cs_wallet);
+            if (m_shadow_signal_payout_quantum != payout_address) {
+                m_shadow_signal_payout_quantum = payout_address;
+                binding_changed = true;
+            }
+        }
+        if (binding_changed) {
+            WalletLogPrintf("Gold Rush PoS signaler bound to configured payout address %s.\n", payout_address);
+        }
         return true;
+    }
     case QuantumAddressBindingResult::INVALID:
         return false;
     case QuantumAddressBindingResult::UNSET:

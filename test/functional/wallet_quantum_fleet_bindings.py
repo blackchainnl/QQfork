@@ -4,6 +4,8 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Test restart-safe fleet bindings without automatic quantum-key creation."""
 
+import time
+
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 
@@ -31,8 +33,19 @@ class WalletQuantumFleetBindingsTest(BitcoinTestFramework):
         wallet = node.get_wallet_rpc(wallet_name)
 
         bound = wallet.getnewquantumaddress("ordinary operator key")["address"]
+        assert_equal(self.key_set(wallet), {bound})
+        tiered = wallet.getnewquantumstakeaddress(
+            "must not be used for automation", 9450
+        )["address"]
         expected_keys = self.key_set(wallet)
-        assert_equal(expected_keys, {bound})
+        assert bound in expected_keys
+        assert tiered in expected_keys
+
+        hard_mode = [
+            "-qqallowautokeycreation=0",
+            "-qqautoredelegate=0",
+            "-qqautodemurrageattest=0",
+        ]
 
         self.log.info("Hard fleet mode requires explicit auto-redelegation shutdown")
         self.stop_node(0)
@@ -59,12 +72,24 @@ class WalletQuantumFleetBindingsTest(BitcoinTestFramework):
             ),
         )
 
+        self.log.info(
+            "All three automatic paths reject a wallet-owned tiered v16 binding"
+        )
+        for option in (
+            "-qqpowpayoutaddress",
+            "-qqpospayoutaddress",
+            "-qqdemurragechangeaddress",
+        ):
+            node.assert_start_raises_init_error(
+                extra_args=hard_mode + [f"{option}={tiered}"],
+                expected_msg=(
+                    f"Error: {option} must be an ordinary direct "
+                    "(non-tiered, non-cold-stake) Quantum Quasar ML-DSA "
+                    "address for the active network."
+                ),
+            )
+
         self.log.info("A missing hard-mode PoW binding fails without creating a key")
-        hard_mode = [
-            "-qqallowautokeycreation=0",
-            "-qqautoredelegate=0",
-            "-qqautodemurrageattest=0",
-        ]
         self.start_node(0, hard_mode)
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(wallet_name)
@@ -87,11 +112,26 @@ class WalletQuantumFleetBindingsTest(BitcoinTestFramework):
         self.restart_node(0, bindings)
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(wallet_name)
-        started = wallet.setpowmining(True, 1, 1)
+        log_offset = node.debug_log_path.stat().st_size
+        with node.assert_debug_log(["Gold Rush PoW worker 0 started"]):
+            started = wallet.setpowmining(True, 1, 1)
         assert started["enabled"]
         assert_equal(started["payout_address"], bound)
         assert "warning" not in started
+        # Give the worker time to perform its first hot-loop re-resolution.
+        # Before the edge-triggered log guard this produced a second identical
+        # binding line immediately, then another line on every loop.
+        time.sleep(0.25)
         wallet.setpowmining(False)
+        log_delta = node.debug_log_path.read_bytes()[log_offset:].decode(
+            "utf-8", errors="replace"
+        )
+        assert_equal(
+            log_delta.count(
+                "Gold Rush PoW miner bound to configured payout address"
+            ),
+            1,
+        )
         wallet.staking(True)
         node.mockscheduler(61)
         assert_equal(self.key_set(wallet), expected_keys)
@@ -108,19 +148,20 @@ class WalletQuantumFleetBindingsTest(BitcoinTestFramework):
         node.mockscheduler(61)
         assert_equal(self.key_set(wallet), expected_keys)
 
-        self.log.info("An invalid explicit binding fails closed after restart")
+        self.log.info("An invalid explicit binding fails closed before wallet load")
+        self.stop_node(0)
         invalid_bindings = hard_mode + ["-qqpowpayoutaddress=not-a-quantum-address"]
-        self.restart_node(0, invalid_bindings)
+        node.assert_start_raises_init_error(
+            extra_args=invalid_bindings,
+            expected_msg=(
+                "Error: -qqpowpayoutaddress must be an ordinary direct "
+                "(non-tiered, non-cold-stake) Quantum Quasar ML-DSA address "
+                "for the active network."
+            ),
+        )
+        self.start_node(0, hard_mode)
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(wallet_name)
-        assert_raises_rpc_error(
-            -4,
-            "valid Quantum Quasar",
-            wallet.setpowmining,
-            True,
-            1,
-            1,
-        )
         assert_equal(self.key_set(wallet), expected_keys)
 
 

@@ -102,11 +102,12 @@ qqautoredelegate=0
 qqautodemurrageattest=0
 ```
 
-The three address options may use the same address. Each value must decode as
-a quantum address for the active network and must be backed by a durably stored
-ML-DSA private key in the wallet performing the operation. Address-book labels
-are not used to resolve an explicit binding. Missing, repeated, invalid, or
-foreign-wallet values fail closed before key generation and return an
+The three address options may use the same address. Each value must be an
+ordinary direct v16 quantum address for the active network, not a tiered or
+cold-stake contract address, and must be backed by a durably stored ML-DSA
+private key in the wallet performing the operation. Address-book labels are
+not used to resolve an explicit binding. Missing, repeated, invalid, contract,
+or foreign-wallet values fail closed before key generation and return an
 actionable wallet error. Keep one independently configured wallet per fleet
 process; a loaded wallet that does not own the process-level binding cannot use
 that automatic path.

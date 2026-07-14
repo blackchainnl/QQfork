@@ -5,11 +5,13 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <addresstype.h>
 #include <common/args.h>
 #include <init.h>
 #include <interfaces/chain.h>
 #include <interfaces/init.h>
 #include <interfaces/wallet.h>
+#include <key_io.h>
 #include <net.h>
 #include <node/context.h>
 #include <node/interface_ui.h>
@@ -26,6 +28,8 @@
 #include <wallet/coincontrol.h>
 #include <wallet/wallet.h>
 #include <walletinitinterface.h>
+
+#include <optional>
 
 using node::NodeContext;
 
@@ -103,9 +107,9 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-powminingthreads=<n>", "Worker threads (CPU cores) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingcpu=<n>", "Per-core CPU utilization target (1-100) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqallowautokeycreation=<true/false>", "Allow background wallet automation to generate new ML-DSA keys (default: true). Set false for fleet operation with explicit -qqpowpayoutaddress, -qqpospayoutaddress, and -qqdemurragechangeaddress bindings and explicit -qqautoredelegate=0. This does not disable user-requested address creation.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
-    argsman.AddArg("-qqpowpayoutaddress=<address>", "Bind automatic Gold Rush PoW rewards to one existing, durably stored quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
-    argsman.AddArg("-qqpospayoutaddress=<address>", "Bind automatic Gold Rush PoS signal rewards to one existing, durably stored quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
-    argsman.AddArg("-qqdemurragechangeaddress=<address>", "Bind automatic demurrage-attestation change to one existing, durably stored quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqpowpayoutaddress=<address>", "Bind automatic Gold Rush PoW rewards to one existing, durably stored ordinary direct (non-tiered, non-cold-stake) quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqpospayoutaddress=<address>", "Bind automatic Gold Rush PoS signal rewards to one existing, durably stored ordinary direct (non-tiered, non-cold-stake) quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqdemurragechangeaddress=<address>", "Bind automatic demurrage-attestation change to one existing, durably stored ordinary direct (non-tiered, non-cold-stake) quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqshadowsignalmaxretryfailures=<n>", "Regtest/testnet-only Gold Rush PoS signal retry ceiling (default: 6)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
     argsman.AddArg("-qqshadowsignalretrybasemillis=<n>", "Regtest/testnet-only Gold Rush PoS signal retry base delay in milliseconds (default: 1000)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
     argsman.AddArg("-qqshadowsignalcleanupdelaymillis=<n>", "Regtest/testnet-only cleanup race-test barrier delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
@@ -180,6 +184,17 @@ bool WalletInit::ParameterInteraction() const
         if (!bindings.empty() && bindings.front().empty()) {
             return InitError(Untranslated(strprintf(
                 "%s requires a non-empty wallet-owned quantum address.", option)));
+        }
+        if (!bindings.empty()) {
+            const CTxDestination candidate = DecodeDestination(bindings.front());
+            const std::optional<QuantumStakeTierProgram> tier = IsValidDestination(candidate)
+                ? GetQuantumStakeTierProgram(GetScriptForDestination(candidate))
+                : std::nullopt;
+            if (!tier || tier->tiered || tier->cold_stake) {
+                return InitError(Untranslated(strprintf(
+                    "%s must be an ordinary direct (non-tiered, non-cold-stake) "
+                    "Quantum Quasar ML-DSA address for the active network.", option)));
+            }
         }
     }
 

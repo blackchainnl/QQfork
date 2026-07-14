@@ -1130,6 +1130,9 @@ public:
     // QQSPROOF transaction at a time.
     std::atomic<bool> m_shadow_pow_claim_submission_inflight{false};
     std::string m_pow_payout_quantum GUARDED_BY(cs_wallet); // auto-created ML-DSA payout address
+    // Runtime cache used to emit the configured QQSIGNAL binding once per
+    // wallet process instead of once per retry attempt.
+    std::string m_shadow_signal_payout_quantum GUARDED_BY(cs_wallet);
     Mutex m_pow_miner_mutex;
     uint256 m_pow_tip_hash GUARDED_BY(m_pow_miner_mutex);
     bool m_pow_claim_inflight GUARDED_BY(m_pow_miner_mutex){false};

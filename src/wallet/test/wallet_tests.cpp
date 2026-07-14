@@ -1703,6 +1703,23 @@ BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsPersistWithoutKeyCreati
             CCoinControl coin_control;
             BOOST_REQUIRE_MESSAGE(wallet->PrepareAutomaticDemurrageChangeAddress(coin_control, error), error.original);
             BOOST_CHECK(coin_control.destChange == bound_dest);
+
+            // The mining loop and signal retry path may resolve their binding
+            // repeatedly. Re-resolution keeps the same cached value, which
+            // also keeps configured-binding logging edge-triggered.
+            created = true;
+            BOOST_REQUIRE_MESSAGE(wallet->EnsurePowPayoutAddress(error, &created), error.original);
+            BOOST_CHECK(!created);
+            created = true;
+            BOOST_REQUIRE_MESSAGE(
+                wallet->EnsureShadowSignalPayoutAddress(payout_script, payout_address, error, &created),
+                error.original);
+            BOOST_CHECK(!created);
+            {
+                LOCK(wallet->cs_wallet);
+                BOOST_CHECK_EQUAL(wallet->m_pow_payout_quantum, address);
+                BOOST_CHECK_EQUAL(wallet->m_shadow_signal_payout_quantum, address);
+            }
             BOOST_CHECK(quantum_inventory(*wallet) == expected_inventory);
         }
 
@@ -1785,9 +1802,54 @@ BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsFailClosed, WalletTesti
     BOOST_CHECK(error.original.find("not backed") != std::string::npos);
     BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
 
-    args_guard.Unset("-qqpospayoutaddress");
+    CTxDestination tiered_dest;
+    {
+        LOCK(m_wallet.cs_wallet);
+        auto created = m_wallet.GetNewTieredQuantumDestination(
+            "tiered binding rejection", /*unbonding_blocks=*/9450);
+        BOOST_REQUIRE(created);
+        tiered_dest = *created;
+    }
+    const size_t tiered_key_count =
+        WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size());
+    BOOST_REQUIRE(tiered_key_count > original_key_count);
+    const std::string tiered_address = EncodeDestination(tiered_dest);
+
+    // A wallet-owned bonded v16 address has a valid ML-DSA key, but it is a
+    // staking contract rather than a direct shadow-ledger payout/change
+    // destination. Every automatic binding must reject it without creating a
+    // replacement key or mutating the configured output state.
+    args_guard.Force("-qqpowpayoutaddress", tiered_address);
+    error.clear();
+    bool created{true};
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(error.original.find("ordinary direct") != std::string::npos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
+
+    args_guard.Force("-qqpospayoutaddress", tiered_address);
     CScript payout_script;
     std::string payout_address;
+    error.clear();
+    created = true;
+    BOOST_CHECK(!m_wallet.EnsureShadowSignalPayoutAddress(payout_script, payout_address, error, &created));
+    BOOST_CHECK(!created);
+    BOOST_CHECK(payout_script.empty());
+    BOOST_CHECK(payout_address.empty());
+    BOOST_CHECK(error.original.find("ordinary direct") != std::string::npos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
+
+    args_guard.Force("-qqdemurragechangeaddress", tiered_address);
+    CCoinControl tiered_coin_control;
+    error.clear();
+    BOOST_CHECK(!m_wallet.PrepareAutomaticDemurrageChangeAddress(tiered_coin_control, error));
+    BOOST_CHECK(std::holds_alternative<CNoDestination>(tiered_coin_control.destChange));
+    BOOST_CHECK(error.original.find("ordinary direct") != std::string::npos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
+
+    args_guard.Unset("-qqpospayoutaddress");
+    payout_script.clear();
+    payout_address.clear();
     error.clear();
     BOOST_CHECK(!m_wallet.EnsureShadowSignalPayoutAddress(payout_script, payout_address, error));
     BOOST_CHECK(error.original.find("-qqpospayoutaddress") != std::string::npos);
@@ -1797,7 +1859,7 @@ BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsFailClosed, WalletTesti
     error.clear();
     BOOST_CHECK(!m_wallet.PrepareAutomaticDemurrageChangeAddress(coin_control, error));
     BOOST_CHECK(error.original.find("-qqdemurragechangeaddress") != std::string::npos);
-    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
 
     args_guard.Force("-qqautodemurrageattest", "0");
     {
@@ -1810,13 +1872,13 @@ BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsFailClosed, WalletTesti
     BOOST_CHECK_EQUAL(
         WITH_LOCK(m_wallet.cs_wallet, return m_wallet.m_demurrage_last_auto_attest_scan_height),
         77);
-    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
 
     // The source-level guard remains fail-closed even if a caller bypasses
     // startup parameter interaction and leaves auto-redelegation enabled.
     args_guard.Force("-qqautoredelegate", "1");
     BOOST_CHECK_EQUAL(MaybeAutoRedelegateQuantumColdStake(m_wallet), 0);
-    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
 }
 
 BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)
