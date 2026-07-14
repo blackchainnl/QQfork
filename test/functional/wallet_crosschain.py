@@ -24,7 +24,7 @@ class WalletCrossChain(BitcoinTestFramework):
 
         # Switch node 1 to testnet before starting it.
         self.nodes[1].chain = 'testnet3'
-        self.nodes[1].extra_args = ['-maxconnections=0', '-prune=550'] # disable testnet sync
+        self.nodes[1].extra_args = ['-maxconnections=0'] # disable testnet sync
         self.nodes[1].replace_in_config([('regtest=', 'testnet='), ('[regtest]', '[test]')])
         self.start_nodes()
 
@@ -58,7 +58,7 @@ class WalletCrossChain(BitcoinTestFramework):
         if not self.options.descriptors:
             self.log.info("Override cross-chain wallet load protection")
             self.stop_nodes()
-            self.start_nodes([['-walletcrosschain', '-prune=550']] * self.num_nodes)
+            self.start_nodes([['-walletcrosschain', '-maxconnections=0']] * self.num_nodes)
             self.nodes[0].loadwallet(node1_wallet)
             self.nodes[1].loadwallet(node0_wallet)
 

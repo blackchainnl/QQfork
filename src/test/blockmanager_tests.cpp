@@ -6,12 +6,15 @@
 
 #include <chainparams.h>
 #include <clientversion.h>
+#include <common/args.h>
+#include <node/blockmanager_args.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
 #include <node/kernel_notifications.h>
-#include <script/solver.h>
 #include <primitives/block.h>
+#include <script/solver.h>
 #include <util/chaintype.h>
+#include <util/result.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
@@ -52,6 +55,56 @@ BOOST_AUTO_TEST_CASE(blockmanager_find_block_pos)
     // add another 8 bytes for the second block's serialization header and we get 293 + 8 = 301
     FlatFilePos actual{blockman.SaveBlockToDisk(params->GenesisBlock(), 1, nullptr)};
     BOOST_CHECK_EQUAL(actual.nPos, BLOCK_SERIALIZATION_HEADER_SIZE + ::GetSerializeSize(TX_WITH_WITNESS(params->GenesisBlock())) + BLOCK_SERIALIZATION_HEADER_SIZE);
+}
+
+BOOST_AUTO_TEST_CASE(blockmanager_pruning_is_regtest_only)
+{
+    KernelNotifications notifications{m_node.exit_status};
+    const auto main_params{CreateChainParams(ArgsManager{}, ChainType::MAIN)};
+    const auto regtest_params{CreateChainParams(ArgsManager{}, ChainType::REGTEST)};
+
+    const auto options_for = [&](const CChainParams& params) {
+        return BlockManager::Options{
+            .chainparams = params,
+            .blocks_dir = m_args.GetBlocksDirPath(),
+            .notifications = notifications,
+        };
+    };
+
+    ArgsManager archival_args;
+    archival_args.ForceSetArg("-prune", "0");
+    auto archival_options = options_for(*main_params);
+    BOOST_REQUIRE(node::ApplyArgsManOptions(archival_args, archival_options));
+    BOOST_CHECK_EQUAL(archival_options.prune_target, 0U);
+
+    for (const std::string value : {"1", "550", "899"}) {
+        ArgsManager unsafe_args;
+        unsafe_args.ForceSetArg("-prune", value);
+        auto unsafe_options = options_for(*main_params);
+        const auto result = node::ApplyArgsManOptions(unsafe_args, unsafe_options);
+        BOOST_CHECK(!result);
+        BOOST_CHECK(util::ErrorString(result).original.find(
+                        "Block pruning is disabled on production networks") !=
+                    std::string::npos);
+        BOOST_CHECK_EQUAL(unsafe_options.prune_target, 0U);
+    }
+
+    ArgsManager fast_args;
+    fast_args.ForceSetArg("-fastprune", "1");
+    auto fast_options = options_for(*main_params);
+    const auto fast_result = node::ApplyArgsManOptions(fast_args, fast_options);
+    BOOST_CHECK(!fast_result);
+    BOOST_CHECK_EQUAL(util::ErrorString(fast_result).original,
+                      "Fast pruning is a regtest-only option in v30.1.1.");
+
+    ArgsManager regtest_args;
+    regtest_args.ForceSetArg("-prune", "1");
+    regtest_args.ForceSetArg("-fastprune", "1");
+    auto regtest_options = options_for(*regtest_params);
+    BOOST_REQUIRE(node::ApplyArgsManOptions(regtest_args, regtest_options));
+    BOOST_CHECK_EQUAL(regtest_options.prune_target,
+                      BlockManager::PRUNE_TARGET_MANUAL);
+    BOOST_CHECK(regtest_options.fast_prune);
 }
 
 // Blackcoin

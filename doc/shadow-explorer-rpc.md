@@ -35,10 +35,10 @@ will therefore fail with `bad-witness-merkle-match`. This RPC setting does not
 change P2P block relay or consensus; it ensures raw RPC responses contain the
 complete witness data an explorer needs.
 
-Initial index construction reads historical block files. A fully synchronized
-index can continue following new blocks on a pruned node, but a later rebuild
-cannot cross deleted block data. Explorer operators should therefore use
-`-prune=0`. `-reindex` wipes and deterministically rebuilds the index.
+Initial index construction reads historical block files. v30.1.1 does not
+support production-network pruning and rejects a nonzero `-prune` value on
+mainnet, testnet, and signet. Explorer operators must use `-prune=0`.
+`-reindex` wipes and deterministically rebuilds the index.
 
 v30.1.1 uses shadowindex schema 8. Schema 5 invalidated prerelease data built
 with the superseded height-5,950,000 claim boundary, schema 6 added proof-mode
@@ -49,8 +49,9 @@ shadowindex schema is discarded and rebuilt automatically. Coinstatsindex
 schema 3 likewise invalidates its
 prerelease schema-2 synthetic-payout statistics. These auxiliary-index rebuilds
 do not require a full block or chainstate reindex when all active-chain block
-files remain available. A pruned operator without the required history must
-disable the affected index or restore the history with a full `-reindex`.
+files remain available. An operator whose older datadir lacks required history
+must disable the affected index or restore the history with `prune=0` and a
+full `-reindex`.
 
 ## Data model
 
