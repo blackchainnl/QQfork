@@ -219,6 +219,23 @@ bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
 
             ValueLifecycleClassification classification;
             if (!GetWalletOutputLifecycle(wallet, outpoint, txout, classification, error)) return false;
+
+            // Ordinary generated outputs retain the wallet's inherited
+            // M+1 display/selection policy. Consensus may accept the output
+            // in the candidate next block at depth M, but AvailableCoins does
+            // not select it until IsTxImmature() clears. Do not report that
+            // value as available one block before the wallet can use it.
+            // Authenticated Gold Rush payouts have their own narrowly scoped
+            // next-block maturity exception in IsTxImmature().
+            if (wallet_immature && !classification.synthetic &&
+                classification.ordinary_spendable) {
+                classification.category =
+                    classification.category == ValueLifecycleCategory::SPENDABLE_LEGACY
+                    ? ValueLifecycleCategory::IMMATURE_LEGACY
+                    : ValueLifecycleCategory::IMMATURE_OTHER;
+                classification.mature = false;
+                classification.ordinary_spendable = false;
+            }
             if (mine_spendable && !AddLifecycleOutput(summary.mine, classification)) {
                 error = "Wallet lifecycle mine balance is out of range";
                 return false;

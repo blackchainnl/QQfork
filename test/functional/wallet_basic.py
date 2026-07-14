@@ -102,6 +102,14 @@ class WalletTest(BitcoinTestFramework):
         assert_equal(self.nodes[1].getbalance(), 10000)
         assert_equal(self.nodes[2].getbalance(), 0)
 
+        node1_balances = self.nodes[1].getbalances()["mine"]
+        assert_equal(node1_balances["trusted"], 10000)
+        assert_equal(node1_balances["lifecycle"]["ordinary_available"], 10000)
+        assert_equal(
+            node1_balances["lifecycle"]["categories"]["immature_legacy"]["count"],
+            COINBASE_MATURITY,
+        )
+
         # Check that only first and second nodes have UTXOs
         utxos = self.nodes[0].listunspent()
         assert_equal(len(utxos), 1)
