@@ -116,7 +116,14 @@ class GoldRushShadowReplayTest(BitcoinTestFramework):
         if staged:
             assert_equal(
                 (datadir / "chainstate-rebuild.journal").read_text(),
-                "blackcoin-chainstate-rebuild-v1\nphase=building\nbase=1\nsnapshot=0\n",
+                "blackcoin-chainstate-rebuild-v2\n"
+                "phase=building\n"
+                "base=1\n"
+                "snapshot=0\n"
+                "commitment=0\n"
+                f"tip={'0' * 64}\n"
+                "coins=0\n"
+                f"full_coin_hash={'0' * 64}\n",
             )
             assert backup_db.is_dir()
             preserved_fingerprint = self.stable_chainstate_fingerprint(backup_db)

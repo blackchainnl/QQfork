@@ -7,6 +7,8 @@
 //
 #include <chainparams.h>
 #include <consensus/validation.h>
+#include <crypto/muhash.h>
+#include <kernel/coinstats.h>
 #include <kernel/disconnected_transactions.h>
 #include <node/kernel_notifications.h>
 #include <node/chainstate.h>
@@ -21,6 +23,7 @@
 #include <test/util/setup_common.h>
 #include <test/util/validation.h>
 #include <timedata.h>
+#include <txdb.h>
 #include <uint256.h>
 #include <util/time.h>
 #include <validation.h>
@@ -28,6 +31,10 @@
 
 #include <tinyformat.h>
 
+#include <fstream>
+#include <iterator>
+#include <limits>
+#include <string>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
@@ -430,7 +437,88 @@ struct SnapshotTestSetup : TestChain100Setup {
             m_node.kernel->interrupt, chainman_opts, blockman_opts);
         return *Assert(m_node.chainman);
     }
+
+    ChainstateManager& BuildAndCommitProtectedChainstate()
+    {
+        // The commitment identifies the rebuilt replacement at COMMIT_READY.
+        // It deliberately does not assert byte-for-byte or Coin-for-Coin
+        // equality with the legacy source, whose nTime/coinstake provenance
+        // may be corrected by reconstruction. Corruption tests mutate only
+        // after this baseline identity has been durably recorded.
+        ChainstateManager& rebuilding = SimulateNodeRestart();
+        node::ChainstateLoadOptions rebuild;
+        rebuild.mempool = Assert(m_node.mempool.get());
+        rebuild.reindex_chainstate = true;
+        auto [status, error] = node::LoadChainstate(
+            rebuilding, m_cache_sizes, rebuild);
+        BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+        std::tie(status, error) = node::VerifyLoadedChainstate(
+            rebuilding, rebuild);
+        BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+
+        BlockValidationState state;
+        BOOST_REQUIRE(rebuilding.ActiveChainstate().ActivateBestChain(
+            state, nullptr));
+        bilingual_str finalize_error;
+        BOOST_REQUIRE(node::FinalizeChainstateRebuild(
+            rebuilding, finalize_error));
+        BOOST_REQUIRE(fs::exists(
+            rebuilding.m_options.datadir / "chainstate-rebuild.journal"));
+        BOOST_REQUIRE(fs::exists(
+            rebuilding.m_options.datadir / "chainstate.rebuild-backup"));
+        return rebuilding;
+    }
 };
+
+static uint256 LegacyMuHash(CCoinsView& view)
+{
+    MuHash3072 muhash;
+    std::unique_ptr<CCoinsViewCursor> cursor = view.Cursor();
+    BOOST_REQUIRE(cursor);
+    while (cursor->Valid()) {
+        COutPoint outpoint;
+        Coin coin;
+        BOOST_REQUIRE(cursor->GetKey(outpoint));
+        BOOST_REQUIRE(cursor->GetValue(coin));
+        BOOST_REQUIRE(!coin.IsSpent());
+        kernel::ApplyCoinHash(muhash, outpoint, coin);
+        cursor->Next();
+    }
+    uint256 result;
+    muhash.Finalize(result);
+    return result;
+}
+
+static void WriteCoinMutation(CCoinsViewDB& view,
+                              const COutPoint& outpoint,
+                              Coin coin)
+{
+    CCoinsMapMemoryResource resource;
+    CCoinsMap changes{0, CCoinsMap::hasher{}, CCoinsMap::key_equal{},
+                      &resource};
+    changes.emplace(outpoint, CCoinsCacheEntry{
+        std::move(coin), CCoinsCacheEntry::DIRTY});
+    const uint256 tip = view.GetBestBlock();
+    BOOST_REQUIRE(!tip.IsNull());
+    BOOST_REQUIRE(view.BatchWrite(changes, tip));
+}
+
+static std::string ReadTextFile(const fs::path& path)
+{
+    std::ifstream file{path};
+    BOOST_REQUIRE(file.is_open());
+    return {std::istreambuf_iterator<char>{file},
+            std::istreambuf_iterator<char>{}};
+}
+
+static void WriteTextFile(const fs::path& path, const std::string& contents)
+{
+    std::ofstream file{path, std::ios::trunc};
+    BOOST_REQUIRE(file.is_open());
+    file << contents;
+    file.close();
+    BOOST_REQUIRE(file.good());
+}
 
 static void WriteSnapshotBaseFile(const fs::path& snapshot_dir,
                                   const uint256& base,
@@ -798,6 +886,157 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_commit_ready_requires_current_verifica
     BOOST_CHECK(!fs::exists(backup));
     BOOST_CHECK_EQUAL(WITH_LOCK(
         ::cs_main, return reopened.ActiveTip()->GetBlockHash()), source_tip);
+}
+
+//! A CLEANUP_READY restart must reopen and authenticate the complete live Coin
+//! set before deleting even one retained backup.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_cleanup_rejects_missing_old_coin, SnapshotTestSetup)
+{
+    const COutPoint target{m_coinbase_txns.front()->GetHash(), 0};
+    ChainstateManager& rebuilding = BuildAndCommitProtectedChainstate();
+    const fs::path datadir = rebuilding.m_options.datadir;
+    const fs::path journal = datadir / "chainstate-rebuild.journal";
+    const fs::path backup = datadir / "chainstate.rebuild-backup";
+
+    ChainstateManager& reopening = SimulateNodeRestart();
+    {
+        CCoinsViewDB live{DBParams{
+            .path = datadir / "chainstate",
+            .cache_bytes = 1 << 20,
+            .memory_only = false,
+            .wipe_data = false,
+            .obfuscate = true}, CoinsViewOptions{}};
+        Coin coin;
+        BOOST_REQUIRE(live.GetCoin(target, coin));
+        coin.Clear();
+        WriteCoinMutation(live, target, std::move(coin));
+    }
+    std::string contents = ReadTextFile(journal);
+    const size_t phase = contents.find("phase=commit-ready\n");
+    BOOST_REQUIRE(phase != std::string::npos);
+    contents.replace(phase, std::string{"phase=commit-ready\n"}.size(),
+                     "phase=cleanup-ready\n");
+    WriteTextFile(journal, contents);
+
+    node::ChainstateLoadOptions normal;
+    normal.mempool = Assert(m_node.mempool.get());
+    const auto [status, error] = node::LoadChainstate(
+        reopening, m_cache_sizes, normal);
+    BOOST_CHECK(status == node::ChainstateLoadStatus::FAILURE_FATAL);
+    BOOST_CHECK(error.original.find("full-Coin commitment") !=
+                std::string::npos);
+    BOOST_CHECK(fs::exists(journal));
+    BOOST_CHECK(fs::exists(backup));
+}
+
+//! Coin time is consensus-relevant persisted provenance but is intentionally
+//! absent from the legacy assumeUTXO MuHash. The rebuild commitment and a full
+//! disconnect check must both detect a time-only mutation.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_commitment_covers_coin_time, SnapshotTestSetup)
+{
+    const COutPoint target{m_coinbase_txns.front()->GetHash(), 0};
+    ChainstateManager& rebuilding = BuildAndCommitProtectedChainstate();
+    const fs::path datadir = rebuilding.m_options.datadir;
+    const fs::path journal = datadir / "chainstate-rebuild.journal";
+    const fs::path backup = datadir / "chainstate.rebuild-backup";
+
+    ChainstateManager& reopened = SimulateNodeRestart();
+    {
+        CCoinsViewDB live{DBParams{
+            .path = datadir / "chainstate",
+            .cache_bytes = 1 << 20,
+            .memory_only = false,
+            .wipe_data = false,
+            .obfuscate = true}, CoinsViewOptions{}};
+        const uint256 legacy_before = LegacyMuHash(live);
+        Coin coin;
+        BOOST_REQUIRE(live.GetCoin(target, coin));
+        BOOST_REQUIRE(coin.nTime < std::numeric_limits<unsigned int>::max());
+        ++coin.nTime;
+        WriteCoinMutation(live, target, std::move(coin));
+        BOOST_CHECK_EQUAL(LegacyMuHash(live), legacy_before);
+    }
+
+    node::ChainstateLoadOptions normal;
+    normal.mempool = Assert(m_node.mempool.get());
+    auto [status, error] = node::LoadChainstate(
+        reopened, m_cache_sizes, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    std::tie(status, error) = node::VerifyLoadedChainstate(reopened, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+
+    bilingual_str finalize_error;
+    BOOST_CHECK(!node::FinalizeChainstateRebuild(reopened, finalize_error));
+    BOOST_CHECK(finalize_error.original.find("full-Coin commitment") !=
+                std::string::npos);
+    BOOST_CHECK(fs::exists(journal));
+    BOOST_CHECK(fs::exists(backup));
+
+    node::ChainstateLoadOptions full_check = normal;
+    full_check.check_blocks = 0;
+    full_check.check_level = 4;
+    std::tie(status, error) = node::VerifyLoadedChainstate(
+        reopened, full_check);
+    BOOST_CHECK(status == node::ChainstateLoadStatus::FAILURE);
+}
+
+//! A committed legacy journal has no state identity to authenticate. It must
+//! retain the backup even if it claims cleanup was already authorized.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_legacy_cleanup_journal_fails_closed, SnapshotTestSetup)
+{
+    ChainstateManager& rebuilding = BuildAndCommitProtectedChainstate();
+    const fs::path datadir = rebuilding.m_options.datadir;
+    const fs::path journal = datadir / "chainstate-rebuild.journal";
+    const fs::path backup = datadir / "chainstate.rebuild-backup";
+    ChainstateManager& reopening = SimulateNodeRestart();
+
+    WriteTextFile(journal,
+                  "blackcoin-chainstate-rebuild-v1\n"
+                  "phase=cleanup-ready\n"
+                  "base=1\n"
+                  "snapshot=0\n");
+    node::ChainstateLoadOptions normal;
+    normal.mempool = Assert(m_node.mempool.get());
+    const auto [status, error] = node::LoadChainstate(
+        reopening, m_cache_sizes, normal);
+    BOOST_CHECK(status == node::ChainstateLoadStatus::FAILURE_FATAL);
+    BOOST_CHECK(error.original.find("predates full-Coin commitments") !=
+                std::string::npos);
+    BOOST_CHECK(fs::exists(journal));
+    BOOST_CHECK(fs::exists(backup));
+}
+
+//! Recovery commitment scans must honor shutdown without advancing cleanup.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_cleanup_commitment_is_interruptible, SnapshotTestSetup)
+{
+    ChainstateManager& rebuilding = BuildAndCommitProtectedChainstate();
+    const fs::path datadir = rebuilding.m_options.datadir;
+    const fs::path journal = datadir / "chainstate-rebuild.journal";
+    const fs::path backup = datadir / "chainstate.rebuild-backup";
+    ChainstateManager& reopening = SimulateNodeRestart();
+
+    std::string contents = ReadTextFile(journal);
+    const size_t phase = contents.find("phase=commit-ready\n");
+    BOOST_REQUIRE(phase != std::string::npos);
+    contents.replace(phase, std::string{"phase=commit-ready\n"}.size(),
+                     "phase=cleanup-ready\n");
+    WriteTextFile(journal, contents);
+
+    node::ChainstateLoadOptions normal;
+    normal.mempool = Assert(m_node.mempool.get());
+    m_node.kernel->interrupt();
+    auto [status, error] = node::LoadChainstate(
+        reopening, m_cache_sizes, normal);
+    m_node.kernel->interrupt.reset();
+    BOOST_CHECK(status == node::ChainstateLoadStatus::INTERRUPTED);
+    BOOST_CHECK(fs::exists(journal));
+    BOOST_CHECK(fs::exists(backup));
+
+    std::tie(status, error) = node::LoadChainstate(
+        reopening, m_cache_sizes, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    BOOST_CHECK(!fs::exists(journal));
+    BOOST_CHECK(!fs::exists(backup));
 }
 
 //! Shutdown between the base and snapshot renames must remain rollback-safe.

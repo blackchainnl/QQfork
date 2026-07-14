@@ -3387,6 +3387,9 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
         uint256 hash = tx.GetHash();
         bool is_coinbase = tx.IsCoinBase();
         bool is_coinstake = tx.IsCoinStake();
+        const unsigned int coin_time = tx.nVersion < 2
+            ? tx.nTime
+            : static_cast<unsigned int>(pindex->GetBlockTime());
 
         // Check that all outputs are available and match the outputs in the block itself
         // exactly.
@@ -3395,7 +3398,11 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
                 COutPoint out(hash, o);
                 Coin coin;
                 bool is_spent = view.SpendCoin(out, &coin);
-                if (!is_spent || tx.vout[o] != coin.out || pindex->nHeight != coin.nHeight || is_coinbase != coin.fCoinBase || is_coinstake != coin.fCoinStake) {
+                if (!is_spent || tx.vout[o] != coin.out ||
+                    pindex->nHeight != coin.nHeight ||
+                    is_coinbase != coin.fCoinBase ||
+                    is_coinstake != coin.fCoinStake ||
+                    coin_time != coin.nTime) {
                     fClean = false; // transaction output mismatch
                 }
             }

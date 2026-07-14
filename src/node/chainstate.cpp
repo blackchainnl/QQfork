@@ -11,6 +11,7 @@
 #include <chain.h>
 #include <coins.h>
 #include <consensus/params.h>
+#include <hash.h>
 #include <logging.h>
 #include <node/blockstorage.h>
 #include <node/caches.h>
@@ -23,6 +24,7 @@
 #include <util/fs.h>
 #include <util/fs_helpers.h>
 #include <util/signalinterrupt.h>
+#include <util/strencodings.h>
 #include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
@@ -34,6 +36,7 @@
 #include <cstdio>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -58,10 +61,34 @@ enum class RebuildPhase {
     CLEANUP_READY,
 };
 
+struct RebuildCommitment {
+    uint256 tip;
+    uint64_t coin_count{0};
+    uint256 full_coin_hash;
+
+    friend bool operator==(const RebuildCommitment& lhs, const RebuildCommitment& rhs)
+    {
+        return lhs.tip == rhs.tip && lhs.coin_count == rhs.coin_count &&
+            lhs.full_coin_hash == rhs.full_coin_hash;
+    }
+    friend bool operator!=(const RebuildCommitment& lhs, const RebuildCommitment& rhs)
+    {
+        return !(lhs == rhs);
+    }
+};
+
 struct RebuildJournal {
+    uint32_t version{2};
     RebuildPhase phase;
     bool base_present;
     bool snapshot_present;
+    std::optional<RebuildCommitment> commitment;
+};
+
+enum class CommitmentResult {
+    SUCCESS,
+    INTERRUPTED,
+    FAILURE,
 };
 
 bool PathExists(const fs::path& path)
@@ -105,10 +132,30 @@ bool WriteJournal(const fs::path& datadir, const RebuildJournal& journal)
 {
     const fs::path path = JournalPath(datadir);
     const fs::path staged = fs::PathFromString(fs::PathToString(path) + ".new");
-    const std::string contents = strprintf(
-        "blackcoin-chainstate-rebuild-v1\nphase=%s\nbase=%d\nsnapshot=%d\n",
-        PhaseName(journal.phase), journal.base_present ? 1 : 0,
-        journal.snapshot_present ? 1 : 0);
+    const bool committed_phase = journal.phase == RebuildPhase::COMMIT_READY ||
+        journal.phase == RebuildPhase::CLEANUP_READY;
+    if ((journal.version != 1 && journal.version != 2) ||
+        (journal.version == 1 && journal.commitment) ||
+        (journal.version == 2 && committed_phase != journal.commitment.has_value())) {
+        return false;
+    }
+
+    std::string contents;
+    if (journal.version == 1) {
+        contents = strprintf(
+            "blackcoin-chainstate-rebuild-v1\nphase=%s\nbase=%d\nsnapshot=%d\n",
+            PhaseName(journal.phase), journal.base_present ? 1 : 0,
+            journal.snapshot_present ? 1 : 0);
+    } else {
+        const RebuildCommitment commitment = journal.commitment.value_or(RebuildCommitment{});
+        contents = strprintf(
+            "blackcoin-chainstate-rebuild-v2\nphase=%s\nbase=%d\nsnapshot=%d\n"
+            "commitment=%d\ntip=%s\ncoins=%u\nfull_coin_hash=%s\n",
+            PhaseName(journal.phase), journal.base_present ? 1 : 0,
+            journal.snapshot_present ? 1 : 0, journal.commitment ? 1 : 0,
+            commitment.tip.ToString(), commitment.coin_count,
+            commitment.full_coin_hash.ToString());
+    }
 
     std::error_code ec;
     fs::remove(staged, ec);
@@ -133,10 +180,9 @@ std::optional<RebuildJournal> ReadJournal(const fs::path& datadir, std::string& 
         error = "chainstate rebuild journal is unreadable";
         return std::nullopt;
     }
-    std::string magic, phase_line, base_line, snapshot_line, trailing;
+    std::string magic, phase_line, base_line, snapshot_line;
     if (!std::getline(file, magic) || !std::getline(file, phase_line) ||
         !std::getline(file, base_line) || !std::getline(file, snapshot_line) ||
-        std::getline(file, trailing) || magic != "blackcoin-chainstate-rebuild-v1" ||
         phase_line.rfind("phase=", 0) != 0 || base_line.rfind("base=", 0) != 0 ||
         snapshot_line.rfind("snapshot=", 0) != 0) {
         error = "chainstate rebuild journal is malformed";
@@ -151,7 +197,116 @@ std::optional<RebuildJournal> ReadJournal(const fs::path& datadir, std::string& 
         error = "chainstate rebuild journal contains an invalid state";
         return std::nullopt;
     }
-    return RebuildJournal{*phase, base == "1", snapshot == "1"};
+
+    if (magic == "blackcoin-chainstate-rebuild-v1") {
+        std::string trailing;
+        if (std::getline(file, trailing)) {
+            error = "chainstate rebuild journal is malformed";
+            return std::nullopt;
+        }
+        return RebuildJournal{1, *phase, base == "1", snapshot == "1", std::nullopt};
+    }
+    if (magic != "blackcoin-chainstate-rebuild-v2") {
+        error = "chainstate rebuild journal has an unsupported version";
+        return std::nullopt;
+    }
+
+    std::string commitment_line, tip_line, coins_line, hash_line, trailing;
+    if (!std::getline(file, commitment_line) || !std::getline(file, tip_line) ||
+        !std::getline(file, coins_line) || !std::getline(file, hash_line) ||
+        std::getline(file, trailing) || commitment_line.rfind("commitment=", 0) != 0 ||
+        tip_line.rfind("tip=", 0) != 0 || coins_line.rfind("coins=", 0) != 0 ||
+        hash_line.rfind("full_coin_hash=", 0) != 0) {
+        error = "chainstate rebuild journal is malformed";
+        return std::nullopt;
+    }
+    const std::string commitment_flag = commitment_line.substr(11);
+    const std::string tip_hex = tip_line.substr(4);
+    const std::string coins_value = coins_line.substr(6);
+    const std::string hash_hex = hash_line.substr(15);
+    uint64_t coin_count{0};
+    if ((commitment_flag != "0" && commitment_flag != "1") ||
+        tip_hex.size() != uint256::size() * 2 || !IsHex(tip_hex) ||
+        hash_hex.size() != uint256::size() * 2 || !IsHex(hash_hex) ||
+        !ParseUInt64(coins_value, &coin_count)) {
+        error = "chainstate rebuild journal contains an invalid commitment";
+        return std::nullopt;
+    }
+    RebuildCommitment commitment{uint256S(tip_hex), coin_count, uint256S(hash_hex)};
+    const bool commitment_present = commitment_flag == "1";
+    const bool committed_phase = *phase == RebuildPhase::COMMIT_READY ||
+        *phase == RebuildPhase::CLEANUP_READY;
+    if (commitment_present != committed_phase ||
+        (commitment_present && (commitment.tip.IsNull() || commitment.full_coin_hash.IsNull())) ||
+        (!commitment_present && (!commitment.tip.IsNull() || commitment.coin_count != 0 ||
+                                 !commitment.full_coin_hash.IsNull()))) {
+        error = "chainstate rebuild journal commitment does not match its phase";
+        return std::nullopt;
+    }
+    return RebuildJournal{2, *phase, base == "1", snapshot == "1",
+                          commitment_present ? std::optional<RebuildCommitment>{commitment}
+                                             : std::nullopt};
+}
+
+CommitmentResult ComputeFullCoinCommitment(
+    CCoinsView& view,
+    const std::function<bool()>& interrupted,
+    RebuildCommitment& result,
+    std::string& error)
+{
+    // This is a commit/reopen identity for the replacement, not a comparison
+    // with the preserved source. Reconstruction may intentionally correct
+    // nTime and coinstake provenance while replaying old blocks. The source is
+    // retained for rollback; the hash binds every logical Coin field in the
+    // rebuilt database to the state that a later process reopens.
+    result = {};
+    if (!view.GetHeadBlocks().empty()) {
+        error = "chainstate has an interrupted-flush marker";
+        return CommitmentResult::FAILURE;
+    }
+
+    std::unique_ptr<CCoinsViewCursor> cursor = view.Cursor();
+    if (!cursor || cursor->GetBestBlock().IsNull()) {
+        error = "chainstate has no stable cursor or saved tip";
+        return CommitmentResult::FAILURE;
+    }
+
+    result.tip = cursor->GetBestBlock();
+    CHashWriter commitment;
+    commitment << std::string{"Blackcoin Chainstate Full Coin Commitment v1"}
+               << result.tip;
+    while (cursor->Valid()) {
+        if ((result.coin_count & 0x3fff) == 0 && interrupted && interrupted()) {
+            return CommitmentResult::INTERRUPTED;
+        }
+        COutPoint outpoint;
+        Coin coin;
+        if (!cursor->GetKey(outpoint) || !cursor->GetValue(coin) || coin.IsSpent()) {
+            error = "chainstate cursor contains an unreadable or spent coin";
+            return CommitmentResult::FAILURE;
+        }
+        if (result.coin_count == std::numeric_limits<uint64_t>::max()) {
+            error = "chainstate coin count overflows";
+            return CommitmentResult::FAILURE;
+        }
+        const uint8_t flags = (coin.fCoinBase ? 1 : 0) | (coin.fCoinStake ? 2 : 0);
+        commitment << outpoint << static_cast<uint32_t>(coin.nHeight) << flags
+                   << static_cast<uint32_t>(coin.nTime) << coin.out;
+        ++result.coin_count;
+        cursor->Next();
+    }
+    if (interrupted && interrupted()) return CommitmentResult::INTERRUPTED;
+    if (!view.GetHeadBlocks().empty() || view.GetBestBlock() != result.tip) {
+        error = "chainstate changed while its full-Coin commitment was computed";
+        return CommitmentResult::FAILURE;
+    }
+    commitment << result.coin_count;
+    result.full_coin_hash = commitment.GetHash();
+    if (result.full_coin_hash.IsNull()) {
+        error = "chainstate full-Coin commitment is null";
+        return CommitmentResult::FAILURE;
+    }
+    return CommitmentResult::SUCCESS;
 }
 
 bool ValidateBackupTopology(const fs::path& datadir,
@@ -183,7 +338,8 @@ bool ReopeningCommittedRebuild(const fs::path& datadir)
 {
     std::string error;
     const std::optional<RebuildJournal> journal = ReadJournal(datadir, error);
-    return journal && journal->phase == RebuildPhase::COMMIT_READY;
+    return journal && journal->version == 2 && journal->commitment &&
+        journal->phase == RebuildPhase::COMMIT_READY;
 }
 
 bool RemoveJournal(const fs::path& datadir)
@@ -344,8 +500,9 @@ ChainstateLoadResult CheckRebuildDiskSpace(
     return {ChainstateLoadStatus::SUCCESS, {}};
 }
 
-ChainstateLoadResult RecoverInterruptedRebuild(const fs::path& datadir)
+ChainstateLoadResult RecoverInterruptedRebuild(ChainstateManager& chainman)
 {
+    const fs::path& datadir = chainman.m_options.datadir;
     std::string parse_error;
     const bool journal_exists = PathExists(JournalPath(datadir));
     std::optional<RebuildJournal> journal = ReadJournal(datadir, parse_error);
@@ -364,6 +521,13 @@ ChainstateLoadResult RecoverInterruptedRebuild(const fs::path& datadir)
                     _("An abandoned partial chainstate rebuild could not be removed. The authoritative chainstate was not changed; correct filesystem permissions and retry.")};
         }
         return {ChainstateLoadStatus::SUCCESS, {}};
+    }
+
+    if (journal->version < 2 &&
+        (journal->phase == RebuildPhase::COMMIT_READY ||
+         journal->phase == RebuildPhase::CLEANUP_READY)) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                _("The committed chainstate rebuild journal predates full-Coin commitments. No backup was removed by this startup. Preserve the datadir and restore or inspect the retained rebuild backup manually.")};
     }
 
     if (journal->phase == RebuildPhase::COMMIT_READY) {
@@ -396,6 +560,38 @@ ChainstateLoadResult RecoverInterruptedRebuild(const fs::path& datadir)
         if (!PathExists(BasePath(datadir))) {
             return {ChainstateLoadStatus::FAILURE_FATAL,
                     _("A verified replacement chainstate is missing. Manual recovery is required.")};
+        }
+
+        RebuildCommitment reopened_commitment;
+        std::string commitment_error;
+        CommitmentResult commitment_result{CommitmentResult::FAILURE};
+        try {
+            CCoinsViewDB reopened_db{DBParams{
+                .path = BasePath(datadir),
+                .cache_bytes = 1 << 20,
+                .memory_only = false,
+                .wipe_data = false,
+                .obfuscate = true}, CoinsViewOptions{}};
+            commitment_result = ComputeFullCoinCommitment(
+                reopened_db,
+                [&chainman] { return bool{chainman.m_interrupt}; },
+                reopened_commitment,
+                commitment_error);
+        } catch (const std::exception& e) {
+            commitment_error = e.what();
+            commitment_result = CommitmentResult::FAILURE;
+        }
+        if (commitment_result == CommitmentResult::INTERRUPTED) {
+            return {ChainstateLoadStatus::INTERRUPTED, {}};
+        }
+        if (commitment_result != CommitmentResult::SUCCESS ||
+            !journal->commitment ||
+            reopened_commitment != *journal->commitment) {
+            if (commitment_error.empty()) {
+                commitment_error = "the reopened database does not match its recorded full-Coin commitment";
+            }
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    strprintf(_("The reopened replacement chainstate failed its full-Coin commitment check (%s). Preserved rebuild backups were not removed; preserve the datadir for recovery."), commitment_error)};
         }
         if ((journal->base_present && !CleanupTree(BaseBackupPath(datadir))) ||
             (journal->snapshot_present && !CleanupTree(SnapshotBackupPath(datadir))) ||
@@ -554,9 +750,11 @@ static ChainstateLoadResult BeginStagedChainstateRebuild(
     chainman.m_chainstate_rebuild_committed_this_process = false;
     chainman.m_chainstate_rebuild_verified_this_process = false;
     RebuildJournal journal{
+        2,
         RebuildPhase::PREPARED,
         PathExists(BasePath(datadir)),
         PathExists(SnapshotPath(datadir)),
+        std::nullopt,
     };
     if (!journal.base_present && !journal.snapshot_present) {
         return {ChainstateLoadStatus::SUCCESS, {}};
@@ -835,7 +1033,7 @@ ChainstateLoadResult LoadChainstate(ChainstateManager& chainman, const CacheSize
     chainman.m_total_coinsdb_cache = cache_sizes.coins_db;
 
     const auto [recovery_status, recovery_error] =
-        RecoverInterruptedRebuild(chainman.m_options.datadir);
+        RecoverInterruptedRebuild(chainman);
     if (recovery_status != ChainstateLoadStatus::SUCCESS) {
         return {recovery_status, recovery_error};
     }
@@ -983,7 +1181,12 @@ bool FinalizeChainstateRebuild(ChainstateManager& chainman, bilingual_str& error
     std::optional<RebuildJournal> journal = ReadJournal(datadir, parse_error);
     if (!journal || (journal->phase != RebuildPhase::BUILDING &&
                      journal->phase != RebuildPhase::COMMIT_READY)) {
+        if (parse_error.empty()) parse_error = "unsupported rebuild phase";
         error = strprintf(_("Cannot commit the rebuilt chainstate because its journal is invalid (%s). Preserved backups were not removed."), parse_error);
+        return false;
+    }
+    if (journal->version != 2) {
+        error = _("Cannot commit a chainstate rebuild recorded by an old journal version without a full-Coin commitment. Preserved backups were not removed.");
         return false;
     }
     std::string topology_error;
@@ -1009,7 +1212,9 @@ bool FinalizeChainstateRebuild(ChainstateManager& chainman, bilingual_str& error
 
     if (chainman.m_chainstate_rebuild_interrupted || chainman.m_interrupt) {
         chainman.m_chainstate_rebuild_interrupted = true;
-        error = _("Chainstate reconstruction was interrupted. The preserved database will be restored on restart.");
+        error = journal->phase == RebuildPhase::BUILDING
+            ? _("Chainstate reconstruction was interrupted. The preserved database will be restored on restart.")
+            : _("Reopened-chainstate verification was interrupted. Preserved backups were not removed; retry in a fresh process.");
         return false;
     }
     if (!RebuiltChainReachesPreservedWork(chainman, *journal, error)) {
@@ -1025,39 +1230,83 @@ bool FinalizeChainstateRebuild(ChainstateManager& chainman, bilingual_str& error
     }
     if (chainman.m_interrupt) {
         chainman.m_chainstate_rebuild_interrupted = true;
-        error = _("Chainstate reconstruction was interrupted before commit. The preserved database will be restored on restart.");
+        error = journal->phase == RebuildPhase::BUILDING
+            ? _("Chainstate reconstruction was interrupted before commit. The preserved database will be restored on restart.")
+            : _("Reopened-chainstate verification was interrupted before cleanup. Preserved backups were not removed; retry in a fresh process.");
         return false;
     }
 
-    if (journal->phase == RebuildPhase::BUILDING) {
-        journal->phase = RebuildPhase::COMMIT_READY;
-        if (!WriteJournal(datadir, *journal)) {
-            error = _("Cannot durably commit the rebuilt chainstate. Preserved backups were not removed and will be restored on restart.");
+    try {
+        // Keep the active chain and its on-disk Coin set stable from the scan
+        // through the durable phase transition and any authorized cleanup.
+        // Otherwise a concurrent flush could change the database after it was
+        // authenticated but before the preserved source was retired.
+        LOCK(::cs_main);
+        const CBlockIndex* active_tip = chainman.ActiveChainstate().m_chain.Tip();
+        if (!active_tip) {
+            error = _("Cannot authenticate the rebuilt chainstate's full-Coin set because the active chainstate has no tip. Preserved backups were not removed.");
             return false;
         }
-        chainman.m_chainstate_rebuild_committed_this_process = true;
-        LogPrintf("Committed staged chainstate rebuild; preserved database will be retired only after a verified restart\n");
-        return true;
-    }
+        RebuildCommitment current_commitment;
+        std::string commitment_error;
+        const CommitmentResult commitment_result = ComputeFullCoinCommitment(
+            chainman.ActiveChainstate().CoinsDB(),
+            [&chainman] { return bool{chainman.m_interrupt}; },
+            current_commitment,
+            commitment_error);
+        if (commitment_result == CommitmentResult::INTERRUPTED) {
+            chainman.m_chainstate_rebuild_interrupted = true;
+            error = _("The full-Coin commitment scan was interrupted. Preserved backups were not removed.");
+            return false;
+        }
+        if (commitment_result != CommitmentResult::SUCCESS) {
+            error = strprintf(_("Cannot authenticate the rebuilt chainstate's full-Coin set (%s). Preserved backups were not removed."), commitment_error);
+            return false;
+        }
+        if (current_commitment.tip != active_tip->GetBlockHash()) {
+            error = _("Cannot authenticate the rebuilt chainstate because its persisted tip does not match the active chain tip. Preserved backups were not removed.");
+            return false;
+        }
 
-    // This manager reopened and verified a COMMIT_READY replacement. Make that
-    // fact durable before beginning retryable backup cleanup.
-    journal->phase = RebuildPhase::CLEANUP_READY;
-    if (!WriteJournal(datadir, *journal)) {
-        error = _("The rebuilt chainstate was reopened and verified, but that state could not be committed for backup cleanup. The preserved backups were not removed.");
+        if (journal->phase == RebuildPhase::BUILDING) {
+            journal->commitment = current_commitment;
+            journal->phase = RebuildPhase::COMMIT_READY;
+            if (!WriteJournal(datadir, *journal)) {
+                error = _("Cannot durably commit the rebuilt chainstate. Preserved backups were not removed and will be restored on restart.");
+                return false;
+            }
+            chainman.m_chainstate_rebuild_committed_this_process = true;
+            LogPrintf("Committed staged chainstate rebuild; preserved database will be retired only after a verified restart\n");
+            return true;
+        }
+
+        if (!journal->commitment || current_commitment != *journal->commitment) {
+            error = _("The reopened chainstate does not match the full-Coin commitment recorded at rebuild commit. Preserved backups were not removed.");
+            return false;
+        }
+
+        // This manager reopened and verified a COMMIT_READY replacement. Make
+        // that fact durable before beginning retryable backup cleanup.
+        journal->phase = RebuildPhase::CLEANUP_READY;
+        if (!WriteJournal(datadir, *journal)) {
+            error = _("The rebuilt chainstate was reopened and verified, but that state could not be committed for backup cleanup. The preserved backups were not removed.");
+            return false;
+        }
+        if ((journal->base_present && !CleanupTree(BaseBackupPath(datadir))) ||
+            (journal->snapshot_present && !CleanupTree(SnapshotBackupPath(datadir))) ||
+            !DirectoryCommit(datadir) || !RemoveJournal(datadir)) {
+            error = _("The rebuilt chainstate was reopened and verified, but preserved backup cleanup could not be completed. Correct filesystem permissions and retry.");
+            return false;
+        }
+        CleanupTree(BasePartialPath(datadir));
+        CleanupTree(SnapshotPartialPath(datadir));
+        DirectoryCommit(datadir);
+        LogPrintf("Verified the rebuilt chainstate after restart and retired preserved databases\n");
+        return true;
+    } catch (const std::exception& e) {
+        error = strprintf(_("Chainstate rebuild authentication or cleanup stopped because of a filesystem/database error (%s). Preserve the datadir and any remaining rebuild backups."), e.what());
         return false;
     }
-    if ((journal->base_present && !CleanupTree(BaseBackupPath(datadir))) ||
-        (journal->snapshot_present && !CleanupTree(SnapshotBackupPath(datadir))) ||
-        !DirectoryCommit(datadir) || !RemoveJournal(datadir)) {
-        error = _("The rebuilt chainstate was reopened and verified, but preserved backup cleanup could not be completed. Correct filesystem permissions and retry.");
-        return false;
-    }
-    CleanupTree(BasePartialPath(datadir));
-    CleanupTree(SnapshotPartialPath(datadir));
-    DirectoryCommit(datadir);
-    LogPrintf("Verified the rebuilt chainstate after restart and retired preserved databases\n");
-    return true;
 }
 
 ChainstateLoadResult VerifyLoadedChainstate(ChainstateManager& chainman, const ChainstateLoadOptions& options)
