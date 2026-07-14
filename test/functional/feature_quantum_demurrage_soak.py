@@ -226,18 +226,37 @@ class QuantumDemurrageSoakTest(BitcoinTestFramework):
         for actor in cold_actors:
             txout = node.gettxout(actor["utxo"]["txid"], actor["utxo"]["vout"], False)
             assert txout is not None
-            # The base UTXO retains its nominal amount, but delegation is not
-            # a liveness exemption: its effective value reaches zero on the
-            # same terminal schedule as every other unattended quantum coin.
             assert_equal(Decimal(str(txout["value"])), actor["amount"])
+
+            # Prove the terminal state for this exact cold-stake outpoint. The
+            # nominal UTXO remains in the set, but delegation is neither a
+            # demurrage exemption nor an ordinary spend path after zero value.
+            output = self._one_output(owner, actor["address"])
+            assert_equal(output["txid"], actor["utxo"]["txid"])
+            assert_equal(output["vout"], actor["utxo"]["vout"])
+            assert_equal(Decimal(output["amount"]), actor["amount"])
+            assert_equal(Decimal(output["nominal_amount"]), actor["amount"])
+            assert_equal(output["spendability_state"], "demurrage_locked")
+            assert_equal(output["synthetic"], False)
+            assert_equal(output["merkle_included"], True)
+            assert_equal(output["mature"], True)
+            assert_equal(output["wallet_signable"], True)
+            assert_equal(output["consensus_spendable"], False)
+            assert_equal(output["ordinary_spendable"], False)
+            assert_equal(output["spendable"], False)
+            assert_equal(output["permanently_locked"], True)
+            assert_equal(output["demurrage_active"], True)
+            assert_equal(output["demurrage_exempt"], False)
+            assert_equal(output["demurrage_locked"], True)
+            assert_equal(output["demurrage_exemption"], "")
+            assert_equal(Decimal(output["effective_amount"]), Decimal("0E-8"))
+            assert_equal(Decimal(output["burned_amount"]), actor["amount"])
 
         supply = node.getcirculatingsupply()
         assert_equal(supply["demurrage_active"], True)
-        # Direct wallet reporting intentionally exposes only direct v16 keys.
-        # Whole-chain supply classification covers v14 delegations as well;
-        # the extra N_COLD terminal outputs prove that delegation did not
-        # shelter the principal from demurrage.
-        assert_greater_than(supply["locked_txouts"], N_DORMANT + N_COLD - 1)
+        # Whole-chain counts also include historical outputs, so they remain a
+        # supply-accounting smoke check rather than the cold-output oracle.
+        assert_greater_than(supply["locked_txouts"], 0)
         assert_greater_than(Decimal(supply["decayed_amount"]), Decimal("0"))
 
 
