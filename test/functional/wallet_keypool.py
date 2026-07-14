@@ -14,18 +14,17 @@ from test_framework.test_framework import BitcoinTestFramework, SkipTest
 from test_framework.util import assert_equal, assert_raises_rpc_error
 from test_framework.wallet_util import WalletUnlock
 
+
+PROTOCOL_WALLET_FEE_RATE = Decimal("0.00100")  # 100 sat/vB
+WATCH_ONLY_FUNDING_AMOUNT = Decimal("0.00100000")
+
+
 class KeyPoolTest(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser)
 
     def set_test_params(self):
         self.num_nodes = 1
-        # This inherited keypool test intentionally constructs very small
-        # transactions at 10 sat/vB. Keep its relay-policy fixture below that
-        # feerate so the assertions continue to exercise keypool exhaustion
-        # and change-address handling rather than Blackcoin's higher default
-        # minimum relay fee.
-        self.extra_args = [["-minrelaytxfee=0.00001"]]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -197,37 +196,46 @@ class KeyPoolTest(BitcoinTestFramework):
         assert_equal(res[0]['success'], True)
 
         with WalletUnlock(w1, 'test'):
-            res = w1.sendtoaddress(address=address, amount=0.00010000)
+            w1.sendtoaddress(address=address, amount=WATCH_ONLY_FUNDING_AMOUNT)
         self.generate(nodes[0], 1)
         destination = addr.pop()
 
-        # Using a fee rate (10 sat / byte) well above the minimum relay rate
-        # creating a 5,000 sat transaction with change should not be possible
-        assert_raises_rpc_error(-4, "Transaction needs a change address, but we can't generate it.", w2.walletcreatefundedpsbt, inputs=[], outputs=[{addr.pop(): 0.00005000}], subtractFeeFromOutputs=[0], feeRate=0.00010)
+        # Use Blackcoin's protocol wallet minimum instead of weakening relay
+        # policy for this inherited keypool fixture.
+        # Creating a 50,000 sat transaction with change should not be possible.
+        assert_raises_rpc_error(-4, "Transaction needs a change address, but we can't generate it.", w2.walletcreatefundedpsbt, inputs=[], outputs=[{addr.pop(): Decimal("0.00050000")}], subtractFeeFromOutputs=[0], feeRate=PROTOCOL_WALLET_FEE_RATE)
 
-        # creating a 10,000 sat transaction without change, with a manual input, should still be possible
-        res = w2.walletcreatefundedpsbt(inputs=w2.listunspent(), outputs=[{destination: 0.00010000}], subtractFeeFromOutputs=[0], feeRate=0.00010)
+        # Creating a 100,000 sat transaction without change, with a manual input, should still be possible.
+        res = w2.walletcreatefundedpsbt(inputs=w2.listunspent(), outputs=[{destination: WATCH_ONLY_FUNDING_AMOUNT}], subtractFeeFromOutputs=[0], feeRate=PROTOCOL_WALLET_FEE_RATE)
         assert_equal("psbt" in res, True)
+        assert_equal(res["fee"], Decimal("0.00011000"))
 
-        # creating a 10,000 sat transaction without change should still be possible
-        res = w2.walletcreatefundedpsbt(inputs=[], outputs=[{destination: 0.00010000}], subtractFeeFromOutputs=[0], feeRate=0.00010)
+        # Creating a 100,000 sat transaction without change should still be possible.
+        res = w2.walletcreatefundedpsbt(inputs=[], outputs=[{destination: WATCH_ONLY_FUNDING_AMOUNT}], subtractFeeFromOutputs=[0], feeRate=PROTOCOL_WALLET_FEE_RATE)
         assert_equal("psbt" in res, True)
-        # should work without subtractFeeFromOutputs if the exact fee is subtracted from the amount
-        res = w2.walletcreatefundedpsbt(inputs=[], outputs=[{destination: 0.00008900}], feeRate=0.00010)
+        assert_equal(res["fee"], Decimal("0.00011000"))
+        # Without subtractFeeFromOutputs, Blackcoin's component-level minimum
+        # fees require additional no-change headroom. The entire remainder is
+        # reported as the fee.
+        res = w2.walletcreatefundedpsbt(inputs=[], outputs=[{destination: Decimal("0.00079000")}], feeRate=PROTOCOL_WALLET_FEE_RATE)
         assert_equal("psbt" in res, True)
+        assert_equal(res["fee"], Decimal("0.00021000"))
 
-        # dust change should be removed
-        res = w2.walletcreatefundedpsbt(inputs=[], outputs=[{destination: 0.00008800}], feeRate=0.00010)
+        # An adjacent no-change amount pins the excess-fee accounting to the
+        # exact unspent remainder.
+        res = w2.walletcreatefundedpsbt(inputs=[], outputs=[{destination: Decimal("0.00078000")}], feeRate=PROTOCOL_WALLET_FEE_RATE)
         assert_equal("psbt" in res, True)
+        assert_equal(res["fee"], Decimal("0.00022000"))
 
-        # create a transaction without change at the maximum fee rate, such that the output is still spendable:
-        res = w2.walletcreatefundedpsbt(inputs=[], outputs=[{destination: 0.00010000}], subtractFeeFromOutputs=[0], feeRate=0.0008823)
+        # A high fee rate should still work while the resulting output remains spendable.
+        res = w2.walletcreatefundedpsbt(inputs=[], outputs=[{destination: WATCH_ONLY_FUNDING_AMOUNT}], subtractFeeFromOutputs=[0], feeRate=Decimal("0.00800"))
         assert_equal("psbt" in res, True)
-        assert_equal(res["fee"], Decimal("0.00009706"))
+        assert_equal(res["fee"], Decimal("0.00088000"))
 
-        # creating a 10,000 sat transaction with a manual change address should be possible
-        res = w2.walletcreatefundedpsbt(inputs=[], outputs=[{destination: 0.00010000}], subtractFeeFromOutputs=[0], feeRate=0.00010, changeAddress=addr.pop())
+        # Creating a 100,000 sat transaction with a manual change address should be possible.
+        res = w2.walletcreatefundedpsbt(inputs=[], outputs=[{destination: WATCH_ONLY_FUNDING_AMOUNT}], subtractFeeFromOutputs=[0], feeRate=PROTOCOL_WALLET_FEE_RATE, changeAddress=addr.pop())
         assert_equal("psbt" in res, True)
+        assert_equal(res["fee"], Decimal("0.00011000"))
 
         if not self.options.descriptors:
             msg = "Error: Private keys are disabled for this wallet"

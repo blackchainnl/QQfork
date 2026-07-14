@@ -86,13 +86,22 @@ class DustRelayFeeTest(BitcoinTestFramework):
             (key_to_p2wpkh_script(pubkey),                     "P2WPKH"),
             (script_to_p2wsh_script(CScript([OP_TRUE])),       "P2WSH"),
             (output_key_to_p2tr_script(pubkey[1:]),            "P2TR"),
-            # witness programs for segwitv2+ can be between 2 and 40 bytes
-            (program_to_witness_script(2,  b'\x66' * 2),       "P2?? (future witness version 2)"),
-            (program_to_witness_script(16, b'\x77' * 40),      "P2?? (future witness version 16)"),
             # Bare multisig is not a standard relay output in this fork; this
             # dust test is limited to otherwise-standard scriptPubKeys.
             (CScript([OP_RETURN, b'superimportanthash']),      "null data (OP_RETURN)"),
         )
+
+        self.log.info("Test future-witness outputs fail closed before quantum-spend activation")
+        for version, program in ((2, b'\x66' * 2), (16, b'\x77' * 40)):
+            tx = self.wallet.create_self_transfer()["tx"]
+            tx.vout.append(CTxOut(
+                nValue=COIN,
+                scriptPubKey=program_to_witness_script(version, program),
+            ))
+            tx.vout[0].nValue -= COIN
+            result = self.nodes[0].testmempoolaccept([tx.serialize().hex()])[0]
+            assert_equal(result["allowed"], False)
+            assert_equal(result["reject-reason"], "quantum-output-premature")
 
         # test default (no parameter), disabled (=0) and a bunch of arbitrary dust fee rates [sat/kvB]
         for dustfee_sat_kvb in (DUST_RELAY_TX_FEE, 0, 1, 66, 500, 1337, 12345, 21212, 333333):
