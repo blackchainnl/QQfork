@@ -20,7 +20,7 @@ from pathlib import Path
 from test_framework.address import address_to_scriptpubkey
 from test_framework.blocktools import COINBASE_MATURITY, create_block, create_coinbase
 from test_framework.key import ECKey
-from test_framework.messages import COIN, COutPoint, CTransaction, CTxIn, CTxOut, from_hex
+from test_framework.messages import COIN, CBlockHeader, COutPoint, CTransaction, CTxIn, CTxOut, from_hex
 from test_framework.script import (
     CScript,
     OP_0,
@@ -151,7 +151,18 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
 
     def mine_and_sync(self, miner, blocks=1, nodes=None):
         address = self.nodes[CANDIDATE].get_deterministic_priv_key().address
-        self.generatetoaddress(miner, blocks, address, sync_fun=self.no_op)
+        generated = miner.generatetoaddress(blocks, address, invalid_call=False)
+
+        # Read the serialized header rather than the verbose object. The pinned
+        # v28.4 daemon validates its own RPC result metadata and incorrectly
+        # declares two verbose getblockheader fields as strings. Raw-header
+        # decoding keeps this interoperability fixture focused on block bytes
+        # and consensus behavior without suppressing candidate RPC validation.
+        header = from_hex(CBlockHeader(), miner.getblockheader(generated[-1], False))
+        for node in self.nodes:
+            current_time = node.mocktime if node.mocktime is not None else 0
+            if current_time < header.nTime:
+                node.setmocktime(header.nTime)
         self.sync_blocks(nodes or self.normative_nodes, timeout=120)
 
     def generate_raw_block(self, producer, transactions):
