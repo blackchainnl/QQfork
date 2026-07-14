@@ -70,6 +70,13 @@ and chainstate. The client checks known block availability before staging and
 leaves the existing chainstate intact when a chainstate-only rebuild is not
 possible. Preserve wallet files and all available block files.
 
+Pruning is not supported by this alpha. Run Quantum Quasar archival and replay
+nodes with `prune=0`. Although the inherited option parser still accepts
+`-prune`, this Blackcoin branch's block-file pruning engine is disabled and no
+verified pruned-node recovery path exists. A datadir with missing historical
+blocks cannot use `-reindex-chainstate`; preserve every wallet and restart with
+`prune=0 -reindex` to redownload full history.
+
 Reconstruction is journaled. The first process retains the original chainstate
 backup after committing the rebuilt state. Stop it cleanly and start once
 without a reindex option; that separate process reopens and verifies the

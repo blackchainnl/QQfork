@@ -71,6 +71,11 @@ delete wallet files or available block files. v30.1.1 checks required block
 availability before staging and leaves the existing chainstate intact if known
 pruned history makes a chainstate-only rebuild impossible.
 
+The v30.1.1 alpha supports archival `prune=0` operation only. The inherited
+option parser accepts `-prune`, but this Blackcoin branch's block-file pruning
+engine is disabled and the release does not claim a verified pruned-node path.
+Keep complete active-chain block files for authenticated Quantum Quasar replay.
+
 The rebuilding process preserves the original chainstate in a journaled backup
 and leaves that backup in place after reconstruction commits. Stop cleanly and
 start once more without either reindex option so a separate process can verify

@@ -144,6 +144,13 @@ or available block files. Allow sufficient disk space and keep the pre-upgrade
 backup until the rebuilt node has synchronized and passed a clean-restart
 comparison.
 
+Pruning is not supported by the v30.1.1 alpha. Run archival and replay nodes
+with `prune=0`. The inherited command-line parser still accepts `-prune`, but
+the Blackcoin block-file selection and unlink pipeline is disabled and no
+pruned-node recovery claim has passed the release gate. If historical blocks
+are missing, preserve wallets and all remaining data, then use
+`prune=0 -reindex` to redownload full history.
+
 v30.1.1 checks the saved chainstate tip and every ancestor through genesis
 before wiping. If a known-pruned block is missing, startup stops with a full
 `-reindex` instruction and leaves the existing chainstate intact. This check
