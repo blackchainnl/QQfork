@@ -3663,6 +3663,19 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         }
         return error("%s: Consensus::CheckBlock: %s", __func__, state.ToString());
     }
+    // ConnectBlock is also the validation path used when reconstructing a
+    // chainstate from already-indexed block files. Recheck witness integrity
+    // here because ContextualCheckBlock is intentionally not replayed, and a
+    // disk mutation can alter witness data without changing the indexed block
+    // hash or transaction Merkle root.
+    const bool expect_witness_commitment =
+        DeploymentActiveAfter(pindex->pprev, m_chainman, Consensus::DEPLOYMENT_SEGWIT) ||
+        (pindex->pprev && IsQuantumWitnessSpendActive(
+             params.GetConsensus(), pindex->pprev->GetMedianTimePast(), pindex->nHeight));
+    if (IsBlockMutated(block, expect_witness_commitment)) {
+        return FatalError(m_chainman.GetNotifications(), state,
+                          "Corrupt witness or Merkle data found while connecting indexed block; shutting down");
+    }
 
     // CheckBlock can authenticate an ML-DSA signature without knowing the
     // block's lifecycle height. Through G the designated legacy client treats
@@ -8083,12 +8096,47 @@ bool ChainstateManager::DeleteSnapshotChainstate()
         LogPrintf("Snapshot chainstate directory disappeared before deletion.\n");
         return false;
     }
-    m_snapshot_chainstate->ResetCoinsViews();
-    if (!DeleteCoinsDBFromDisk(*snapshot_datadir, /*is_snapshot=*/ true)) {
-        LogPrintf("Deletion of %s failed. Please remove it manually to continue reindexing.\n",
-                  fs::PathToString(*snapshot_datadir));
+    fs::path quarantine = fs::PathFromString(
+        fs::PathToString(*snapshot_datadir) + "_QUARANTINED");
+    if (fs::exists(quarantine)) {
+        LogPrintf("Refusing to quarantine snapshot because %s already exists\n",
+                  fs::PathToString(quarantine));
         return false;
     }
+
+    m_snapshot_chainstate->ResetCoinsViews();
+    try {
+        fs::rename(*snapshot_datadir, quarantine);
+    } catch (const fs::filesystem_error& e) {
+        LogPrintf("Quarantine of snapshot chainstate %s failed: %s\n",
+                  fs::PathToString(*snapshot_datadir), e.what());
+        return false;
+    }
+    if (!DirectoryCommit(snapshot_datadir->parent_path())) {
+        LogPrintf("Could not durably commit snapshot quarantine %s\n",
+                  fs::PathToString(quarantine));
+        try {
+            fs::rename(quarantine, *snapshot_datadir);
+            DirectoryCommit(snapshot_datadir->parent_path());
+        } catch (const fs::filesystem_error& e) {
+            LogPrintf("Could not restore snapshot quarantine after commit failure: %s\n", e.what());
+        }
+        // Keep the in-memory snapshot attached so this startup cannot proceed.
+        return false;
+    }
+    LogPrintf("Preserved snapshot chainstate in quarantine %s\n",
+              fs::PathToString(quarantine));
+
+    DetachSnapshotChainstateForRebuild();
+    return true;
+}
+
+void ChainstateManager::DetachSnapshotChainstateForRebuild()
+{
+    AssertLockHeld(::cs_main);
+    Assert(m_snapshot_chainstate);
+    Assert(m_ibd_chainstate);
+    m_snapshot_chainstate->ResetCoinsViews();
 
     // ActivateExistingSnapshot moved the node mempool from the background
     // chainstate to the snapshot chainstate. Move it back before destroying
@@ -8113,7 +8161,6 @@ bool ChainstateManager::DeleteSnapshotChainstate()
             m_active_chainstate->TryAddBlockIndexCandidate(&block_index);
         }
     }
-    return true;
 }
 
 ChainstateRole Chainstate::GetRole() const

@@ -1017,6 +1017,12 @@ public:
     RecursiveMutex& GetMutex() const LOCK_RETURNED(::cs_main) { return ::cs_main; }
 
     const util::SignalInterrupt& m_interrupt;
+    //! Latches an interrupted staged rebuild so resetting the process signal
+    //! cannot authorize a later commit in the same ChainstateManager.
+    std::atomic<bool> m_chainstate_rebuild_interrupted{false};
+    //! Prevents a second finalizer call in the building process from treating
+    //! COMMIT_READY as proof that a separate process reopened the replacement.
+    std::atomic<bool> m_chainstate_rebuild_committed_this_process{false};
     const Options m_options;
     std::thread m_thread_load;
     //! A single BlockManager instance is shared across each constructed
@@ -1291,8 +1297,12 @@ public:
 
     void ResetChainstates() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
-    //! Remove the snapshot-based chainstate and all on-disk artifacts.
-    //! Used when reindex{-chainstate} is called during snapshot use.
+    //! Move a snapshot chainstate out of the active path without destroying
+    //! its files, then return mempool ownership to the background chainstate.
+    void DetachSnapshotChainstateForRebuild() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    //! Quarantine the snapshot-based chainstate and detach it. Quarantined
+    //! files are preserved for recovery instead of being destroyed in place.
     [[nodiscard]] bool DeleteSnapshotChainstate() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Switch the active chainstate to one based on a UTXO snapshot that was loaded

@@ -5,6 +5,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <node/blockstorage.h>
+#include <node/chainstate_rebuild.h>
 
 #include <chain.h>
 #include <clientversion.h>
@@ -49,6 +50,11 @@ static constexpr uint8_t DB_LAST_BLOCK{'l'};
 bool BlockTreeDB::ReadBlockFileInfo(int nFile, CBlockFileInfo& info)
 {
     return Read(std::make_pair(DB_BLOCK_FILES, nFile), info);
+}
+
+bool BlockTreeDB::ReadBlockIndexEntry(const uint256& hash, CDiskBlockIndex& index)
+{
+    return Read(std::make_pair(DB_BLOCK_INDEX, hash), index);
 }
 
 bool BlockTreeDB::WriteReindexing(bool fReindexing)
@@ -275,6 +281,10 @@ bool BlockManager::LoadBlockIndex(const std::optional<uint256>& snapshot_blockha
         const AssumeutxoData& au_data = *Assert(maybe_au_data);
         m_snapshot_height = au_data.height;
         CBlockIndex* base{LookupBlockIndex(*snapshot_blockhash)};
+        if (!base || base->nHeight != au_data.height) {
+            return error("%s: snapshot base %s is absent from the block index or has the wrong height",
+                         __func__, snapshot_blockhash->ToString());
+        }
 
         // Since nChainTx (responsible for estimated progress) isn't persisted
         // to disk, we must bootstrap the value for assumedvalid chainstates
@@ -1035,6 +1045,16 @@ void ImportBlocks(ChainstateManager& chainman, std::vector<fs::path> vImportFile
                 chainman.GetNotifications().fatalError(strprintf("Failed to connect best block (%s)", state.ToString()));
                 return;
             }
+            if (chainman.m_interrupt) {
+                chainman.m_chainstate_rebuild_interrupted = true;
+                LogPrintf("Interrupt requested during staged chainstate reconstruction; preserved backup will be restored on restart\n");
+                return;
+            }
+        }
+        bilingual_str finalize_error;
+        if (!node::FinalizeChainstateRebuild(chainman, finalize_error)) {
+            chainman.GetNotifications().fatalError(finalize_error.original, finalize_error);
+            return;
         }
     } // End scope of ImportingNow
 }

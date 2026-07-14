@@ -28,6 +28,7 @@
 #include <node/blockstorage.h>
 #include <node/blockmanager_args.h>
 #include <node/chainstate.h>
+#include <node/chainstate_rebuild.h>
 #include <node/chainstatemanager_args.h>
 #include <node/context.h>
 #include <node/kernel_notifications.h>
@@ -239,6 +240,10 @@ void ChainTestingSetup::LoadVerifyActivateChainstate()
     BlockValidationState state;
     if (!chainman.ActiveChainstate().ActivateBestChain(state)) {
         throw std::runtime_error(strprintf("ActivateBestChain failed. (%s)", state.ToString()));
+    }
+    bilingual_str finalize_error;
+    if (!node::FinalizeChainstateRebuild(chainman, finalize_error)) {
+        throw std::runtime_error(finalize_error.original);
     }
 }
 

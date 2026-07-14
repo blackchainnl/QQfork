@@ -220,6 +220,7 @@ BITCOIN_CORE_H = \
   node/blockstorage.h \
   node/caches.h \
   node/chainstate.h \
+  node/chainstate_rebuild.h \
   node/chainstatemanager_args.h \
   node/coin.h \
   node/coins_view_args.h \

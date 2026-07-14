@@ -10,6 +10,7 @@
 #include <kernel/disconnected_transactions.h>
 #include <node/kernel_notifications.h>
 #include <node/chainstate.h>
+#include <node/chainstate_rebuild.h>
 #include <node/utxo_snapshot.h>
 #include <random.h>
 #include <rpc/blockchain.h>
@@ -402,7 +403,352 @@ struct SnapshotTestSetup : TestChain100Setup {
         }
         return *Assert(m_node.chainman);
     }
+
+    // Recreate the manager without flushing, modeling process death at an
+    // arbitrary point in the staged-rebuild protocol.
+    ChainstateManager& SimulateCrashRestart()
+    {
+        ChainstateManager& chainman = *Assert(m_node.chainman);
+        SyncWithValidationInterfaceQueue();
+        LOCK(::cs_main);
+        chainman.ResetChainstates();
+        m_node.notifications = std::make_unique<KernelNotifications>(m_node.exit_status);
+        const ChainstateManager::Options chainman_opts{
+            .chainparams = ::Params(),
+            .datadir = chainman.m_options.datadir,
+            .adjusted_time_callback = GetAdjustedTime,
+            .notifications = *m_node.notifications,
+        };
+        const BlockManager::Options blockman_opts{
+            .chainparams = chainman_opts.chainparams,
+            .blocks_dir = m_args.GetBlocksDirPath(),
+            .notifications = chainman_opts.notifications,
+        };
+        m_node.chainman.reset();
+        m_node.chainman = std::make_unique<ChainstateManager>(
+            m_node.kernel->interrupt, chainman_opts, blockman_opts);
+        return *Assert(m_node.chainman);
+    }
 };
+
+static void WriteSnapshotBaseFile(const fs::path& snapshot_dir,
+                                  const uint256& base,
+                                  bool trailing_byte = false)
+{
+    const fs::path path = snapshot_dir / node::SNAPSHOT_BLOCKHASH_FILENAME;
+    AutoFile file{fsbridge::fopen(path, "wb")};
+    BOOST_REQUIRE(!file.IsNull());
+    file << base;
+    if (trailing_byte) {
+        BOOST_REQUIRE(std::fputc(0x01, file.Get()) != EOF);
+    }
+    BOOST_REQUIRE_EQUAL(file.fclose(), 0);
+}
+
+//! Snapshot base metadata is a fixed-width authenticated pointer. Missing,
+//! truncated, and trailing data must never be accepted as a usable base.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_snapshot_metadata_is_strict, SnapshotTestSetup)
+{
+    this->SetupSnapshot();
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const fs::path snapshot_dir = *node::FindSnapshotChainstateDir(
+        chainman.m_options.datadir);
+    const uint256 original_base = *WITH_LOCK(
+        ::cs_main, return node::ReadSnapshotBaseBlockhash(snapshot_dir));
+    const fs::path metadata_path = snapshot_dir / node::SNAPSHOT_BLOCKHASH_FILENAME;
+
+    {
+        AutoFile file{fsbridge::fopen(metadata_path, "wb")};
+        BOOST_REQUIRE(!file.IsNull());
+        BOOST_REQUIRE_EQUAL(file.fclose(), 0);
+    }
+    BOOST_CHECK(!WITH_LOCK(
+        ::cs_main, return node::ReadSnapshotBaseBlockhash(snapshot_dir)));
+
+    WriteSnapshotBaseFile(snapshot_dir, original_base, /*trailing_byte=*/true);
+    BOOST_CHECK(!WITH_LOCK(
+        ::cs_main, return node::ReadSnapshotBaseBlockhash(snapshot_dir)));
+
+    BOOST_REQUIRE(fs::remove(metadata_path));
+    BOOST_CHECK(!WITH_LOCK(
+        ::cs_main, return node::ReadSnapshotBaseBlockhash(snapshot_dir)));
+
+    WriteSnapshotBaseFile(snapshot_dir, original_base);
+    BOOST_CHECK_EQUAL(
+        *WITH_LOCK(::cs_main, return node::ReadSnapshotBaseBlockhash(snapshot_dir)),
+        original_base);
+
+    // A failed staged write must leave the committed metadata untouched.
+    const fs::path staged = fs::PathFromString(
+        fs::PathToString(metadata_path) + ".new");
+    fs::create_directory(staged);
+    {
+        AutoFile blocker{fsbridge::fopen(staged / "blocker", "wb")};
+        BOOST_REQUIRE(!blocker.IsNull());
+        BOOST_REQUIRE_EQUAL(blocker.fclose(), 0);
+    }
+    BOOST_CHECK(!WITH_LOCK(
+        ::cs_main, return node::WriteSnapshotBaseBlockhash(
+            chainman.ActiveChainstate())));
+    BOOST_CHECK_EQUAL(
+        *WITH_LOCK(::cs_main, return node::ReadSnapshotBaseBlockhash(snapshot_dir)),
+        original_base);
+    BOOST_REQUIRE_EQUAL(fs::remove_all(staged), 2U);
+}
+
+//! Snapshot removal must fail before changing the active snapshot when its
+//! quarantine destination is unavailable.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_snapshot_quarantine_failure_is_nonmutating, SnapshotTestSetup)
+{
+    this->SetupSnapshot();
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const fs::path snapshot_dir = *node::FindSnapshotChainstateDir(
+        chainman.m_options.datadir);
+    const fs::path quarantine = fs::PathFromString(
+        fs::PathToString(snapshot_dir) + "_QUARANTINED");
+    fs::create_directory(quarantine);
+
+    BOOST_CHECK(!WITH_LOCK(
+        ::cs_main, return chainman.DeleteSnapshotChainstate()));
+    BOOST_CHECK(chainman.IsSnapshotActive());
+    BOOST_CHECK(fs::exists(snapshot_dir));
+    BOOST_CHECK(fs::exists(
+        snapshot_dir / node::SNAPSHOT_BLOCKHASH_FILENAME));
+
+    BOOST_REQUIRE(fs::remove(quarantine));
+}
+
+//! A chainstate-only rebuild must not erase either database when a persisted
+//! snapshot directory has lost its base metadata.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_reindex_chainstate_rejects_missing_snapshot_metadata, SnapshotTestSetup)
+{
+    this->SetupSnapshot();
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const fs::path base_dir = chainman.m_options.datadir / "chainstate";
+    const fs::path snapshot_dir = *node::FindSnapshotChainstateDir(
+        chainman.m_options.datadir);
+    const uint256 original_base = *WITH_LOCK(
+        ::cs_main, return node::ReadSnapshotBaseBlockhash(snapshot_dir));
+    const uint256 base_tip = WITH_LOCK(
+        ::cs_main, return chainman.GetAll().front()->CoinsDB().GetBestBlock());
+    const uint256 snapshot_tip = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChainstate().CoinsDB().GetBestBlock());
+    const fs::path metadata_path = snapshot_dir / node::SNAPSHOT_BLOCKHASH_FILENAME;
+
+    ChainstateManager& restarted = this->SimulateNodeRestart();
+    BOOST_REQUIRE(fs::remove(metadata_path));
+
+    node::ChainstateLoadOptions options;
+    options.mempool = Assert(m_node.mempool.get());
+    options.reindex_chainstate = true;
+    const auto [status, error] = node::LoadChainstate(
+        restarted, m_cache_sizes, options);
+
+    BOOST_CHECK(status == node::ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED);
+    BOOST_CHECK(error.original.find("base-block metadata is missing, malformed, or unreadable") !=
+                std::string::npos);
+    BOOST_CHECK(fs::exists(base_dir));
+    BOOST_CHECK(fs::exists(snapshot_dir));
+    {
+        CCoinsViewDB base_db{DBParams{
+            .path = base_dir, .cache_bytes = 1 << 20, .memory_only = false,
+            .wipe_data = false, .obfuscate = true}, CoinsViewOptions{}};
+        CCoinsViewDB snapshot_db{DBParams{
+            .path = snapshot_dir, .cache_bytes = 1 << 20, .memory_only = false,
+            .wipe_data = false, .obfuscate = true}, CoinsViewOptions{}};
+        BOOST_CHECK_EQUAL(base_db.GetBestBlock(), base_tip);
+        BOOST_CHECK_EQUAL(snapshot_db.GetBestBlock(), snapshot_tip);
+    }
+    WriteSnapshotBaseFile(snapshot_dir, original_base);
+}
+
+//! A syntactically valid snapshot base that is absent from the authoritative
+//! block index must fail safely instead of reaching SnapshotBase()'s assertion
+//! or authorizing a destructive rebuild.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_reindex_chainstate_rejects_unknown_snapshot_base, SnapshotTestSetup)
+{
+    this->SetupSnapshot();
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const fs::path base_dir = chainman.m_options.datadir / "chainstate";
+    const fs::path snapshot_dir = *node::FindSnapshotChainstateDir(
+        chainman.m_options.datadir);
+    const uint256 original_base = *WITH_LOCK(
+        ::cs_main, return node::ReadSnapshotBaseBlockhash(snapshot_dir));
+
+    ChainstateManager& restarted = this->SimulateNodeRestart();
+    const auto approved_but_absent = Params().AssumeutxoForHeight(299);
+    BOOST_REQUIRE(approved_but_absent);
+    const uint256 unknown_base = approved_but_absent->blockhash;
+    WriteSnapshotBaseFile(snapshot_dir, unknown_base);
+
+    node::ChainstateLoadOptions options;
+    options.mempool = Assert(m_node.mempool.get());
+    options.reindex_chainstate = true;
+    const auto [status, error] = node::LoadChainstate(
+        restarted, m_cache_sizes, options);
+
+    BOOST_CHECK(status == node::ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED);
+    BOOST_CHECK(error.original.find("base is not an approved entry in the local block index") !=
+                std::string::npos);
+    BOOST_CHECK(fs::exists(base_dir));
+    BOOST_CHECK(fs::exists(snapshot_dir));
+    WriteSnapshotBaseFile(snapshot_dir, original_base);
+}
+
+//! A crash after staging both source databases must restore their exact saved
+//! tips before a normal startup is allowed to continue.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_staged_rebuild_crash_rolls_back, SnapshotTestSetup)
+{
+    this->SetupSnapshot();
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const fs::path datadir = chainman.m_options.datadir;
+    const uint256 base_tip = WITH_LOCK(
+        ::cs_main, return chainman.GetAll().front()->CoinsDB().GetBestBlock());
+    const uint256 snapshot_tip = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChainstate().CoinsDB().GetBestBlock());
+
+    ChainstateManager& restarted = this->SimulateNodeRestart();
+    node::ChainstateLoadOptions rebuild;
+    rebuild.mempool = Assert(m_node.mempool.get());
+    rebuild.reindex_chainstate = true;
+    auto [status, error] = node::LoadChainstate(
+        restarted, m_cache_sizes, rebuild);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    BOOST_CHECK(fs::exists(datadir / "chainstate-rebuild.journal"));
+    BOOST_CHECK(fs::exists(datadir / "chainstate.rebuild-backup"));
+    BOOST_CHECK(fs::exists(datadir / "chainstate_snapshot.rebuild-backup"));
+
+    // ActivateBestChain returns success after making limited progress when a
+    // shutdown interrupt is raised. That partial reconstruction must never be
+    // allowed to cross the durable commit transition.
+    m_node.kernel->interrupt();
+    BlockValidationState partial_state;
+    BOOST_REQUIRE(restarted.ActiveChainstate().ActivateBestChain(
+        partial_state, nullptr));
+    bilingual_str finalize_error;
+    BOOST_CHECK(!node::FinalizeChainstateRebuild(restarted, finalize_error));
+    BOOST_CHECK(finalize_error.original.find("interrupted") != std::string::npos);
+    BOOST_CHECK(fs::exists(datadir / "chainstate-rebuild.journal"));
+    BOOST_CHECK(fs::exists(datadir / "chainstate.rebuild-backup"));
+    m_node.kernel->interrupt.reset();
+
+    // Clearing the process interrupt cannot make the partial chain
+    // authoritative because the manager remembers that reconstruction was
+    // interrupted. Only a fresh process may recover the preserved source.
+    finalize_error = {};
+    BOOST_CHECK(!node::FinalizeChainstateRebuild(restarted, finalize_error));
+    BOOST_CHECK(finalize_error.original.find("interrupted") != std::string::npos);
+    BOOST_CHECK(fs::exists(datadir / "chainstate-rebuild.journal"));
+    BOOST_CHECK(fs::exists(datadir / "chainstate.rebuild-backup"));
+
+    ChainstateManager& recovered = this->SimulateCrashRestart();
+    node::ChainstateLoadOptions normal;
+    normal.mempool = Assert(m_node.mempool.get());
+    std::tie(status, error) = node::LoadChainstate(
+        recovered, m_cache_sizes, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    BOOST_CHECK(!fs::exists(datadir / "chainstate-rebuild.journal"));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate.rebuild-backup"));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate_snapshot.rebuild-backup"));
+    WITH_LOCK(::cs_main, {
+        BOOST_CHECK_EQUAL(
+            recovered.ActiveChainstate().CoinsDB().GetBestBlock(), snapshot_tip);
+        if (recovered.IsSnapshotActive()) {
+            BOOST_REQUIRE_EQUAL(recovered.GetAll().size(), 2U);
+            BOOST_CHECK_EQUAL(
+                recovered.GetAll().front()->CoinsDB().GetBestBlock(), base_tip);
+        }
+    });
+}
+
+//! Shutdown between the base and snapshot renames must remain rollback-safe.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_staged_rebuild_interrupt_rolls_back, SnapshotTestSetup)
+{
+    this->SetupSnapshot();
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const fs::path datadir = chainman.m_options.datadir;
+    const uint256 base_tip = WITH_LOCK(
+        ::cs_main, return chainman.GetAll().front()->CoinsDB().GetBestBlock());
+    const uint256 snapshot_tip = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChainstate().CoinsDB().GetBestBlock());
+
+    ChainstateManager& restarted = this->SimulateNodeRestart();
+    int interrupt_poll{0};
+    node::ChainstateLoadOptions rebuild;
+    rebuild.mempool = Assert(m_node.mempool.get());
+    rebuild.reindex_chainstate = true;
+    rebuild.check_interrupt = [&] { return ++interrupt_poll == 5; };
+    auto [status, error] = node::LoadChainstate(
+        restarted, m_cache_sizes, rebuild);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::INTERRUPTED);
+    BOOST_CHECK(fs::exists(datadir / "chainstate-rebuild.journal"));
+    BOOST_CHECK(fs::exists(datadir / "chainstate.rebuild-backup"));
+    BOOST_CHECK(fs::exists(datadir / "chainstate_snapshot"));
+
+    ChainstateManager& recovered = this->SimulateCrashRestart();
+    node::ChainstateLoadOptions normal;
+    normal.mempool = Assert(m_node.mempool.get());
+    std::tie(status, error) = node::LoadChainstate(
+        recovered, m_cache_sizes, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    WITH_LOCK(::cs_main, {
+        BOOST_CHECK_EQUAL(
+            recovered.ActiveChainstate().CoinsDB().GetBestBlock(), snapshot_tip);
+        if (recovered.IsSnapshotActive()) {
+            BOOST_CHECK_EQUAL(
+                recovered.GetAll().front()->CoinsDB().GetBestBlock(), base_tip);
+        }
+    });
+}
+
+//! If the preserved source contained only a snapshot database, rollback must
+//! remove the newly created base database rather than treating it as part of
+//! the original topology.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_snapshot_only_rebuild_rolls_back_partial_base, SnapshotTestSetup)
+{
+    this->SetupSnapshot();
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const fs::path datadir = chainman.m_options.datadir;
+    const fs::path base_dir = datadir / "chainstate";
+    const fs::path snapshot_dir = *node::FindSnapshotChainstateDir(datadir);
+    const uint256 snapshot_tip = WITH_LOCK(
+        ::cs_main, return chainman.ActiveChainstate().CoinsDB().GetBestBlock());
+
+    ChainstateManager& restarted = this->SimulateNodeRestart();
+    BOOST_REQUIRE(fs::remove_all(base_dir) > 0);
+
+    node::ChainstateLoadOptions rebuild;
+    rebuild.mempool = Assert(m_node.mempool.get());
+    rebuild.reindex_chainstate = true;
+    auto [status, error] = node::LoadChainstate(
+        restarted, m_cache_sizes, rebuild);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    BOOST_CHECK(fs::exists(base_dir));
+    BOOST_CHECK(fs::exists(datadir / "chainstate-rebuild.journal"));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate.rebuild-backup"));
+    BOOST_CHECK(fs::exists(datadir / "chainstate_snapshot.rebuild-backup"));
+
+    ChainstateManager& recovered = this->SimulateCrashRestart();
+    node::ChainstateLoadOptions interrupted_start;
+    interrupted_start.mempool = Assert(m_node.mempool.get());
+    interrupted_start.check_interrupt = [] { return true; };
+    std::tie(status, error) = node::LoadChainstate(
+        recovered, m_cache_sizes, interrupted_start);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::INTERRUPTED);
+
+    BOOST_CHECK(!fs::exists(base_dir));
+    BOOST_CHECK(fs::exists(snapshot_dir));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate-rebuild.journal"));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate.rebuild-partial"));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate_snapshot.rebuild-backup"));
+    CCoinsViewDB snapshot_db{DBParams{
+        .path = snapshot_dir,
+        .cache_bytes = 1 << 20,
+        .memory_only = false,
+        .wipe_data = false,
+        .obfuscate = true}, CoinsViewOptions{}};
+    BOOST_CHECK_EQUAL(snapshot_db.GetBestBlock(), snapshot_tip);
+}
 
 //! Test basic snapshot activation.
 BOOST_FIXTURE_TEST_CASE(chainstatemanager_activate_snapshot, SnapshotTestSetup)
@@ -443,16 +789,36 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_delete_snapshot_rehomes_mempool, Snaps
     m_args.ForceSetArg("-reindex-chainstate", "1");
     this->LoadVerifyActivateChainstate();
 
+    ChainstateManager& rebuilding = *Assert(m_node.chainman);
+    const fs::path datadir = rebuilding.m_options.datadir;
+    BOOST_CHECK(!rebuilding.IsSnapshotActive());
+    BOOST_CHECK(rebuilding.ActiveChainstate().GetMempool() == node_mempool);
+    BOOST_CHECK(!rebuilding.m_blockman.m_snapshot_height);
+    BOOST_CHECK_EQUAL(rebuilding.GetAll().size(), 1U);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        rebuilding.GetMutex(), return rebuilding.ActiveTip()->GetBlockHash()),
+        snapshot_tip_hash);
+    BOOST_CHECK(!fs::exists(snapshot_dir));
+    BOOST_CHECK(fs::exists(datadir / "chainstate-rebuild.journal"));
+    BOOST_CHECK(fs::exists(datadir / "chainstate.rebuild-backup"));
+    BOOST_CHECK(fs::exists(datadir / "chainstate_snapshot.rebuild-backup"));
+
+    // The rebuilding process may commit the replacement, but the source
+    // backups remain until a separate process reopens and verifies it. A
+    // repeated one-shot flag must complete that verification, not collide
+    // with the existing journal or start another rebuild.
+    this->SimulateNodeRestart();
+    this->LoadVerifyActivateChainstate();
+
     ChainstateManager& rebuilt = *Assert(m_node.chainman);
     BOOST_CHECK(!rebuilt.IsSnapshotActive());
     BOOST_CHECK(rebuilt.ActiveChainstate().GetMempool() == node_mempool);
-    BOOST_CHECK(!rebuilt.m_blockman.m_snapshot_height);
-    BOOST_CHECK_EQUAL(rebuilt.GetAll().size(), 1U);
     BOOST_CHECK_EQUAL(WITH_LOCK(
         rebuilt.GetMutex(), return rebuilt.ActiveTip()->GetBlockHash()),
         snapshot_tip_hash);
-
-    BOOST_CHECK(!fs::exists(snapshot_dir));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate-rebuild.journal"));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate.rebuild-backup"));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate_snapshot.rebuild-backup"));
 
     // Exercise block creation, undo writing, and activation after the rebuild.
     const int previous_height = WITH_LOCK(

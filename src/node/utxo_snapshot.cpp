@@ -14,10 +14,12 @@
 #include <txdb.h>
 #include <uint256.h>
 #include <util/fs.h>
+#include <util/fs_helpers.h>
 #include <validation.h>
 
 #include <cassert>
 #include <cstdio>
+#include <exception>
 #include <optional>
 #include <string>
 
@@ -31,19 +33,40 @@ bool WriteSnapshotBaseBlockhash(Chainstate& snapshot_chainstate)
     const std::optional<fs::path> chaindir = snapshot_chainstate.CoinsDB().StoragePath();
     assert(chaindir); // Sanity check that chainstate isn't in-memory.
     const fs::path write_to = *chaindir / node::SNAPSHOT_BLOCKHASH_FILENAME;
+    const fs::path staged = fs::PathFromString(fs::PathToString(write_to) + ".new");
 
-    FILE* file{fsbridge::fopen(write_to, "wb")};
+    // Never truncate the only durable snapshot pointer in place. A crash or
+    // short write must leave the previously committed file available.
+    std::error_code remove_ec;
+    fs::remove(staged, remove_ec);
+
+    FILE* file{fsbridge::fopen(staged, "wb")};
     AutoFile afile{file};
     if (afile.IsNull()) {
         LogPrintf("[snapshot] failed to open base blockhash file for writing: %s\n",
-                  fs::PathToString(write_to));
+                  fs::PathToString(staged));
         return false;
     }
-    afile << *snapshot_chainstate.m_from_snapshot_blockhash;
+    try {
+        afile << *snapshot_chainstate.m_from_snapshot_blockhash;
+    } catch (const std::exception& e) {
+        LogPrintf("[snapshot] failed to write staged base blockhash file %s: %s\n",
+                  fs::PathToString(staged), e.what());
+        return false;
+    }
 
-    if (afile.fclose() != 0) {
-        LogPrintf("[snapshot] failed to close base blockhash file %s after writing\n",
+    const bool committed = FileCommit(afile.Get());
+    const bool closed = afile.fclose() == 0;
+    if (!committed || !closed) {
+        LogPrintf("[snapshot] failed to durably commit base blockhash file %s\n",
+                  fs::PathToString(staged));
+        fs::remove(staged, remove_ec);
+        return false;
+    }
+    if (!RenameOver(staged, write_to) || !DirectoryCommit(*chaindir)) {
+        LogPrintf("[snapshot] failed to atomically install base blockhash file %s\n",
                   fs::PathToString(write_to));
+        fs::remove(staged, remove_ec);
         return false;
     }
     return true;
@@ -74,12 +97,20 @@ std::optional<uint256> ReadSnapshotBaseBlockhash(fs::path chaindir)
             read_from_str);
         return std::nullopt;
     }
-    afile >> base_blockhash;
+    try {
+        afile >> base_blockhash;
+    } catch (const std::exception& e) {
+        LogPrintf("[snapshot] malformed base blockhash file %s: %s\n",
+                  read_from_str, e.what());
+        return std::nullopt;
+    }
 
     if (std::fgetc(afile.Get()) != EOF) {
-        LogPrintf("[snapshot] warning: unexpected trailing data in %s\n", read_from_str);
+        LogPrintf("[snapshot] unexpected trailing data in %s\n", read_from_str);
+        return std::nullopt;
     } else if (std::ferror(afile.Get())) {
-        LogPrintf("[snapshot] warning: i/o error reading %s\n", read_from_str);
+        LogPrintf("[snapshot] i/o error reading %s\n", read_from_str);
+        return std::nullopt;
     }
     return base_blockhash;
 }

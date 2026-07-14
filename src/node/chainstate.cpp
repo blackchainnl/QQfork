@@ -5,6 +5,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <node/chainstate.h>
+#include <node/chainstate_rebuild.h>
 
 #include <arith_uint256.h>
 #include <chain.h>
@@ -20,18 +21,346 @@
 #include <txdb.h>
 #include <uint256.h>
 #include <util/fs.h>
+#include <util/fs_helpers.h>
+#include <util/signalinterrupt.h>
 #include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
+#include <cstdio>
+#include <exception>
+#include <fstream>
 #include <limits>
 #include <memory>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace node {
+
+namespace {
+
+constexpr const char* REBUILD_JOURNAL{"chainstate-rebuild.journal"};
+constexpr const char* REBUILD_BASE_BACKUP{"chainstate.rebuild-backup"};
+constexpr const char* REBUILD_SNAPSHOT_BACKUP{"chainstate_snapshot.rebuild-backup"};
+constexpr const char* REBUILD_BASE_PARTIAL{"chainstate.rebuild-partial"};
+constexpr const char* REBUILD_SNAPSHOT_PARTIAL{"chainstate_snapshot.rebuild-partial"};
+
+enum class RebuildPhase {
+    PREPARED,
+    BUILDING,
+    ROLLING_BACK,
+    COMMIT_READY,
+    CLEANUP_READY,
+};
+
+struct RebuildJournal {
+    RebuildPhase phase;
+    bool base_present;
+    bool snapshot_present;
+};
+
+bool PathExists(const fs::path& path)
+{
+    // Filesystem errors are not equivalent to absence. Let the caller fail
+    // closed while the rebuild journal and any preserved backups remain.
+    return fs::exists(path);
+}
+
+const char* PhaseName(RebuildPhase phase)
+{
+    switch (phase) {
+    case RebuildPhase::PREPARED: return "prepared";
+    case RebuildPhase::BUILDING: return "building";
+    case RebuildPhase::ROLLING_BACK: return "rolling-back";
+    case RebuildPhase::COMMIT_READY: return "commit-ready";
+    case RebuildPhase::CLEANUP_READY: return "cleanup-ready";
+    }
+    return "invalid";
+}
+
+std::optional<RebuildPhase> ParsePhase(const std::string& value)
+{
+    if (value == "prepared") return RebuildPhase::PREPARED;
+    if (value == "building") return RebuildPhase::BUILDING;
+    if (value == "rolling-back") return RebuildPhase::ROLLING_BACK;
+    if (value == "commit-ready") return RebuildPhase::COMMIT_READY;
+    if (value == "cleanup-ready") return RebuildPhase::CLEANUP_READY;
+    return std::nullopt;
+}
+
+fs::path JournalPath(const fs::path& datadir) { return datadir / REBUILD_JOURNAL; }
+fs::path BasePath(const fs::path& datadir) { return datadir / "chainstate"; }
+fs::path SnapshotPath(const fs::path& datadir) { return datadir / fs::u8path(std::string{"chainstate"} + std::string{SNAPSHOT_CHAINSTATE_SUFFIX}); }
+fs::path BaseBackupPath(const fs::path& datadir) { return datadir / REBUILD_BASE_BACKUP; }
+fs::path SnapshotBackupPath(const fs::path& datadir) { return datadir / REBUILD_SNAPSHOT_BACKUP; }
+fs::path BasePartialPath(const fs::path& datadir) { return datadir / REBUILD_BASE_PARTIAL; }
+fs::path SnapshotPartialPath(const fs::path& datadir) { return datadir / REBUILD_SNAPSHOT_PARTIAL; }
+
+bool WriteJournal(const fs::path& datadir, const RebuildJournal& journal)
+{
+    const fs::path path = JournalPath(datadir);
+    const fs::path staged = fs::PathFromString(fs::PathToString(path) + ".new");
+    const std::string contents = strprintf(
+        "blackcoin-chainstate-rebuild-v1\nphase=%s\nbase=%d\nsnapshot=%d\n",
+        PhaseName(journal.phase), journal.base_present ? 1 : 0,
+        journal.snapshot_present ? 1 : 0);
+
+    std::error_code ec;
+    fs::remove(staged, ec);
+    FILE* file = fsbridge::fopen(staged, "wb");
+    if (!file) return false;
+    const bool wrote = std::fwrite(contents.data(), 1, contents.size(), file) == contents.size();
+    const bool committed = wrote && FileCommit(file);
+    const bool closed = std::fclose(file) == 0;
+    if (!committed || !closed || !RenameOver(staged, path) || !DirectoryCommit(datadir)) {
+        fs::remove(staged, ec);
+        return false;
+    }
+    return true;
+}
+
+std::optional<RebuildJournal> ReadJournal(const fs::path& datadir, std::string& error)
+{
+    const fs::path path = JournalPath(datadir);
+    if (!PathExists(path)) return std::nullopt;
+    std::ifstream file{path};
+    if (!file) {
+        error = "chainstate rebuild journal is unreadable";
+        return std::nullopt;
+    }
+    std::string magic, phase_line, base_line, snapshot_line, trailing;
+    if (!std::getline(file, magic) || !std::getline(file, phase_line) ||
+        !std::getline(file, base_line) || !std::getline(file, snapshot_line) ||
+        std::getline(file, trailing) || magic != "blackcoin-chainstate-rebuild-v1" ||
+        phase_line.rfind("phase=", 0) != 0 || base_line.rfind("base=", 0) != 0 ||
+        snapshot_line.rfind("snapshot=", 0) != 0) {
+        error = "chainstate rebuild journal is malformed";
+        return std::nullopt;
+    }
+    const auto phase = ParsePhase(phase_line.substr(6));
+    const std::string base = base_line.substr(5);
+    const std::string snapshot = snapshot_line.substr(9);
+    if (!phase || (base != "0" && base != "1") ||
+        (snapshot != "0" && snapshot != "1") ||
+        (base == "0" && snapshot == "0")) {
+        error = "chainstate rebuild journal contains an invalid state";
+        return std::nullopt;
+    }
+    return RebuildJournal{*phase, base == "1", snapshot == "1"};
+}
+
+bool ValidateBackupTopology(const fs::path& datadir,
+                            const RebuildJournal& journal,
+                            bool allow_missing_expected,
+                            std::string& error)
+{
+    const std::array<std::pair<bool, fs::path>, 2> backups{{
+        {journal.base_present, BaseBackupPath(datadir)},
+        {journal.snapshot_present, SnapshotBackupPath(datadir)},
+    }};
+    for (const auto& [expected, path] : backups) {
+        const bool exists = PathExists(path);
+        if (!expected && exists) {
+            error = strprintf("undeclared chainstate rebuild backup exists at %s",
+                              fs::PathToString(path));
+            return false;
+        }
+        if (expected && !exists && !allow_missing_expected) {
+            error = strprintf("declared chainstate rebuild backup is missing at %s",
+                              fs::PathToString(path));
+            return false;
+        }
+    }
+    return true;
+}
+
+bool ReopeningCommittedRebuild(const fs::path& datadir)
+{
+    std::string error;
+    const std::optional<RebuildJournal> journal = ReadJournal(datadir, error);
+    return journal && journal->phase == RebuildPhase::COMMIT_READY;
+}
+
+bool RemoveJournal(const fs::path& datadir)
+{
+    std::error_code ec;
+    if (!fs::remove(JournalPath(datadir), ec) || ec) return false;
+    return DirectoryCommit(datadir);
+}
+
+bool CommitRename(const fs::path& from, const fs::path& to, const fs::path& datadir)
+{
+    try {
+        fs::rename(from, to);
+    } catch (const fs::filesystem_error& e) {
+        LogPrintf("Chainstate rebuild rename %s -> %s failed: %s\n",
+                  fs::PathToString(from), fs::PathToString(to), e.what());
+        return false;
+    }
+    return DirectoryCommit(datadir);
+}
+
+bool RestoreJournaledPath(const fs::path& datadir, const fs::path& live,
+                          const fs::path& backup, const fs::path& partial,
+                          bool expected, std::string& error)
+{
+    if (!expected) {
+        if (PathExists(backup)) {
+            error = strprintf("unexpected rebuild backup exists at %s", fs::PathToString(backup));
+            return false;
+        }
+        if (PathExists(live)) {
+            if (PathExists(partial)) {
+                error = strprintf("cannot preserve partial rebuild because %s already exists", fs::PathToString(partial));
+                return false;
+            }
+            if (!CommitRename(live, partial, datadir)) {
+                error = strprintf("could not preserve partial rebuild at %s", fs::PathToString(partial));
+                return false;
+            }
+        }
+        return true;
+    }
+    if (PathExists(backup)) {
+        if (PathExists(live)) {
+            if (PathExists(partial)) {
+                error = strprintf("cannot preserve partial rebuild because %s already exists", fs::PathToString(partial));
+                return false;
+            }
+            if (!CommitRename(live, partial, datadir)) {
+                error = strprintf("could not preserve partial rebuild at %s", fs::PathToString(partial));
+                return false;
+            }
+        }
+        if (!CommitRename(backup, live, datadir)) {
+            error = strprintf("could not restore original chainstate from %s", fs::PathToString(backup));
+            return false;
+        }
+    } else if (!PathExists(live)) {
+        error = strprintf("both live and backup chainstate are missing for %s", fs::PathToString(live));
+        return false;
+    }
+    return true;
+}
+
+bool CleanupTree(const fs::path& path)
+{
+    if (!PathExists(path)) return true;
+    std::error_code ec;
+    fs::remove_all(path, ec);
+    return !ec && !PathExists(path);
+}
+
+ChainstateLoadResult RecoverInterruptedRebuild(const fs::path& datadir)
+{
+    std::string parse_error;
+    const bool journal_exists = PathExists(JournalPath(datadir));
+    std::optional<RebuildJournal> journal = ReadJournal(datadir, parse_error);
+    if (journal_exists && !journal) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                strprintf(_("The chainstate rebuild journal is unreadable or malformed (%s). No data was changed. Preserve the datadir and repair the journal or restore from backup."), parse_error)};
+    }
+    if (!journal) {
+        if (PathExists(BaseBackupPath(datadir)) || PathExists(SnapshotBackupPath(datadir))) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    _("An unjournaled chainstate rebuild backup exists. No data was changed. Preserve the datadir and resolve the backup manually before startup.")};
+        }
+        if (!CleanupTree(BasePartialPath(datadir)) ||
+            !CleanupTree(SnapshotPartialPath(datadir))) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    _("An abandoned partial chainstate rebuild could not be removed. The authoritative chainstate was not changed; correct filesystem permissions and retry.")};
+        }
+        return {ChainstateLoadStatus::SUCCESS, {}};
+    }
+
+    if (journal->phase == RebuildPhase::COMMIT_READY) {
+        std::string topology_error;
+        if (!ValidateBackupTopology(datadir, *journal,
+                                    /*allow_missing_expected=*/false,
+                                    topology_error)) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    strprintf(_("A committed chainstate rebuild has an inconsistent backup topology (%s). No data was changed; preserve the datadir for manual recovery."), topology_error)};
+        }
+        if (!PathExists(BasePath(datadir))) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    _("A committed replacement chainstate is missing. The preserved backup was not changed; manual recovery is required.")};
+        }
+        // The replacement reached a durable commit point in a previous
+        // process, but the preserved source must remain until this process has
+        // reopened and verified the replacement. FinalizeChainstateRebuild()
+        // advances to CLEANUP_READY only after that succeeds.
+        return {ChainstateLoadStatus::SUCCESS, {}};
+    }
+
+    if (journal->phase == RebuildPhase::CLEANUP_READY) {
+        std::string topology_error;
+        if (!ValidateBackupTopology(datadir, *journal,
+                                    /*allow_missing_expected=*/true,
+                                    topology_error)) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    strprintf(_("A verified chainstate rebuild has an inconsistent backup topology (%s). No additional data was changed; preserve the datadir for manual recovery."), topology_error)};
+        }
+        if (!PathExists(BasePath(datadir))) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    _("A verified replacement chainstate is missing. Manual recovery is required.")};
+        }
+        if ((journal->base_present && !CleanupTree(BaseBackupPath(datadir))) ||
+            (journal->snapshot_present && !CleanupTree(SnapshotBackupPath(datadir))) ||
+            !DirectoryCommit(datadir) || !RemoveJournal(datadir)) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    _("The rebuilt chainstate was reopened and verified, but old backup cleanup could not be completed. Retry after correcting filesystem permissions.")};
+        }
+        CleanupTree(BasePartialPath(datadir));
+        CleanupTree(SnapshotPartialPath(datadir));
+        return {ChainstateLoadStatus::SUCCESS, {}};
+    }
+
+    std::string topology_error;
+    const bool backup_moves_may_be_incomplete =
+        journal->phase == RebuildPhase::PREPARED ||
+        journal->phase == RebuildPhase::ROLLING_BACK;
+    if (!ValidateBackupTopology(datadir, *journal,
+                                backup_moves_may_be_incomplete,
+                                topology_error)) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                strprintf(_("A chainstate rebuild has an inconsistent backup topology (%s). No data was changed; preserve the datadir for manual recovery."), topology_error)};
+    }
+    if (journal->phase != RebuildPhase::ROLLING_BACK) {
+        journal->phase = RebuildPhase::ROLLING_BACK;
+        if (!WriteJournal(datadir, *journal)) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    _("Unable to durably mark an interrupted chainstate rebuild for rollback. No chainstate was changed.")};
+        }
+    }
+
+    std::string restore_error;
+    if (!RestoreJournaledPath(datadir, BasePath(datadir), BaseBackupPath(datadir),
+                              BasePartialPath(datadir), journal->base_present, restore_error) ||
+        !RestoreJournaledPath(datadir, SnapshotPath(datadir), SnapshotBackupPath(datadir),
+                              SnapshotPartialPath(datadir), journal->snapshot_present, restore_error)) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                strprintf(_("Interrupted chainstate rebuild rollback stopped safely: %s. Preserve the datadir and backups for manual recovery."), restore_error)};
+    }
+    if (!RemoveJournal(datadir)) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                _("The original chainstate was restored, but the rebuild journal could not be cleared. No data was removed; correct filesystem permissions and retry.")};
+    }
+    if (!CleanupTree(BasePartialPath(datadir)) ||
+        !CleanupTree(SnapshotPartialPath(datadir)) ||
+        !DirectoryCommit(datadir)) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                _("The original chainstate was restored, but an abandoned partial rebuild could not be removed. Correct filesystem permissions and retry.")};
+    }
+    LogPrintf("Restored the original chainstate after an interrupted staged rebuild\n");
+    return {ChainstateLoadStatus::SUCCESS, {}};
+}
+
+} // namespace
 
 static bilingual_str ChainstateRebuildRequiredMessage()
 {
@@ -65,7 +394,7 @@ std::optional<int> FindChainstateRebuildPreflightFailureHeight(
     return std::nullopt;
 }
 
-static ChainstateLoadResult PreflightChainstateRebuild(
+static ChainstateLoadResult ValidateChainstateRebuildSources(
     ChainstateManager& chainman,
     const CacheSizes& cache_sizes,
     const ChainstateLoadOptions& options) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
@@ -101,7 +430,8 @@ static ChainstateLoadResult PreflightChainstateRebuild(
 
         if (target.IsNull()) {
             chainstate->ResetCoinsViews();
-            continue;
+            return {ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED,
+                    _("Cannot run -reindex-chainstate because an existing chainstate has no authenticated saved tip. No files were moved or wiped. Restart with full -reindex to rebuild block history; wallets are not removed.")};
         }
 
         const CBlockIndex* block = chainman.m_blockman.LookupBlockIndex(target);
@@ -120,8 +450,75 @@ static ChainstateLoadResult PreflightChainstateRebuild(
                     strprintf(_("Cannot run -reindex-chainstate because locally stored, transaction-validated block history is incomplete at height %d. The existing chainstate was not wiped. Disable pruning and restart with full -reindex to redownload and validate missing history; wallets are not removed."),
                               *missing_height)};
         }
+
         chainstate->ResetCoinsViews();
     }
+    return {ChainstateLoadStatus::SUCCESS, {}};
+}
+
+static ChainstateLoadResult BeginStagedChainstateRebuild(
+    ChainstateManager& chainman,
+    const ChainstateLoadOptions& options) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    AssertLockHeld(::cs_main);
+    const fs::path& datadir = chainman.m_options.datadir;
+    chainman.m_chainstate_rebuild_interrupted = false;
+    chainman.m_chainstate_rebuild_committed_this_process = false;
+    RebuildJournal journal{
+        RebuildPhase::PREPARED,
+        PathExists(BasePath(datadir)),
+        PathExists(SnapshotPath(datadir)),
+    };
+    if (!journal.base_present && !journal.snapshot_present) {
+        return {ChainstateLoadStatus::SUCCESS, {}};
+    }
+    if (PathExists(BaseBackupPath(datadir)) ||
+        PathExists(SnapshotBackupPath(datadir)) ||
+        PathExists(BasePartialPath(datadir)) ||
+        PathExists(SnapshotPartialPath(datadir)) ||
+        PathExists(JournalPath(datadir))) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                _("Refusing to stage a chainstate rebuild because a journal, backup, or partial rebuild already exists. No data was changed.")};
+    }
+    if (options.check_interrupt && options.check_interrupt()) {
+        return {ChainstateLoadStatus::INTERRUPTED, {}};
+    }
+    if (!WriteJournal(datadir, journal)) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                _("Unable to durably create the chainstate rebuild journal. No chainstate was moved or wiped.")};
+    }
+
+    if (journal.base_present) {
+        if (options.check_interrupt && options.check_interrupt()) {
+            return {ChainstateLoadStatus::INTERRUPTED, {}};
+        }
+        if (!CommitRename(BasePath(datadir), BaseBackupPath(datadir), datadir)) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    _("Unable to preserve the original chainstate in its rebuild backup. The journal will restore any completed rename on next startup.")};
+        }
+    }
+    if (journal.snapshot_present) {
+        if (options.check_interrupt && options.check_interrupt()) {
+            return {ChainstateLoadStatus::INTERRUPTED, {}};
+        }
+        if (!CommitRename(SnapshotPath(datadir), SnapshotBackupPath(datadir), datadir)) {
+            return {ChainstateLoadStatus::FAILURE_FATAL,
+                    _("Unable to preserve the snapshot chainstate in its rebuild backup. The journal will restore completed renames on next startup.")};
+        }
+    }
+    if (options.check_interrupt && options.check_interrupt()) {
+        return {ChainstateLoadStatus::INTERRUPTED, {}};
+    }
+
+    if (chainman.IsSnapshotActive()) {
+        chainman.DetachSnapshotChainstateForRebuild();
+    }
+    journal.phase = RebuildPhase::BUILDING;
+    if (!WriteJournal(datadir, journal)) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                _("Unable to durably enter the chainstate rebuild phase. Preserved backups remain journaled and will be restored on next startup.")};
+    }
+    LogPrintf("Staged chainstate rebuild: original databases preserved until rebuilt state commits\n");
     return {ChainstateLoadStatus::SUCCESS, {}};
 }
 
@@ -132,6 +529,16 @@ static ChainstateLoadResult CompleteChainstateInitialization(
     const CacheSizes& cache_sizes,
     const ChainstateLoadOptions& options) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
 {
+    // A rebuilding process leaves COMMIT_READY and its source backup in place.
+    // The next process must reopen the replacement as an ordinary chainstate
+    // before it is allowed to retire that backup. Treat a repeated one-shot
+    // -reindex-chainstate flag as verification during this transition rather
+    // than attempting to stage another rebuild over the existing journal.
+    const bool reopen_committed_rebuild =
+        ReopeningCommittedRebuild(chainman.m_options.datadir);
+    const bool rebuild_chainstate =
+        options.reindex_chainstate && !reopen_committed_rebuild;
+
     auto& pblocktree{chainman.m_blockman.m_block_tree_db};
     // new BlockTreeDB tries to delete the existing file, which
     // fails if it's still open from the previous loop. Close it first:
@@ -149,6 +556,23 @@ static ChainstateLoadResult CompleteChainstateInitialization(
 
     if (options.check_interrupt && options.check_interrupt()) return {ChainstateLoadStatus::INTERRUPTED, {}};
 
+    // Validate the persisted snapshot pointer directly against the block-tree
+    // database before BlockManager can dereference it while bootstrapping
+    // assumeUTXO metadata.
+    if (chainman.IsSnapshotActive()) {
+        const std::optional<uint256> snapshot_hash = chainman.SnapshotBlockhash();
+        const auto assumeutxo = snapshot_hash
+            ? chainman.GetParams().AssumeutxoForBlockhash(*snapshot_hash)
+            : std::nullopt;
+        CDiskBlockIndex disk_base;
+        if (!snapshot_hash || !assumeutxo ||
+            !pblocktree->ReadBlockIndexEntry(*snapshot_hash, disk_base) ||
+            disk_base.nHeight != assumeutxo->height) {
+            return {ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED,
+                    _("The snapshot chainstate base is not an approved entry in the local block index. No chainstate was moved or wiped. Move the chainstate_snapshot directory aside or use full -reindex.")};
+        }
+    }
+
     // Note that LoadBlockIndex sets fReindex global based on the disk flag!
     // From here on, fReindex and options.reindex values may be different!
     if (!chainman.LoadBlockIndex()) {
@@ -163,21 +587,35 @@ static ChainstateLoadResult CompleteChainstateInitialization(
         return {ChainstateLoadStatus::FAILURE_INCOMPATIBLE_DB, _("Incorrect or no genesis block found. Wrong datadir for network?")};
     }
 
-    // A chainstate-only rebuild is safe only if every block needed to recreate
-    // each persisted chainstate is still present. Check this before opening any
-    // coins database with wipe_data=true or deleting an assumeUTXO snapshot.
-    if (options.reindex_chainstate && !options.reindex) {
-        const auto [preflight_status, preflight_error] =
-            PreflightChainstateRebuild(chainman, cache_sizes, options);
-        if (preflight_status != ChainstateLoadStatus::SUCCESS) {
-            return {preflight_status, preflight_error};
+    // Snapshot metadata is read before the block index is loaded. Validate its
+    // base against the now-authoritative index before initializing, deleting,
+    // or wiping either chainstate. A stale or fabricated base must remain a
+    // recoverable startup error rather than reaching SnapshotBase() as null.
+    if (chainman.IsSnapshotActive()) {
+        const std::optional<uint256> snapshot_base = chainman.SnapshotBlockhash();
+        if (!snapshot_base ||
+            !chainman.m_blockman.LookupBlockIndex(*snapshot_base)) {
+            return {ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED,
+                    _("The snapshot chainstate base block is absent from the local block index. No chainstate was wiped. Remove or restore the snapshot chainstate, or restart with full -reindex to rebuild local block history.")};
         }
     }
 
-    if (chainman.IsSnapshotActive() && options.reindex_chainstate && !options.reindex) {
-        LogPrintf("[snapshot] deleting snapshot chainstate after rebuild preflight\n");
-        if (!chainman.DeleteSnapshotChainstate()) {
-            return {ChainstateLoadStatus::FAILURE_FATAL, Untranslated("Couldn't remove snapshot chainstate.")};
+    // Authenticate each saved source before moving it. The original databases
+    // remain available in a journaled backup while reconstruction performs
+    // full block/transaction/signature checks on the chain it actually selects.
+    if (rebuild_chainstate && !options.reindex) {
+        auto [source_status, source_error] =
+            ValidateChainstateRebuildSources(chainman, cache_sizes, options);
+        if (source_status != ChainstateLoadStatus::SUCCESS) {
+            return {source_status, source_error};
+        }
+        if (options.check_interrupt && options.check_interrupt()) {
+            return {ChainstateLoadStatus::INTERRUPTED, {}};
+        }
+        auto [stage_status, stage_error] =
+            BeginStagedChainstateRebuild(chainman, options);
+        if (stage_status != ChainstateLoadStatus::SUCCESS) {
+            return {stage_status, stage_error};
         }
     }
 
@@ -190,7 +628,7 @@ static ChainstateLoadResult CompleteChainstateInitialization(
     }
 
     auto is_coinsview_empty = [&](Chainstate* chainstate) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
-        return options.reindex || options.reindex_chainstate || chainstate->CoinsTip().GetBestBlock().IsNull();
+        return options.reindex || rebuild_chainstate || chainstate->CoinsTip().GetBestBlock().IsNull();
     };
 
     assert(chainman.m_total_coinstip_cache > 0);
@@ -211,7 +649,9 @@ static ChainstateLoadResult CompleteChainstateInitialization(
         chainstate->InitCoinsDB(
             /*cache_size_bytes=*/chainman.m_total_coinsdb_cache * init_cache_fraction,
             /*in_memory=*/options.coins_db_in_memory,
-            /*should_wipe=*/options.reindex || options.reindex_chainstate);
+            // -reindex-chainstate builds in a fresh live path while the old
+            // database remains journaled under its backup name.
+            /*should_wipe=*/options.reindex);
 
         if (options.coins_error_cb) {
             chainstate->CoinsErrorCatcher().AddReadErrCallback(options.coins_error_cb);
@@ -297,6 +737,17 @@ ChainstateLoadResult LoadChainstate(ChainstateManager& chainman, const CacheSize
     chainman.m_total_coinstip_cache = cache_sizes.coins;
     chainman.m_total_coinsdb_cache = cache_sizes.coins_db;
 
+    const auto [recovery_status, recovery_error] =
+        RecoverInterruptedRebuild(chainman.m_options.datadir);
+    if (recovery_status != ChainstateLoadStatus::SUCCESS) {
+        return {recovery_status, recovery_error};
+    }
+    if (options.reindex &&
+        ReopeningCommittedRebuild(chainman.m_options.datadir)) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                _("A rebuilt chainstate is awaiting its protected verification restart. Restart once without -reindex so the preserved backup can be verified and retired, then retry the full reindex if it is still required.")};
+    }
+
     // Load the fully validated chainstate.
     chainman.InitializeChainstate(options.mempool);
 
@@ -304,7 +755,13 @@ ChainstateLoadResult LoadChainstate(ChainstateManager& chainman, const CacheSize
     // removes it before the block index is wiped, so an interrupted startup
     // cannot leave an empty index paired with a stale snapshot. A
     // chainstate-only rebuild defers deletion until block-data preflight.
+    const bool snapshot_dir_present =
+        node::FindSnapshotChainstateDir(chainman.m_options.datadir).has_value();
     const bool has_snapshot = chainman.DetectSnapshotChainstate();
+    if (snapshot_dir_present && !has_snapshot) {
+        return {ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED,
+                _("A snapshot chainstate directory exists but its base-block metadata is missing, malformed, or unreadable. No chainstate was wiped. Remove or restore the malformed snapshot directory before retrying; use full -reindex if local block history also requires recovery.")};
+    }
     if (has_snapshot && options.reindex) {
         LogPrintf("[snapshot] deleting snapshot chainstate before full reindex\n");
         if (!chainman.DeleteSnapshotChainstate()) {
@@ -362,10 +819,151 @@ ChainstateLoadResult LoadChainstate(ChainstateManager& chainman, const CacheSize
     return {ChainstateLoadStatus::SUCCESS, {}};
 }
 
+static bool RebuiltChainReachesPreservedWork(
+    ChainstateManager& chainman,
+    const RebuildJournal& journal,
+    bilingual_str& error)
+{
+    const fs::path& datadir = chainman.m_options.datadir;
+    const std::array<std::pair<bool, fs::path>, 2> sources{{
+        {journal.base_present, BaseBackupPath(datadir)},
+        {journal.snapshot_present, SnapshotBackupPath(datadir)},
+    }};
+
+    for (const auto& [present, path] : sources) {
+        if (!present) continue;
+        if (!PathExists(path)) {
+            error = strprintf(_("Cannot authenticate preserved chainstate source %s because it is missing."), fs::PathToString(path));
+            return false;
+        }
+        try {
+            CCoinsViewDB source_db{DBParams{
+                .path = path,
+                .cache_bytes = 1 << 20,
+                .memory_only = false,
+                .wipe_data = false,
+                .obfuscate = true}, CoinsViewOptions{}};
+            const std::vector<uint256> heads = source_db.GetHeadBlocks();
+            uint256 target = source_db.GetBestBlock();
+            if (!heads.empty()) {
+                if (heads.size() != 2 || heads.front().IsNull()) {
+                    error = strprintf(_("Cannot commit the rebuilt chainstate because preserved source %s has an invalid interrupted-flush marker."), fs::PathToString(path));
+                    return false;
+                }
+                target = heads.front();
+            }
+            if (target.IsNull()) {
+                error = strprintf(_("Cannot commit the rebuilt chainstate because preserved source %s has no authenticated tip."), fs::PathToString(path));
+                return false;
+            }
+
+            const bool sufficient_work = WITH_LOCK(::cs_main, {
+                const CBlockIndex* source_tip =
+                    chainman.m_blockman.LookupBlockIndex(target);
+                const CBlockIndex* rebuilt_tip =
+                    chainman.ActiveChainstate().m_chain.Tip();
+                return source_tip && rebuilt_tip &&
+                    rebuilt_tip->nChainWork >= source_tip->nChainWork;
+            });
+            if (!sufficient_work) {
+                error = strprintf(_("Cannot commit the rebuilt chainstate because it does not reach the validated work of preserved source %s. The preserved database will be restored on restart."), fs::PathToString(path));
+                return false;
+            }
+        } catch (const std::exception& e) {
+            error = strprintf(_("Cannot authenticate preserved chainstate source %s before commit: %s"), fs::PathToString(path), e.what());
+            return false;
+        }
+    }
+    return true;
+}
+
+bool FinalizeChainstateRebuild(ChainstateManager& chainman, bilingual_str& error)
+{
+    const fs::path& datadir = chainman.m_options.datadir;
+    if (!PathExists(JournalPath(datadir))) return true;
+
+    std::string parse_error;
+    std::optional<RebuildJournal> journal = ReadJournal(datadir, parse_error);
+    if (!journal || (journal->phase != RebuildPhase::BUILDING &&
+                     journal->phase != RebuildPhase::COMMIT_READY)) {
+        error = strprintf(_("Cannot commit the rebuilt chainstate because its journal is invalid (%s). Preserved backups were not removed."), parse_error);
+        return false;
+    }
+    std::string topology_error;
+    if (!ValidateBackupTopology(datadir, *journal,
+                                /*allow_missing_expected=*/false,
+                                topology_error)) {
+        error = strprintf(_("Cannot commit the rebuilt chainstate because its backup topology is inconsistent (%s). Preserved data was not removed."), topology_error);
+        return false;
+    }
+
+    // COMMIT_READY written by this manager proves a durable build, but not a
+    // separate-process reopen. Leave the backup in place until next startup.
+    if (journal->phase == RebuildPhase::COMMIT_READY &&
+        chainman.m_chainstate_rebuild_committed_this_process) {
+        return true;
+    }
+
+    if (chainman.m_chainstate_rebuild_interrupted || chainman.m_interrupt) {
+        chainman.m_chainstate_rebuild_interrupted = true;
+        error = _("Chainstate reconstruction was interrupted. The preserved database will be restored on restart.");
+        return false;
+    }
+    if (!RebuiltChainReachesPreservedWork(chainman, *journal, error)) {
+        return false;
+    }
+
+    BlockValidationState flush_state;
+    if (!chainman.ActiveChainstate().FlushStateToDisk(
+            flush_state, FlushStateMode::ALWAYS)) {
+        error = strprintf(_("Cannot durably flush the rebuilt chainstate (%s). Preserved backups were not removed."),
+                          flush_state.ToString());
+        return false;
+    }
+    if (chainman.m_interrupt) {
+        chainman.m_chainstate_rebuild_interrupted = true;
+        error = _("Chainstate reconstruction was interrupted before commit. The preserved database will be restored on restart.");
+        return false;
+    }
+
+    if (journal->phase == RebuildPhase::BUILDING) {
+        journal->phase = RebuildPhase::COMMIT_READY;
+        if (!WriteJournal(datadir, *journal)) {
+            error = _("Cannot durably commit the rebuilt chainstate. Preserved backups were not removed and will be restored on restart.");
+            return false;
+        }
+        chainman.m_chainstate_rebuild_committed_this_process = true;
+        LogPrintf("Committed staged chainstate rebuild; preserved database will be retired only after a verified restart\n");
+        return true;
+    }
+
+    // This manager reopened and verified a COMMIT_READY replacement. Make that
+    // fact durable before beginning retryable backup cleanup.
+    journal->phase = RebuildPhase::CLEANUP_READY;
+    if (!WriteJournal(datadir, *journal)) {
+        error = _("The rebuilt chainstate was reopened and verified, but that state could not be committed for backup cleanup. The preserved backups were not removed.");
+        return false;
+    }
+    if ((journal->base_present && !CleanupTree(BaseBackupPath(datadir))) ||
+        (journal->snapshot_present && !CleanupTree(SnapshotBackupPath(datadir))) ||
+        !DirectoryCommit(datadir) || !RemoveJournal(datadir)) {
+        error = _("The rebuilt chainstate was reopened and verified, but preserved backup cleanup could not be completed. Correct filesystem permissions and retry.");
+        return false;
+    }
+    CleanupTree(BasePartialPath(datadir));
+    CleanupTree(SnapshotPartialPath(datadir));
+    DirectoryCommit(datadir);
+    LogPrintf("Verified the rebuilt chainstate after restart and retired preserved databases\n");
+    return true;
+}
+
 ChainstateLoadResult VerifyLoadedChainstate(ChainstateManager& chainman, const ChainstateLoadOptions& options)
 {
+    const bool rebuild_chainstate =
+        options.reindex_chainstate &&
+        !ReopeningCommittedRebuild(chainman.m_options.datadir);
     auto is_coinsview_empty = [&](Chainstate* chainstate) EXCLUSIVE_LOCKS_REQUIRED(::cs_main) {
-        return options.reindex || options.reindex_chainstate || chainstate->CoinsTip().GetBestBlock().IsNull();
+        return options.reindex || rebuild_chainstate || chainstate->CoinsTip().GetBestBlock().IsNull();
     };
 
     LOCK(cs_main);

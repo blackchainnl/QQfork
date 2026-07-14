@@ -128,7 +128,11 @@ class AssumeutxoTest(BitcoinTestFramework):
         chainstate_snapshot_path.mkdir()
         with open(chainstate_snapshot_path / "base_blockhash", 'wb') as f:
             f.write(b'z' * 32)
-        expected_error = f"Error: A fatal internal error occurred, see debug.log for details"
+        expected_error = (
+            "Error: The snapshot chainstate base is not an approved entry in the local "
+            "block index. No chainstate was moved or wiped. Move the "
+            "chainstate_snapshot directory aside or use full -reindex."
+        )
         self.nodes[0].assert_start_raises_init_error(expected_msg=expected_error)
 
         # resurrect node again
@@ -308,8 +312,27 @@ class AssumeutxoTest(BitcoinTestFramework):
         self.log.info("Test -reindex-chainstate of an assumeutxo-synced node")
         self.restart_node(2, extra_args=[
             '-reindex-chainstate=1', *self.extra_args[2]])
+        rebuild_journal = n2.chain_path / "chainstate-rebuild.journal"
+        rebuild_backup = n2.chain_path / "chainstate.rebuild-backup"
+        self.wait_until(
+            lambda: (
+                rebuild_journal.exists()
+                and "phase=commit-ready\n" in rebuild_journal.read_text()
+            ),
+            timeout=60,
+        )
+        assert rebuild_backup.is_dir()
         assert_equal(n2.getblockchaininfo()["blocks"], FINAL_HEIGHT)
-        self.wait_until(lambda: n2.getblockcount() == FINAL_HEIGHT)
+        assert_equal(n2.getblockcount(), FINAL_HEIGHT)
+
+        self.log.info("Verify the rebuilt chainstate before testing full -reindex")
+        self.restart_node(2, extra_args=self.extra_args[2])
+        self.wait_until(
+            lambda: not rebuild_journal.exists() and not rebuild_backup.exists(),
+            timeout=60,
+        )
+        assert_equal(n2.getblockcount(), FINAL_HEIGHT)
+        self.wait_for_indexes(n2, n2_indexes)
 
         self.log.info("Test -reindex of an assumeutxo-synced node")
         self.restart_node(2, extra_args=['-reindex=1', *self.extra_args[2]])
