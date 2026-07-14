@@ -115,9 +115,6 @@ private:
     bool m_coldstake_fund_available{false};
     bool m_coldstake_withdraw_available{false};
     bool m_demurrage_sweep_available{false};
-    // Fail closed until a full wallet refresh confirms that the next block is
-    // in a phase where quantum outputs can be funded.
-    bool m_quantum_funding_active{false};
     bool m_coldstake_operator_user_selected{false};
     QString m_selfstake_last_action_status;
     QString m_operator_last_action_status;

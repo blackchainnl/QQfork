@@ -389,6 +389,11 @@ public:
     //! Read wallet migration progress and deadline state.
     virtual WalletMigrationStatus getMigrationStatus() = 0;
 
+    //! Return whether the active tip permits funding quantum outputs in the
+    //! next block. This lightweight GUI guard fails closed if chain state is
+    //! temporarily unavailable.
+    virtual bool isQuantumFundingActive() = 0;
+
     //! Sweep spendable legacy coins into a wallet-backed quantum address.
     virtual util::Result<WalletQuantumActionTx> migrateLegacyToQuantum() = 0;
 

@@ -2735,6 +2735,17 @@ public:
         }
         return status;
     }
+    bool isQuantumFundingActive() override
+    {
+        TRY_LOCK(::cs_main, main_lock);
+        if (!main_lock || !m_wallet->HaveChain()) return false;
+
+        const CBlockIndex* tip = m_wallet->chain().chainman().ActiveChain().Tip();
+        if (!tip) return false;
+
+        return IsQuantumWitnessSpendActive(
+            Params().GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1);
+    }
     util::Result<WalletQuantumActionTx> migrateLegacyToQuantum() override
     {
         return CreateQuantumMigrationSweep(*m_wallet, /*goldrush_rewards_only=*/false);

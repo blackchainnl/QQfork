@@ -33,6 +33,7 @@
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
 #include <validation.h>
+#include <validationinterface.h>
 #include <wallet/test/util.h>
 #include <wallet/wallet.h>
 
@@ -1051,6 +1052,79 @@ void TestGUI(interfaces::Node& node)
     TestGUIWatchOnly(node, test);
 }
 
+void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
+{
+    const std::vector<const char*> phase_args{
+        "-regtest",
+        "-shadowwhitelistheight=20",
+        "-shadowgoldrushstartheight=30",
+        "-shadowgoldrushendheight=101",
+        "-qqgoldrushendheight=101",
+        "-qqmigrationendheight=140",
+    };
+    TestChain100Setup test{ChainType::REGTEST, phase_args};
+    for (int i = 0; i < 5; ++i) {
+        test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+    }
+
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style(PlatformStyle::instantiate("other"));
+    const std::shared_ptr<CWallet>& wallet = SetupDescriptorsWallet(node, test);
+    MiniGUI mini_gui(node, platform_style.get());
+    mini_gui.initModelForWallet(node, wallet, platform_style.get());
+
+    StakingMiningPage page(platform_style.get());
+    page.setClientModel(mini_gui.clientModel.get());
+    page.setWalletModel(mini_gui.walletModel.get());
+    page.show();
+    qApp->processEvents();
+
+    QPushButton* refresh_details = page.findChild<QPushButton*>("stakingMiningRefresh");
+    QPushButton* migration_legacy_sweep = page.findChild<QPushButton*>("migrationLegacySweep");
+    QPushButton* migration_goldrush_sweep = page.findChild<QPushButton*>("migrationGoldrushSweep");
+    QVERIFY(refresh_details);
+    QVERIFY(migration_legacy_sweep);
+    QVERIFY(migration_goldrush_sweep);
+
+    refresh_details->click();
+    qApp->processEvents();
+    QVERIFY(mini_gui.walletModel->wallet().isQuantumFundingActive());
+    QVERIFY(migration_legacy_sweep->isEnabled());
+    QVERIFY(migration_goldrush_sweep->isEnabled());
+
+    // Roll back every Migration block. The inexpensive status path must read
+    // the active tip again and disable funding without a full detail refresh.
+    for (int i = 0; i < 5; ++i) {
+        CBlockIndex* tip = WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Tip());
+        BlockValidationState state;
+        QVERIFY(test.m_node.chainman->ActiveChainstate().InvalidateBlock(state, tip));
+    }
+    SyncWithValidationInterfaceQueue();
+    QCOMPARE(WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Height()), 100);
+    QVERIFY(QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection));
+    qApp->processEvents();
+    QVERIFY(!mini_gui.walletModel->wallet().isQuantumFundingActive());
+    QVERIFY(!migration_legacy_sweep->isEnabled());
+    QVERIFY(!migration_goldrush_sweep->isEnabled());
+
+    // Mine an alternate branch back into Migration. The same lightweight path
+    // must enable the controls again from the new active tip.
+    test.coinbaseKey.MakeNewKey(true);
+    for (int i = 0; i < 5; ++i) {
+        test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+    }
+    SyncWithValidationInterfaceQueue();
+    QCOMPARE(WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Height()), 105);
+    QVERIFY(QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection));
+    qApp->processEvents();
+    QVERIFY(mini_gui.walletModel->wallet().isQuantumFundingActive());
+    QVERIFY(migration_legacy_sweep->isEnabled());
+    QVERIFY(migration_goldrush_sweep->isEnabled());
+}
+
 } // namespace
 
 void WalletTests::walletTests()
@@ -1067,4 +1141,5 @@ void WalletTests::walletTests()
     }
 #endif
     TestGUI(m_node);
+    TestQuantumFundingControlsFollowReorg(m_node);
 }
