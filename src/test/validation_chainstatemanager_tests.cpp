@@ -980,6 +980,48 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_commitment_covers_coin_time, SnapshotT
     BOOST_CHECK(status == node::ChainstateLoadStatus::FAILURE);
 }
 
+//! Coinstake provenance is also absent from the legacy assumeUTXO MuHash. A
+//! post-commit mutation of only that persisted flag must retain the backup.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_commitment_covers_coinstake_flag, SnapshotTestSetup)
+{
+    const COutPoint target{m_coinbase_txns.front()->GetHash(), 0};
+    ChainstateManager& rebuilding = BuildAndCommitProtectedChainstate();
+    const fs::path datadir = rebuilding.m_options.datadir;
+    const fs::path journal = datadir / "chainstate-rebuild.journal";
+    const fs::path backup = datadir / "chainstate.rebuild-backup";
+
+    ChainstateManager& reopened = SimulateNodeRestart();
+    {
+        CCoinsViewDB live{DBParams{
+            .path = datadir / "chainstate",
+            .cache_bytes = 1 << 20,
+            .memory_only = false,
+            .wipe_data = false,
+            .obfuscate = true}, CoinsViewOptions{}};
+        const uint256 legacy_before = LegacyMuHash(live);
+        Coin coin;
+        BOOST_REQUIRE(live.GetCoin(target, coin));
+        coin.fCoinStake = !coin.fCoinStake;
+        WriteCoinMutation(live, target, std::move(coin));
+        BOOST_CHECK_EQUAL(LegacyMuHash(live), legacy_before);
+    }
+
+    node::ChainstateLoadOptions normal;
+    normal.mempool = Assert(m_node.mempool.get());
+    auto [status, error] = node::LoadChainstate(
+        reopened, m_cache_sizes, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    std::tie(status, error) = node::VerifyLoadedChainstate(reopened, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+
+    bilingual_str finalize_error;
+    BOOST_CHECK(!node::FinalizeChainstateRebuild(reopened, finalize_error));
+    BOOST_CHECK(finalize_error.original.find("full-Coin commitment") !=
+                std::string::npos);
+    BOOST_CHECK(fs::exists(journal));
+    BOOST_CHECK(fs::exists(backup));
+}
+
 //! A committed legacy journal has no state identity to authenticate. It must
 //! retain the backup even if it claims cleanup was already authorized.
 BOOST_FIXTURE_TEST_CASE(chainstatemanager_legacy_cleanup_journal_fails_closed, SnapshotTestSetup)
