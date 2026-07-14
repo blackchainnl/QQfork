@@ -44,6 +44,16 @@ class WalletSendTest(BitcoinTestFramework):
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
 
+    def setup_network(self):
+        super().setup_network()
+        # The default two-node topology gives node 1 only an outbound peer.
+        # Whitelist permissions apply to inbound peers, so a transaction
+        # created by node 1 would otherwise depend on its randomized outbound
+        # inventory deadline. This test freezes mocktime and that deadline can
+        # never expire. Add the reverse connection so sends in either direction
+        # have an inbound whitelisted relay path.
+        self.connect_nodes(0, 1)
+
     def sync_mocktime_to_tip(self):
         tip_time = max(node.getblockheader(node.getbestblockhash())["time"] for node in self.nodes)
         for node in self.nodes:
@@ -191,11 +201,7 @@ class WalletSendTest(BitcoinTestFramework):
             assert_equal(from_balance_before, from_balance)
 
         if to_wallet:
-            # This inherited wallet test can run under heavy parallel load in
-            # the full standard suite. The send path is deterministic, but
-            # mempool relay can exceed the default 60s sync window on loaded
-            # hosts; keep the assertion while giving relay more time.
-            self.sync_mempools(timeout=120)
+            self.sync_mempools()
             if add_to_wallet:
                 if not subtract_fee_from_outputs:
                     assert_equal(to_wallet.getbalances()["mine"]["untrusted_pending"], to_untrusted_pending_before + Decimal(amount if amount else 0))
