@@ -110,6 +110,11 @@ class TestNode():
             "-debugexclude=rand",
             "-uacomment=testnode%d" % i,
         ]
+        # Blackcoin More releases used blackmore.conf as their default config
+        # filename. Always point previous-release binaries at the framework's
+        # generated blackcoin.conf so they use the isolated test ports.
+        if version is not None:
+            self.args.append(f"-conf={self.bitcoinconf.name}")
         if self.descriptors is None:
             self.args.append("-disablewallet")
 
