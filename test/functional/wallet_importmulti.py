@@ -24,7 +24,10 @@ from test_framework.script import (
     OP_NOP,
 )
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.descriptors import descsum_create
+from test_framework.descriptors import (
+    descsum_create,
+    xkey_to_main_prefix,
+)
 from test_framework.util import (
     assert_equal,
     assert_greater_than,
@@ -580,10 +583,14 @@ class ImportMultiTest(BitcoinTestFramework):
                      labels=[p2sh_p2wpkh_label])
 
         # Test ranged descriptor fails if range is not specified
-        xpriv = "tprv8ZgxMBicQKsPeuVhWwi6wuMQGfPKi9Li5GtX35jVNknACgqe3CY4g5xgkfDDJcmtF7o1QnxWDRYw4H5P26PXq7sbcUkEqeR4fg3Kxp2tigg"
-        addresses = ["2N7yv4p8G8yEaPddJxY41kPihnWvs39qCMf", "2MsHxyb2JS3pAySeNUsJ7mNnurtpeenDzLA"] # hdkeypath=m/0'/0'/0' and 1'
-        addresses += ["bcrt1qrd3n235cj2czsfmsuvqqpr3lu6lg0ju7scl8gn", "bcrt1qfqeppuvj0ww98r6qghmdkj70tv8qpchehegrg8"] # wpkh subscripts corresponding to the above addresses
-        desc = "sh(wpkh(" + xpriv + "/0'/0'/*'" + "))"
+        xpriv = xkey_to_main_prefix("tprv8ZgxMBicQKsPeuVhWwi6wuMQGfPKi9Li5GtX35jVNknACgqe3CY4g5xgkfDDJcmtF7o1QnxWDRYw4H5P26PXq7sbcUkEqeR4fg3Kxp2tigg")
+        inner_desc = "wpkh(" + xpriv + "/0'/0'/*'" + ")"
+        desc = "sh(" + inner_desc + ")"
+        # Derive chain-correct outer and inner destinations. The inherited
+        # vectors used Bitcoin tprv and bcrt encodings, while Blackcoin
+        # regtest deliberately uses xprv and blrt.
+        addresses = self.nodes[0].deriveaddresses(descsum_create(desc), [0, 1])
+        addresses += self.nodes[0].deriveaddresses(descsum_create(inner_desc), [0, 1])
         self.log.info("Ranged descriptor import should fail without a specified range")
         self.test_importmulti({"desc": descsum_create(desc),
                                "timestamp": "now"},
@@ -860,17 +867,12 @@ class ImportMultiTest(BitcoinTestFramework):
         wrpc = self.nodes[1].get_wallet_rpc("noprivkeys")
         assert_equal(wrpc.getwalletinfo()["keypoolsize"], 0)
         assert_equal(wrpc.getwalletinfo()["private_keys_enabled"], False)
-        xpub = "tpubDAXcJ7s7ZwicqjprRaEWdPoHKrCS215qxGYxpusRLLmJuT69ZSicuGdSfyvyKpvUNYBW1s2U3NSrT6vrCYB9e6nZUEvrqnwXPF8ArTCRXMY"
-        addresses = [
-            'bcrt1qtmp74ayg7p24uslctssvjm06q5phz4yrxucgnv', # m/0'/0'/0
-            'bcrt1q8vprchan07gzagd5e6v9wd7azyucksq2xc76k8', # m/0'/0'/1
-            'bcrt1qtuqdtha7zmqgcrr26n2rqxztv5y8rafjp9lulu', # m/0'/0'/2
-            'bcrt1qau64272ymawq26t90md6an0ps99qkrse58m640', # m/0'/0'/3
-            'bcrt1qsg97266hrh6cpmutqen8s4s962aryy77jp0fg0', # m/0'/0'/4
-        ]
+        xpub = xkey_to_main_prefix("tpubDAXcJ7s7ZwicqjprRaEWdPoHKrCS215qxGYxpusRLLmJuT69ZSicuGdSfyvyKpvUNYBW1s2U3NSrT6vrCYB9e6nZUEvrqnwXPF8ArTCRXMY")
+        keypool_desc = descsum_create('wpkh([80002067/0h/0h]' + xpub + '/*)')
+        addresses = self.nodes[0].deriveaddresses(keypool_desc, [0, 4])
         result = wrpc.importmulti(
             [{
-                'desc': descsum_create('wpkh([80002067/0h/0h]' + xpub + '/*)'),
+                'desc': keypool_desc,
                 'keypool': True,
                 'timestamp': 'now',
                 'range' : [0, 4],
