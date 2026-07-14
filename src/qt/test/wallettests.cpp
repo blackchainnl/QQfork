@@ -620,9 +620,18 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     const CTxDestination payout_dest = DecodeDestination(info.payout_address);
     QVERIFY(IsValidDestination(payout_dest));
     QVERIFY(IsQuantumMigrationDestination(payout_dest));
-    refresh_details->click();
-    qApp->processEvents();
-    QCOMPARE(pow_payout->text(), QString::fromStdString(info.payout_address));
+    const QString expected_payout = QString::fromStdString(info.payout_address);
+    // The details page deliberately uses nonblocking wallet locks so an active
+    // miner or signer cannot freeze the Qt event loop. Under sanitizers the
+    // first refresh can legitimately observe that transient busy state. Retry
+    // the same user-visible refresh action instead of requiring the GUI thread
+    // to wait for the wallet mutex.
+    for (int attempt = 0; attempt < 50 && pow_payout->text() != expected_payout; ++attempt) {
+        refresh_details->click();
+        qApp->processEvents();
+        if (pow_payout->text() != expected_payout) QTest::qWait(20);
+    }
+    QCOMPARE(pow_payout->text(), expected_payout);
     QVERIFY(pow_copy->isEnabled());
 
     pow_copy->click();
