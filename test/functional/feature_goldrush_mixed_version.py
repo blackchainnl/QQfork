@@ -2,17 +2,20 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Run the designated v26 reference and the v30.1.1 candidate together.
+"""Run pinned historical releases and the v30.1.1 candidate together.
 
-v28.4.0 and v30.1.0 are started and version-checked as diagnostic builds, but
-they are not compatibility authorities: both contain known consensus changes
-that the v30.1.1 Gold Rush bridge deliberately removes. The normative pair is
-the exact v26.2.0 reference and the candidate. It relays adversarial,
-legacy-valid blocks in both directions, reorganizes both directions, and
-persists the common tip across restart.
+The exact v26.2.0 reference and candidate remain the normative pair for
+adversarial legacy-valid blocks and two-way reorganizations. The exact pinned
+v30.1.0 release is also a scoped Gold Rush bridge authority: it and the
+candidate must accept byte-identical ordinary base blocks in both propagation
+directions and persist their common tip across restart. v28.4.0 remains a
+diagnostic build because v26/v28 already diverge on known consensus paths.
 """
 
 from decimal import Decimal
+import hashlib
+import json
+from pathlib import Path
 
 from test_framework.address import address_to_scriptpubkey
 from test_framework.blocktools import COINBASE_MATURITY, create_block, create_coinbase
@@ -37,7 +40,10 @@ from test_framework.util import assert_equal
 VERSIONS = [260200, 280400, 300100, None]
 EXPECTED_RPC_VERSIONS = [260200, 280400, 300100, 300101]
 REFERENCE = 0
+V30_1_0 = 2
 CANDIDATE = 3
+V30_1_0_COMMIT = "f647dc75c9479c03e81414f145a8d233b60959c7"
+V30_1_0_REF_OBJECT = "1d16eba95983fb2bf41246de6250d7762a450c50"
 GOLD_RUSH_ARGS = [
     "-shadowwhitelistheight=1",
     "-shadowgoldrushstartheight=2",
@@ -65,6 +71,7 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         self.skip_if_no_previous_releases()
 
     def setup_nodes(self):
+        self.assert_v30_1_0_provenance()
         self.add_nodes(self.num_nodes, extra_args=self.extra_args, versions=VERSIONS)
         self.start_nodes()
 
@@ -81,11 +88,66 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
     def normative_nodes(self):
         return [self.nodes[REFERENCE], self.nodes[CANDIDATE]]
 
+    @property
+    def v30_bridge_nodes(self):
+        return [self.nodes[V30_1_0], self.nodes[CANDIDATE]]
+
+    @staticmethod
+    def file_sha256(path):
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def assert_v30_1_0_provenance(self):
+        """Fail closed if the v30.1.0 fixture is not the pinned release build."""
+        releases = Path(self.options.previous_releases_path)
+        provenance_path = releases / "provenance.json"
+        if not provenance_path.is_file():
+            raise AssertionError(
+                "mixed-version provenance.json is missing; build fixtures with "
+                "ci/mixed-version/build_previous_releases.py"
+            )
+        try:
+            provenance = json.loads(provenance_path.read_text(encoding="utf8"))
+        except (OSError, ValueError) as error:
+            raise AssertionError(f"cannot read mixed-version provenance: {error}") from error
+        if provenance.get("schema") != 1:
+            raise AssertionError("unsupported mixed-version provenance schema")
+        sources = [
+            source for source in provenance.get("sources", [])
+            if source.get("version") == "v30.1.0"
+        ]
+        if len(sources) != 1:
+            raise AssertionError("mixed-version provenance must contain exactly one v30.1.0 source")
+        source = sources[0]
+        assert_equal(source.get("commit"), V30_1_0_COMMIT)
+        assert_equal(source.get("ref_object"), V30_1_0_REF_OBJECT)
+        assert_equal(source.get("tag_kind"), "annotated")
+        assert_equal(source.get("install_dir"), "v30.1")
+        for binary in ("blackcoind", "blackcoin-cli"):
+            binary_path = releases / "v30.1" / "bin" / binary
+            if not binary_path.is_file():
+                raise AssertionError(f"pinned v30.1.0 fixture is missing {binary_path}")
+            assert_equal(
+                self.file_sha256(binary_path),
+                source.get("binaries", {}).get(binary),
+            )
+
     def assert_normative_tip(self):
         tips = [node.getbestblockhash() for node in self.normative_nodes]
         assert_equal(len(set(tips)), 1)
         heights = [node.getblockcount() for node in self.normative_nodes]
         assert_equal(len(set(heights)), 1)
+
+    def assert_v30_bridge_block(self, block_hash):
+        tips = [node.getbestblockhash() for node in self.v30_bridge_nodes]
+        assert_equal(tips, [block_hash, block_hash])
+        heights = [node.getblockcount() for node in self.v30_bridge_nodes]
+        assert_equal(len(set(heights)), 1)
+        raw_blocks = [node.getblock(block_hash, 0) for node in self.v30_bridge_nodes]
+        assert_equal(len(set(raw_blocks)), 1)
 
     def mine_and_sync(self, miner, blocks=1, nodes=None):
         address = self.nodes[CANDIDATE].get_deterministic_priv_key().address
@@ -294,6 +356,58 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         self.sync_blocks(self.normative_nodes, timeout=120)
         self.assert_normative_tip()
 
+    def exercise_v30_1_0_gold_rush_bridge(self):
+        """Prove the pinned v30.1.0/candidate ordinary-block bridge both ways."""
+        assert_equal(
+            self.nodes[V30_1_0].getbestblockhash(),
+            self.nodes[CANDIDATE].getbestblockhash(),
+        )
+        for node in self.v30_bridge_nodes:
+            assert_equal(node.getquantumquasarinfo()["phase"], "gold_rush")
+
+        # Isolate this scoped pair from the v26 authority. First, v30.1.0
+        # produces a base block and the candidate accepts those exact bytes.
+        self.disconnect_nodes(CANDIDATE, REFERENCE)
+        self.connect_nodes(CANDIDATE, V30_1_0)
+        v30_hash = self.generatetoaddress(
+            self.nodes[V30_1_0],
+            1,
+            self.nodes[CANDIDATE].get_deterministic_priv_key().address,
+            sync_fun=self.no_op,
+        )[0]
+        self.sync_blocks(self.v30_bridge_nodes, timeout=120)
+        self.assert_v30_bridge_block(v30_hash)
+
+        # Reverse the producer/receiver roles and the outbound connection.
+        # The lagging v30.1.0 node must fetch and accept the candidate block.
+        self.disconnect_nodes(CANDIDATE, V30_1_0)
+        candidate_hash = self.generatetoaddress(
+            self.nodes[CANDIDATE],
+            1,
+            self.nodes[CANDIDATE].get_deterministic_priv_key().address,
+            sync_fun=self.no_op,
+        )[0]
+        assert_equal(self.nodes[V30_1_0].getbestblockhash(), v30_hash)
+        self.connect_nodes(V30_1_0, CANDIDATE)
+        self.sync_blocks(self.v30_bridge_nodes, timeout=120)
+        self.assert_v30_bridge_block(candidate_hash)
+
+        # Each daemon must reload the same accepted tip from its own isolated
+        # datadir before reconnecting. This catches acceptance that was only
+        # transient in memory or dependent on the original peer session.
+        for index in (V30_1_0, CANDIDATE):
+            self.restart_node(index)
+            assert_equal(self.nodes[index].getbestblockhash(), candidate_hash)
+        self.connect_nodes(CANDIDATE, V30_1_0)
+        self.sync_blocks(self.v30_bridge_nodes, timeout=120)
+        self.assert_v30_bridge_block(candidate_hash)
+
+        # Return the candidate to the v26 authority for the existing
+        # adversarial/reorg gate. v30.1.0 remains scoped to ordinary blocks.
+        self.connect_nodes(CANDIDATE, REFERENCE)
+        self.sync_blocks(self.normative_nodes, timeout=120)
+        self.assert_normative_tip()
+
     def run_test(self):
         self.log.info("Verifying every daemon is the pinned historical/candidate build")
         for node, expected in zip(self.nodes, EXPECTED_RPC_VERSIONS):
@@ -322,6 +436,9 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
             self.coinbase_utxo(mined[0]),
             change_script,
         )
+
+        self.log.info("Bridging byte-identical Gold Rush base blocks with pinned v30.1.0 both ways")
+        self.exercise_v30_1_0_gold_rush_bridge()
 
         self.log.info("Stopping diagnostic builds before known split-path fixtures")
         self.stop_node(1)
