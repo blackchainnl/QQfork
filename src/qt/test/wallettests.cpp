@@ -221,6 +221,7 @@ std::shared_ptr<CWallet> SetupLegacyWatchOnlyWallet(interfaces::Node& node, Test
 {
     std::shared_ptr<CWallet> wallet = std::make_shared<CWallet>(node.context()->chain.get(), "", CreateMockableWalletDatabase());
     wallet->LoadWallet();
+    const uint256 tip_hash = WITH_LOCK(node.context()->chainman->GetMutex(), return node.context()->chainman->ActiveChain().Tip()->GetBlockHash());
     {
         LOCK(wallet->cs_wallet);
         wallet->SetWalletFlag(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
@@ -229,7 +230,7 @@ std::shared_ptr<CWallet> SetupLegacyWatchOnlyWallet(interfaces::Node& node, Test
         CPubKey pubKey = test.coinbaseKey.GetPubKey();
         bool import_keys = wallet->ImportPubKeys({pubKey.GetID()}, {{pubKey.GetID(), pubKey}} , /*key_origins=*/{}, /*add_keypool=*/false, /*internal=*/false, /*timestamp=*/1);
         assert(import_keys);
-        wallet->SetLastBlockProcessed(105, WITH_LOCK(node.context()->chainman->GetMutex(), return node.context()->chainman->ActiveChain().Tip()->GetBlockHash()));
+        wallet->SetLastBlockProcessed(105, tip_hash);
     }
     SyncUpWallet(wallet, node);
     return wallet;
@@ -239,20 +240,23 @@ std::shared_ptr<CWallet> SetupDescriptorsWallet(interfaces::Node& node, TestChai
 {
     std::shared_ptr<CWallet> wallet = std::make_shared<CWallet>(node.context()->chain.get(), "", CreateMockableWalletDatabase());
     wallet->LoadWallet();
-    LOCK(wallet->cs_wallet);
-    wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
-    wallet->SetupDescriptorScriptPubKeyMans();
+    const uint256 tip_hash = WITH_LOCK(node.context()->chainman->GetMutex(), return node.context()->chainman->ActiveChain().Tip()->GetBlockHash());
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
 
-    // Add the coinbase key
-    FlatSigningProvider provider;
-    std::string error;
-    std::unique_ptr<Descriptor> desc = Parse("combo(" + EncodeSecret(test.coinbaseKey) + ")", provider, error, /* require_checksum=*/ false);
-    assert(desc);
-    WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
-    if (!wallet->AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
-    CTxDestination dest = GetDestinationForKey(test.coinbaseKey.GetPubKey(), wallet->m_default_address_type);
-    wallet->SetAddressBook(dest, "", wallet::AddressPurpose::RECEIVE);
-    wallet->SetLastBlockProcessed(105, WITH_LOCK(node.context()->chainman->GetMutex(), return node.context()->chainman->ActiveChain().Tip()->GetBlockHash()));
+        // Add the coinbase key
+        FlatSigningProvider provider;
+        std::string error;
+        std::unique_ptr<Descriptor> desc = Parse("combo(" + EncodeSecret(test.coinbaseKey) + ")", provider, error, /* require_checksum=*/ false);
+        assert(desc);
+        WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
+        if (!wallet->AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
+        CTxDestination dest = GetDestinationForKey(test.coinbaseKey.GetPubKey(), wallet->m_default_address_type);
+        wallet->SetAddressBook(dest, "", wallet::AddressPurpose::RECEIVE);
+        wallet->SetLastBlockProcessed(105, tip_hash);
+    }
     SyncUpWallet(wallet, node);
     wallet->SetBroadcastTransactions(true);
     return wallet;
