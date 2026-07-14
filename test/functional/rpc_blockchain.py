@@ -119,7 +119,7 @@ class BlockchainTest(BitcoinTestFramework):
             expected_msg=": The block database contains a block which appears to be from the future."
             " This may be due to your computer's date and time being set incorrectly."
             f" Only rebuild the block database if you are sure that your computer's date and time are correct.{os.linesep}"
-            "Please restart with -reindex or -reindex-chainstate to recover.",
+            "Please restart with -reindex to rebuild the full block database.",
         )
         self.log.info("A block tip of MAX_FUTURE_BLOCK_TIME in the future is fine")
         self.start_node(0, extra_args=[f"-mocktime={TIME_RANGE_TIP - MAX_FUTURE_BLOCK_TIME}"])
@@ -221,6 +221,19 @@ class BlockchainTest(BitcoinTestFramework):
                     'signalling': '#'*elapsed,
                 },
                 'active': False
+            },
+            'taproot': {
+                'type': 'bip9',
+                'height': 0,
+                'active': True,
+                'bip9': {
+                    'start_time': -1,
+                    'timeout': 0x7fffffffffffffff,
+                    'min_activation_height': 0,
+                    'status': 'active',
+                    'since': 0,
+                    'status_next': 'active',
+                },
             },
           }
         })

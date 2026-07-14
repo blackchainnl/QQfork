@@ -20,6 +20,12 @@ class KeyPoolTest(BitcoinTestFramework):
 
     def set_test_params(self):
         self.num_nodes = 1
+        # This inherited keypool test intentionally constructs very small
+        # transactions at 10 sat/vB. Keep its relay-policy fixture below that
+        # feerate so the assertions continue to exercise keypool exhaustion
+        # and change-address handling rather than Blackcoin's higher default
+        # minimum relay fee.
+        self.extra_args = [["-minrelaytxfee=0.00001"]]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
