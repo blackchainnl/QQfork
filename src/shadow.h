@@ -36,6 +36,73 @@ struct ShadowGoldRushInfo {
     unsigned int pow_target_bits{0};
 };
 
+/** Snapshot-decodable provenance for one synthetic Gold Rush payout marker. */
+struct GoldRushPayoutMarkerInfo {
+    COutPoint payout_outpoint;
+    CScript payout_script;
+    CAmount nominal_amount{0};
+    uint32_t origin_height{0};
+    uint256 origin_block_hash;
+    uint32_t origin_block_time{0};
+};
+
+/** Authenticated rolling issuance/spend totals at an exact active tip. */
+struct GoldRushInventoryInfo {
+    uint32_t tip_height{0};
+    uint256 tip_hash;
+    uint64_t issued_count{0};
+    CAmount issued_nominal{0};
+    uint64_t spent_count{0};
+    CAmount spent_nominal{0};
+};
+
+/** Mutually exclusive next-block value states used by wallet and supply APIs. */
+enum class ValueLifecycleCategory : uint8_t {
+    SPENDABLE_LEGACY,
+    IMMATURE_LEGACY,
+    FINAL_LOCKED_LEGACY,
+    GOLD_RUSH_SYNTHETIC_IMMATURE,
+    GOLD_RUSH_SYNTHETIC_MATURE_LOCKED,
+    DIRECT_QUANTUM_PHASE_LOCKED,
+    MIGRATION_SPENDABLE_DIRECT_QUANTUM,
+    QUANTUM_CONTRACT_RESTRICTED,
+    DEMURRAGE_LOCKED,
+    FINAL_CONDITIONAL_EUTXO,
+    IMMATURE_OTHER,
+    OTHER,
+    COUNT,
+};
+
+struct ValueLifecycleClassification {
+    ValueLifecycleCategory category{ValueLifecycleCategory::OTHER};
+    bool synthetic{false};
+    bool merkle_included{true};
+    bool mature{true};
+    bool consensus_spendable{false};
+    bool ordinary_spendable{false};
+    bool permanently_locked{false};
+    bool conditional{false};
+    bool legacy_scheduled_final_lockout{false};
+    bool requires_quantum_migration{false};
+    bool demurrage_active{false};
+    bool demurrage_exempt{false};
+    bool demurrage_locked{false};
+    int64_t maturity_height{-1};
+    int64_t earliest_spend_height{-1};
+    int64_t earliest_spend_mtp{-1};
+    CAmount nominal_amount{0};
+    CAmount effective_amount{0};
+    CAmount burned_amount{0};
+    std::string demurrage_exemption;
+};
+
+enum class ValueLifecycleResult : uint8_t {
+    OK,
+    INVALID_AMOUNT,
+    INVALID_SCHEDULE,
+    INVALID_SYNTHETIC_PROVENANCE,
+};
+
 struct ShadowReplayStateInfo {
     uint32_t schema{0};
     bool required_for_tip{false};
@@ -198,6 +265,9 @@ static constexpr uint32_t SHADOW_ARGON2_LANES = 1;
  *  Direct payouts are bounded per block by ShadowBaseReward() and the coinstake
  *  reward cap; this invariant locks the total scheduled issuance against drift. */
 static constexpr CAmount SHADOW_MAX_EMISSION = 51437700 * COIN;
+
+/** Checked deterministic scheduled emission through last_height, inclusive. */
+std::optional<CAmount> GetScheduledShadowEmissionThrough(int last_height);
 
 /** Get the magic OP_RETURN prefix used for Quantum Quasar shadow proofs. */
 const std::vector<unsigned char>& GetShadowPrefix();
@@ -395,6 +465,34 @@ bool DecodeShadowClaimMarker(const CTxOut& txout, ShadowClaimMarkerInfo& info);
 bool IsShadowMarkerScript(const CScript& script);
 /** Authenticate a marker by its reserved deterministic outpoint before destructive maintenance. */
 bool IsAuthenticatedShadowMarkerOutpoint(const COutPoint& outpoint, const Coin& coin, const CBlockIndex* pindexTip);
+/** Decode a payout marker using only one immutable UTXO snapshot entry and its
+ * exact active-chain anchor. This deliberately does not consult live chainstate. */
+bool DecodeAuthenticatedGoldRushPayoutMarker(const COutPoint& marker_outpoint,
+                                             const Coin& marker_coin,
+                                             const CBlockIndex* pindex_tip,
+                                             GoldRushPayoutMarkerInfo& info);
+/** Decode the authenticated rolling Gold Rush inventory from one immutable
+ * UTXO snapshot entry. */
+bool DecodeAuthenticatedGoldRushInventory(const COutPoint& inventory_outpoint,
+                                          const Coin& inventory_coin,
+                                          const CBlockIndex* pindex_tip,
+                                          GoldRushInventoryInfo& info);
+/** True only for the strict positive coin shape that consensus requires to
+ * have authenticated synthetic provenance. */
+bool IsGoldRushPayoutCandidateCoin(const Coin& coin, const Consensus::Params& consensus);
+
+/** Classify one UTXO for the candidate next block. The caller supplies whether
+ * synthetic provenance was authenticated from the same chainstate snapshot. */
+ValueLifecycleResult ClassifyValueLifecycle(
+    const Coin& coin,
+    bool authenticated_synthetic_goldrush,
+    const Consensus::Params& consensus,
+    int evaluation_height,
+    int64_t evaluation_mtp,
+    std::optional<int> latest_attestation_height,
+    std::optional<int> attestation_coverage_start_height,
+    ValueLifecycleClassification& classification);
+const char* ValueLifecycleCategoryName(ValueLifecycleCategory category);
 using ShadowBlockReader = std::function<bool(const CBlockIndex&, CBlock&)>;
 /** Versioned schedule/semantics marker used to decide whether startup must
  *  rebuild exact shadow state even when aggregate obligation is unchanged. */

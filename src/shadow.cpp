@@ -3540,6 +3540,29 @@ CAmount ShadowBaseReward(int height)
     return 463 * COIN;
 }
 
+std::optional<CAmount> GetScheduledShadowEmissionThrough(int last_height)
+{
+    if (SHADOW_REWARD_START_HEIGHT < 0 ||
+        SHADOW_REWARD_END_HEIGHT < SHADOW_REWARD_START_HEIGHT ||
+        SHADOW_PHASE1_END_HEIGHT < SHADOW_REWARD_START_HEIGHT ||
+        SHADOW_PHASE1_END_HEIGHT > SHADOW_REWARD_END_HEIGHT ||
+        SHADOW_HALVING_INTERVAL_BLOCKS < 1) {
+        return std::nullopt;
+    }
+
+    const int end = std::min(last_height, SHADOW_REWARD_END_HEIGHT);
+    if (end < SHADOW_REWARD_START_HEIGHT) return CAmount{0};
+
+    CAmount total{0};
+    for (int64_t height = SHADOW_REWARD_START_HEIGHT; height <= end; ++height) {
+        const CAmount reward = ShadowBaseReward(static_cast<int>(height));
+        const auto next = CheckedAddMoney(total, reward);
+        if (!next) return std::nullopt;
+        total = *next;
+    }
+    return total;
+}
+
 const std::string& GetQuantumQuasarBlockNotice()
 {
     static const std::string notice =
@@ -4643,6 +4666,267 @@ bool IsAuthenticatedShadowMarkerOutpoint(const COutPoint& outpoint, const Coin& 
     // Retain them here rather than risk deleting a legacy-valid user output;
     // deterministic replay overwrites the authentic records it reconstructs.
     return false;
+}
+
+bool DecodeAuthenticatedGoldRushPayoutMarker(const COutPoint& marker_outpoint,
+                                             const Coin& marker_coin,
+                                             const CBlockIndex* pindex_tip,
+                                             GoldRushPayoutMarkerInfo& info)
+{
+    info = {};
+    valtype payload;
+    GoldRushPayoutRecord record;
+    if (!IsAuthenticatedShadowMarkerOutpoint(marker_outpoint, marker_coin, pindex_tip) ||
+        !ParseMarkerScript(marker_coin.out.scriptPubKey, MARKER_GOLD_RUSH_PAYOUT, &payload) ||
+        !DecodeGoldRushPayoutRecordPayload(payload, record) ||
+        marker_outpoint != GoldRushPayoutOutpoint(record.payout_outpoint)) {
+        return false;
+    }
+    const CBlockIndex* origin = SafeGetAncestor(pindex_tip, static_cast<int>(record.origin_height));
+    if (!origin || origin->GetBlockHash() != record.origin_block_hash ||
+        marker_coin.nHeight != record.origin_height ||
+        marker_coin.nTime != static_cast<uint32_t>(origin->GetBlockTime())) {
+        return false;
+    }
+    info.payout_outpoint = record.payout_outpoint;
+    info.payout_script = record.target;
+    info.nominal_amount = record.nominal_amount;
+    info.origin_height = record.origin_height;
+    info.origin_block_hash = record.origin_block_hash;
+    info.origin_block_time = marker_coin.nTime;
+    return true;
+}
+
+bool DecodeAuthenticatedGoldRushInventory(const COutPoint& inventory_outpoint,
+                                          const Coin& inventory_coin,
+                                          const CBlockIndex* pindex_tip,
+                                          GoldRushInventoryInfo& info)
+{
+    info = {};
+    GoldRushInventoryState state;
+    if (!pindex_tip || inventory_outpoint != GoldRushInventoryOutpoint() ||
+        !IsAuthenticatedShadowMarkerOutpoint(inventory_outpoint, inventory_coin, pindex_tip) ||
+        !DecodeGoldRushInventory(inventory_coin.out.scriptPubKey, state) ||
+        !GoldRushInventoryRootsValid(state) ||
+        state.tip_height != static_cast<uint32_t>(pindex_tip->nHeight) ||
+        state.tip_hash != pindex_tip->GetBlockHash()) {
+        return false;
+    }
+    info.tip_height = state.tip_height;
+    info.tip_hash = state.tip_hash;
+    info.issued_count = state.issued_count;
+    info.issued_nominal = state.issued_nominal;
+    info.spent_count = state.spent_count;
+    info.spent_nominal = state.spent_nominal;
+    return true;
+}
+
+bool IsGoldRushPayoutCandidateCoin(const Coin& coin, const Consensus::Params& consensus)
+{
+    if (SHADOW_REWARD_START_HEIGHT < 0 ||
+        SHADOW_REWARD_END_HEIGHT < SHADOW_REWARD_START_HEIGHT) {
+        return false;
+    }
+    const auto tier = GetQuantumStakeTierProgram(coin.out.scriptPubKey);
+    return coin.fCoinBase && !coin.fCoinStake && coin.out.nValue > 0 &&
+        static_cast<int64_t>(coin.nHeight) >= SHADOW_REWARD_START_HEIGHT &&
+        static_cast<int64_t>(coin.nHeight) <= SHADOW_REWARD_END_HEIGHT &&
+        static_cast<int64_t>(coin.nHeight) > consensus.nLastPOWBlock &&
+        tier && !tier->tiered && !tier->cold_stake;
+}
+
+const char* ValueLifecycleCategoryName(ValueLifecycleCategory category)
+{
+    switch (category) {
+    case ValueLifecycleCategory::SPENDABLE_LEGACY: return "spendable_legacy";
+    case ValueLifecycleCategory::IMMATURE_LEGACY: return "immature_legacy";
+    case ValueLifecycleCategory::FINAL_LOCKED_LEGACY: return "final_locked_legacy";
+    case ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_IMMATURE: return "gold_rush_synthetic_immature";
+    case ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_MATURE_LOCKED: return "gold_rush_synthetic_mature_locked";
+    case ValueLifecycleCategory::DIRECT_QUANTUM_PHASE_LOCKED: return "direct_quantum_phase_locked";
+    case ValueLifecycleCategory::MIGRATION_SPENDABLE_DIRECT_QUANTUM: return "migration_spendable_direct_quantum";
+    case ValueLifecycleCategory::QUANTUM_CONTRACT_RESTRICTED: return "quantum_contract_restricted";
+    case ValueLifecycleCategory::DEMURRAGE_LOCKED: return "demurrage_locked";
+    case ValueLifecycleCategory::FINAL_CONDITIONAL_EUTXO: return "final_conditional_eutxo";
+    case ValueLifecycleCategory::IMMATURE_OTHER: return "immature_other";
+    case ValueLifecycleCategory::OTHER: return "other";
+    case ValueLifecycleCategory::COUNT: break;
+    }
+    return "unknown";
+}
+
+ValueLifecycleResult ClassifyValueLifecycle(
+    const Coin& coin,
+    bool authenticated_synthetic_goldrush,
+    const Consensus::Params& consensus,
+    int evaluation_height,
+    int64_t evaluation_mtp,
+    std::optional<int> latest_attestation_height,
+    std::optional<int> attestation_coverage_start_height,
+    ValueLifecycleClassification& classification)
+{
+    classification = {};
+    if (!MoneyRange(coin.out.nValue) || evaluation_height < 0 ||
+        consensus.nCoinbaseMaturity < 0) {
+        return ValueLifecycleResult::INVALID_AMOUNT;
+    }
+
+    const Consensus::Params::QuantumLifecycleState lifecycle =
+        consensus.GetQuantumLifecycleState(evaluation_mtp, evaluation_height);
+    if (!lifecycle.schedule_valid) return ValueLifecycleResult::INVALID_SCHEDULE;
+
+    const auto tier = GetQuantumStakeTierProgram(coin.out.scriptPubKey);
+    const bool direct_quantum = tier && !tier->tiered && !tier->cold_stake;
+    const bool quantum_contract = (tier && (tier->tiered || tier->cold_stake)) ||
+        IsQuantumColdStakeScript(coin.out.scriptPubKey);
+    const bool eutxo = IsEUTXOScript(coin.out.scriptPubKey);
+    const bool legacy = !direct_quantum && !quantum_contract && !eutxo;
+    if (authenticated_synthetic_goldrush &&
+        (!direct_quantum || !IsGoldRushPayoutCandidateCoin(coin, consensus))) {
+        return ValueLifecycleResult::INVALID_SYNTHETIC_PROVENANCE;
+    }
+
+    classification.synthetic = authenticated_synthetic_goldrush;
+    classification.merkle_included = !authenticated_synthetic_goldrush;
+    classification.nominal_amount = coin.out.nValue;
+
+    const bool generated = coin.IsCoinBase() || coin.IsCoinStake();
+    if (generated) {
+        classification.maturity_height =
+            static_cast<int64_t>(coin.nHeight) + consensus.nCoinbaseMaturity;
+        classification.mature = static_cast<int64_t>(evaluation_height) >=
+            classification.maturity_height;
+    }
+
+    const Consensus::DemurrageEvaluation demurrage = Consensus::EvaluateDemurrage(
+        coin, consensus, evaluation_height, evaluation_mtp,
+        latest_attestation_height, attestation_coverage_start_height);
+    if (!MoneyRange(demurrage.nominal_value) ||
+        !MoneyRange(demurrage.effective_value) ||
+        !MoneyRange(demurrage.burned_value) ||
+        demurrage.nominal_value != coin.out.nValue ||
+        demurrage.effective_value > demurrage.nominal_value ||
+        demurrage.burned_value != demurrage.nominal_value - demurrage.effective_value) {
+        return ValueLifecycleResult::INVALID_AMOUNT;
+    }
+    classification.effective_amount = demurrage.effective_value;
+    classification.burned_amount = demurrage.burned_value;
+    classification.demurrage_active = demurrage.active;
+    classification.demurrage_exempt = demurrage.exempt;
+    classification.demurrage_locked = demurrage.locked;
+    classification.demurrage_exemption = demurrage.exemption;
+
+    const bool quantum_spends_active = IsQuantumWitnessSpendActive(
+        consensus, evaluation_mtp, evaluation_height);
+    const bool final_lockout = consensus.IsQuantumFinalLockout(
+        evaluation_mtp, evaluation_height);
+
+    int64_t quantum_unlock_height = SHADOW_REWARD_END_HEIGHT >= 0
+        ? static_cast<int64_t>(SHADOW_REWARD_END_HEIGHT) + 1
+        : -1;
+    int64_t quantum_unlock_mtp{-1};
+    if (consensus.IsGoldRushEndScheduled()) {
+        if (lifecycle.height_authoritative) {
+            quantum_unlock_height = std::max<int64_t>(
+                quantum_unlock_height,
+                static_cast<int64_t>(consensus.nGoldRushEndHeight) + 1);
+        } else if (consensus.nGoldRushEndTime == std::numeric_limits<int64_t>::max()) {
+            return ValueLifecycleResult::INVALID_SCHEDULE;
+        } else {
+            quantum_unlock_mtp = consensus.nGoldRushEndTime + 1;
+        }
+    }
+
+    if (legacy) {
+        classification.legacy_scheduled_final_lockout =
+            consensus.IsMigrationEndScheduled() && !final_lockout;
+        classification.requires_quantum_migration = !final_lockout;
+        if (final_lockout) {
+            classification.category = ValueLifecycleCategory::FINAL_LOCKED_LEGACY;
+            classification.permanently_locked = true;
+            return ValueLifecycleResult::OK;
+        }
+    }
+
+    if (authenticated_synthetic_goldrush) {
+        classification.earliest_spend_height = classification.maturity_height;
+        if (quantum_unlock_height >= 0) {
+            classification.earliest_spend_height = std::max(
+                classification.earliest_spend_height, quantum_unlock_height);
+        }
+        classification.earliest_spend_mtp = quantum_unlock_mtp;
+        if (!classification.mature) {
+            classification.category = ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_IMMATURE;
+            return ValueLifecycleResult::OK;
+        }
+        if (!quantum_spends_active) {
+            classification.category = ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_MATURE_LOCKED;
+            return ValueLifecycleResult::OK;
+        }
+    } else if (!classification.mature) {
+        classification.category = legacy
+            ? ValueLifecycleCategory::IMMATURE_LEGACY
+            : ValueLifecycleCategory::IMMATURE_OTHER;
+        classification.earliest_spend_height = classification.maturity_height;
+        if (legacy && lifecycle.height_authoritative &&
+            classification.maturity_height >
+                static_cast<int64_t>(consensus.nQuantumMigrationEndHeight)) {
+            classification.earliest_spend_height = -1;
+        }
+        return ValueLifecycleResult::OK;
+    }
+
+    if (demurrage.locked) {
+        classification.category = ValueLifecycleCategory::DEMURRAGE_LOCKED;
+        classification.permanently_locked = true;
+        return ValueLifecycleResult::OK;
+    }
+
+    if (legacy) {
+        classification.category = ValueLifecycleCategory::SPENDABLE_LEGACY;
+        classification.consensus_spendable = true;
+        classification.ordinary_spendable = true;
+        classification.earliest_spend_height = evaluation_height;
+        return ValueLifecycleResult::OK;
+    }
+
+    if (direct_quantum) {
+        if (!quantum_spends_active) {
+            classification.category = ValueLifecycleCategory::DIRECT_QUANTUM_PHASE_LOCKED;
+            classification.earliest_spend_height = quantum_unlock_height;
+            classification.earliest_spend_mtp = quantum_unlock_mtp;
+            return ValueLifecycleResult::OK;
+        }
+        classification.category =
+            ValueLifecycleCategory::MIGRATION_SPENDABLE_DIRECT_QUANTUM;
+        classification.consensus_spendable = true;
+        classification.ordinary_spendable = true;
+        classification.earliest_spend_height = evaluation_height;
+        return ValueLifecycleResult::OK;
+    }
+
+    if (quantum_contract) {
+        classification.category = ValueLifecycleCategory::QUANTUM_CONTRACT_RESTRICTED;
+        classification.consensus_spendable = quantum_spends_active;
+        if (!quantum_spends_active) {
+            classification.earliest_spend_height = quantum_unlock_height;
+            classification.earliest_spend_mtp = quantum_unlock_mtp;
+        }
+        if (tier && tier->IsUnbonding()) {
+            classification.earliest_spend_height = std::max<int64_t>(
+                classification.earliest_spend_height, tier->unlock_height);
+        }
+        return ValueLifecycleResult::OK;
+    }
+
+    if (eutxo && final_lockout) {
+        classification.category = ValueLifecycleCategory::FINAL_CONDITIONAL_EUTXO;
+        classification.conditional = true;
+        return ValueLifecycleResult::OK;
+    }
+
+    classification.category = ValueLifecycleCategory::OTHER;
+    return ValueLifecycleResult::OK;
 }
 
 bool CollectAuthenticatedShadowStateOutpoints(const CCoinsViewCache& view, const CBlockIndex* pindexTip,

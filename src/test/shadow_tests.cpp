@@ -20,6 +20,7 @@
 
 #include <map>
 #include <array>
+#include <limits>
 #include <set>
 #include <string>
 #include <tuple>
@@ -2537,6 +2538,164 @@ BOOST_AUTO_TEST_CASE(shadow_emission_schedule_within_cap)
     // No reward is emitted outside the epoch window.
     BOOST_CHECK_EQUAL(ShadowBaseReward(SHADOW_REWARD_START_HEIGHT - 1), CAmount{0});
     BOOST_CHECK_EQUAL(ShadowBaseReward(SHADOW_REWARD_END_HEIGHT + 1), CAmount{0});
+}
+
+BOOST_AUTO_TEST_CASE(value_lifecycle_categories_pin_gold_rush_and_final_boundaries)
+{
+    ShadowScheduleGuard schedule{/*whitelist_height=*/9,
+                                 /*reward_start_height=*/10,
+                                 /*gold_rush_blocks=*/11};
+    Consensus::Params params = Params().GetConsensus();
+    params.nQuantumLifecycleStartHeight = 10;
+    params.nGoldRushEndHeight = 20;
+    params.nQuantumMigrationEndHeight = 40;
+    params.nDemurrageActivationHeight = 41;
+    params.nDemurrageMinActivationHeight = 41;
+    params.nDemurrageBlocksPerMonth = 1;
+    params.nCoinbaseMaturity = 5;
+    params.nLastPOWBlock = 0;
+
+    const Coin legacy{CTxOut{5 * COIN, CScript{} << OP_TRUE},
+                      /*height=*/12, /*coinbase=*/false, /*coinstake=*/false,
+                      /*time=*/0};
+    ValueLifecycleClassification state;
+    BOOST_REQUIRE(ClassifyValueLifecycle(
+        legacy, /*synthetic=*/false, params, /*evaluation_height=*/20,
+        /*evaluation_mtp=*/0, std::nullopt, std::nullopt, state) ==
+        ValueLifecycleResult::OK);
+    BOOST_CHECK(state.category == ValueLifecycleCategory::SPENDABLE_LEGACY);
+    BOOST_CHECK(state.consensus_spendable);
+    BOOST_CHECK(state.ordinary_spendable);
+    BOOST_CHECK(state.legacy_scheduled_final_lockout);
+    BOOST_CHECK(state.requires_quantum_migration);
+    BOOST_CHECK_EQUAL(state.nominal_amount, 5 * COIN);
+    BOOST_CHECK_EQUAL(state.effective_amount, 5 * COIN);
+
+    BOOST_REQUIRE(ClassifyValueLifecycle(
+        legacy, /*synthetic=*/false, params, /*evaluation_height=*/41,
+        /*evaluation_mtp=*/0, std::nullopt, std::nullopt, state) ==
+        ValueLifecycleResult::OK);
+    BOOST_CHECK(state.category == ValueLifecycleCategory::FINAL_LOCKED_LEGACY);
+    BOOST_CHECK(!state.consensus_spendable);
+    BOOST_CHECK(!state.ordinary_spendable);
+    BOOST_CHECK(state.permanently_locked);
+    BOOST_CHECK(!state.legacy_scheduled_final_lockout);
+    BOOST_CHECK(!state.requires_quantum_migration);
+
+    const Coin synthetic{CTxOut{580 * COIN, QuantumScript(0x71)},
+                         /*height=*/15, /*coinbase=*/true, /*coinstake=*/false,
+                         /*time=*/0};
+    BOOST_REQUIRE(ClassifyValueLifecycle(
+        synthetic, /*synthetic=*/true, params, /*evaluation_height=*/19,
+        /*evaluation_mtp=*/0, std::nullopt, std::nullopt, state) ==
+        ValueLifecycleResult::OK);
+    BOOST_CHECK(state.category == ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_IMMATURE);
+    BOOST_CHECK(state.synthetic);
+    BOOST_CHECK(!state.merkle_included);
+    BOOST_CHECK(!state.mature);
+    BOOST_CHECK(!state.consensus_spendable);
+    BOOST_CHECK_EQUAL(state.maturity_height, 20);
+    BOOST_CHECK_EQUAL(state.earliest_spend_height, 21);
+
+    BOOST_REQUIRE(ClassifyValueLifecycle(
+        synthetic, /*synthetic=*/true, params, /*evaluation_height=*/20,
+        /*evaluation_mtp=*/0, std::nullopt, std::nullopt, state) ==
+        ValueLifecycleResult::OK);
+    BOOST_CHECK(state.category == ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_MATURE_LOCKED);
+    BOOST_CHECK(state.mature);
+    BOOST_CHECK(!state.consensus_spendable);
+    BOOST_CHECK_EQUAL(state.earliest_spend_height, 21);
+
+    BOOST_REQUIRE(ClassifyValueLifecycle(
+        synthetic, /*synthetic=*/true, params, /*evaluation_height=*/21,
+        /*evaluation_mtp=*/0, std::nullopt, std::nullopt, state) ==
+        ValueLifecycleResult::OK);
+    BOOST_CHECK(state.category == ValueLifecycleCategory::MIGRATION_SPENDABLE_DIRECT_QUANTUM);
+    BOOST_CHECK(state.consensus_spendable);
+    BOOST_CHECK(state.ordinary_spendable);
+    BOOST_CHECK(state.synthetic);
+    BOOST_CHECK(!state.merkle_included);
+    BOOST_CHECK_EQUAL(state.earliest_spend_height, 21);
+
+    const Coin false_synthetic{CTxOut{580 * COIN, CScript{} << OP_TRUE},
+                               /*height=*/15, /*coinbase=*/true,
+                               /*coinstake=*/false, /*time=*/0};
+    BOOST_CHECK(ClassifyValueLifecycle(
+        false_synthetic, /*synthetic=*/true, params, /*evaluation_height=*/21,
+        /*evaluation_mtp=*/0, std::nullopt, std::nullopt, state) ==
+        ValueLifecycleResult::INVALID_SYNTHETIC_PROVENANCE);
+}
+
+BOOST_AUTO_TEST_CASE(value_lifecycle_pins_direct_quantum_and_demurrage_accounting)
+{
+    ShadowScheduleGuard schedule{/*whitelist_height=*/9,
+                                 /*reward_start_height=*/10,
+                                 /*gold_rush_blocks=*/11};
+    Consensus::Params params = Params().GetConsensus();
+    params.nQuantumLifecycleStartHeight = 10;
+    params.nGoldRushEndHeight = 20;
+    params.nQuantumMigrationEndHeight = 40;
+    params.nDemurrageActivationHeight = 41;
+    params.nDemurrageMinActivationHeight = 41;
+    params.nDemurrageBlocksPerMonth = 1;
+    params.nCoinbaseMaturity = 5;
+    params.nLastPOWBlock = 0;
+
+    const Coin direct{CTxOut{10 * COIN, QuantumScript(0x72)},
+                      /*height=*/12, /*coinbase=*/false, /*coinstake=*/false,
+                      /*time=*/0};
+    ValueLifecycleClassification state;
+    BOOST_REQUIRE(ClassifyValueLifecycle(
+        direct, /*synthetic=*/false, params, /*evaluation_height=*/20,
+        /*evaluation_mtp=*/0, std::nullopt, std::nullopt, state) ==
+        ValueLifecycleResult::OK);
+    BOOST_CHECK(state.category == ValueLifecycleCategory::DIRECT_QUANTUM_PHASE_LOCKED);
+    BOOST_CHECK(!state.consensus_spendable);
+    BOOST_CHECK_EQUAL(state.earliest_spend_height, 21);
+
+    BOOST_REQUIRE(ClassifyValueLifecycle(
+        direct, /*synthetic=*/false, params, /*evaluation_height=*/21,
+        /*evaluation_mtp=*/0, std::nullopt, std::nullopt, state) ==
+        ValueLifecycleResult::OK);
+    BOOST_CHECK(state.category == ValueLifecycleCategory::MIGRATION_SPENDABLE_DIRECT_QUANTUM);
+    BOOST_CHECK(state.consensus_spendable);
+    BOOST_CHECK(state.ordinary_spendable);
+
+    BOOST_REQUIRE(ClassifyValueLifecycle(
+        direct, /*synthetic=*/false, params, /*evaluation_height=*/65,
+        /*evaluation_mtp=*/0, std::nullopt, std::nullopt, state) ==
+        ValueLifecycleResult::OK);
+    BOOST_CHECK(state.category == ValueLifecycleCategory::DEMURRAGE_LOCKED);
+    BOOST_CHECK(state.demurrage_active);
+    BOOST_CHECK(state.demurrage_locked);
+    BOOST_CHECK(state.permanently_locked);
+    BOOST_CHECK_EQUAL(state.nominal_amount, 10 * COIN);
+    BOOST_CHECK_EQUAL(state.effective_amount, 0);
+    BOOST_CHECK_EQUAL(state.burned_amount, 10 * COIN);
+
+    BOOST_REQUIRE(ClassifyValueLifecycle(
+        direct, /*synthetic=*/false, params, /*evaluation_height=*/50,
+        /*evaluation_mtp=*/0, /*latest_attestation_height=*/50,
+        /*attestation_coverage_start_height=*/41, state) ==
+        ValueLifecycleResult::OK);
+    BOOST_CHECK(state.category == ValueLifecycleCategory::MIGRATION_SPENDABLE_DIRECT_QUANTUM);
+    BOOST_CHECK(state.demurrage_active);
+    BOOST_CHECK(state.demurrage_exempt);
+    BOOST_CHECK_EQUAL(state.demurrage_exemption, "attested");
+    BOOST_CHECK_EQUAL(state.effective_amount, 10 * COIN);
+    BOOST_CHECK_EQUAL(state.burned_amount, 0);
+}
+
+BOOST_AUTO_TEST_CASE(shadow_emission_checked_helper_pins_boundaries)
+{
+    BOOST_REQUIRE(GetScheduledShadowEmissionThrough(SHADOW_REWARD_START_HEIGHT - 1));
+    BOOST_CHECK_EQUAL(*GetScheduledShadowEmissionThrough(SHADOW_REWARD_START_HEIGHT - 1), 0);
+    BOOST_REQUIRE(GetScheduledShadowEmissionThrough(SHADOW_REWARD_START_HEIGHT));
+    BOOST_CHECK_EQUAL(*GetScheduledShadowEmissionThrough(SHADOW_REWARD_START_HEIGHT), 580 * COIN);
+    BOOST_REQUIRE(GetScheduledShadowEmissionThrough(SHADOW_REWARD_END_HEIGHT));
+    BOOST_CHECK_EQUAL(*GetScheduledShadowEmissionThrough(SHADOW_REWARD_END_HEIGHT), SHADOW_MAX_EMISSION);
+    BOOST_REQUIRE(GetScheduledShadowEmissionThrough(std::numeric_limits<int>::max()));
+    BOOST_CHECK_EQUAL(*GetScheduledShadowEmissionThrough(std::numeric_limits<int>::max()), SHADOW_MAX_EMISSION);
 }
 
 BOOST_AUTO_TEST_CASE(shadow_base_reward_boundaries_are_pinned)
