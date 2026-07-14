@@ -32,6 +32,9 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.extra_args = [[
             "-allowunsafequantumkeyrpc=1",
+            # The test enables staking only while constructing its PoS claim block.
+            # Prevent wallet reloads from racing the later reorg assertions.
+            "-autostartstaking=0",
             "-txindex=1",
             "-staketimio=50",
             "-shadowwhitelistheight=1",

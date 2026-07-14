@@ -35,6 +35,25 @@ class GoldRushInfoTest(BitcoinTestFramework):
         for node in self.nodes:
             node.setmocktime((tip_time & ~0xf) + 16)
 
+    def _generate_with_peer_offline(self, node, blocks, address):
+        """Generate a large batch without making the idle peer time out."""
+        self.disconnect_nodes(0, 1)
+        try:
+            hashes = self.generatetoaddress(node, blocks, address, sync_fun=self.no_op)
+        finally:
+            self.connect_nodes(0, 1)
+        self.sync_blocks()
+        return hashes
+
+    @staticmethod
+    def _mempool_pow_claims(node):
+        claims = []
+        for txid in node.getrawmempool():
+            tx = node.getrawtransaction(txid, True)
+            if any(QQSPROOF_HEX in output["scriptPubKey"]["hex"] for output in tx["vout"]):
+                claims.append(txid)
+        return claims
+
     def _assert_builtin_pow_miner_lifecycle(self):
         node = self.nodes[0]
         wallet_name = "goldrush_pow_builtin"
@@ -42,8 +61,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
         wallet = node.get_wallet_rpc(wallet_name)
         target = wallet.getnewaddress()
 
-        self.generatetoaddress(node, 101, target, sync_fun=self.no_op)
-        self.sync_blocks()
+        self._generate_with_peer_offline(node, 101, target)
         self._sync_mocktime_to_tip()
 
         if not self.is_cli_compiled():
@@ -106,9 +124,8 @@ class GoldRushInfoTest(BitcoinTestFramework):
 
         rpc_target = wallet.getnewaddress()
         cli_target = wallet.getnewaddress()
-        self.generatetoaddress(node, 101, rpc_target, sync_fun=self.no_op)
-        self.generatetoaddress(node, 101, cli_target, sync_fun=self.no_op)
-        self.sync_blocks()
+        self._generate_with_peer_offline(node, 101, rpc_target)
+        self._generate_with_peer_offline(node, 101, cli_target)
         self._sync_mocktime_to_tip()
 
         self.log.info("Checking miner work RPC for a non-whitelisted PoW target")
@@ -141,6 +158,14 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(wallet.getpowmininginfo()["enabled"], False)
 
         self._assert_builtin_pow_miner_lifecycle()
+
+        # The built-in worker can win while its lifecycle telemetry is sampled.
+        # Its next-block-only claim must expire before the manual claim checks.
+        if self._mempool_pow_claims(node):
+            self.log.info("Advancing the tip to expire a claim found by the built-in PoW miner")
+            self._generate_with_peer_offline(node, 1, node.get_deterministic_priv_key().address)
+            self._sync_mocktime_to_tip()
+        assert_equal(self._mempool_pow_claims(node), [])
 
         self.disconnect_nodes(0, 1)
 
