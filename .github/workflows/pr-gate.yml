@@ -472,8 +472,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             automake bison build-essential cmake gettext gperf libtool \
-            pkg-config python3 g++-mingw-w64-x86-64-posix \
-            binutils-mingw-w64-x86-64
+            pkg-config python3 g++-mingw-w64-x86-64-posix
 
       - name: Build pinned Windows dependencies
         run: |
@@ -495,18 +494,12 @@ jobs:
           mkdir -p ci/scratch
           cxx=$(sed -n 's/^CXX = //p' src/Makefile)
           "$cxx" --version | sed -n '1p' > ci/scratch/windows-cross-compiler.txt
-          for binary in src/test/test_blackcoin.exe src/bench/bench_blackcoin.exe; do
-            "$WINDOWS_HOST-objdump" -f "$binary" |
-              grep -Fq 'architecture: i386:x86-64'
-            "$WINDOWS_HOST-objdump" -p "$binary" > "$binary.imports"
-            if grep -Eiq \
-              'DLL Name: (libstdc\+\+-6|libgcc_s_[^ ]+|libwinpthread-1|libssp-0)\.dll' \
-              "$binary.imports"; then
-              echo "Non-system runtime DLL imported by $binary" >&2
-              grep -i 'DLL Name:' "$binary.imports" >&2
-              exit 1
-            fi
-          done
+          python3 ci/release/verify_windows_native_binary.py \
+            --binary src/test/test_blackcoin.exe \
+            --binary src/bench/bench_blackcoin.exe \
+            --source-sha "$TARGET_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --output-manifest ci/scratch/windows-native-inputs.json
 
       - name: Upload exact Windows vector binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
@@ -517,6 +510,7 @@ jobs:
             src/bench/bench_blackcoin.exe
             src/Makefile
             ci/scratch/windows-cross-compiler.txt
+            ci/scratch/windows-native-inputs.json
           if-no-files-found: error
           retention-days: 3
 
@@ -552,6 +546,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          python ci/release/verify_windows_native_binary.py \
+            --binary src/test/test_blackcoin.exe \
+            --binary src/bench/bench_blackcoin.exe \
+            --source-sha "$TARGET_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --expected-manifest ci/scratch/windows-native-inputs.json
           for suite in dbwrapper_tests crypto_hardening_tests demurrage_tests shadow_tests; do
             src/test/test_blackcoin.exe \
               --run_test="$suite" --log_level=test_suite

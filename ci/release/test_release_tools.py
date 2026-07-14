@@ -72,6 +72,54 @@ class ReleaseToolTests(unittest.TestCase):
         path.write_bytes(header)
         path.chmod(0o755)
 
+    def write_windows_test_pe(self, path, imports=("KERNEL32.dll",),
+                              machine=0x8664, optional_magic=0x020B,
+                              delay_imports=False):
+        data = bytearray(0x800)
+        pe_offset = 0x80
+        optional_offset = pe_offset + 24
+        optional_size = 0xF0
+        section_table = optional_offset + optional_size
+        section_rva = 0x1000
+        section_raw = 0x200
+
+        data[:2] = b"MZ"
+        struct.pack_into("<I", data, 0x3C, pe_offset)
+        data[pe_offset:pe_offset + 4] = b"PE\0\0"
+        struct.pack_into(
+            "<HHIIIHH", data, pe_offset + 4,
+            machine, 1, 0, 0, 0, optional_size, 0x0022,
+        )
+        struct.pack_into("<H", data, optional_offset, optional_magic)
+        struct.pack_into("<I", data, optional_offset + 60, section_raw)
+        struct.pack_into("<I", data, optional_offset + 108, 16)
+        import_size = (len(imports) + 1) * 20
+        struct.pack_into(
+            "<II", data, optional_offset + 112 + 8,
+            section_rva, import_size,
+        )
+        if delay_imports:
+            struct.pack_into(
+                "<II", data, optional_offset + 112 + 13 * 8,
+                section_rva + 0x380, 32,
+            )
+
+        data[section_table:section_table + 8] = b".idata\0\0"
+        struct.pack_into(
+            "<IIII", data, section_table + 8,
+            0x500, section_rva, 0x600, section_raw,
+        )
+        for index, dll in enumerate(imports):
+            name_rva = section_rva + 0x100 + index * 0x40
+            struct.pack_into(
+                "<IIIII", data, section_raw + index * 20,
+                0, 0, 0, name_rva, section_rva + 0x300 + index * 8,
+            )
+            encoded = dll.encode("ascii") + b"\0"
+            name_offset = section_raw + 0x100 + index * 0x40
+            data[name_offset:name_offset + len(encoded)] = encoded
+        path.write_bytes(data)
+
     def make_resource_bundle(self, directory, source_sha, repository,
                              provenance_manifest):
         verifier = load_module("verify_resource_benchmark_bundle")
@@ -162,6 +210,47 @@ class ReleaseToolTests(unittest.TestCase):
                     verifier.verify_bundle(directory, source_sha, repository, manifest)
             finally:
                 manifest.unlink(missing_ok=True)
+
+    def test_windows_native_binary_gate_is_allowlisted_and_artifact_bound(self):
+        verifier = load_module("verify_windows_native_binary")
+        repository = "Blackcoin-Dev/Blackcoin"
+        source_sha = "56" * 20
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            test_binary = root / "test_blackcoin.exe"
+            bench_binary = root / "bench_blackcoin.exe"
+            self.write_windows_test_pe(test_binary, ("KERNEL32.dll", "WS2_32.dll"))
+            self.write_windows_test_pe(bench_binary, ("KERNEL32.dll",))
+            paths = [test_binary, bench_binary]
+
+            manifest = verifier.build_manifest(paths, source_sha, repository)
+            self.assertEqual(
+                {record["name"] for record in manifest["binaries"]},
+                {"test_blackcoin.exe", "bench_blackcoin.exe"},
+            )
+            expected = root / "windows-native-inputs.json"
+            expected.write_text(json.dumps(manifest), encoding="utf-8")
+            verifier.verify_expected(
+                verifier.build_manifest(paths, source_sha, repository), expected
+            )
+
+            bench_binary.write_bytes(bench_binary.read_bytes() + b"changed")
+            with self.assertRaisesRegex(RuntimeError, "differ from the cross-build"):
+                verifier.verify_expected(
+                    verifier.build_manifest(paths, source_sha, repository), expected
+                )
+
+            self.write_windows_test_pe(bench_binary, ("zlib1.dll",))
+            with self.assertRaisesRegex(RuntimeError, "non-system or unreviewed"):
+                verifier.build_manifest(paths, source_sha, repository)
+
+            self.write_windows_test_pe(bench_binary, machine=0xAA64)
+            with self.assertRaisesRegex(RuntimeError, "expected AMD64"):
+                verifier.build_manifest(paths, source_sha, repository)
+
+            self.write_windows_test_pe(bench_binary, delay_imports=True)
+            with self.assertRaisesRegex(RuntimeError, "delay imports"):
+                verifier.build_manifest(paths, source_sha, repository)
 
     def test_resource_benchmark_evidence_is_source_bound_and_fail_closed(self):
         generator = load_module("generate_resource_benchmark_evidence")
@@ -707,7 +796,9 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("runs-on: ubuntu-24.04-arm", gate)
         self.assertIn("native-windows-crypto:", gate)
         self.assertIn("runs-on: windows-2025", gate)
-        self.assertIn("architecture: i386:x86-64", gate)
+        self.assertEqual(gate.count("verify_windows_native_binary.py"), 2)
+        self.assertIn("windows-native-inputs.json", gate)
+        self.assertNotIn("libstdc\\+\\+-6", gate)
         self.assertIn("--platform windows", gate)
         self.assertIn("--architecture arm64", gate)
         self.assertIn("--architecture x86_64", gate)
