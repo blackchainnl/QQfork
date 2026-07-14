@@ -57,7 +57,6 @@ from test_framework.script import (
     MAX_SCRIPT_ELEMENT_SIZE,
     OP_0,
     OP_1,
-    OP_2,
     OP_14,
     OP_15,
     OP_16,
