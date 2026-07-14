@@ -18,6 +18,8 @@
 #include <util/check.h>
 #include <util/moneystr.h>
 
+#include <limits>
+
 bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
 {
     if (tx.nLockTime == 0)
@@ -256,16 +258,23 @@ CAmount GetMinFee(const CTransaction& tx, uint32_t nTimeTx)
 
 CAmount GetMinFee(size_t nBytes, uint32_t nTime)
 {
+    // CFeeRate stores byte counts as uint32_t. Real transactions are already
+    // bounded far below that limit, but callers and tests may supply an
+    // arbitrary size_t. Refuse to truncate an out-of-domain value into a
+    // smaller, apparently affordable transaction.
+    if (nBytes > std::numeric_limits<uint32_t>::max()) return MAX_MONEY;
+    const uint32_t fee_bytes{static_cast<uint32_t>(nBytes)};
+
     CAmount nMinFee;
     CFeeRate nMinFeeRate;
 
     if (Params().GetConsensus().IsProtocolV3_1(nTime)) {
         nMinFeeRate = CFeeRate{TX_FEE_PER_KB};
-        nMinFee = (nBytes <= 100) ? MIN_TX_FEE : nMinFeeRate.GetFee(nBytes);
+        nMinFee = (fee_bytes <= 100) ? MIN_TX_FEE : nMinFeeRate.GetFee(fee_bytes);
     }
     else {
         nMinFeeRate = CFeeRate{DEFAULT_MIN_RELAY_TX_FEE};
-        nMinFee = nMinFeeRate.GetFee(nBytes);
+        nMinFee = nMinFeeRate.GetFee(fee_bytes);
     }
 
     if (!MoneyRange(nMinFee))
