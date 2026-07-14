@@ -108,7 +108,7 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
 
         wallet.walletpassphrase(passphrase, 100, True)
         assert_raises_rpc_error(-13, "staking only", wallet.dumpquantumkey, first["address"])
-        assert_raises_rpc_error(-4, "staking only", wallet.getnewquantumaddress, "blocked")
+        assert_raises_rpc_error(-13, "staking only", wallet.getnewquantumaddress, "blocked")
 
         # Verification is internal and does not disclose or create a key, so a
         # staking-only unlock may still produce a complete checked backup.
