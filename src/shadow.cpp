@@ -1986,7 +1986,10 @@ bool HashMeetsLeadingZeroBits(const uint256& hash, unsigned int bits)
         bits -= 8;
     }
     if (bits == 0) return true;
-    const unsigned char mask = 0xff << (8 - bits);
+    // Integer promotion makes the shift operate on unsigned int. Narrow the
+    // result explicitly after the shift so sanitizer builds do not treat the
+    // intentional low-byte mask as an implicit signed truncation.
+    const unsigned char mask = static_cast<unsigned char>(0xffU << (8U - bits));
     return (*data & mask) == 0;
 }
 
