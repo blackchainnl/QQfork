@@ -134,6 +134,10 @@ QString ColdStakeGuide()
 <h3>Delegator example</h3>
 <p>A user wants another node to stake for them. They select a verified node from the list, create a delegation deposit address, choose an amount, and click Delegate coins. The wallet signs a transaction that sends the selected quantum value into the cold-stake contract. The selected node can stake it, but the owner wallet remains the spend authority.</p>
 
+<h3>Automatic redelegation is conditional</h3>
+<p>When automatic mode is enabled, a normally unlocked private-key owner wallet can move a safe, owner-spendable delegation only after its operator has no observed wins for 6 x the expected interval, clamped to 300-4,050 blocks. A 1,350-block activation probation, attempt and success rate limits, and up to 1,350 blocks of deterministic jitter also apply. The wallet requires a meaningfully better verified target.</p>
+<p>An over-cap current pool does not trigger redelegation. Over-cap targets are excluded when an under-cap alternative exists; if every verified candidate is over the cap, the bootstrap fallback can still select one. A missing target or transaction failure leaves the delegation unchanged.</p>
+
 <h3>Unstaking example</h3>
 <p>If the user stops a delegation, the wallet owner-spends the delegation back to a fresh wallet-backed quantum address when the selected output is spendable. If a bonded output is still in its unbonding period, the wallet explains the unlock height instead of silently failing.</p>
 
@@ -174,9 +178,9 @@ QString DemurrageGuide()
     return QObject::tr(R"HTML(
 <h2>Demurrage and liveness attestations</h2>
 <p>Demurrage is an inactivity rule for eligible direct, tiered, and cold-stake quantum outputs. It is inactive throughout Gold Rush and Migration, then activates automatically with Final Lockout at height 6,922,000.</p>
-<p>A liveness attestation is a small fee-paying transaction that proves the controlling quantum key is still actively managed. The wallet can create attestations for wallet-backed quantum addresses.</p>
-<p><b>Example:</b> a user has a direct quantum output that has not moved for many months. Before it begins to lose effective value, the wallet can send an attestation for that key. The Account tab shows whether outputs are decaying, locked, or protected by a recent attestation.</p>
-<p>Cold-stake delegation alone is not exempt; a successful coinstake spends and recreates the output and refreshes its activity. Mainnet configures no exempt scripts. Any nominal-minus-effective principal realized by a spend is permanently burned and is never paid to a miner, staker, treasury, reward pool, or claim participant.</p>
+<p>A liveness attestation is a small fee-paying transaction that proves the controlling quantum key is still actively managed. The wallet can create attestations only for eligible wallet-backed direct or tiered v16 addresses. A cold-stake output cannot be attested.</p>
+<p><b>Example:</b> a user has an eligible direct quantum output that has not moved for many months. Before it begins to lose effective value, the wallet can send an attestation for that key. Automatic attempts require staking to be enabled, a normally unlocked private-key wallet, a safe spendable fee input, and available attestation capacity. Construction or broadcast failure can defer an attempt. Merely leaving the wallet online does not guarantee an attestation.</p>
+<p>Cold-stake delegation alone is not exempt; a successful coinstake spends and recreates the output and refreshes its activity. The Account tab shows whether outputs are decaying, locked, or protected by a recent qualifying attestation. Mainnet configures no exempt scripts. Any nominal-minus-effective principal realized by a spend is permanently burned and is never paid to a miner, staker, treasury, reward pool, or claim participant.</p>
 )HTML");
 }
 

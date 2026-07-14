@@ -1403,7 +1403,7 @@ WalletDemurrageInfo GetWalletDemurrageInfo(CWallet& wallet)
         } else if (eval.locked) {
             output.action = "locked: this output can no longer be spent";
         } else if (attestation_due && info.wallet_staking_enabled) {
-            output.action = "auto-attest eligible while staking";
+            output.action = "attestation due: automatic attempt also requires normal unlock and a safe fee input";
         } else if (attestation_due) {
             output.action = "manual attestation recommended";
         } else if (eval.burned_value > 0) {

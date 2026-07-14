@@ -2350,10 +2350,11 @@ static RPCHelpMan redelegatequantumcoldstake()
 static RPCHelpMan senddemurrageattestation()
 {
     return RPCHelpMan{"senddemurrageattestation",
-        "\nCreate a fee-paying demurrage liveness attestation for a wallet-backed Blackcoin ML-DSA address.\n"
+        "\nCreate a fee-paying demurrage liveness attestation for an eligible wallet-backed direct or tiered v16 Blackcoin ML-DSA address.\n"
+        "Cold-stake outputs cannot be attested.\n"
         "The attestation output carries no value; it refreshes the key's inactivity clock once mined after -qqdemurrageheight is active.\n",
         {
-            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-backed Blackcoin migration address to attest."},
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Eligible wallet-backed direct or tiered v16 Blackcoin migration address to attest."},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Attestation options.",
             {
                 {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{false}, "Build and return the transaction without committing it to the wallet."},
@@ -2457,11 +2458,11 @@ static RPCHelpMan getdemurragewalletinfo()
             {RPCResult::Type::BOOL, "demurrage_height_guard_satisfied", "Whether evaluation_height is at or above demurrage_effective_activation_height"},
             {RPCResult::Type::BOOL, "demurrage_post_migration_guard_satisfied", "Whether evaluation_time is after quantum_migration_deadline_time"},
             {RPCResult::Type::BOOL, "wallet_staking_enabled", "Whether this wallet has staking enabled"},
-            {RPCResult::Type::NUM, "quantum_outputs", "Wallet-owned direct quantum outputs considered"},
+            {RPCResult::Type::NUM, "quantum_outputs", "Wallet-owned direct or tiered v16 quantum outputs considered"},
             {RPCResult::Type::NUM, "decaying_outputs", "Outputs whose effective value is below nominal value"},
             {RPCResult::Type::NUM, "locked_outputs", "Outputs at the 24-month demurrage lock point"},
             {RPCResult::Type::NUM, "attestation_due_outputs", "Outputs at or beyond the 3-month auto-attestation policy threshold"},
-            {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal value of considered wallet-owned direct quantum outputs"},
+            {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal value of considered wallet-owned direct or tiered v16 quantum outputs"},
             {RPCResult::Type::STR_AMOUNT, "effective_amount", "Demurrage-adjusted spendable value at evaluation_height"},
             {RPCResult::Type::STR_AMOUNT, "burned_if_spent_amount", "Amount that would be burned if all considered outputs were spent at evaluation_height"},
             {RPCResult::Type::ARR, "outputs", "Per-output demurrage state",
@@ -2581,7 +2582,7 @@ static RPCHelpMan getdemurragewalletinfo()
         } else if (eval.locked) {
             action = "locked: this output can no longer be spent";
         } else if (attestation_due && wallet_staking_enabled) {
-            action = "auto-attest eligible while staking";
+            action = "attestation due: automatic attempt also requires normal unlock and a safe fee input";
         } else if (attestation_due) {
             action = "senddemurrageattestation recommended";
         } else if (eval.burned_value > 0) {

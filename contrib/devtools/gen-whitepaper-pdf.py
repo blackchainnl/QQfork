@@ -4,6 +4,7 @@
 Requires: pip install reportlab
 Usage: python3 contrib/devtools/gen-whitepaper-pdf.py
 """
+import hashlib
 import os
 import re
 
@@ -12,7 +13,7 @@ from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT  # type: ignore[i
 from reportlab.lib.pagesizes import letter  # type: ignore[import]
 from reportlab.lib.styles import ParagraphStyle  # type: ignore[import]
 from reportlab.lib.units import inch  # type: ignore[import]
-from reportlab.platypus import (BaseDocTemplate, Frame, HRFlowable, KeepTogether,  # type: ignore[import]
+from reportlab.platypus import (BaseDocTemplate, CondPageBreak, Frame, HRFlowable, KeepTogether,  # type: ignore[import]
                                 PageBreak, PageTemplate, Paragraph, Spacer, Table,
                                 TableStyle)
 from reportlab.platypus.tableofcontents import TableOfContents  # type: ignore[import]
@@ -203,6 +204,7 @@ def parse(md_lines):
             txt = inline(s[3:])
             block = [Paragraph(txt, H1),
                      HRFlowable(width="100%", thickness=1.1, color=GOLD, spaceBefore=0, spaceAfter=8)]
+            flow.append(CondPageBreak(1.25*inch))
             if first_h1_done:
                 flow.append(Spacer(1, 6))
             flow.append(KeepTogether(block))
@@ -305,8 +307,8 @@ DOC_AUTHOR = "Quantum Quasar Developers"
 DOC_SUBJECT = "A Post-Quantum, Participation-First Evolution of Blackcoin"
 DOC_KEYWORDS = ("Blackcoin, Quantum Quasar, Protocol V4, ML-DSA-44, post-quantum, "
                 "proof-of-stake, demurrage, Gold Rush, quantum staking")
-DOC_CREATOR = "Adobe Acrobat Pro 24.2.20933"
-DOC_PRODUCER = "Adobe PDF Library 24.2.159"
+DOC_CREATOR = "Blackcoin gen-whitepaper-pdf.py (ReportLab)"
+DOC_PRODUCER = "pypdf"
 # Fixed authoring/revision timestamps (America/Denver, UTC-06) for a reproducible build.
 PDF_DATE = "D:20260714120000-06'00'"
 XMP_CREATE = "2026-07-14T12:00:00-06:00"
@@ -314,7 +316,7 @@ XMP_MODIFY = "2026-07-14T12:00:00-06:00"
 
 def _xmp_packet(doc_id, inst_id):
     return ("<?xpacket begin=\"\\ufeff\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n"
-            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core 9.1-c003 79.b0f8be9, 2024/01/12-14:24:29\">\n"
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"pypdf\">\n"
             " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n"
             "  <rdf:Description rdf:about=\"\"\n"
             "    xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\"\n"
@@ -338,7 +340,7 @@ def _xmp_packet(doc_id, inst_id):
             "<?xpacket end=\"w\"?>")
 
 def stamp_metadata(path):
-    """Rewrite DocInfo + XMP so the file presents as Acrobat-authored output."""
+    """Rewrite DocInfo and XMP with truthful deterministic generator metadata."""
     import uuid
     from pypdf import PdfReader, PdfWriter  # type: ignore[import]
     from pypdf.generic import DecodedStreamObject, NameObject  # type: ignore[import]
@@ -356,7 +358,15 @@ def stamp_metadata(path):
         "/ModDate": PDF_DATE,
     })
     doc_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "blackcoin-quantum-quasar-whitepaper"))
-    inst_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "blackcoin-quantum-quasar-whitepaper-30.1.0"))
+    with open(SRC, "rb") as source_file:
+        source_bytes = source_file.read()
+    with open(__file__, "rb") as generator_file:
+        generator_bytes = generator_file.read()
+    revision_digest = hashlib.sha256(source_bytes + b"\0" + generator_bytes).hexdigest()
+    inst_id = str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"blackcoin-quantum-quasar-whitepaper:{revision_digest}",
+    ))
     xmp = DecodedStreamObject()
     xmp.set_data(_xmp_packet(doc_id, inst_id).encode("utf-8"))
     xmp[NameObject("/Type")] = NameObject("/Metadata")

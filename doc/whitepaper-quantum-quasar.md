@@ -78,10 +78,11 @@ pillars below all serve that goal.
   holdings that remain inactive for more than six months begin a slow, capped decay.
   Decayed principal is burned when spent; it is never added to transaction fees or paid
   to a miner or staker. The point is to ensure that keys are alive
-  and that the security weight of the supply reflects who is actually present. A single
-  automatic, near-free liveness attestation every few months (the wallet does it for you)
-  keeps a direct quantum holding current. A cold-stake output is also subject to the
-  activity clock; a successful coinstake spends and recreates it, resetting that clock.
+  and that the security weight of the supply reflects who is actually present. For an
+  eligible direct or tiered v16 holding, the wallet can attempt a low-fee liveness
+  attestation when staking is enabled, the wallet is normally unlocked, and a safe fee
+  input is available. A cold-stake output is also subject to the activity clock; a
+  successful coinstake spends and recreates it, resetting that clock.
 
 - **A bounded, well-signposted quantum migration.** Legacy elliptic-curve outputs are the
   network's quantum attack surface. Gold Rush keeps ordinary quantum funding disabled so
@@ -177,20 +178,22 @@ revealed at spend time.
 
 ### 3.3 New witness versions and address types
 
-V4 defines three new SegWit witness versions, each a 32-byte commitment
+V4 defines three new SegWit witness versions. Direct v14/v16 programs and the reserved
+v15 shape are 32 bytes; tiered v14/v16 programs are 40 bytes
 (`src/consensus/quantum_witness.h`, `src/addresstype.h`). All use the mainnet Bech32
 human-readable prefix **`blk`** (`src/kernel/chainparams.cpp`).
 
 | Witness v | Program | Purpose |
 |:---:|:---:|---------|
-| **v16** | 32-byte commitment | **Quantum migration** output: the ML-DSA-protected home for migrated coins. Subject to demurrage. |
+| **v16** | 32-byte direct or 40-byte tiered program | **Quantum migration / tiered staking** output: an ML-DSA-protected home for migrated coins. Subject to demurrage. |
 | **v15** | 32-byte commitment | **Reserved EUTXO shape**: disabled/frozen in v30.1.1 because it has no quantum ownership authorization. |
-| **v14** | 32-byte commitment | **Quantum cold-stake**: owner/staker-separated delegation output, subject to inactivity demurrage. |
+| **v14** | 32-byte direct or 40-byte tiered program | **Quantum cold-stake**: owner/staker-separated delegation output, subject to inactivity demurrage. |
 
-For the authenticated v14 and v16 paths, the on-chain address is a 32-byte commitment and
-the bulky ML-DSA public key and signature are supplied in the witness at spend time. The
-reserved v15 commitment does not commit to an ML-DSA owner; this is why v30.1.1 must not
-fund or spend it.
+For authenticated v14 and v16 paths, the base program carries a 32-byte commitment. A
+tiered program prepends eight bytes of state to a 32-byte commitment. The bulky ML-DSA
+public key and signature are supplied in the witness at spend time. The reserved v15
+commitment does not commit to an ML-DSA owner; this is why v30.1.1 must not fund or spend
+it.
 
 ### 3.4 Self-test on startup
 
@@ -313,7 +316,8 @@ transactions carried in OP_RETURN outputs:
   be reimbursed in one block. Invalid, malformed, and excess claims receive nothing, and
   all credits still sum exactly to the pre-existing pool.
 
-The wallet automates both. See §9 for the exact RPCs (`sendshadowsignal`,
+The wallet can automate both when the corresponding staking/mining mode and signing
+prerequisites are satisfied. See §9 for the exact RPCs (`sendshadowsignal`,
 `sendshadowpowclaim`, `setpowmining`, `getgoldrushinfo`).
 
 ---
@@ -421,8 +425,9 @@ inactive_blocks = spend_height − effective_last_active
 
 If `inactive_blocks ≤ DEMURRAGE_GRACE_BLOCKS` (**243,000 blocks = 6 months**), the output
 is **exempt**, full value, no decay (`"young"` if freshly created/moved, `"attested"` if
-kept alive by an attestation). Creating, moving, attesting, or receiving the coin all
-reset the clock.
+kept alive by a qualifying attestation). Creating, moving, or receiving an output resets
+its clock. A qualifying attestation resets the clock only for an eligible direct/tiered
+v16 key.
 
 ### 6.3 The decay curve
 
@@ -445,7 +450,8 @@ only the effective value as input principal. The transaction fee is then
 block producer. A coinstake is governed by the same rule: only effective principal is
 returned, and its reward remains limited to the ordinary PoS subsidy plus explicit fees.
 
-**Decay table (a quantum coin that is never attested, moved, or successfully staked):**
+**Decay table (a subject output with no qualifying attestation, spend/recreation, or
+successful coinstake):**
 
 | Months inactive | Value retained |
 |:---:|:---:|
@@ -462,17 +468,19 @@ tiny), and the losses only become material deep into the second year of *total* 
 This is by design, it gives even a careless holder a very long runway, while ensuring that
 genuinely dead coins eventually stop counting as security weight.
 
-### 6.4 Staying at 100% is automatic and nearly free
+### 6.4 Keeping eligible holdings at 100%
 
-There are three ways to keep a quantum holding at full value, and the wallet handles them
-for you:
+There are three ways to keep a quantum holding at full value. Which one applies depends on
+the output type and wallet state:
 
-- **Automatic liveness attestation.** A demurrage attestation is a zero-value, fee-only
-  transaction carrying an ML-DSA signature (`senddemurrageattestation`) that resets the
-  clock. An attestation is valid for **6 months** (`DEMURRAGE_ATTEST_VALIDITY_BLOCKS =
-  243,000`), and the wallet auto-attests at the **3-month** mark
-  (`DEMURRAGE_AUTO_ATTEST_BLOCKS = 121,500`) while it is running and unlocked for
-  quantum/legacy staking. A holder who simply keeps their wallet online never decays.
+- **Wallet-assisted liveness attestation.** A demurrage attestation is a zero-value,
+  fee-only transaction carrying an ML-DSA signature (`senddemurrageattestation`) that
+  resets an eligible direct or tiered v16 key's clock. An attestation is valid for
+  **6 months** (`DEMURRAGE_ATTEST_VALIDITY_BLOCKS = 243,000`), and the wallet attempts one
+  at the **3-month** mark (`DEMURRAGE_AUTO_ATTEST_BLOCKS = 121,500`) only while staking is
+  enabled, the private-key wallet is normally unlocked rather than staking-only, and a
+  safe spendable fee input is available. Capacity, construction, or broadcast failures
+  can defer an attempt; merely leaving a wallet online is not a guarantee.
 - **Active cold staking.** Cold-stake (v14) outputs remain subject to demurrage. Each
   successful coinstake realizes any accrued burn, returns only effective principal plus
   the ordinary reward, recreates the output, and resets its activity clock. Delegation by
@@ -486,7 +494,8 @@ attestation is due, and whether the output is locked. `sweepdemurragedecay` spen
 that are decaying but still have positive effective value, realizes the burn, and moves the
 remainder minus the explicit fee to a fresh quantum address. Outputs at zero effective
 value are permanently locked and are skipped. The GUI surfaces the same information and
-can send attestations with one click.
+can request an attestation for an eligible selected address; normal unlock, key, fee, and
+broadcast requirements still apply.
 
 In short, timely participation preserves principal. Any decay realized by a spend is
 destroyed, not redistributed.
@@ -547,21 +556,30 @@ tuned by the community without a fork.
 
 ### 7.4 Autonomous redelegation
 
-Delegations do not have to be babysat. The wallet's redelegation engine
-(`src/wallet/redelegation.h`) automatically moves stake away from operators who stop
-producing, or away from pools that exceed the cap, subject to careful policy:
+An unlocked owner wallet can use the redelegation engine
+(`src/wallet/redelegation.h`) to move an eligible delegation after its current operator
+has produced no observed wins for the policy interval and a meaningfully better verified
+target is available. A pool exceeding the policy cap does not itself trigger
+redelegation.
 
-- **Trigger:** an operator that produces zero wins for `6 × expected_interval_blocks`.
-- **Rate limiting:** a minimum of **1,350 blocks** (≈ 1 day) between redelegation attempts,
-  with a matching probation period after a failed attempt, and randomized jitter to avoid a
-  synchronized "thundering herd" of redelegations.
-- **Ranking:** it considers the top candidates by liveness improvement and share, and never
-  redelegates into a pool if doing so would breach the cap.
+- **Trigger:** `6 × expected_interval_blocks`, clamped to **300-4,050 blocks**, followed by
+  deterministic per-delegation jitter of up to **1,350 blocks**.
+- **Dampers:** attempts and successes have a **1,350-block** rate limit. A separate
+  **1,350-block** probation period runs from the current delegation's activation height;
+  it is not a probation period created by a failed attempt.
+- **Ranking:** verified non-current operators are ranked first by observed liveness and then
+  by smaller pool share. Over-cap targets are removed when an under-cap alternative exists.
+  If every verified candidate is over the cap, the bootstrap fallback permits those
+  candidates and reports the projection.
+- **Execution prerequisites:** automatic mode must be enabled, the owner wallet must be
+  normally unlocked with private keys, and the delegation must be safe and owner-spendable.
+  A missing target or transaction failure leaves the delegation unchanged.
 - **RPCs:** `getquantumredelegationinfo` (dry-run/status), `redelegatequantumcoldstake`
   (manual, with cap enforcement and a dry-run mode).
 
-The net effect: a delegator's coins keep working for them and keep the pool distribution
-healthy, with no manual intervention.
+The policy can reduce maintenance for an unlocked owner wallet, but it is not a consensus
+guarantee of liveness or pool distribution and does not remove the need to monitor failed
+or deferred attempts.
 
 ---
 
@@ -659,7 +677,7 @@ RPC set.
 
 | RPC | Purpose |
 |-----|---------|
-| `senddemurrageattestation` | Send a liveness attestation to reset a quantum output's clock |
+| `senddemurrageattestation` | Send a liveness attestation for an eligible wallet-backed direct/tiered v16 key; cold-stake outputs cannot be attested |
 | `getdemurragewalletinfo` | Per-output decay state, effective value, attestation-due flag |
 | `sweepdemurragedecay` | Realize decay on still-spendable outputs and move the effective remainder |
 
@@ -698,7 +716,8 @@ The Qt wallet adds two dedicated pages:
 The **Unlock Wallet** dialog offers two explicit, mutually-exclusive modes: **For Legacy
 Staking Only** (mint PoS blocks, no spending or quantum actions) and **Legacy and Quantum
 Staking** (full unlock, required for any quantum, Gold Rush, migration, or cold-staking
-transaction, and for the automatic demurrage attestations that keep holdings at 100%).
+transaction). Automatic demurrage-attestation attempts additionally require staking to be
+enabled and a safe spendable fee input.
 
 ---
 
@@ -717,9 +736,12 @@ Alice holds 250,000 BLK and wants zero maintenance.
 4. **Optional:** she runs `fundquantumcoldstakeaddress` to delegate to a cold-staking
    operator (or her own hot node). Her principal stays owner-controlled and can earn
    staking rewards. Successful coinstakes refresh the output's activity clock.
-5. **Afterward:** if she leaves coins in a direct quantum address, her wallet auto-attests
-   every 3 months while online. If she delegates, she monitors successful staking or moves
-   the output before prolonged inactivity; delegation alone is not an exemption.
+5. **Afterward:** if she leaves coins in a direct quantum address, her wallet can attempt an
+   attestation at 3 months while staking is enabled, normally unlocked, and funded by a safe
+   fee input. She still monitors the reported state because an attempt can be deferred. If
+   she delegates, she monitors successful staking or moves the output before prolonged
+   inactivity; delegation alone is not an exemption and cold-stake outputs cannot be
+   attested.
 
 Alice prepares during Gold Rush, completes one migration action during Migration, and can
 optionally add a staking workflow.
@@ -729,9 +751,11 @@ optionally add a staking workflow.
 Bob holds 40,000 BLK (above the 10,000 whitelist threshold) and runs a node.
 
 1. His account is captured in the whitelist snapshot at height 5,945,000.
-2. During Gold Rush he simply keeps staking. Each time he mints a PoS block, his wallet
-   broadcasts a `sendshadowsignal` within the 14-day window, and he is credited from the
-   PoS pool, on top of his normal staking rewards.
+2. During Gold Rush he keeps staking. After a qualifying solve, a normally unlocked wallet
+   attempts a QQSIGNAL if that legacy target does not already have an active signal. The
+   confirmed signal remains active for the 14-day window; later solves do not cause one
+   signal per minted block. While active, he shares the PoS pool on top of normal staking
+   rewards.
 3. If he wants to also work the PoW lane, he enables `setpowmining`; the light 1-MiB
    Argon2id puzzle lets his ordinary CPU submit `sendshadowpowclaim` proofs for a share of
    the PoW pool.
@@ -761,11 +785,13 @@ Dan wants to stake on behalf of others.
 
 1. He posts a 30-day operator bond (`fundquantumoperatorbond`), registering a verified
    commitment.
-2. Delegators send him cold-stake delegations; their principals remain theirs, and the
-   20% per-pool cap keeps any one operator (including Dan) from dominating.
-3. If Dan's node goes down, delegators' wallets **autonomously redelegate** away from him
-   after the trigger window, so delegators are protected without lifting a finger, and
-   Dan is incentivized to stay reliable.
+2. Delegators send him cold-stake delegations; their principals remain theirs. The 20%
+   wallet-policy cap steers new delegations toward under-cap alternatives when they exist,
+   but it does not prevent an operator from exceeding that share.
+3. If Dan's node stops producing, a normally unlocked owner wallet can redelegate an
+   eligible, owner-spendable delegation after the clamped zero-win trigger, rate limits,
+   probation, and jitter, but only if a meaningfully better verified target is available.
+   The owner still monitors failures and prolonged inactivity.
 
 ---
 
@@ -790,8 +816,8 @@ distributed set of participants.
   supply is a stronger, more valuable supply for everyone who stayed.
 
 - **Tiered, cold, and pooled staking** lower the barrier to participation: cold delegation
-  lets a holder participate without exposing the owner key on a hot node, and
-  autonomous redelegation keeps the pool landscape healthy and decentralized on its own.
+  lets a holder participate without exposing the owner key on a hot node, and conditional
+  owner-wallet redelegation can steer stale delegations toward better verified operators.
 
 Across all of these mechanics, the V4 equilibrium points every holder toward the same
 choice. Whether large or small, technical or not, the sensible move is to participate,
@@ -837,8 +863,7 @@ that help nearly effortless, and burns realized decay rather than redistributing
 
 - **The per-pool cap is policy, not consensus.** It cannot by itself prevent a determined
   operator from accumulating stake; it only steers the default wallet behavior. Genuine
-  decentralization still depends on delegators choosing diverse operators, which the
-  autonomous redelegation engine actively encourages.
+  decentralization still depends on delegators choosing diverse operators.
 
 ---
 
@@ -873,15 +898,23 @@ the competing-claim boundary shown below.
 | `DEMURRAGE_GRACE_BLOCKS` | 243,000 (6 months) | No-decay grace period | `consensus/demurrage.h` |
 | `DEMURRAGE_ZERO_BLOCKS` | 972,000 (24 months) | Full-decay point | `consensus/demurrage.h` |
 | Decay window | 729,000 (18 months) | Quadratic decay span | `consensus/demurrage.cpp` |
-| `DEMURRAGE_ATTEST_VALIDITY_BLOCKS` | 243,000 (6 months) | Attestation validity | `consensus/demurrage.cpp` |
-| `DEMURRAGE_AUTO_ATTEST_BLOCKS` | 121,500 (3 months) | Wallet auto-attest cadence | `consensus/demurrage.cpp` |
+| `DEMURRAGE_ATTEST_VALIDITY_BLOCKS` | 243,000 (6 months) | Attestation validity | `consensus/demurrage.h` |
+| `DEMURRAGE_AUTO_ATTEST_BLOCKS` | 121,500 (3 months) | Conditional wallet attempt threshold | `consensus/demurrage.h` |
 | `DEMURRAGE_BLOCKS_PER_MONTH` | 40,500 | Block/month conversion | `consensus/demurrage.h` |
 | ML-DSA public key | 1,312 bytes | Quantum public key size | `crypto/mldsa.h` |
 | ML-DSA signature | 2,420 bytes | Quantum signature size | `crypto/mldsa.h` |
-| Quantum migration witness | v16, 32-byte program | Migrated-coin output | `consensus/quantum_witness.h` |
-| EUTXO witness | v15, 32-byte program | Reserved shape; funding and spending disabled in v30.1.1 | `addresstype.h` |
-| Cold-stake witness | v14, 32-byte program | Delegation output (subject to inactivity demurrage) | `consensus/quantum_witness.h` |
+| `QUANTUM_MIGRATION_PROGRAM_SIZE` | 32 bytes | Direct v16 program | `consensus/quantum_witness.h` |
+| `QUANTUM_TIERED_PROGRAM_SIZE` | 40 bytes | Tiered v14/v16 program | `consensus/quantum_witness.h` |
+| `EUTXO_PROGRAM_SIZE` | 32 bytes | Reserved v15 shape; funding and spending disabled in v30.1.1 | `addresstype.h` |
+| `QUANTUM_COLDSTAKE_PROGRAM_SIZE` | 32 bytes | Direct v14 program | `consensus/quantum_witness.h` |
 | `QUANTUM_POOL_CAP_BPS` | 2000 (20%) | Per-pool delegation cap (policy) | `node/quantum_pool.h` |
+| `QuantumRedelegationPolicy::trigger_multiplier` | 6 | Expected zero-win interval multiplier | `wallet/redelegation.h` |
+| `QuantumRedelegationPolicy::min_trigger_blocks` | 300 blocks | Minimum zero-win trigger | `wallet/redelegation.h` |
+| `QuantumRedelegationPolicy::max_patience_blocks` | 4,050 blocks | Maximum zero-win trigger | `wallet/redelegation.h` |
+| `QuantumRedelegationPolicy::rate_limit_blocks` | 1,350 blocks | Attempt/success rate limit | `wallet/redelegation.h` |
+| `QuantumRedelegationPolicy::probation_blocks` | 1,350 blocks | Current-target activation probation | `wallet/redelegation.h` |
+| `QuantumRedelegationPolicy::stampede_jitter_blocks` | 1,350 blocks | Deterministic maximum jitter | `wallet/redelegation.h` |
+| `QuantumRedelegationPolicy::liveness_improvement_blocks` | 300 blocks | Required target liveness improvement | `wallet/redelegation.h` |
 | Operator bond period | 40,500 blocks (30 days) | Verified operator commitment | `wallet/rpc/staking.cpp` |
 | Block time | 64 seconds | Mainnet target spacing | `kernel/chainparams.cpp` |
 | Bech32 HRP | `blk` | Mainnet address prefix | `kernel/chainparams.cpp` |
@@ -902,8 +935,10 @@ the competing-claim boundary shown below.
 - **Demurrage**, the liveness mechanism by which inactive quantum outputs slowly lose
   effective value. Realized decay is burned, never paid to a miner or staker. Timely
   attestation or a spend/recreation refreshes activity; cold delegation alone does not.
-- **Attestation**, a zero-value ML-DSA-signed transaction that resets a quantum output's
-  demurrage clock; auto-sent by the wallet.
+- **Attestation**, a zero-value ML-DSA-signed transaction that resets an eligible direct or
+  tiered v16 key's demurrage clock. Cold-stake outputs cannot be attested. The wallet can
+  attempt attestations only when its staking, unlock, key, fee-input, and capacity
+  prerequisites are satisfied.
 - **Cold staking**, owner/staker key separation (witness v14) letting a holder delegate
   staking while retaining principal control; subject to the inactivity schedule.
 - **Tiered staking**, self-staking with a consensus-visible bonding/unbonding lock schedule.

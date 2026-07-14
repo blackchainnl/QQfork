@@ -108,15 +108,20 @@ principal safety while improving operator distribution.
   consensus split for eligible cold-stake coinstakes.
 - Tiered staking weights use a deterministic fixed-point curve for eligible
   quantum staking commitments.
-- Autonomous redelegation lets an unlocked owner wallet move a delegation when
-  the current operator has not won for the configured interval and a better
-  verified target is available.
+- Automatic redelegation lets a normally unlocked private-key owner wallet move
+  a safe, owner-spendable delegation only after the current operator has no
+  observed wins for the clamped policy interval and a meaningfully better
+  verified target is available. Rate limits, activation probation, and
+  deterministic jitter also apply.
 - The per-pool cap is wallet and policy guidance. It steers new delegations away
-  from oversized operators when alternatives exist, but it is not a consensus
+  from oversized operators when under-cap alternatives exist, but exceeding the
+  cap does not trigger redelegation. If every verified target is over the cap,
+  the bootstrap fallback may still select one. The cap is not a consensus
   defense and does not prevent solo staking or operator sub-pools.
 - Cold-stake outputs remain subject to demurrage. A successful coinstake or
-  authenticated liveness attestation refreshes activity; delegation by itself
-  is not an exemption.
+  owner spend/recreation refreshes the output; delegation by itself is not an
+  exemption. Liveness attestations apply only to eligible direct/tiered v16
+  keys and cannot refresh a cold-stake output.
 
 ## Demurrage And Liveness
 
@@ -124,9 +129,11 @@ Demurrage activates automatically at the first Final height after the
 migration deadline. It applies to eligible direct, tiered, and cold-stake
 quantum outputs; mainnet configures no exempt scripts. It is inactive during
 Gold Rush and Migration. Wallet-backed liveness attestations can refresh
-eligible direct quantum keys, and successful cold-stake coinstakes refresh
-their recreated outputs. Any realized decay is permanently burned, not paid to
-a miner, staker, treasury, or reward pool.
+eligible direct/tiered v16 keys, but not cold-stake outputs. Automatic attempts
+also require staking to be enabled, a normally unlocked private-key wallet, and
+a safe spendable fee input. Successful cold-stake coinstakes refresh their
+recreated outputs. Any realized decay is permanently burned, not paid to a
+miner, staker, treasury, or reward pool.
 
 Witness-v15 EUTXO commitments are not a usable activity path. v30.1.1 provides
 no supported funding or spending workflow, and consensus rejects v15 outputs

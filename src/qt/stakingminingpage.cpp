@@ -870,6 +870,8 @@ void StakingMiningPage::setupUi()
            "<li>Delegate coins. Pending funding appears immediately and becomes active after confirmation.</li>"
            "<li>Use Stop delegation to owner-spend back to a fresh quantum address.</li>"
            "</ol>"
+           "<h3>Automatic redelegation</h3>"
+           "<p>When enabled, automatic redelegation requires a normally unlocked private-key owner wallet and a safe owner-spendable delegation. It runs only after a clamped zero-win interval, activation probation, rate limits, and deterministic jitter, and only when a meaningfully better verified target is available. An over-cap current pool does not trigger it. The cap excludes over-cap targets only while an under-cap alternative exists; the all-over-cap bootstrap can still select one.</p>"
            "<h3>Gold Rush rewards</h3>"
            "<p>Gold Rush reward outputs cannot fund delegation during Gold Rush. After Gold Rush and maturity, they are ordinary direct quantum funds and do not require a preliminary move.</p>"),
         coldstakeBox);
@@ -1058,9 +1060,9 @@ void StakingMiningPage::setupUi()
     m_demurrage_guards = new QLabel(QStringLiteral("-"), migrationBox);
     m_demurrage_guards->setObjectName(QStringLiteral("demurrageGuards"));
     m_demurrage_guards->setWordWrap(true);
-    m_demurrage_attest = new QPushButton(tr("Attest selected quantum address"), migrationBox);
+    m_demurrage_attest = new QPushButton(tr("Attest selected direct/tiered address"), migrationBox);
     m_demurrage_attest->setObjectName(QStringLiteral("demurrageAttest"));
-    m_demurrage_attest->setToolTip(tr("Create a fee-paying liveness attestation for the selected wallet-backed quantum address."));
+    m_demurrage_attest->setToolTip(tr("Create a fee-paying liveness attestation for an eligible wallet-backed direct or tiered v16 address. Cold-stake outputs cannot be attested."));
     m_demurrage_sweep = new QPushButton(tr("Sweep decaying outputs"), migrationBox);
     m_demurrage_sweep->setObjectName(QStringLiteral("demurrageSweep"));
     m_demurrage_sweep->setToolTip(tr("Move currently decaying wallet-owned quantum outputs to a fresh quantum address, realizing the demurrage burn."));
@@ -1124,7 +1126,7 @@ void StakingMiningPage::setupUi()
         tr("<h3>Purpose</h3>"
            "<p>Demurrage is a post-migration inactivity rule for eligible quantum outputs. It is inactive during Gold Rush and Migration, then starts automatically with Final Lockout at height 6,922,000.</p>"
            "<h3>Attestations</h3>"
-           "<p>A liveness attestation is a small fee-paying transaction for a selected quantum address. It proves the key is still being actively maintained and resets the inactivity clock for that key.</p>"
+           "<p>A liveness attestation is a small fee-paying transaction for an eligible wallet-backed direct or tiered v16 address. It resets that key's inactivity clock. Cold-stake outputs cannot be attested. Automatic attempts require staking to be enabled, a normally unlocked private-key wallet, a safe spendable fee input, and available capacity; construction or broadcast failures can defer them.</p>"
            "<h3>Scope and burn</h3>"
            "<p>Direct, tiered, and cold-stake quantum outputs are subject to the inactivity schedule; delegation alone is not exempt, and mainnet configures no exempt scripts. Any decay realized by a valid spend is permanently burned and is not paid to a miner, staker, treasury, reward pool, or claim participant. The panel shows current exposure, effective value, and guard state.</p>"),
         migrationBox);
@@ -1562,13 +1564,13 @@ void StakingMiningPage::onSendDemurrageAttestation()
     if (!m_wallet_model) return;
     const QString address = m_quantum_address->text().trimmed();
     if (address.isEmpty()) {
-        m_demurrage_status->setText(tr("Select or create a quantum address before sending an attestation."));
+        m_demurrage_status->setText(tr("Select or create an eligible direct or tiered v16 address before sending an attestation."));
         return;
     }
     const int rc = QMessageBox::question(
         this,
         tr("Demurrage attestation"),
-        tr("This will create a small fee-paying liveness attestation for the selected quantum address:\n%1\n\nContinue?")
+        tr("This will create a small fee-paying liveness attestation for the selected eligible direct or tiered v16 address:\n%1\n\nContinue?")
             .arg(address));
     if (rc != QMessageBox::Yes) return;
 

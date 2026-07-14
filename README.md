@@ -32,11 +32,12 @@ helping secure the chain**.
 - **Liveness demurrage.** Demurrage activates automatically at the first Final
   block. Eligible quantum coins that then remain inactive for more than six
   months slowly decay. Decayed principal is permanently burned when spent and
-  is never paid to a miner, staker, treasury, or reward pool. A timely liveness
-  attestation, ordinary spend, or successful cold-stake refresh keeps the
-  activity clock current.
+  is never paid to a miner, staker, treasury, or reward pool. A timely
+  direct/tiered-v16 liveness attestation, ordinary spend, or successful cold-stake
+  refresh keeps the applicable activity clock current.
 - **Rich quantum staking.** Tiered self-staking, cold staking with owner/staker key
-  separation, operator bonds, a per-pool decentralization cap, and autonomous redelegation.
+  separation, operator bonds, a per-pool decentralization cap, and conditional
+  owner-wallet redelegation.
 - **Advanced primitives.** RGB client-side asset commitments plus
   inspection-only EUTXO commitment decoding and wallet metadata. Do not fund a
   witness-v15 address in v30.1.1; its creation and spend RPCs intentionally
