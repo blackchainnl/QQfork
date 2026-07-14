@@ -1036,20 +1036,22 @@ BOOST_FIXTURE_TEST_CASE(shadow_proof_internal_failure_preserves_base_validity_an
     // Replaying from the same durable parent reproduces the exact synthetic
     // transaction identity and accounting, which is the restart/reindex
     // contract used by ConnectBlock and RollforwardBlock callers.
-    CCoinsViewCache replay_view{&chainstate.CoinsTip()};
+    std::unique_ptr<CCoinsViewCache> replay_view;
     BlockValidationState replay_state;
     std::vector<ShadowSyntheticPayoutTransaction> replay_payouts;
     ShadowGoldRushInfo replay_shadow;
     {
         LOCK(cs_main);
-        SeedLegacyShadowClaimView(replay_view, parent, candidate);
+        replay_view = std::make_unique<CCoinsViewCache>(
+            &chainstate.CoinsTip());
+        SeedLegacyShadowClaimView(*replay_view, parent, candidate);
         BOOST_REQUIRE(chainstate.ConnectBlock(
-            candidate.block, replay_state, candidate.index.get(), replay_view,
+            candidate.block, replay_state, candidate.index.get(), *replay_view,
             /*fJustCheck=*/true, /*fCheckBlockSig=*/false));
-        replay_shadow = GetShadowGoldRushInfo(replay_view,
+        replay_shadow = GetShadowGoldRushInfo(*replay_view,
                                               candidate.index.get());
         replay_payouts = GetAppliedShadowClaimPayoutTransactionRecords(
-            replay_view, candidate.index->nHeight, candidate.block_hash,
+            *replay_view, candidate.index->nHeight, candidate.block_hash,
             candidate.index->GetBlockTime());
     }
     BOOST_CHECK(replay_state.IsValid());
@@ -1084,6 +1086,10 @@ BOOST_FIXTURE_TEST_CASE(bounded_claim_accounting_accepts_max_weight_malformed_bl
                                           uint32_t expected_malformed,
                                           uint32_t expected_invalid,
                                           uint32_t expected_over_limit) {
+        // The cache remains backed by the active chainstate throughout this
+        // maximum-weight evaluation, so retain cs_main for every possible
+        // parent lookup as well as the final ConnectBlock call.
+        LOCK(cs_main);
         CCoinsViewCache view{&chainstate.CoinsTip()};
         SeedLegacyShadowClaimView(view, parent, candidate);
         ShadowPowAccountingContext context;
@@ -1137,15 +1143,12 @@ BOOST_FIXTURE_TEST_CASE(bounded_claim_accounting_accepts_max_weight_malformed_bl
 
         BlockValidationState state;
         const auto connect_start = std::chrono::steady_clock::now();
-        {
-            LOCK(cs_main);
-            BOOST_REQUIRE_MESSAGE(
-                chainstate.ConnectBlock(candidate.block, state,
-                                        candidate.index.get(), view,
-                                        /*fJustCheck=*/true,
-                                        /*fCheckBlockSig=*/false),
-                state.ToString());
-        }
+        BOOST_REQUIRE_MESSAGE(
+            chainstate.ConnectBlock(candidate.block, state,
+                                    candidate.index.get(), view,
+                                    /*fJustCheck=*/true,
+                                    /*fCheckBlockSig=*/false),
+            state.ToString());
         const auto connect_seconds =
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::steady_clock::now() - connect_start)
@@ -1160,6 +1163,7 @@ BOOST_FIXTURE_TEST_CASE(bounded_claim_accounting_accepts_max_weight_malformed_bl
 
     LegacyShadowClaimCandidate single;
     {
+        LOCK(cs_main);
         CCoinsViewCache construction_view{&chainstate.CoinsTip()};
         SeedLegacyShadowClaimView(construction_view, parent, single);
         single = BuildLegacyShadowClaimCandidate(
@@ -1204,6 +1208,7 @@ BOOST_FIXTURE_TEST_CASE(bounded_claim_accounting_accepts_max_weight_malformed_bl
 
     LegacyShadowClaimCandidate many;
     {
+        LOCK(cs_main);
         CCoinsViewCache construction_view{&chainstate.CoinsTip()};
         SeedLegacyShadowClaimView(construction_view, parent, many);
         many = BuildLegacyShadowClaimCandidate(
