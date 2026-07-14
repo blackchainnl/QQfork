@@ -8702,7 +8702,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         }
         if (!EnsurePowPayoutAddress(error)) {
             WalletLogPrintf("Gold Rush PoW worker %d stopped: %s\n", worker_id, error.original);
-            m_pow_state = WalletPowMiningState::ERROR;
+            m_pow_state = WalletPowMiningState::RUNTIME_ERROR;
             m_pow_mining_enabled = false;
             break;
         }
@@ -8715,7 +8715,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         const CTxDestination quantum_dest = DecodeDestination(quantum_address);
         if (!IsValidDestination(quantum_dest) || !IsQuantumMigrationDestination(quantum_dest)) {
             WalletLogPrintf("Gold Rush PoW worker %d stopped: invalid payout address\n", worker_id);
-            m_pow_state = WalletPowMiningState::ERROR;
+            m_pow_state = WalletPowMiningState::RUNTIME_ERROR;
             m_pow_mining_enabled = false;
             break;
         }

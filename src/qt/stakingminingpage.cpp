@@ -2621,7 +2621,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     case interfaces::WalletPowMiningState::HASHING:
         pow_runtime_summary = tr("hashing at %1 tries/s").arg(QString::number(info.hashrate, 'f', 1));
         break;
-    case interfaces::WalletPowMiningState::ERROR:
+    case interfaces::WalletPowMiningState::RUNTIME_ERROR:
         pow_runtime_summary = tr("stopped after an error");
         break;
     }
@@ -2670,7 +2670,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         recommended_action = tr("Send this wallet a confirmed, spendable legacy BLK UTXO so it can authenticate and pay the fee for a Gold Rush PoW claim.");
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
         recommended_action = tr("Unlock this wallet normally. Gold Rush PoW claims cannot be signed while the wallet is locked or unlocked for staking only.");
-    } else if (info.state == interfaces::WalletPowMiningState::ERROR) {
+    } else if (info.state == interfaces::WalletPowMiningState::RUNTIME_ERROR) {
         recommended_action = tr("The Gold Rush PoW worker stopped after an error. Review debug.log, correct the reported problem, and restart the miner.");
     } else if (info.epoch_active && info.wallet_whitelisted_scripts > 0 && !normal_signing_available) {
         recommended_action = tr("Unlock with <b>Quantum and Legacy Staking</b> if you want this wallet to broadcast Gold Rush PoS signals. Legacy staking-only unlock will not create quantum signal transactions.");
@@ -2697,7 +2697,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         m_pow_status->setText(tr("PoW mining is enabled but waiting for an available chain tip."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::STARTING) {
         m_pow_status->setText(tr("PoW mining is starting and checking wallet and chain readiness."));
-    } else if (info.state == interfaces::WalletPowMiningState::ERROR) {
+    } else if (info.state == interfaces::WalletPowMiningState::RUNTIME_ERROR) {
         m_pow_status->setText(tr("PoW mining stopped after an error. Review debug.log before restarting the miner."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::EPOCH_INACTIVE) {
         m_pow_status->setText(tr("PoW mining is enabled and waiting until the Gold Rush epoch is active."));

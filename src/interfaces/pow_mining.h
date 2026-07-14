@@ -21,7 +21,7 @@ enum class WalletPowMiningState : uint8_t {
     CLAIM_IN_FLIGHT,
     READY,
     HASHING,
-    ERROR,
+    RUNTIME_ERROR,
 };
 
 constexpr std::string_view WalletPowMiningStateName(WalletPowMiningState state) noexcept
@@ -36,7 +36,7 @@ constexpr std::string_view WalletPowMiningStateName(WalletPowMiningState state) 
     case WalletPowMiningState::CLAIM_IN_FLIGHT: return "claim_in_flight";
     case WalletPowMiningState::READY: return "ready";
     case WalletPowMiningState::HASHING: return "hashing";
-    case WalletPowMiningState::ERROR: return "error";
+    case WalletPowMiningState::RUNTIME_ERROR: return "error";
     }
     return "error";
 }
