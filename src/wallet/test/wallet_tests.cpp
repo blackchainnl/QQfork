@@ -164,6 +164,7 @@ BOOST_FIXTURE_TEST_CASE(commit_refreshes_mempool_state_before_async_callbacks, T
         *m_node.chain,
         WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()),
         wallet_key);
+    wallet->SetBroadcastTransactions(/*broadcast=*/true);
     SyncWithValidationInterfaceQueue();
 
     // Keep transactionAddedToMempool queued so the synchronous post-broadcast
