@@ -147,6 +147,8 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("crypto-source-provenance:", workflow)
         self.assertIn("--fetch-upstream", workflow)
         self.assertIn("--require-upstream", workflow)
+        self.assertIn('--repository "$GITHUB_REPOSITORY"', workflow)
+        self.assertIn('--source-commit "$TARGET_SHA"', workflow)
         self.assertIn("quantum-crypto-provenance-${{ env.TARGET_SHA }}", workflow)
         release_workflow = (root / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
@@ -165,6 +167,14 @@ class ReleaseToolTests(unittest.TestCase):
         )
         self.assertIn(manifest["wycheproof"]["commit"], manifest["wycheproof"]["source_url"])
         self.assertTrue(manifest["wycheproof"]["source_url"].startswith("https://"))
+        self.assertEqual(
+            manifest["liboqs"]["upstream_files"]["src/common/rand/rand.c"],
+            "744cf859858fbf0591138f6921e10f910bcdcc4a4a6a7defc871f8d085647b19",
+        )
+        self.assertEqual(
+            manifest["liboqs"]["upstream_files"]["src/common/rand/rand.h"],
+            "e38e720b1680d51f6f87b9a2985b97e1530b476cc5f9c68dc62e4d7682915457",
+        )
 
     def test_quantum_crypto_downloader_rejects_untrusted_or_wrong_bytes(self):
         verifier = load_path(
@@ -194,6 +204,113 @@ class ReleaseToolTests(unittest.TestCase):
                         destination,
                     )
             self.assertFalse(destination.exists())
+
+    def test_quantum_crypto_rng_policy_rejects_production_hook_mutation(self):
+        verifier = load_path(
+            "verify_quantum_crypto_rng_policy",
+            TOOLS.parent.parent / "contrib" / "devtools" / "verify-quantum-crypto-sources.py",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "src" / "test").mkdir(parents=True)
+            (root / "src" / "good.cpp").write_text(
+                "void UsePinnedRandomness() {}\n", encoding="utf-8"
+            )
+            (root / "src" / "test" / "fixture.cpp").write_text(
+                "void OQS_randombytes_switch_algorithm();\n", encoding="utf-8"
+            )
+            policy = verifier.verify_no_rng_hook_mutation(root)
+            self.assertEqual(policy["files_scanned"], 1)
+            self.assertEqual(policy["violations"], [])
+
+            (root / "src" / "bad.cpp").write_text(
+                "void f() { OQS_randombytes_custom_algorithm(nullptr); }\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(SystemExit, "may not replace or switch"):
+                verifier.verify_no_rng_hook_mutation(root)
+
+    def test_quantum_crypto_kat_must_match_fresh_regeneration(self):
+        verifier = load_path(
+            "verify_quantum_crypto_kat",
+            TOOLS.parent.parent / "contrib" / "devtools" / "verify-quantum-crypto-sources.py",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tools = root / "contrib" / "devtools"
+            crypto = root / "src" / "crypto"
+            tools.mkdir(parents=True)
+            crypto.mkdir(parents=True)
+            source = root / "pinned.json"
+            source.write_bytes(b"freshly-generated-header\n")
+            (tools / "gen-mldsa44-kat.py").write_text(
+                "from pathlib import Path\n"
+                "import sys\n"
+                "Path(sys.argv[2]).write_bytes(Path(sys.argv[1]).read_bytes())\n",
+                encoding="utf-8",
+            )
+            checked_in = crypto / "mldsa_kat.h"
+            checked_in.write_bytes(source.read_bytes())
+            self.assertEqual(
+                verifier.verify_generated_kat(root, source),
+                hashlib.sha256(source.read_bytes()).hexdigest(),
+            )
+
+            checked_in.write_bytes(b"stale-or-tampered-header\n")
+            with self.assertRaisesRegex(SystemExit, "differs from the freshly regenerated"):
+                verifier.verify_generated_kat(root, source)
+
+    def test_quantum_crypto_evidence_rejects_repository_or_commit_mismatch(self):
+        verifier = load_path(
+            "verify_quantum_crypto_source_binding",
+            TOOLS.parent.parent / "contrib" / "devtools" / "verify-quantum-crypto-sources.py",
+        )
+        clean = (
+            subprocess.CompletedProcess([], 0, stdout=SOURCE_SHA + "\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+        )
+        with mock.patch.object(verifier.subprocess, "run", side_effect=clean):
+            self.assertEqual(
+                verifier.verify_source_checkout(
+                    Path("/checkout"), "Blackcoin-Dev/Blackcoin", SOURCE_SHA
+                ),
+                {"repository": "Blackcoin-Dev/Blackcoin", "commit": SOURCE_SHA},
+            )
+        with self.assertRaisesRegex(SystemExit, "repository must be exactly"):
+            verifier.verify_source_checkout(Path("/checkout"), "fork/Blackcoin", SOURCE_SHA)
+        mismatch = (
+            subprocess.CompletedProcess([], 0, stdout="f" * 40 + "\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+        )
+        with mock.patch.object(verifier.subprocess, "run", side_effect=mismatch):
+            with self.assertRaisesRegex(SystemExit, "source commit mismatch"):
+                verifier.verify_source_checkout(
+                    Path("/checkout"), "Blackcoin-Dev/Blackcoin", SOURCE_SHA
+                )
+        dirty = (
+            subprocess.CompletedProcess([], 0, stdout=SOURCE_SHA + "\n", stderr=""),
+            subprocess.CompletedProcess([], 0, stdout=" M src/crypto/mldsa.cpp\n", stderr=""),
+        )
+        with mock.patch.object(verifier.subprocess, "run", side_effect=dirty):
+            with self.assertRaisesRegex(SystemExit, "not clean"):
+                verifier.verify_source_checkout(
+                    Path("/checkout"), "Blackcoin-Dev/Blackcoin", SOURCE_SHA
+                )
+
+    def test_quantum_crypto_evidence_records_exact_source_identity(self):
+        verifier = load_path(
+            "verify_quantum_crypto_evidence_writer",
+            TOOLS.parent.parent / "contrib" / "devtools" / "verify-quantum-crypto-sources.py",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "manifest.json"
+            evidence = root / "evidence.json"
+            manifest.write_text("{}\n", encoding="utf-8")
+            source = {"repository": "Blackcoin-Dev/Blackcoin", "commit": SOURCE_SHA}
+            verifier.write_evidence(evidence, manifest, root, source, {}, {})
+            document = json.loads(evidence.read_text(encoding="utf-8"))
+            self.assertEqual(document["source"], source)
 
     def test_release_runbook_is_blackcoin_specific_and_covers_immutable_rollback(self):
         root = TOOLS.parent.parent

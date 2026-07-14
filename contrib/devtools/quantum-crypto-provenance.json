@@ -6,6 +6,8 @@
     "archive_url": "https://codeload.github.com/open-quantum-safe/liboqs/tar.gz/refs/tags/0.15.0",
     "archive_sha256": "3983f7cd1247f37fb76a040e6fd684894d44a84cecdcfbdb90559b3216684b5c",
     "upstream_files": {
+      "src/common/rand/rand.c": "744cf859858fbf0591138f6921e10f910bcdcc4a4a6a7defc871f8d085647b19",
+      "src/common/rand/rand.h": "e38e720b1680d51f6f87b9a2985b97e1530b476cc5f9c68dc62e4d7682915457",
       "src/sig/ml_dsa/CMakeLists.txt": "2e3f06e6b4fabf496f36547211c4d6d4f0ff33e53b3dd035ca1e406bbf4833bc",
       "src/sig/ml_dsa/sig_ml_dsa.h": "4c66c0d190b93dff9a5f430f2ade016e6dd11f2b7b8dade1761493c86a06d936",
       "src/sig/ml_dsa/sig_ml_dsa_44.c": "726f33d7d0743276df64fef13815ecd1888371890ec71752e3b1a71cc95270c7",

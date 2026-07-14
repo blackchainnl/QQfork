@@ -4,16 +4,35 @@
 import argparse
 import hashlib
 import json
-import tarfile
 from pathlib import Path
 import re
+import subprocess
+import sys
+import tarfile
+import tempfile
 import urllib.parse
 import urllib.request
 
 
 ALLOWED_UPSTREAM_HOSTS = {"codeload.github.com", "raw.githubusercontent.com"}
+EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
+FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MAX_UPSTREAM_BYTES = 128 * 1024 * 1024
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+FORBIDDEN_RNG_HOOKS = (
+    "OQS_randombytes_custom_algorithm",
+    "OQS_randombytes_switch_algorithm",
+)
+SOURCE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp"}
+NONPRODUCTION_SOURCE_PREFIXES = (
+    ("src", "bench"),
+    ("src", "test"),
+    ("src", "crc32c"),
+    ("src", "leveldb"),
+    ("src", "minisketch"),
+    ("src", "secp256k1"),
+    ("src", "univalue"),
+)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -65,6 +84,98 @@ def verify_local_files(root: Path, component: dict) -> dict:
         check_hash(str(path), actual, expected)
         verified[relative] = actual
     return verified
+
+
+def verify_source_checkout(root: Path, repository: str, source_commit: str) -> dict:
+    if repository != EXPECTED_REPOSITORY:
+        raise SystemExit(
+            f"source repository must be exactly {EXPECTED_REPOSITORY}, got {repository}"
+        )
+    if not FULL_SHA_RE.fullmatch(source_commit):
+        raise SystemExit("source commit must be a full lowercase 40-character SHA-1")
+    try:
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise SystemExit(f"cannot verify source checkout: {error}") from error
+    if head != source_commit:
+        raise SystemExit(f"source commit mismatch: checkout HEAD is {head}, expected {source_commit}")
+    if status:
+        raise SystemExit("source checkout is not clean; provenance evidence requires exact committed bytes")
+    return {"repository": repository, "commit": source_commit}
+
+
+def _is_nonproduction_source(relative: Path) -> bool:
+    parts = relative.parts
+    return any(parts[:len(prefix)] == prefix for prefix in NONPRODUCTION_SOURCE_PREFIXES)
+
+
+def verify_no_rng_hook_mutation(root: Path) -> dict:
+    source_root = root / "src"
+    if not source_root.is_dir():
+        raise SystemExit(f"missing production source directory: {source_root}")
+    inventory = []
+    violations = []
+    for path in sorted(source_root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in SOURCE_SUFFIXES:
+            continue
+        relative = path.relative_to(root)
+        if _is_nonproduction_source(relative):
+            continue
+        data = path.read_bytes()
+        inventory.append(f"{relative.as_posix()} {sha256_bytes(data)}")
+        for symbol in FORBIDDEN_RNG_HOOKS:
+            if symbol.encode("ascii") in data:
+                violations.append(f"{relative.as_posix()}: {symbol}")
+    if not inventory:
+        raise SystemExit("no production source files were scanned for forbidden RNG hooks")
+    if violations:
+        raise SystemExit(
+            "production source may not replace or switch the liboqs RNG: "
+            + "; ".join(violations)
+        )
+    return {
+        "scope": "production source excluding explicit test, benchmark, and vendored trees",
+        "files_scanned": len(inventory),
+        "inventory_sha256": sha256_bytes(("\n".join(inventory) + "\n").encode("utf-8")),
+        "forbidden_symbols": list(FORBIDDEN_RNG_HOOKS),
+        "violations": [],
+    }
+
+
+def verify_generated_kat(root: Path, wycheproof_json: Path) -> str:
+    generator = root / "contrib" / "devtools" / "gen-mldsa44-kat.py"
+    checked_in = root / "src" / "crypto" / "mldsa_kat.h"
+    if not generator.is_file() or not checked_in.is_file():
+        raise SystemExit("missing ML-DSA KAT generator or checked-in header")
+    with tempfile.TemporaryDirectory(prefix="blackcoin-mldsa-kat-") as temporary:
+        generated = Path(temporary) / "mldsa_kat.h"
+        try:
+            subprocess.run(
+                [sys.executable, str(generator), str(wycheproof_json), str(generated)],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            detail = getattr(error, "stderr", "") or str(error)
+            raise SystemExit(f"ML-DSA KAT regeneration failed: {detail.strip()}") from error
+        if generated.read_bytes() != checked_in.read_bytes():
+            raise SystemExit(
+                "checked-in src/crypto/mldsa_kat.h differs from the freshly regenerated "
+                "pinned Wycheproof vectors"
+            )
+    return sha256_file(checked_in)
 
 
 def download_pinned(url: str, expected_sha256: str, destination: Path) -> Path:
@@ -125,7 +236,7 @@ def validate_manifest(manifest: dict) -> None:
 
 
 def write_evidence(path: Path, manifest_path: Path, repo_root: Path,
-                   local: dict, upstream: dict) -> None:
+                   source: dict, local: dict, upstream: dict) -> None:
     try:
         recorded_manifest = str(manifest_path.resolve().relative_to(repo_root.resolve()))
     except ValueError:
@@ -136,6 +247,7 @@ def write_evidence(path: Path, manifest_path: Path, repo_root: Path,
             "path": recorded_manifest,
             "sha256": sha256_file(manifest_path),
         },
+        "source": source,
         "local": local,
         "upstream": upstream,
         "complete": set(upstream) == {"liboqs", "argon2", "wycheproof"},
@@ -159,10 +271,22 @@ def main() -> None:
                         help="fail unless all three upstream objects are verified")
     parser.add_argument("--evidence", type=Path,
                         help="write a machine-readable verification record")
+    parser.add_argument("--repository",
+                        help="exact GitHub owner/repository recorded in evidence")
+    parser.add_argument("--source-commit",
+                        help="full 40-character checkout commit recorded in evidence")
     args = parser.parse_args()
 
     manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
     validate_manifest(manifest)
+
+    source = None
+    if args.evidence:
+        if not args.repository or not args.source_commit:
+            raise SystemExit("--evidence requires --repository and --source-commit")
+        source = verify_source_checkout(args.repo_root, args.repository, args.source_commit)
+    elif args.repository or args.source_commit:
+        raise SystemExit("--repository and --source-commit are valid only with --evidence")
 
     explicit = (args.liboqs_archive, args.argon2_archive, args.wycheproof_json)
     if args.fetch_upstream and any(explicit):
@@ -187,6 +311,7 @@ def main() -> None:
     local = {
         "argon2": verify_local_files(args.repo_root, manifest["argon2"]),
         "wycheproof": verify_local_files(args.repo_root, manifest["wycheproof"]),
+        "rng_policy": verify_no_rng_hook_mutation(args.repo_root),
     }
     upstream = {}
     if args.liboqs_archive:
@@ -197,11 +322,18 @@ def main() -> None:
         actual = sha256_file(args.wycheproof_json)
         check_hash(str(args.wycheproof_json), actual,
                    manifest["wycheproof"]["source_sha256"])
-        upstream["wycheproof"] = {"source_sha256": actual}
+        upstream["wycheproof"] = {
+            "source_sha256": actual,
+            "regenerated_header_sha256": verify_generated_kat(
+                args.repo_root, args.wycheproof_json
+            ),
+        }
     if args.require_upstream and set(upstream) != {"liboqs", "argon2", "wycheproof"}:
         raise SystemExit("complete liboqs, Argon2, and Wycheproof provenance is required")
     if args.evidence:
-        write_evidence(args.evidence, args.manifest, args.repo_root, local, upstream)
+        write_evidence(
+            args.evidence, args.manifest, args.repo_root, source, local, upstream
+        )
 
     print("quantum cryptography source provenance verified")
 

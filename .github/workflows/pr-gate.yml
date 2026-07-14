@@ -139,6 +139,8 @@ jobs:
           python3 contrib/devtools/verify-quantum-crypto-sources.py \
             --fetch-upstream "$RUNNER_TEMP/quantum-crypto-upstream" \
             --require-upstream \
+            --repository "$GITHUB_REPOSITORY" \
+            --source-commit "$TARGET_SHA" \
             --evidence quantum-crypto-provenance-evidence.json
 
       - name: Upload exact-source provenance evidence
