@@ -345,9 +345,15 @@ jobs:
             echo "::error::Release build configured without SQLite wallet support"
             exit 1
           }
-          if ! make -j "$MAKEJOBS" ${{ matrix.goal }}; then
-            make ${{ matrix.goal }} V=1
+          make_args=()
+          if [[ "${{ matrix.name }}" == "windows-64-bit" ]]; then
+            make_args+=("BITCOIN_WIN_INSTALLER=$PWD/blackcoin-$CONFIGURED_VERSION-win64-setup.exe")
           fi
+          for goal in ${{ matrix.goal }}; do
+            if ! make -j "$MAKEJOBS" "${make_args[@]}" "$goal"; then
+              make "${make_args[@]}" "$goal" V=1
+            fi
+          done
 
       - name: Build and execute target crypto vectors
         if: ${{ !startsWith(matrix.name, 'macos-') }}
