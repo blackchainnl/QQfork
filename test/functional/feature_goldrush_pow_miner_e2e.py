@@ -128,8 +128,9 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
             now = time.time()
             if now - last_log >= 10:
                 self.log.info(
-                    "PoW miner wait: enabled=%s epoch_active=%s hashrate=%.2f claims=%s next_claim=%s mempool_claims=%s",
+                    "PoW miner wait: enabled=%s state=%s epoch_active=%s hashrate=%.2f claims=%s next_claim=%s mempool_claims=%s",
                     info["enabled"],
+                    info["state"],
                     info["epoch_active"],
                     info["hashrate"],
                     info["claims_submitted"],
@@ -234,13 +235,19 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         assert_equal(started["cpu_percent"], 100)
         assert_equal(node.validateaddress(started["payout_address"])["isvalid"], True)
         try:
-            time.sleep(1)
+            self.wait_until(
+                lambda: miner_wallet.getpowmininginfo()["state"] == "no_spendable_legacy_fee_utxo",
+                timeout=10,
+            )
             info = miner_wallet.getpowmininginfo()
             assert_equal(info["enabled"], True)
+            assert_equal(info["state"], "no_spendable_legacy_fee_utxo")
+            assert_equal(info["hashrate"], 0)
             assert_equal(info["claims_submitted"], 0)
             assert not (set(self._pow_claim_txids()) - existing_claims), "unfunded PoW miner must not broadcast a QQSPROOF claim"
         finally:
             miner_wallet.setpowmining(False)
+            assert_equal(miner_wallet.getpowmininginfo()["state"], "disabled")
             self._sync_mocktime_to_tip()
 
     def _start_miner_until_claim(self, miner_wallet):
@@ -253,10 +260,17 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         assert_equal(node.validateaddress(payout_address)["isvalid"], True)
         try:
             claim_txid = self._wait_for_miner_claim(miner_wallet)
-            assert_equal(miner_wallet.getpowmininginfo()["payout_address"], payout_address)
+            self.wait_until(
+                lambda: miner_wallet.getpowmininginfo()["state"] == "claim_in_flight",
+                timeout=10,
+            )
+            info = miner_wallet.getpowmininginfo()
+            assert_equal(info["payout_address"], payout_address)
+            assert_equal(info["state"], "claim_in_flight")
             return claim_txid, payout_address
         finally:
             miner_wallet.setpowmining(False)
+            assert_equal(miner_wallet.getpowmininginfo()["state"], "disabled")
             self._sync_mocktime_to_tip()
 
     def run_test(self):

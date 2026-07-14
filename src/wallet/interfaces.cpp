@@ -2330,6 +2330,7 @@ public:
         ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
         WalletPowMiningInfo info;
         info.enabled = m_wallet->m_pow_mining_enabled;
+        info.state = m_wallet->m_pow_state;
         info.threads = m_wallet->m_pow_threads;
         info.cpu_percent = m_wallet->m_pow_cpu_percent;
         info.hashrate = m_wallet->m_pow_hashrate;

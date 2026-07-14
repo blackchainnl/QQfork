@@ -2022,6 +2022,7 @@ static RPCHelpMan getpowmininginfo()
         {},
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is enabled."},
+            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, epoch_inactive, claim_in_flight, ready, hashing, or error."},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
             {RPCResult::Type::NUM, "cpu_percent", "Per-core CPU duty-cycle target."},
             {RPCResult::Type::NUM, "hashrate", "Aggregate Argon2id tries per second."},
@@ -2044,6 +2045,7 @@ static RPCHelpMan getpowmininginfo()
 
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("enabled", pwallet->m_pow_mining_enabled.load());
+    obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pwallet->m_pow_state.load())));
     obj.pushKV("threads", pwallet->m_pow_threads.load());
     obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
     obj.pushKV("hashrate", pwallet->m_pow_hashrate.load());

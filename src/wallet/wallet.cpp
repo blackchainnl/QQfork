@@ -117,6 +117,7 @@
 struct KeyOriginInfo;
 
 using interfaces::FoundBlock;
+using interfaces::WalletPowMiningState;
 
 namespace wallet {
 
@@ -8397,6 +8398,7 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
     m_pow_hashrate_start_ms = GetTime<std::chrono::milliseconds>().count();
     m_pow_next_nonce = 0;
     m_pow_claims_submitted = 0;
+    m_pow_state = WalletPowMiningState::STARTING;
     m_stop_pow_mining_thread = false;
     {
         LOCK(m_pow_miner_mutex);
@@ -8436,6 +8438,7 @@ void CWallet::StopPowMining()
         group->clear();
     }
     m_pow_hashrate = 0.0;
+    m_pow_state = WalletPowMiningState::DISABLED;
     m_stop_pow_mining_thread = false;
 }
 
@@ -8641,6 +8644,8 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
     while (!IsPowMiningClosing() && m_pow_mining_enabled.load()) {
         bilingual_str error;
         if (!HaveChain()) {
+            m_pow_hashrate = 0.0;
+            m_pow_state = WalletPowMiningState::CHAIN_UNAVAILABLE;
             SleepPowMiner(*this, std::chrono::seconds{1});
             continue;
         }
@@ -8653,11 +8658,13 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         }
         if (cannot_claim) {
             m_pow_hashrate = 0.0;
+            m_pow_state = WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY;
             SleepPowMiner(*this, std::chrono::seconds{2});
             continue;
         }
         if (!EnsurePowPayoutAddress(error)) {
             WalletLogPrintf("Gold Rush PoW worker %d stopped: %s\n", worker_id, error.original);
+            m_pow_state = WalletPowMiningState::ERROR;
             m_pow_mining_enabled = false;
             break;
         }
@@ -8670,6 +8677,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         const CTxDestination quantum_dest = DecodeDestination(quantum_address);
         if (!IsValidDestination(quantum_dest) || !IsQuantumMigrationDestination(quantum_dest)) {
             WalletLogPrintf("Gold Rush PoW worker %d stopped: invalid payout address\n", worker_id);
+            m_pow_state = WalletPowMiningState::ERROR;
             m_pow_mining_enabled = false;
             break;
         }
@@ -8684,6 +8692,10 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         }
         if (!have_target) {
             m_pow_hashrate = 0.0;
+            const bool claim_inflight = WITH_LOCK(m_pow_miner_mutex, return m_pow_claim_inflight);
+            m_pow_state = claim_inflight
+                ? WalletPowMiningState::CLAIM_IN_FLIGHT
+                : WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO;
             SleepPowMiner(*this, std::chrono::seconds{5});
             continue;
         }
@@ -8702,6 +8714,8 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             LOCK(cs_main);
             const CBlockIndex* tip = chainman.ActiveChain().Tip();
             if (!tip) {
+                m_pow_hashrate = 0.0;
+                m_pow_state = WalletPowMiningState::CHAIN_UNAVAILABLE;
                 loop_sleep = std::chrono::seconds{1};
             } else {
                 const Consensus::Params& consensus = Params().GetConsensus();
@@ -8709,8 +8723,10 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 const bool active = IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), next_height);
                 if (!active) {
                     m_pow_hashrate = 0.0;
+                    m_pow_state = WalletPowMiningState::EPOCH_INACTIVE;
                     loop_sleep = std::chrono::seconds{2};
                 } else {
+                    m_pow_state = WalletPowMiningState::READY;
                     tip_hash = tip->GetBlockHash();
                     bool claim_inflight{false};
                     {
@@ -8723,6 +8739,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                         claim_inflight = m_pow_claim_inflight;
                     }
                     if (claim_inflight) {
+                        m_pow_state = WalletPowMiningState::CLAIM_IN_FLIGHT;
                         loop_sleep = std::chrono::seconds{1};
                     } else {
                         // Snapshot the PoW work (the only coins-view read) under cs_main, then grind
@@ -8731,7 +8748,11 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                         nonce_start = m_pow_next_nonce.fetch_add(POW_MINER_BATCH_TRIES);
                         work = PrepareShadowPowWork(target, quantum_payout_script, tip, chainman.ActiveChainstate().CoinsTip());
                         should_grind = work.valid;
-                        if (!should_grind) loop_sleep = std::chrono::seconds{2};
+                        if (!should_grind) {
+                            m_pow_hashrate = 0.0;
+                            m_pow_state = WalletPowMiningState::CHAIN_UNAVAILABLE;
+                            loop_sleep = std::chrono::seconds{2};
+                        }
                     }
                 }
             }
@@ -8741,9 +8762,11 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             continue;
         }
         if (should_grind) {
+            m_pow_state = WalletPowMiningState::HASHING;
             const auto batch_start = std::chrono::steady_clock::now();
             proof_found = GrindShadowPowWork(work, nonce_start, 1, POW_MINER_BATCH_TRIES, proof, &tries_done);
             batch_elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - batch_start);
+            m_pow_state = WalletPowMiningState::READY;
         }
 
         if (tries_done > 0) {
@@ -8772,6 +8795,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             }
             if (SubmitShadowPowClaim(target, target_dest, proof, error)) {
                 ++m_pow_claims_submitted;
+                m_pow_state = WalletPowMiningState::CLAIM_IN_FLIGHT;
                 while (!IsPowMiningClosing() && m_pow_mining_enabled.load()) {
                     bool tip_changed = false;
                     {
@@ -8787,6 +8811,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 const bool conflict = IsShadowPowClaimConflict(error);
                 WalletLogPrintf("Gold Rush PoW worker %d could not submit claim: %s\n", worker_id, error.original);
                 if (conflict) {
+                    m_pow_state = WalletPowMiningState::CLAIM_IN_FLIGHT;
                     while (!IsPowMiningClosing() && m_pow_mining_enabled.load()) {
                         bool tip_changed = false;
                         {

@@ -10,6 +10,7 @@
 #include <addresstype.h>
 #include <consensus/amount.h>
 #include <interfaces/chain.h>
+#include <interfaces/pow_mining.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <support/allocators/secure.h>
@@ -602,6 +603,7 @@ struct WalletMigrationResult
 struct WalletPowMiningInfo
 {
     bool enabled{false};            //!< whether in-process PoW mining is currently requested
+    WalletPowMiningState state{WalletPowMiningState::DISABLED}; //!< bounded worker readiness/waiting state
     int threads{0};                 //!< worker threads (CPU cores) configured
     int cpu_percent{0};             //!< per-core CPU duty-cycle target, 1..100
     double hashrate{0.0};           //!< Argon2id tries per second (aggregate)

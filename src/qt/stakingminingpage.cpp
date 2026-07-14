@@ -1431,6 +1431,7 @@ void StakingMiningPage::onApplyPow()
     if (enabled && !current_info.enabled) {
         const QString body = tr("This will start the built-in Gold Rush PoW miner with %1 CPU core(s) at %2% target duty cycle.\n\n"
                                 "The wallet must be normally unlocked so it can sign QQSPROOF claim transactions. "
+                                "The miner also needs a confirmed, spendable legacy BLK UTXO to authenticate and pay the fee for each claim. "
                                 "A wallet-backed quantum payout key may be created automatically; back up this wallet after enabling mining.\n\n"
                                 "Start mining now?")
                                  .arg(cores)
@@ -2590,6 +2591,40 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     } else {
         unlock_mode = tr("locked");
     }
+
+    QString pow_runtime_summary;
+    switch (info.state) {
+    case interfaces::WalletPowMiningState::DISABLED:
+        pow_runtime_summary = tr("off");
+        break;
+    case interfaces::WalletPowMiningState::STARTING:
+        pow_runtime_summary = tr("starting");
+        break;
+    case interfaces::WalletPowMiningState::CHAIN_UNAVAILABLE:
+        pow_runtime_summary = tr("waiting for chain state");
+        break;
+    case interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY:
+        pow_runtime_summary = tr("waiting for a normal wallet unlock");
+        break;
+    case interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO:
+        pow_runtime_summary = tr("waiting for a spendable legacy fee UTXO");
+        break;
+    case interfaces::WalletPowMiningState::EPOCH_INACTIVE:
+        pow_runtime_summary = tr("waiting for Gold Rush");
+        break;
+    case interfaces::WalletPowMiningState::CLAIM_IN_FLIGHT:
+        pow_runtime_summary = tr("waiting for the submitted claim to resolve");
+        break;
+    case interfaces::WalletPowMiningState::READY:
+        pow_runtime_summary = tr("ready at %1 tries/s").arg(QString::number(info.hashrate, 'f', 1));
+        break;
+    case interfaces::WalletPowMiningState::HASHING:
+        pow_runtime_summary = tr("hashing at %1 tries/s").arg(QString::number(info.hashrate, 'f', 1));
+        break;
+    case interfaces::WalletPowMiningState::ERROR:
+        pow_runtime_summary = tr("stopped after an error");
+        break;
+    }
     m_staking_summary->setText(tr(
         "<b>Wallet mining snapshot</b><br>"
         "Legacy spendable: %1 &nbsp;|&nbsp; Quantum-controlled: %2<br>"
@@ -2599,7 +2634,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         .arg(formatBLK(balances.quantum_balance))
         .arg(wallet_signal_text)
         .arg(formatBLK(info.pos_estimated_payout_per_signaler))
-        .arg(info.enabled ? tr("running") : tr("off"))
+        .arg(pow_runtime_summary)
         .arg(formatBLK(info.next_claim_payout))
         .arg(unlock_mode));
 
@@ -2626,12 +2661,18 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         "%1<br>"
         "Next claim: %2<br>"
         "Payout: %3")
-        .arg(info.enabled ? tr("running at %1 tries/s").arg(QString::number(info.hashrate, 'f', 1)) : tr("off"))
+        .arg(pow_runtime_summary)
         .arg(formatBLK(info.next_claim_payout))
         .arg(info.payout_address.empty() ? tr("not created yet") : shortenHex(info.payout_address)));
 
     QString recommended_action;
-    if (info.epoch_active && info.wallet_whitelisted_scripts > 0 && !normal_signing_available) {
+    if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
+        recommended_action = tr("Send this wallet a confirmed, spendable legacy BLK UTXO so it can authenticate and pay the fee for a Gold Rush PoW claim.");
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
+        recommended_action = tr("Unlock this wallet normally. Gold Rush PoW claims cannot be signed while the wallet is locked or unlocked for staking only.");
+    } else if (info.state == interfaces::WalletPowMiningState::ERROR) {
+        recommended_action = tr("The Gold Rush PoW worker stopped after an error. Review debug.log, correct the reported problem, and restart the miner.");
+    } else if (info.epoch_active && info.wallet_whitelisted_scripts > 0 && !normal_signing_available) {
         recommended_action = tr("Unlock with <b>Quantum and Legacy Staking</b> if you want this wallet to broadcast Gold Rush PoS signals. Legacy staking-only unlock will not create quantum signal transactions.");
     } else if (info.epoch_active && info.wallet_recent_solve_qualified && !info.wallet_active_signal) {
         recommended_action = tr("This wallet has a recent PoS solve. Keep staking enabled and use a normal unlock so the wallet can publish the Gold Rush signal.");
@@ -2648,6 +2689,20 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         m_pow_status->setText(m_pow_pending_enabled ? tr("Starting Gold Rush PoW mining...") : tr("Stopping Gold Rush PoW mining..."));
     } else if (m_pow_settings_dirty && info.enabled) {
         m_pow_status->setText(tr("PoW miner settings changed. Click Apply to update the miner."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
+        m_pow_status->setText(tr("PoW mining is enabled but waiting for a confirmed, spendable legacy BLK UTXO to authenticate and pay the next claim fee."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
+        m_pow_status->setText(tr("PoW mining is enabled but waiting for a normal wallet unlock; locked and staking-only wallets cannot sign claims."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CHAIN_UNAVAILABLE) {
+        m_pow_status->setText(tr("PoW mining is enabled but waiting for an available chain tip."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::STARTING) {
+        m_pow_status->setText(tr("PoW mining is starting and checking wallet and chain readiness."));
+    } else if (info.state == interfaces::WalletPowMiningState::ERROR) {
+        m_pow_status->setText(tr("PoW mining stopped after an error. Review debug.log before restarting the miner."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::EPOCH_INACTIVE) {
+        m_pow_status->setText(tr("PoW mining is enabled and waiting until the Gold Rush epoch is active."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_IN_FLIGHT) {
+        m_pow_status->setText(tr("PoW mining is enabled and waiting for the submitted claim to confirm, conflict, or expire at the next tip."));
     } else if (info.enabled && info.epoch_active) {
         m_pow_status->setText(tr("Hashrate: %1 tries/s   |   Next claim payout: %2   |   Claims submitted: %3")
             .arg(QString::number(info.hashrate, 'f', 1))

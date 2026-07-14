@@ -8,6 +8,7 @@ from test_framework.util import assert_equal, assert_raises_rpc_error
 QQSPROOF_HEX = "51515350524f4f46"
 GOLD_RUSH_END_HEIGHT = 501
 MIGRATION_END_HEIGHT = 700
+POW_WALLET_PASSPHRASE = "goldrush-pow-state-test"
 
 class GoldRushInfoTest(BitcoinTestFramework):
     def add_options(self, parser):
@@ -72,6 +73,9 @@ class GoldRushInfoTest(BitcoinTestFramework):
         cli_wallet = node.cli(f"-rpcwallet={wallet_name}")
         legacy_payout = wallet.getnewquantumaddress("goldrush-pow")["address"]
         assert_equal(wallet.getaddressinfo(legacy_payout)["labels"], ["goldrush-pow"])
+        assert_equal(wallet.getpowmininginfo()["state"], "disabled")
+        wallet.encryptwallet(POW_WALLET_PASSPHRASE)
+        wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
         # Use real clock time while the worker runs. The hashrate meter is wall-clock based,
         # while epoch activity is derived from the already-connected chain tip.
         node.setmocktime(0)
@@ -88,7 +92,13 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(node.validateaddress(payout)["isvalid"], True)
             assert_equal(wallet.getpowmininginfo()["payout_address"], payout)
 
-            self.wait_until(lambda: wallet.getpowmininginfo()["hashrate"] > 0, timeout=60)
+            self.wait_until(
+                lambda: (
+                    wallet.getpowmininginfo()["hashrate"] > 0
+                    and wallet.getpowmininginfo()["state"] in ("ready", "hashing", "claim_in_flight")
+                ),
+                timeout=60,
+            )
             info = cli_wallet.getpowmininginfo()
             assert_equal(info["enabled"], True)
             assert_equal(info["threads"], 1)
@@ -96,6 +106,27 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(info["epoch_active"], True)
             assert_equal(info["payout_address"], payout)
             assert info["hashrate"] > 0
+
+            self.log.info("Locking an enabled miner reports a fail-soft waiting state")
+            wallet.walletlock()
+            self._generate_with_peer_offline(node, 1, node.get_deterministic_priv_key().address)
+            self.wait_until(
+                lambda: wallet.getpowmininginfo()["state"] == "wallet_locked_or_staking_only",
+                timeout=10,
+            )
+            locked = wallet.getpowmininginfo()
+            assert_equal(locked["enabled"], True)
+            assert_equal(locked["state"], "wallet_locked_or_staking_only")
+            assert_equal(locked["hashrate"], 0)
+
+            wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
+            self.wait_until(
+                lambda: (
+                    wallet.getpowmininginfo()["hashrate"] > 0
+                    and wallet.getpowmininginfo()["state"] in ("ready", "hashing", "claim_in_flight")
+                ),
+                timeout=60,
+            )
         finally:
             try:
                 cli_wallet.setpowmining(False)
@@ -104,6 +135,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
 
         stopped = wallet.getpowmininginfo()
         assert_equal(stopped["enabled"], False)
+        assert_equal(stopped["state"], "disabled")
         assert_equal(stopped["hashrate"], 0)
         if payout:
             assert_equal(stopped["payout_address"], payout)
@@ -244,6 +276,26 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(cli_claim["proof_mode_byte"], 0)
             assert cli_claim["proof"].startswith(QQSPROOF_HEX)
             assert cli_claim["txid"] in node.getrawmempool()
+
+        self.log.info("An enabled miner reports epoch_inactive after the Gold Rush height window")
+        remaining = GOLD_RUSH_END_HEIGHT - node.getblockcount()
+        if remaining > 0:
+            self._generate_with_peer_offline(node, remaining, node.get_deterministic_priv_key().address)
+        builtin_wallet = node.get_wallet_rpc("goldrush_pow_builtin")
+        builtin_wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
+        try:
+            builtin_wallet.setpowmining(True, 1, 100)
+            self.wait_until(
+                lambda: builtin_wallet.getpowmininginfo()["state"] == "epoch_inactive",
+                timeout=10,
+            )
+            inactive = builtin_wallet.getpowmininginfo()
+            assert_equal(inactive["enabled"], True)
+            assert_equal(inactive["state"], "epoch_inactive")
+            assert_equal(inactive["hashrate"], 0)
+        finally:
+            builtin_wallet.setpowmining(False)
+        assert_equal(builtin_wallet.getpowmininginfo()["state"], "disabled")
 
     def run_test(self):
         node = self.nodes[0]

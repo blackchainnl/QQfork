@@ -35,6 +35,7 @@
 #include <validation.h>
 #include <validationinterface.h>
 #include <wallet/test/util.h>
+#include <wallet/spend.h>
 #include <wallet/wallet.h>
 
 #include <algorithm>
@@ -292,17 +293,21 @@ public:
     }
 };
 
-void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
+void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wallet, const PlatformStyle* platformStyle)
 {
     WalletModel& walletModel = *mini_gui.walletModel;
     struct PowMiningCleanup {
         WalletModel& wallet_model;
+        std::shared_ptr<CWallet> wallet;
+        std::vector<COutPoint> locked_coins;
         ~PowMiningCleanup()
         {
             std::string ignored_error;
             wallet_model.wallet().setPowMining(false, 1, 10, ignored_error);
+            LOCK(wallet->cs_wallet);
+            for (const COutPoint& outpoint : locked_coins) wallet->UnlockCoin(outpoint);
         }
-    } cleanup{walletModel};
+    } cleanup{walletModel, core_wallet};
 
     std::string error;
     QVERIFY(walletModel.wallet().setPowMining(false, 1, 10, error));
@@ -335,6 +340,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QPushButton* pow_copy = page.findChild<QPushButton*>("powCopy");
     QLabel* pow_status = page.findChild<QLabel*>("powStatus");
     QLabel* pow_warning = page.findChild<QLabel*>("powWarning");
+    QLabel* pow_dashboard = page.findChild<QLabel*>("stakingMiningDashboardPow");
     QPushButton* refresh_details = page.findChild<QPushButton*>("stakingMiningRefresh");
     QLabel* refresh_hint = page.findChild<QLabel*>("stakingMiningRefreshHint");
     QLabel* migration_phase = page.findChild<QLabel*>("migrationPhase");
@@ -402,6 +408,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(pow_copy);
     QVERIFY(pow_status);
     QVERIFY(pow_warning);
+    QVERIFY(pow_dashboard);
     QVERIFY(refresh_details);
     QVERIFY(refresh_hint);
     QVERIFY(migration_phase);
@@ -651,7 +658,33 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     pow_enable->click();
     qApp->processEvents();
     QVERIFY(!walletModel.wallet().getPowMiningInfo().enabled);
+    QCOMPARE(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED);
     QCOMPARE(pow_status->text(), QString("Gold Rush PoW mining is off."));
+
+    {
+        LOCK2(::cs_main, core_wallet->cs_wallet);
+        for (const wallet::COutput& output : wallet::AvailableCoins(*core_wallet).All()) {
+            QVERIFY(core_wallet->LockCoin(output.outpoint));
+            cleanup.locked_coins.push_back(output.outpoint);
+        }
+    }
+    QVERIFY(!cleanup.locked_coins.empty());
+
+    ConfirmMessageBox(QMessageBox::Yes);
+    pow_enable->click();
+    QTRY_VERIFY_WITH_TIMEOUT(
+        walletModel.wallet().getPowMiningInfo().state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO,
+        10000);
+    QCOMPARE(walletModel.wallet().getPowMiningInfo().hashrate, 0.0);
+
+    refresh_details->click();
+    QTRY_VERIFY_WITH_TIMEOUT(pow_status->text().contains(QString("legacy BLK UTXO")), 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(pow_dashboard->text().contains(QString("waiting for a spendable legacy fee UTXO")), 10000);
+    QVERIFY(!pow_dashboard->text().contains(QString("running at 0")));
+
+    pow_enable->click();
+    qApp->processEvents();
+    QCOMPARE(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED);
 }
 
 void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet, const PlatformStyle* platformStyle)
@@ -939,7 +972,7 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     WalletModel& walletModel = *mini_gui.walletModel;
     SendCoinsDialog& sendCoinsDialog = mini_gui.sendCoinsDialog;
 
-    TestStakingMiningPageControls(mini_gui, platformStyle.get());
+    TestStakingMiningPageControls(mini_gui, wallet, platformStyle.get());
     TestWalletPagesScale(mini_gui, platformStyle.get());
     TestStakingMiningPageSurvivesWalletModelDeletion(node, wallet, platformStyle.get());
     TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(node, platformStyle.get());

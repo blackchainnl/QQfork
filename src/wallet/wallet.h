@@ -13,6 +13,7 @@
 #include <consensus/tx_verify.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
+#include <interfaces/pow_mining.h>
 #include <kernel/cs_main.h>
 #include <logging.h>
 #include <outputtype.h>
@@ -1087,6 +1088,7 @@ public:
     // Built-in Gold Rush Proof-of-Work miner (in-process; NO external miner). Configured from the
     // GUI "Staking & Mining" tab / setpowmining RPC; the in-process Argon2id solver reads these.
     std::atomic<bool> m_pow_mining_enabled{false};
+    std::atomic<interfaces::WalletPowMiningState> m_pow_state{interfaces::WalletPowMiningState::DISABLED};
     std::atomic<int> m_pow_threads{1};         // CPU cores / worker threads
     std::atomic<int> m_pow_cpu_percent{1};     // per-core CPU duty-cycle target, 1..100
     std::atomic<double> m_pow_hashrate{0.0};   // aggregate Argon2id tries/s reported by the solver
