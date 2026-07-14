@@ -181,7 +181,7 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
     // supply a deterministic spend time (for blocks, the block time) instead of
     // using local adjusted time, or block validity can depend on verifier clock.
     int64_t nTimeTx = tx.nTime;
-    if (!nTimeTx && tx.nVersion >= 2)
+    if (tx.nVersion >= 2)
         nTimeTx = nSpendTime;
 
     CAmount nValueIn = 0;
