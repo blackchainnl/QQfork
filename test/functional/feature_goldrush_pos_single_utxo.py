@@ -56,10 +56,15 @@ class GoldRushPosSingleUtxoTest(BitcoinTestFramework):
         self._set_mocktime((tip_time & ~0xf) + 16)
 
     def _staking_inputs(self, wallet):
-        return [
-            {"txid": utxo["txid"], "vout": utxo["vout"]}
-            for utxo in wallet.listunspent(1, 9999999)
-        ]
+        inputs = []
+        for utxo in wallet.listunspent(1, 9999999):
+            address = utxo.get("address")
+            if address:
+                address_info = wallet.getaddressinfo(address)
+                if address_info.get("isquantummigration", False) or address_info.get("isquantumcoldstake", False):
+                    continue
+            inputs.append({"txid": utxo["txid"], "vout": utxo["vout"]})
+        return inputs
 
     def _find_next_kernel_time(self, wallet):
         inputs = self._staking_inputs(wallet)
