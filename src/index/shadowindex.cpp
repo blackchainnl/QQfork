@@ -396,7 +396,8 @@ bool IsValidShadowIndexRecord(const ShadowIndexRecord& record)
     if (record.outpoint.hash.IsNull() || record.outpoint.n != 0 ||
         record.origin_height < static_cast<uint32_t>(SHADOW_REWARD_START_HEIGHT) ||
         record.origin_height > static_cast<uint32_t>(SHADOW_REWARD_END_HEIGHT) ||
-        record.origin_block_hash.IsNull() || record.nominal_amount <= 0 ||
+        record.origin_block_hash.IsNull() || record.origin_block_time == 0 ||
+        record.nominal_amount <= 0 ||
         !MoneyRange(record.nominal_amount) ||
         !IsBoundedShadowEventScript(record.script_pub_key)) {
         return false;
@@ -421,7 +422,7 @@ bool IsValidShadowIndexRecord(const ShadowIndexRecord& record)
             record.spend_input_index == 0 && record.effective_amount_at_spend == 0 &&
             record.decayed_amount_at_spend == 0;
     }
-    return record.spend_height >= record.origin_height &&
+    return record.spend_height > record.origin_height &&
         !record.spend_block_hash.IsNull() && !record.spending_txid.IsNull() &&
         record.effective_amount_at_spend >= 0 &&
         MoneyRange(record.effective_amount_at_spend) &&
