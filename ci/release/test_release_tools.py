@@ -793,6 +793,7 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn('test "$IS_RELEASE" = "true"', workflow)
         self.assertIn("- 'v30.1.1'", workflow)
         self.assertNotIn("- 'v30.1.1-alpha", workflow)
+        self.assertNotIn("- 'v30.1.1-beta", workflow)
         self.assertIn("UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE", workflow)
 
     def test_reproducibility_requires_identical_bytes(self):
