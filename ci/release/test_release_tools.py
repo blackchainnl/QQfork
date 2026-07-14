@@ -1466,6 +1466,8 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("macos-15-intel", workflow)
         self.assertIn("codesign --force --deep --sign - --timestamp=none", workflow)
         self.assertIn("macos_adhoc_signed=$MACOS_SELECTED", workflow)
+        self.assertIn('metadata["LSArchitecturePriority"] = [os.environ["EXPECTED_ARCH"]]', workflow)
+        self.assertIn('verify_plist_architecture "$verified_plist"', workflow)
         self.assertIn("Developer-ID sign and notarize macOS artifacts", workflow)
 
     def test_reproducibility_requires_identical_bytes(self):
