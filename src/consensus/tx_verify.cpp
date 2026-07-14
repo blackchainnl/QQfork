@@ -14,8 +14,6 @@
 #include <consensus/validation.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
-#include <shadow.h>
-#include <util/time.h>
 #include <validation.h>
 #include <util/check.h>
 #include <util/moneystr.h>
@@ -179,17 +177,12 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
                          strprintf("%s: inputs missing/spent", __func__));
     }
 
-    // Preserve the exact legacy v2+ timestamp behavior through Gold Rush. The
-    // legacy network substitutes local adjusted time when nTime is absent; a
-    // deterministic block-time substitution before G+1 would reject blocks the
-    // dominant implementation accepts. Once the scheduled fork is active, use
-    // the caller's deterministic block/next-block time.
+    // Blackcoin v2+ transactions do not serialize nTime. Consensus callers must
+    // supply a deterministic spend time (for blocks, the block time) instead of
+    // using local adjusted time, or block validity can depend on verifier clock.
     int64_t nTimeTx = tx.nTime;
-    if (!nTimeTx && tx.nVersion >= 2) {
-        nTimeTx = IsQuantumWitnessSpendActive(::Params().GetConsensus(), nDemurrageTime, nSpendHeight)
-            ? nSpendTime
-            : GetAdjustedTimeSeconds();
-    }
+    if (!nTimeTx && tx.nVersion >= 2)
+        nTimeTx = nSpendTime;
 
     CAmount nValueIn = 0;
     for (unsigned int i = 0; i < tx.vin.size(); ++i) {

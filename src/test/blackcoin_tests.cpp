@@ -7,6 +7,7 @@
 #include <consensus/amount.h>
 #include <consensus/demurrage.h>
 #include <consensus/params.h>
+#include <consensus/tx_verify.h>
 #include <consensus/validation.h>
 #include <core_io.h>
 #include <crypto/mldsa.h>
@@ -27,6 +28,7 @@
 #include <uint256.h>
 #include <util/chaintype.h>
 #include <util/strencodings.h>
+#include <util/time.h>
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
@@ -182,6 +184,64 @@ BOOST_AUTO_TEST_CASE(mainnet_lifecycle_is_height_coherent_and_demurrage_is_autom
         pre_final_coin, consensus, migration_end + 1, active_mtp);
     BOOST_CHECK(first_final.active);
     BOOST_CHECK_EQUAL(first_final.inactive_blocks, 0);
+}
+
+BOOST_AUTO_TEST_CASE(mainnet_gold_rush_v2_missing_time_is_deterministic)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int spend_height = MAINNET_SHADOW_REWARD_START_HEIGHT + 3;
+    const int64_t spend_time = consensus.nProtocolV4Time + 600;
+    const int64_t early_mock_time = spend_time - 1'000;
+    const int64_t late_mock_time = spend_time + 1'000;
+
+    BOOST_REQUIRE(consensus.GetQuantumQuasarPhase(spend_time, spend_height) ==
+                  Consensus::QuantumQuasarPhase::GOLD_RUSH);
+    BOOST_REQUIRE(!IsQuantumWitnessSpendActive(consensus, spend_time, spend_height));
+
+    struct InputCheckResult {
+        bool accepted;
+        std::string reject_reason;
+    };
+    const auto check_at_mock_time = [&](int coin_time, int64_t mock_time) {
+        CCoinsView base;
+        CCoinsViewCache view{&base};
+        const COutPoint outpoint{uint256::ONE, 0};
+        view.AddCoin(outpoint,
+                     Coin{CTxOut{2 * COIN, CScript() << OP_TRUE},
+                          spend_height - 1, false, false, coin_time},
+                     false);
+
+        CMutableTransaction spend;
+        spend.nVersion = 2;
+        spend.nTime = 0;
+        spend.vin.emplace_back(outpoint);
+        spend.vout.emplace_back(1 * COIN, CScript() << OP_TRUE);
+
+        SetMockTime(mock_time);
+        TxValidationState state;
+        CAmount fee{-1};
+        const bool accepted = Consensus::CheckTxInputs(
+            CTransaction{spend}, state, view, spend_height, spend_time,
+            spend_time, fee);
+        return InputCheckResult{accepted, state.GetRejectReason()};
+    };
+
+    // This is the deterministic v30.1.0 contract: a missing serialized nTime
+    // is evaluated against the caller's block/spend time, never verifier time.
+    const auto rejected_early = check_at_mock_time(spend_time + 1, early_mock_time);
+    const auto rejected_late = check_at_mock_time(spend_time + 1, late_mock_time);
+    BOOST_CHECK(!rejected_early.accepted);
+    BOOST_CHECK_EQUAL(rejected_early.reject_reason, "bad-txns-time-earlier-than-input");
+    BOOST_CHECK_EQUAL(rejected_early.accepted, rejected_late.accepted);
+    BOOST_CHECK_EQUAL(rejected_early.reject_reason, rejected_late.reject_reason);
+
+    const auto accepted_early = check_at_mock_time(spend_time - 1, early_mock_time);
+    const auto accepted_late = check_at_mock_time(spend_time - 1, late_mock_time);
+    BOOST_CHECK(accepted_early.accepted);
+    BOOST_CHECK(accepted_early.reject_reason.empty());
+    BOOST_CHECK_EQUAL(accepted_early.accepted, accepted_late.accepted);
+    BOOST_CHECK_EQUAL(accepted_early.reject_reason, accepted_late.reject_reason);
+    SetMockTime(0);
 }
 
 BOOST_AUTO_TEST_CASE(phase_schedule_height_overrides)

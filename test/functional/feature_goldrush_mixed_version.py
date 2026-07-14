@@ -15,7 +15,7 @@ persists the common tip across restart.
 from decimal import Decimal
 
 from test_framework.address import address_to_scriptpubkey
-from test_framework.blocktools import COINBASE_MATURITY
+from test_framework.blocktools import COINBASE_MATURITY, create_block, create_coinbase
 from test_framework.key import ECKey
 from test_framework.messages import COIN, COutPoint, CTransaction, CTxIn, CTxOut, from_hex
 from test_framework.script import (
@@ -26,6 +26,7 @@ from test_framework.script import (
     OP_FALSE,
     OP_NOP4,
     OP_RETURN,
+    OP_TRUE,
     sign_input_legacy,
 )
 from test_framework.script_util import key_to_p2pk_script, program_to_witness_script, script_to_p2sh_script
@@ -217,6 +218,82 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
             tx_hex = self.signed_coin_spend(coin, outputs)
             self.generate_raw_block(producer, [tx_hex])
 
+    def exercise_v2_clock_determinism(self, coin, change_script):
+        """Prove candidate/v30.1.0 block validity never depends on node time.
+
+        v26/v28 substitute local adjusted time for the omitted v2 transaction
+        timestamp. That historical rule is intrinsically nondeterministic. The
+        candidate must instead preserve the already-deployed v30.1.0 contract:
+        ConnectBlock supplies the candidate block time to CheckTxInputs.
+        """
+        funding_hex = self.signed_coin_spend(coin, [
+            CTxOut(COIN, CScript([OP_TRUE])),
+            CTxOut(coin["value"] - COIN - FEE, change_script),
+        ])
+        funding_result = self.generateblock(
+            self.nodes[CANDIDATE],
+            self.nodes[CANDIDATE].get_deterministic_priv_key().address,
+            [funding_hex],
+            sync_fun=self.no_op,
+        )
+        self.sync_blocks(self.nodes, timeout=180)
+
+        funding = from_hex(CTransaction(), funding_hex)
+        funding.rehash()
+        parent_hash = funding_result["hash"]
+        parent_time = self.nodes[CANDIDATE].getblockheader(parent_hash)["time"]
+        spend = self.tx_from_outputs(
+            funding.hash,
+            0,
+            COIN,
+            [CTxOut(COIN - FEE, change_script)],
+        )
+        height = self.nodes[CANDIDATE].getblockcount() + 1
+        block = create_block(
+            int(parent_hash, 16),
+            create_coinbase(height),
+            parent_time + 1,
+            txlist=[spend],
+        )
+        block.solve()
+        raw_block = block.serialize().hex()
+
+        # Isolate every verifier so the byte-identical block is evaluated under
+        # the clock assigned below, not first relayed by another generation.
+        for index in (1, 2, CANDIDATE):
+            self.disconnect_nodes(index, REFERENCE)
+
+        early_time = parent_time - 1_000
+        late_time = parent_time + 1_000
+        self.nodes[REFERENCE].setmocktime(early_time)
+        self.nodes[1].setmocktime(early_time)
+        self.nodes[2].setmocktime(early_time)
+        self.nodes[CANDIDATE].setmocktime(late_time)
+
+        # The two historical generations expose the inherited clock seam. The
+        # already-deployed v30.1.0 and this candidate must agree despite clocks
+        # on opposite sides of the funding block time.
+        assert_equal(
+            self.nodes[REFERENCE].submitblock(raw_block),
+            "bad-txns-time-earlier-than-input",
+        )
+        assert_equal(
+            self.nodes[1].submitblock(raw_block),
+            "bad-txns-time-earlier-than-input",
+        )
+        assert_equal(self.nodes[2].submitblock(raw_block), None)
+        assert_equal(self.nodes[CANDIDATE].submitblock(raw_block), None)
+
+        # Recover the normative v26 node under its own late-clock behavior so
+        # the remainder of the interoperability/reorg test stays on one chain.
+        for node in self.nodes:
+            node.setmocktime(late_time)
+        self.nodes[REFERENCE].reconsiderblock(block.hash)
+        assert_equal(self.nodes[REFERENCE].submitblock(raw_block), None)
+        self.connect_nodes(CANDIDATE, REFERENCE)
+        self.sync_blocks(self.normative_nodes, timeout=120)
+        self.assert_normative_tip()
+
     def run_test(self):
         self.log.info("Verifying every daemon is the pinned historical/candidate build")
         for node, expected in zip(self.nodes, EXPECTED_RPC_VERSIONS):
@@ -237,13 +314,19 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         assert_equal(self.nodes[2].getquantumquasarinfo()["phase"], "gold_rush")
         assert_equal(self.nodes[3].getquantumquasarinfo()["phase"], "gold_rush")
 
-        self.log.info("Stopping diagnostic builds before known split-path fixtures")
-        self.stop_node(1)
-        self.stop_node(2)
-        coins = [self.coinbase_utxo(block_hash) for block_hash in mined[:12]]
         change_script = address_to_scriptpubkey(
             self.nodes[CANDIDATE].get_deterministic_priv_key().address
         )
+        self.log.info("Checking v2 missing-time behavior across four exact generations")
+        self.exercise_v2_clock_determinism(
+            self.coinbase_utxo(mined[0]),
+            change_script,
+        )
+
+        self.log.info("Stopping diagnostic builds before known split-path fixtures")
+        self.stop_node(1)
+        self.stop_node(2)
+        coins = [self.coinbase_utxo(block_hash) for block_hash in mined[1:13]]
 
         self.log.info("Crossing NOP4 discriminator blocks in both directions")
         self.exercise_nop4_both_directions(coins, change_script)
