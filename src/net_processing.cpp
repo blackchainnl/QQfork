@@ -2022,10 +2022,17 @@ bool PeerManagerImpl::MaybePunishNodeForBlock(NodeId nodeid, const BlockValidati
             break;
         }
     case BlockValidationResult::BLOCK_INVALID_HEADER:
-    case BlockValidationResult::BLOCK_CHECKPOINT:
     case BlockValidationResult::BLOCK_INVALID_PREV:
     case BlockValidationResult::BLOCK_HEADER_SPAM:
         if (peer) Misbehaving(*peer, 100, message);
+        return true;
+    case BlockValidationResult::BLOCK_CHECKPOINT:
+        // A peer can disagree with a locally configured or release-specific
+        // checkpoint while still sending an otherwise well-formed header.
+        // Reject the conflicting history, but accumulate only the deployed
+        // rolling-checkpoint penalty instead of immediately discouraging the
+        // peer as if it had sent intrinsically invalid consensus data.
+        if (peer) Misbehaving(*peer, 1, message);
         return true;
     // Conflicting (but not necessarily invalid) data or different policy:
     case BlockValidationResult::BLOCK_MISSING_PREV:
