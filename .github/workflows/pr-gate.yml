@@ -114,6 +114,9 @@ jobs:
       - name: Test fail-closed release tooling
         run: python3 ci/release/test_release_tools.py
 
+      - name: Test script corpus precondition tooling
+        run: python3 ci/test/test_verify_script_assets.py
+
       - name: Run repository linters
         shell: bash
         env:
@@ -193,7 +196,15 @@ jobs:
       - name: Compile candidate
         run: make -j "$MAKEJOBS"
 
+      - name: Provision pinned Blackcoin-compatible script vectors
+        env:
+          DIR_UNIT_TEST_DATA: ${{ github.workspace }}/.ci/unit_test_data
+        run: ./ci/test/prepare_script_assets.sh
+
       - name: Run unit and utility tests
+        env:
+          DIR_UNIT_TEST_DATA: ${{ github.workspace }}/.ci/unit_test_data
+          REQUIRE_SCRIPT_ASSETS_TEST: 1
         run: make -j "$MAKEJOBS" check
 
       - name: Upload exact test binaries

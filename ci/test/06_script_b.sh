@@ -18,8 +18,7 @@ export UBSAN_OPTIONS="suppressions=${BASE_ROOT_DIR}/test/sanitizer_suppressions/
 # The release gate must not silently follow a moving fuzz corpus or unit-test
 # vector.  Update this commit and the checksum together after explicit review.
 QA_ASSETS_COMMIT="${QA_ASSETS_COMMIT:-0772287676fdf3fcf87631b383b12442ab48ce75}"
-SCRIPT_ASSETS_SHA256="${SCRIPT_ASSETS_SHA256:-cd789a58ec45916e1721cdd14e82ca4c93100959f1cef4e229b22e3bf539f095}"
-export QA_ASSETS_COMMIT SCRIPT_ASSETS_SHA256
+export QA_ASSETS_COMMIT
 
 if [ "$CI_OS_NAME" == "macos" ]; then
   top -l 1 -s 0 | awk ' /PhysMem/ {print}'
@@ -79,17 +78,7 @@ if [ "$RUN_FUZZ_TESTS" = "true" ]; then
   )
 elif [ "$RUN_UNIT_TESTS" = "true" ] || [ "$RUN_UNIT_TESTS_SEQUENTIAL" = "true" ]; then
   export DIR_UNIT_TEST_DATA=${DIR_QA_ASSETS}/unit_test_data/
-  if [ ! -d "$DIR_UNIT_TEST_DATA" ]; then
-    mkdir -p "$DIR_UNIT_TEST_DATA"
-    ${CI_RETRY_EXE} curl --location --fail \
-      "https://raw.githubusercontent.com/bitcoin-core/qa-assets/${QA_ASSETS_COMMIT}/unit_test_data/script_assets_test.json" \
-      -o "${DIR_UNIT_TEST_DATA}/script_assets_test.json"
-  fi
-  if command -v sha256sum >/dev/null 2>&1; then
-    echo "${SCRIPT_ASSETS_SHA256}  ${DIR_UNIT_TEST_DATA}/script_assets_test.json" | sha256sum --check --strict
-  else
-    echo "${SCRIPT_ASSETS_SHA256}  ${DIR_UNIT_TEST_DATA}/script_assets_test.json" | shasum -a 256 --check
-  fi
+  "${BASE_ROOT_DIR}/ci/test/prepare_script_assets.sh"
 fi
 
 mkdir -p "${BASE_SCRATCH_DIR}/sanitizer-output/"
@@ -185,11 +174,11 @@ if [ -n "$USE_VALGRIND" ]; then
 fi
 
 if [ "$RUN_UNIT_TESTS" = "true" ]; then
-  bash -c "${TEST_RUNNER_ENV} DIR_UNIT_TEST_DATA=${DIR_UNIT_TEST_DATA} LD_LIBRARY_PATH=${DEPENDS_DIR}/${HOST}/lib make $MAKEJOBS check VERBOSE=1"
+  bash -c "${TEST_RUNNER_ENV} REQUIRE_SCRIPT_ASSETS_TEST=1 DIR_UNIT_TEST_DATA=${DIR_UNIT_TEST_DATA} LD_LIBRARY_PATH=${DEPENDS_DIR}/${HOST}/lib make $MAKEJOBS check VERBOSE=1"
 fi
 
 if [ "$RUN_UNIT_TESTS_SEQUENTIAL" = "true" ]; then
-  bash -c "${TEST_RUNNER_ENV} DIR_UNIT_TEST_DATA=${DIR_UNIT_TEST_DATA} LD_LIBRARY_PATH=${DEPENDS_DIR}/${HOST}/lib ${BASE_OUTDIR}/bin/test_blackcoin --catch_system_errors=no -l test_suite"
+  bash -c "${TEST_RUNNER_ENV} REQUIRE_SCRIPT_ASSETS_TEST=1 DIR_UNIT_TEST_DATA=${DIR_UNIT_TEST_DATA} LD_LIBRARY_PATH=${DEPENDS_DIR}/${HOST}/lib ${BASE_OUTDIR}/bin/test_blackcoin --catch_system_errors=no -l test_suite"
 fi
 
 if [ "$RUN_FUNCTIONAL_TESTS" = "true" ]; then
