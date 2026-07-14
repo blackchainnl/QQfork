@@ -399,6 +399,8 @@ class ReleaseToolTests(unittest.TestCase):
             "initially unpublished",
             "optional public alpha prerelease",
             "`v30.1.1-alpha1`",
+            "get /repos/blackcoin-dev/blackcoin/immutable-releases",
+            "`enabled=true`",
             "github `prerelease` is true and `latest` remains false",
             "`signed=false`, `notarized=false`",
             "never be marked latest",

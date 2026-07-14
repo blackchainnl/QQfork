@@ -31,6 +31,11 @@ The public alpha release must satisfy all of these controls:
 
 - the tag points to the exact source SHA recorded in every asset filename and
   canary manifest;
+- immediately before promotion, the reviewer retains the response from
+  `GET /repos/Blackcoin-Dev/Blackcoin/immutable-releases` and requires
+  `enabled=true`. The repository returned `enabled=true` and
+  `enforced_by_owner=false` on 2026-07-13; that observation does not replace the
+  fresh prepublication check because repository settings are external state;
 - GitHub `prerelease` is true and `latest` remains false;
 - `signed=false`, `notarized=false` in the canary manifest remain unchanged.
   Its `published=false` value records that the build workflow did not publish
