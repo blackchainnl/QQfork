@@ -57,6 +57,25 @@ static CBlock BuildBlockTestCase() {
 // (block + mempool + our copy from the GetSharedTx call)
 constexpr long SHARED_TX_OFFSET{3};
 
+class InspectableHeaderAndShortIDs final : public CBlockHeaderAndShortTxIDs
+{
+public:
+    explicit InspectableHeaderAndShortIDs(const CBlock& block)
+        : CBlockHeaderAndShortTxIDs{block}
+    {
+    }
+
+    const std::vector<PrefilledTransaction>& PrefilledTransactions() const
+    {
+        return prefilledtxn;
+    }
+
+    const std::vector<uint64_t>& ShortTxIDs() const
+    {
+        return shorttxids;
+    }
+};
+
 BOOST_AUTO_TEST_CASE(SimpleRoundTripTest)
 {
     CTxMemPool& pool = *Assert(m_node.mempool);
@@ -112,6 +131,66 @@ BOOST_AUTO_TEST_CASE(SimpleRoundTripTest)
         BOOST_CHECK_EQUAL(block.hashMerkleRoot.ToString(), BlockMerkleRoot(block3, &mutated).ToString());
         BOOST_CHECK(!mutated);
     }
+}
+
+BOOST_AUTO_TEST_CASE(ProofOfStakePrefillsCoinstakeTest)
+{
+    CTxMemPool& pool = *Assert(m_node.mempool);
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    TestMemPoolEntryHelper entry;
+    CBlock block{BuildBlockTestCase()};
+    CMutableTransaction coinstake{*block.vtx[1]};
+    coinstake.vout.insert(coinstake.vout.begin(), CTxOut{0, CScript{}});
+    block.vtx[1] = MakeTransactionRef(coinstake);
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+    BOOST_REQUIRE(block.IsProofOfStake());
+
+    LOCK2(cs_main, pool.cs);
+    pool.addUnchecked(entry.FromTx(block.vtx[2]));
+
+    InspectableHeaderAndShortIDs encoded{block};
+    const auto& prefilled = encoded.PrefilledTransactions();
+    const auto& short_ids = encoded.ShortTxIDs();
+    BOOST_REQUIRE_EQUAL(prefilled.size(), 2U);
+    BOOST_CHECK_EQUAL(prefilled[0].index, 0U);
+    BOOST_CHECK_EQUAL(prefilled[1].index, 0U);
+    BOOST_CHECK(prefilled[0].tx->GetHash() == block.vtx[0]->GetHash());
+    BOOST_CHECK(prefilled[1].tx->GetHash() == block.vtx[1]->GetHash());
+    BOOST_REQUIRE_EQUAL(short_ids.size(), 1U);
+    BOOST_CHECK_EQUAL(short_ids[0], encoded.GetShortID(block.vtx[2]->GetWitnessHash()));
+
+    CDataStream stream{SER_NETWORK};
+    stream << encoded;
+    CBlockHeaderAndShortTxIDs decoded;
+    stream >> decoded;
+
+    PartiallyDownloadedBlock partial_block{&pool, &chainman};
+    BOOST_REQUIRE(partial_block.InitData(decoded, extra_txn) == READ_STATUS_OK);
+    BOOST_CHECK(partial_block.IsTxAvailable(0));
+    BOOST_CHECK(partial_block.IsTxAvailable(1));
+    BOOST_CHECK(partial_block.IsTxAvailable(2));
+
+    partial_block.m_check_block_mock = [](const CBlock&, BlockValidationState&,
+                                          const Consensus::Params&, Chainstate&,
+                                          bool, bool, bool) { return true; };
+    CBlock reconstructed;
+    BOOST_REQUIRE(partial_block.FillBlock(reconstructed, {}) == READ_STATUS_OK);
+    BOOST_CHECK(reconstructed.GetHash() == block.GetHash());
+    BOOST_CHECK(reconstructed.hashMerkleRoot == block.hashMerkleRoot);
+}
+
+BOOST_AUTO_TEST_CASE(SingleTransactionCompactBlockDoesNotUnderflowTest)
+{
+    CBlock block{BuildBlockTestCase()};
+    block.vtx.resize(1);
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+
+    InspectableHeaderAndShortIDs encoded{block};
+    const auto& prefilled = encoded.PrefilledTransactions();
+    BOOST_REQUIRE_EQUAL(prefilled.size(), 1U);
+    BOOST_CHECK_EQUAL(prefilled[0].index, 0U);
+    BOOST_CHECK(prefilled[0].tx->GetHash() == block.vtx[0]->GetHash());
+    BOOST_CHECK(encoded.ShortTxIDs().empty());
 }
 
 class TestHeaderAndShortIDs {

@@ -21,14 +21,19 @@
 
 CBlockHeaderAndShortTxIDs::CBlockHeaderAndShortTxIDs(const CBlock& block) :
         nonce(GetRand<uint64_t>()),
-        shorttxids(block.vtx.size() - 1), prefilledtxn(1), header(block), vchBlockSig(block.vchBlockSig) {
+        header(block), vchBlockSig(block.vchBlockSig) {
     FillShortTxIDSelector();
     //TODO: Use our mempool prior to block acceptance to predictively fill more than just the coinbase
-    prefilledtxn[0] = {0, block.vtx[0]};
+    const bool prefill_coinstake = block.IsProofOfStake() && block.vtx.size() > 1;
+    prefilledtxn = prefill_coinstake
+        ? std::vector<PrefilledTransaction>{{0, block.vtx[0]}, {0, block.vtx[1]}}
+        : std::vector<PrefilledTransaction>{{0, block.vtx[0]}};
+    const size_t first_short_id = prefill_coinstake ? 2 : 1;
+    shorttxids.resize(block.vtx.size() - first_short_id);
     header.nFlags = block.nFlags;
-    for (size_t i = 1; i < block.vtx.size(); i++) {
+    for (size_t i = first_short_id; i < block.vtx.size(); ++i) {
         const CTransaction& tx = *block.vtx[i];
-        shorttxids[i - 1] = GetShortID(tx.GetWitnessHash());
+        shorttxids[i - first_short_id] = GetShortID(tx.GetWitnessHash());
     }
 }
 
