@@ -68,7 +68,7 @@ class ChainstateWriteCrashTest(BitcoinTestFramework):
 
         # Node3 is a normal node with default args, except will mine full blocks
         # and txs with "dust" outputs
-        self.node3_args = ["-blockmaxweight=4000000", "-dustrelayfee=0"]
+        self.node3_args = ["-blockmaxweight=4000000", "-dustrelayfee=0", "-rpcserialversion=1"]
         self.extra_args = [self.node0_args, self.node1_args, self.node2_args, self.node3_args]
 
     def setup_network(self):
@@ -112,7 +112,9 @@ class ChainstateWriteCrashTest(BitcoinTestFramework):
         Returns true if the block was submitted successfully; false otherwise."""
 
         try:
-            self.nodes[node_index].submitblock(block)
+            result = self.nodes[node_index].submitblock(block)
+            if result is not None:
+                raise AssertionError(f"node {node_index} rejected block: {result}")
             return True
         except (http.client.CannotSendRequest, http.client.RemoteDisconnected) as e:
             self.log.debug(f"node {node_index} submitblock raised exception: {e}")
