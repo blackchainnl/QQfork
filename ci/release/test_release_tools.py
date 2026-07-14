@@ -51,23 +51,29 @@ class ReleaseToolTests(unittest.TestCase):
     def test_resource_benchmark_evidence_is_source_bound_and_fail_closed(self):
         generator = load_module("generate_resource_benchmark_evidence")
 
-        def result(name, unit, median):
+        def result(name, unit, median, batch=1):
             return {
                 "name": name,
                 "unit": unit,
-                "batch": 1,
+                "batch": batch,
                 "epochs": 11,
+                "minEpochTime": 0.25 / 11,
                 "median(elapsed)": median,
                 "medianAbsolutePercentError(elapsed)": 0.01,
                 "totalTime": median * 11,
+                "measurements": [
+                    {"iterations": 1, "elapsed": median} for _ in range(11)
+                ],
             }
 
         document = {
             "results": [
                 result("QuantumArgon2id1MiB", "op", 0.00025),
-                result("QuantumArgon2id64ClaimBlock", "block", 0.016),
+                result("QuantumArgon2id64ClaimBlock", "proof", 0.016, 64),
                 result("QuantumMLDSA44Verify", "op", 0.00005),
-                result("QuantumMLDSA44MaxWeightBlock", "block", 0.41075),
+                result(
+                    "QuantumMLDSA44MaxWeightBlock", "signature", 0.41075, 8215
+                ),
             ]
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -83,6 +89,13 @@ class ReleaseToolTests(unittest.TestCase):
                 platform="linux",
                 architecture="x86_64",
                 toolchain="GCC 11.4.0",
+                compiler_flags="-O2 -g",
+                build_profile="native-test",
+                minimum_runtime_ms=250,
+                provenance_manifest=(
+                    TOOLS.parent.parent /
+                    "contrib" / "devtools" / "quantum-crypto-provenance.json"
+                ),
                 required_domains={"crypto"},
             )
             self.assertTrue(evidence["coverage"]["crypto"])
@@ -97,6 +110,17 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertEqual(
                 mldsa_bound["maximum_verifications"], 8215
             )
+            self.assertIn(evidence["runner"]["endianness"], ("little", "big"))
+            self.assertEqual(evidence["build"]["compiler_flags"], "-O2 -g")
+            self.assertEqual(evidence["build"]["profile"], "native-test")
+            self.assertEqual(evidence["build"]["minimum_benchmark_runtime_ms"], 250)
+            self.assertRegex(
+                evidence["inputs"]["quantum_crypto_provenance_manifest_sha256"],
+                r"^[0-9a-f]{64}$",
+            )
+            self.assertEqual(
+                evidence["consensus_limits"]["minimum_quantum_input_weight"], 3903
+            )
             with self.assertRaisesRegex(RuntimeError, "large-block"):
                 generator.generate_evidence(
                     nanobench_json=raw,
@@ -105,13 +129,44 @@ class ReleaseToolTests(unittest.TestCase):
                     platform="linux",
                     architecture="x86_64",
                     toolchain="GCC 11.4.0",
+                    compiler_flags="-O2 -g",
+                    build_profile="native-test",
+                    minimum_runtime_ms=250,
+                    provenance_manifest=(
+                        TOOLS.parent.parent /
+                        "contrib" / "devtools" / "quantum-crypto-provenance.json"
+                    ),
                     required_domains={"crypto", "large-block"},
                 )
 
             document["results"].append(document["results"][0])
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "duplicate nanobench result"):
-                generator.parse_measurements(raw)
+                generator.parse_measurements(raw, {"crypto"}, 250)
+
+            document["results"].pop()
+            document["results"][1]["batch"] = 63
+            raw.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "expected 64"):
+                generator.parse_measurements(raw, {"crypto"}, 250)
+
+            document["results"][1]["batch"] = 64
+            document["results"][0]["median(elapsed)"] *= 2
+            raw.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "median does not match"):
+                generator.parse_measurements(raw, {"crypto"}, 250)
+
+            document["results"][0]["median(elapsed)"] /= 2
+            document["results"][0]["totalTime"] *= 2
+            raw.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "total time does not match"):
+                generator.parse_measurements(raw, {"crypto"}, 250)
+
+            document["results"][0]["totalTime"] /= 2
+            document["results"].append(result("UnexpectedQuantumBenchmark", "op", 1.0))
+            raw.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "benchmark set mismatch"):
+                generator.parse_measurements(raw, {"crypto"}, 250)
 
     def test_resource_benchmark_workflow_measures_and_does_not_overclaim(self):
         root = TOOLS.parent.parent
@@ -132,10 +187,25 @@ class ReleaseToolTests(unittest.TestCase):
         ):
             with self.subTest(benchmark=benchmark):
                 self.assertIn(f"BENCHMARK({benchmark}", benchmark_source)
+        self.assertIn("GetSizeOfCompactSize(ML_DSA::SIGNATURE_BYTES)", benchmark_source)
+        self.assertIn("GetSizeOfCompactSize(ML_DSA::PUBLICKEY_BYTES)", benchmark_source)
+        self.assertIn("static_assert(MIN_QUANTUM_INPUT_WEIGHT == 3903)", benchmark_source)
+        self.assertIn("SHADOW_ARGON2_TIME_COST", benchmark_source)
+        self.assertIn("SHADOW_ARGON2_MEMORY_KIB", benchmark_source)
+        self.assertIn("SHADOW_ARGON2_LANES", benchmark_source)
+        self.assertIn("bench.batch(MAX_SHADOW_POW_EVALS_PER_BLOCK)", benchmark_source)
+        self.assertIn("bench.batch(MAX_BLOCK_MLDSA_VERIFICATIONS)", benchmark_source)
+        self.assertIn("Argon2 single-operation benchmark failed", benchmark_source)
+        self.assertIn("ML-DSA single-operation benchmark failed", benchmark_source)
         self.assertIn("resource-benchmarks-linux:", gate)
         self.assertIn("--require-domain large-block", gate)
         self.assertIn("--require-domain synthetic-state", gate)
         self.assertIn("quantum-resource-benchmarks-macos-", gate)
+        self.assertIn('--compiler-flags="$cxxflags"', gate)
+        self.assertIn("--build-profile native-debug-lockorder", gate)
+        self.assertIn("--build-profile native-walletless-default", gate)
+        self.assertIn("--minimum-runtime-ms 250", gate)
+        self.assertIn("--provenance-manifest", gate)
         self.assertIn("pattern: quantum-resource-benchmarks-*", release)
         self.assertIn("test \"${#resource_evidence[@]}\" -eq 3", release)
 

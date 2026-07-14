@@ -78,9 +78,6 @@ static constexpr uint32_t MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK = (V4_MAX_BLOCK_WEI
 static_assert(static_cast<CAmount>(MAX_SHADOW_POW_EVALS_PER_BLOCK - 1) * CENT <
               (463 * COIN) / 2,
               "Gold Rush POW pool must exceed all capped loser reimbursements");
-static constexpr uint32_t SHADOW_ARGON2_TIME_COST = 1;
-static constexpr uint32_t SHADOW_ARGON2_MEMORY_KIB = 1024;
-static constexpr uint32_t SHADOW_ARGON2_LANES = 1;
 std::atomic<uint64_t> g_shadow_argon2_test_failures{0};
 // Increment whenever an auxiliary namespace or its authentication semantics
 // changes. This prevents a checkpoint produced by a prerelease schema from

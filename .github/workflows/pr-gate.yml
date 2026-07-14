@@ -204,6 +204,7 @@ jobs:
             src/blackcoin-util
             src/blackcoin-wallet
             src/bench/bench_blackcoin
+            src/Makefile
             test/config.ini
           if-no-files-found: error
           retention-days: 3
@@ -235,6 +236,10 @@ jobs:
           binary=src/bench/bench_blackcoin
           raw=quantum-resource-linux-x86_64-nanobench.json
           evidence=quantum-resource-linux-x86_64-evidence.json
+          cxx=$(sed -n 's/^CXX = //p' src/Makefile)
+          cxxflags=$(sed -n 's/^CXXFLAGS = //p' src/Makefile)
+          test -n "$cxx"
+          test -n "$cxxflags"
           chmod +x "$binary"
           "$binary" \
             -filter='Quantum(Argon2id|MLDSA44).*' \
@@ -252,7 +257,11 @@ jobs:
             --source-sha "$TARGET_SHA" \
             --platform linux \
             --architecture x86_64 \
-            --toolchain "$(c++ --version | sed -n '1p')" \
+            --toolchain "$cxx; $(c++ --version | sed -n '1p')" \
+            --compiler-flags="$cxxflags" \
+            --build-profile native-debug-lockorder \
+            --minimum-runtime-ms 250 \
+            --provenance-manifest contrib/devtools/quantum-crypto-provenance.json \
             "${requirements[@]}" \
             --output "$evidence"
 
@@ -323,6 +332,10 @@ jobs:
           set -euo pipefail
           raw=quantum-resource-macos-${{ matrix.expected_arch }}-nanobench.json
           evidence=quantum-resource-macos-${{ matrix.expected_arch }}-evidence.json
+          cxx=$(sed -n 's/^CXX = //p' src/Makefile)
+          cxxflags=$(sed -n 's/^CXXFLAGS = //p' src/Makefile)
+          test -n "$cxx"
+          test -n "$cxxflags"
           src/bench/bench_blackcoin \
             -filter='Quantum(Argon2id|MLDSA44).*' \
             -min-time=250 \
@@ -333,7 +346,11 @@ jobs:
             --source-sha "$TARGET_SHA" \
             --platform macos \
             --architecture "${{ matrix.expected_arch }}" \
-            --toolchain "$(clang++ --version | sed -n '1p')" \
+            --toolchain "$cxx; $(clang++ --version | sed -n '1p')" \
+            --compiler-flags="$cxxflags" \
+            --build-profile native-walletless-default \
+            --minimum-runtime-ms 250 \
+            --provenance-manifest contrib/devtools/quantum-crypto-provenance.json \
             --require-domain crypto \
             --output "$evidence"
 
