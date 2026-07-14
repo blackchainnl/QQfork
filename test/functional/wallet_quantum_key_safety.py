@@ -44,6 +44,8 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         node = self.nodes[0]
         wallet_name = node.getwalletinfo()["walletname"]
         wallet = node.get_wallet_rpc(wallet_name)
+        legacy_address = wallet.getnewaddress("legacy-before-quantum-backup", "legacy")
+        legacy_message = "Blackcoin v30.1.1 recovery proof"
 
         self.log.info("Raw private-key RPCs are disabled by default")
         first = wallet.getnewquantumaddress("first")
@@ -116,6 +118,12 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert_equal(first_inventory["total"], 1)
         assert first_inventory["all_backed_up"]
         assert_equal(first_inventory["keys"][0]["address"], first["address"])
+        assert first_restore.getaddressinfo(legacy_address)["ismine"]
+        assert node.verifymessage(
+            legacy_address,
+            first_restore.signmessage(legacy_address, legacy_message),
+            legacy_message,
+        )
 
         node.restorewallet("quantum_current_restore", current_backup)
         current_restore = node.get_wallet_rpc("quantum_current_restore")
@@ -125,6 +133,12 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert_equal(
             {entry["address"] for entry in current_inventory["keys"]},
             {first["address"], second["address"]},
+        )
+        assert current_restore.getaddressinfo(legacy_address)["ismine"]
+        assert node.verifymessage(
+            legacy_address,
+            current_restore.signmessage(legacy_address, legacy_message),
+            legacy_message,
         )
 
         self.log.info("A locked-wallet failure cannot replace an existing good backup")
