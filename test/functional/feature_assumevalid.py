@@ -100,7 +100,10 @@ class AssumeValidTest(BitcoinTestFramework):
         """Send a header chain without exceeding the protocol batch limit."""
         for start in range(0, len(blocks), MAX_HEADERS_PER_MESSAGE):
             p2p_conn.send_header_for_blocks(blocks[start:start + MAX_HEADERS_PER_MESSAGE])
-        p2p_conn.sync_with_ping()
+            # Keep the receive queue bounded under the lock-order/debug CI
+            # builds, where processing one full header batch is deliberately
+            # much slower than a release binary.
+            p2p_conn.sync_with_ping(timeout=self.rpc_timeout)
 
     def send_blocks(self, p2p_conn, blocks):
         """Send a long block chain in bounded batches."""
