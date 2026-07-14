@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "status_date": "2026-07-13",
+  "status_date": "2026-07-14",
   "baselines": {
     "v30_1_0": "f647dc75c9479c03e81414f145a8d233b60959c7",
     "v30_1_1_audit_base": "7fde566f5f564e43f4c2d76502bd7e43c819e35f",
@@ -356,6 +356,19 @@
       "risk": "Replacing the consensus-adjacent vendored cryptographic subtree for performance and API changes is higher beta risk than retaining 0.4.0, which already contains the 0.3.1 and 0.3.2 compiler timing fixes.",
       "owner": "cryptography",
       "target": "post-beta isolated secp256k1 update"
+    },
+    {
+      "package": "crc32c",
+      "candidate": "vendored baseline plus upstream d3d60ac6e0f16780bcfcc825385e1d338801a558",
+      "upstream_commit": "d3d60ac6e0f16780bcfcc825385e1d338801a558",
+      "source": "https://github.com/google/crc32c/commit/d3d60ac6e0f16780bcfcc825385e1d338801a558",
+      "disposition": "backported",
+      "reason": "The exact upstream change replaces ARM64 unaligned and strict-aliasing pointer casts with memcpy-backed little-endian loads. It removes the native UBSan failure in LevelDB setup without disabling alignment checks or changing CRC32C results.",
+      "tracked_files": [
+        {"path": "src/crc32c/src/crc32c_arm64.cc", "sha256": "5eb1d9c73d9f9c34a7f61310d6e806c5632ec587369a9baecb881cca0f951559"},
+        {"path": "src/crc32c/src/crc32c_read_le.h", "sha256": "3719844b07935695a9fb6291870632a54e4ea0bbf884cac5f1cd9ae549309208"},
+        {"path": "src/crc32c/src/crc32c_read_le_unittest.cc", "sha256": "34394b2847528a3914239f9f86ec450367968ec6ae55415aa86ddf3fba53c71d"}
+      ]
     }
   ],
   "build_constraints": {

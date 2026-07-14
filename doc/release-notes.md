@@ -111,6 +111,13 @@ unsupported systems.
 Notable changes
 ===============
 
+### Native ARM64 sanitizer setup
+
+The vendored crc32c ARM64 path now uses its `memcpy`-backed unaligned readers,
+matching upstream commit `d3d60ac6e0f16780bcfcc825385e1d338801a558`.
+This removes an alignment-UBSan stop in LevelDB setup without suppressing the
+sanitizer or changing CRC32C results.
+
 ### Version line
 
 - v30.1.1 continues the v30 protocol line and makes the authenticated

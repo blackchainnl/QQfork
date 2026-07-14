@@ -23,6 +23,12 @@ EXPECTED_BASELINES = {
     "legacy_v26_2_0": "b54edb619b0d42df4b3a73a29b02d9eb885516d5",
     "active_legacy_v28_4_0": "5c1a4a5efc3886a69f01d50109c251d153ed092e",
 }
+CRC32C_ARM64_BACKPORT = "d3d60ac6e0f16780bcfcc825385e1d338801a558"
+CRC32C_ARM64_BACKPORT_FILES = {
+    "src/crc32c/src/crc32c_arm64.cc",
+    "src/crc32c/src/crc32c_read_le.h",
+    "src/crc32c/src/crc32c_read_le_unittest.cc",
+}
 
 
 def fail(message):
@@ -295,18 +301,48 @@ def verify_delta_and_vendored(root, document, dependencies):
 
     vendored = document.get("vendored_components")
     require(isinstance(vendored, list) and vendored, "vendored component review is missing")
-    for component in vendored:
-        require(component.get("package") == "secp256k1", "unexpected vendored component")
-        expected_hash = component.get("tracked_tree_sha256")
-        require(SHA256_RE.fullmatch(expected_hash or "") is not None,
-                "secp256k1 tracked tree hash is invalid")
-        require(tracked_tree_sha256(root, "src/secp256k1/") == expected_hash,
-                "vendored secp256k1 tree changed without a manifest review")
-        require(component.get("disposition") == "deferred",
-                "secp256k1 0.5.1 delta must retain an explicit disposition")
-        for field in ("risk", "owner", "target"):
-            require(isinstance(component.get(field), str) and component[field],
-                    f"secp256k1 disposition lacks {field}")
+    vendored_by_name = {component.get("package"): component for component in vendored}
+    require(len(vendored_by_name) == len(vendored),
+            "vendored component review contains duplicate packages")
+    require(set(vendored_by_name) == {"secp256k1", "crc32c"},
+            "vendored component inventory must contain secp256k1 and crc32c")
+
+    secp256k1 = vendored_by_name["secp256k1"]
+    expected_hash = secp256k1.get("tracked_tree_sha256")
+    require(SHA256_RE.fullmatch(expected_hash or "") is not None,
+            "secp256k1 tracked tree hash is invalid")
+    require(tracked_tree_sha256(root, "src/secp256k1/") == expected_hash,
+            "vendored secp256k1 tree changed without a manifest review")
+    require(secp256k1.get("disposition") == "deferred",
+            "secp256k1 0.5.1 delta must retain an explicit disposition")
+    for field in ("risk", "owner", "target"):
+        require(isinstance(secp256k1.get(field), str) and secp256k1[field],
+                f"secp256k1 disposition lacks {field}")
+
+    crc32c = vendored_by_name["crc32c"]
+    require(crc32c.get("upstream_commit") == CRC32C_ARM64_BACKPORT,
+            "crc32c ARM64 backport commit differs from the reviewed upstream fix")
+    require(crc32c.get("source") ==
+            f"https://github.com/google/crc32c/commit/{CRC32C_ARM64_BACKPORT}",
+            "crc32c ARM64 backport must link the exact upstream commit")
+    require(crc32c.get("disposition") == "backported",
+            "crc32c ARM64 alignment fix must remain an explicit backport")
+    require(isinstance(crc32c.get("reason"), str) and crc32c["reason"],
+            "crc32c ARM64 backport reason is missing")
+    tracked_files = crc32c.get("tracked_files")
+    require(isinstance(tracked_files, list),
+            "crc32c ARM64 backport tracked-file inventory is missing")
+    by_path = {record.get("path"): record for record in tracked_files}
+    require(len(by_path) == len(tracked_files),
+            "crc32c ARM64 backport contains duplicate tracked files")
+    require(set(by_path) == CRC32C_ARM64_BACKPORT_FILES,
+            "crc32c ARM64 backport tracked-file inventory differs")
+    for relative, record in by_path.items():
+        expected_file_hash = record.get("sha256")
+        require(SHA256_RE.fullmatch(expected_file_hash or "") is not None,
+                f"crc32c ARM64 backport hash is invalid: {relative}")
+        require(sha256(root / relative) == expected_file_hash,
+                f"crc32c ARM64 backport file changed without review: {relative}")
 
 
 def verify_capability_and_lifetime(root):
@@ -372,6 +408,7 @@ def verify_documentation(root):
         "all 31 candidate recipes",
         "libnatpmp",
         "bitcoin-core/libmultiprocess",
+        CRC32C_ARM64_BACKPORT,
     ):
         require(marker in audit, f"dependency audit is missing {marker}")
 

@@ -9,6 +9,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import platform as host_platform
 import re
 import statistics
 import subprocess
@@ -62,6 +63,18 @@ DIRECT_QUANTUM_SCRIPT_BYTES = 34
 CANONICAL_P2PKH_SCRIPT_BYTES = 25
 POOL_V2_BYTES = 49
 SHADOW_MAX_EMISSION_SATOSHIS = 51_437_700 * 100_000_000
+
+NATIVE_PLATFORMS = {
+    "linux": "linux",
+    "darwin": "macos",
+    "windows": "windows",
+}
+NATIVE_ARCHITECTURES = {
+    "amd64": "x86_64",
+    "x86_64": "x86_64",
+    "aarch64": "arm64",
+    "arm64": "arm64",
+}
 
 DOMAIN_BENCHMARKS = {
     "crypto": {
@@ -460,6 +473,50 @@ def checked_line(value: str, label: str) -> str:
     return value
 
 
+def native_runner_identity() -> tuple[str, str, str, str]:
+    reported_platform = checked_line(host_platform.system(), "native platform")
+    reported_architecture = checked_line(
+        host_platform.machine(), "native architecture"
+    )
+    normalized_platform = NATIVE_PLATFORMS.get(reported_platform.lower())
+    normalized_architecture = NATIVE_ARCHITECTURES.get(
+        reported_architecture.lower()
+    )
+    if normalized_platform is None:
+        raise RuntimeError(
+            f"unsupported native benchmark platform: {reported_platform}"
+        )
+    if normalized_architecture is None:
+        raise RuntimeError(
+            f"unsupported native benchmark architecture: {reported_architecture}"
+        )
+    return (
+        normalized_platform,
+        normalized_architecture,
+        reported_platform,
+        reported_architecture,
+    )
+
+
+def verify_native_runner(
+    requested_platform: str, requested_architecture: str
+) -> tuple[str, str]:
+    (
+        native_platform,
+        native_architecture,
+        reported_platform,
+        reported_architecture,
+    ) = native_runner_identity()
+    if (requested_platform != native_platform or
+            requested_architecture != native_architecture):
+        raise RuntimeError(
+            "benchmark identity is not native: "
+            f"requested {requested_platform}/{requested_architecture}, "
+            f"runner reports {reported_platform}/{reported_architecture}"
+        )
+    return reported_platform, reported_architecture
+
+
 def verify_source_checkout(repo_root: Path, repository: str,
                            source_sha: str,
                            allowed_untracked: tuple[Path, ...] = ()) -> None:
@@ -650,6 +707,9 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
     epoch_source_contract = verify_epoch_source_contract(repo_root)
     if not LABEL_RE.fullmatch(platform) or not LABEL_RE.fullmatch(architecture):
         raise RuntimeError("platform and architecture must be simple stable labels")
+    reported_platform, reported_architecture = verify_native_runner(
+        platform, architecture
+    )
     toolchain = checked_line(toolchain, "toolchain")
     compiler_flags = checked_line(compiler_flags, "compiler flags")
     build_profile = checked_line(build_profile, "build profile")
@@ -753,6 +813,9 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
         "runner": {
             "platform": platform,
             "architecture": architecture,
+            "reported_platform": reported_platform,
+            "reported_architecture": reported_architecture,
+            "native_execution_verified": True,
             "endianness": sys.byteorder,
             "toolchain": toolchain,
         },

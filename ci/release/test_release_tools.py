@@ -50,6 +50,7 @@ def load_path(name, path):
 class ReleaseToolTests(unittest.TestCase):
     def test_resource_benchmark_evidence_is_source_bound_and_fail_closed(self):
         generator = load_module("generate_resource_benchmark_evidence")
+        native_platform, native_architecture, _, _ = generator.native_runner_identity()
         repository = TOOLS.parent.parent
         source_sha = subprocess.run(
             ["git", "-C", str(repository), "rev-parse", "HEAD"],
@@ -101,8 +102,8 @@ class ReleaseToolTests(unittest.TestCase):
                 source_sha=source_sha,
                 repo_root=repository,
                 repository="Blackcoin-Dev/Blackcoin",
-                platform="linux",
-                architecture="x86_64",
+                platform=native_platform,
+                architecture=native_architecture,
                 toolchain="GCC 11.4.0",
                 compiler_flags="-O2 -g",
                 build_profile="native-test",
@@ -117,6 +118,7 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertTrue(evidence["coverage"]["large-block"])
             self.assertTrue(evidence["coverage"]["synthetic-state"])
             self.assertTrue(evidence["release_resource_evidence_complete"])
+            self.assertTrue(evidence["runner"]["native_execution_verified"])
             argon_bound = evidence["derived_upper_bounds"]["shadow_pow_argon2_block"]
             mldsa_bound = evidence["derived_upper_bounds"]["quantum_mldsa_block"]
             self.assertEqual(
@@ -252,8 +254,8 @@ class ReleaseToolTests(unittest.TestCase):
                 source_sha=source_sha,
                 repo_root=repository,
                 repository="Blackcoin-Dev/Blackcoin",
-                platform="linux",
-                architecture="x86_64",
+                platform=native_platform,
+                architecture=native_architecture,
                 toolchain="GCC 11.4.0",
                 compiler_flags="-O2 -g",
                 build_profile="native-test",
@@ -275,8 +277,8 @@ class ReleaseToolTests(unittest.TestCase):
                     source_sha=source_sha,
                     repo_root=repository,
                     repository="Blackcoin-Dev/Blackcoin",
-                    platform="linux",
-                    architecture="x86_64",
+                    platform=native_platform,
+                    architecture=native_architecture,
                     toolchain="GCC 11.4.0",
                     compiler_flags="-O2 -g",
                     build_profile="native-test",
@@ -302,8 +304,8 @@ class ReleaseToolTests(unittest.TestCase):
                     source_sha=source_sha,
                     repo_root=repository,
                     repository="Blackcoin-Dev/Blackcoin",
-                    platform="linux",
-                    architecture="x86_64",
+                    platform=native_platform,
+                    architecture=native_architecture,
                     toolchain="GCC 11.4.0",
                     compiler_flags="-O2 -g",
                     build_profile="native-test",
@@ -334,8 +336,8 @@ class ReleaseToolTests(unittest.TestCase):
                     source_sha=source_sha,
                     repo_root=repository,
                     repository="Blackcoin-Dev/Blackcoin",
-                    platform="linux",
-                    architecture="x86_64",
+                    platform=native_platform,
+                    architecture=native_architecture,
                     toolchain="GCC 11.4.0",
                     compiler_flags="-O2 -g",
                     build_profile="native-test",
@@ -486,7 +488,46 @@ class ReleaseToolTests(unittest.TestCase):
             with self.assertRaisesRegex(
                     RuntimeError, "epoch-bound source contract changed"):
                 generator.verify_epoch_source_contract(root)
+    def test_resource_benchmark_rejects_emulated_platform_identity(self):
+        generator = load_module("generate_resource_benchmark_evidence")
+        native_platform, native_architecture, _, _ = generator.native_runner_identity()
+        self.assertEqual(
+            generator.verify_native_runner(native_platform, native_architecture),
+            (generator.host_platform.system(), generator.host_platform.machine()),
+        )
+        wrong_architecture = "arm64" if native_architecture == "x86_64" else "x86_64"
+        with self.assertRaisesRegex(RuntimeError, "is not native"):
+            generator.verify_native_runner(native_platform, wrong_architecture)
+        wrong_platform = "windows" if native_platform != "windows" else "linux"
+        with self.assertRaisesRegex(RuntimeError, "is not native"):
+            generator.verify_native_runner(wrong_platform, native_architecture)
 
+    def test_resource_benchmark_normalizes_supported_native_runners(self):
+        generator = load_module("generate_resource_benchmark_evidence")
+        cases = (
+            ("Linux", "aarch64", "linux", "arm64"),
+            ("Linux", "x86_64", "linux", "x86_64"),
+            ("Darwin", "arm64", "macos", "arm64"),
+            ("Darwin", "x86_64", "macos", "x86_64"),
+            ("Windows", "AMD64", "windows", "x86_64"),
+        )
+        for system, machine, expected_platform, expected_architecture in cases:
+            with self.subTest(system=system, machine=machine):
+                with mock.patch.object(generator.host_platform, "system",
+                                       return_value=system):
+                    with mock.patch.object(generator.host_platform, "machine",
+                                           return_value=machine):
+                        self.assertEqual(
+                            generator.native_runner_identity(),
+                            (expected_platform, expected_architecture,
+                             system, machine),
+                        )
+
+        with mock.patch.object(generator.host_platform, "system",
+                               return_value="UnknownOS"):
+            with self.assertRaisesRegex(RuntimeError,
+                                        "unsupported native benchmark platform"):
+                generator.native_runner_identity()
     def test_resource_benchmark_workflow_measures_and_does_not_overclaim(self):
         root = TOOLS.parent.parent
         gate = (root / ".github" / "workflows" / "pr-gate.yml").read_text(
@@ -521,6 +562,16 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("Argon2 single-operation benchmark failed", benchmark_source)
         self.assertIn("ML-DSA single-operation benchmark failed", benchmark_source)
         self.assertIn("resource-benchmarks-linux:", gate)
+        self.assertIn("native-linux-arm64-crypto:", gate)
+        self.assertIn("native-linux-arm64-ubsan:", gate)
+        self.assertIn("runs-on: ubuntu-24.04-arm", gate)
+        self.assertIn("native-windows-crypto:", gate)
+        self.assertIn("runs-on: windows-2025", gate)
+        self.assertIn("architecture: i386:x86-64", gate)
+        self.assertIn("--platform windows", gate)
+        self.assertIn("--architecture arm64", gate)
+        self.assertIn("--architecture x86_64", gate)
+        self.assertIn("crc32c_accepts_unaligned_arm64_input", gate)
         self.assertIn("--require-domain large-block", gate)
         self.assertIn("--require-domain synthetic-state", gate)
         self.assertIn("MAXIMUM_MAINNET_SYNTHETIC_CLAIMS == 751", benchmark_source)
@@ -536,7 +587,8 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("--minimum-runtime-ms 250", gate)
         self.assertIn("--provenance-manifest", gate)
         self.assertIn("pattern: quantum-resource-benchmarks-*", release)
-        self.assertIn("test \"${#resource_evidence[@]}\" -eq 3", release)
+        self.assertIn("test \"${#resource_evidence[@]}\" -eq 5", release)
+        self.assertIn("test \"${#resource_raw[@]}\" -eq 5", release)
 
     def test_quantum_crypto_provenance_is_mandatory_and_retained(self):
         root = TOOLS.parent.parent

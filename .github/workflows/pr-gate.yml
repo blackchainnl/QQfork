@@ -285,6 +285,315 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  native-linux-arm64-crypto:
+    name: Linux ARM64 native cryptographic vectors and resources
+    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    env:
+      ARM64_HOST: aarch64-linux-gnu
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout and native architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(uname -m)" = "aarch64"
+          python3 - <<'PY'
+          import platform
+          assert platform.system() == "Linux"
+          assert platform.machine().lower() in {"aarch64", "arm64"}
+          PY
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            automake bison build-essential cmake gettext gperf libtool \
+            pkg-config python3
+
+      - name: Restore pinned native dependency cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: depends/built
+          key: native-linux-arm64-${{ hashFiles('depends/*.mk', 'depends/packages/*', 'depends/patches/**/*') }}
+
+      - name: Build pinned native dependencies
+        run: |
+          make -j "$MAKEJOBS" -C depends HOST="$ARM64_HOST" \
+            NO_WALLET=1 NO_QT=1 NO_UPNP=1 NO_NATPMP=1
+
+      - name: Configure native walletless benchmark build
+        run: |
+          ./autogen.sh
+          ./configure \
+            --prefix="$PWD/depends/$ARM64_HOST" \
+            --disable-wallet --with-gui=no --enable-bench --disable-zmq
+
+      - name: Compile and run native vectors
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -C src -j "$MAKEJOBS" test/test_blackcoin bench/bench_blackcoin
+          for suite in dbwrapper_tests crypto_hardening_tests demurrage_tests shadow_tests; do
+            src/test/test_blackcoin --run_test="$suite" --log_level=test_suite
+          done
+
+      - name: Measure native Linux ARM64 resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          raw=quantum-resource-linux-arm64-nanobench.json
+          evidence=quantum-resource-linux-arm64-evidence.json
+          cxx=$(sed -n 's/^CXX = //p' src/Makefile)
+          cxxflags=$(sed -n 's/^CXXFLAGS = //p' src/Makefile)
+          test -n "$cxx"
+          test -n "$cxxflags"
+          src/bench/bench_blackcoin \
+            -filter='Quantum(Argon2id|MLDSA44|LargeBlock|SyntheticState).*' \
+            -min-time=250 \
+            -output-json="$raw"
+          python3 ci/release/generate_resource_benchmark_evidence.py \
+            --nanobench-json "$raw" \
+            --binary src/bench/bench_blackcoin \
+            --source-sha "$TARGET_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repo-root . \
+            --platform linux \
+            --architecture arm64 \
+            --toolchain "$cxx; $($cxx --version | sed -n '1p')" \
+            --compiler-flags="$cxxflags" \
+            --build-profile native-linux-arm64-walletless \
+            --minimum-runtime-ms 250 \
+            --provenance-manifest contrib/devtools/quantum-crypto-provenance.json \
+            --require-domain crypto \
+            --require-domain large-block \
+            --require-domain synthetic-state \
+            --output "$evidence"
+
+      - name: Upload native Linux ARM64 resource evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: quantum-resource-benchmarks-linux-arm64-${{ env.TARGET_SHA }}
+          path: quantum-resource-linux-arm64-*.json
+          if-no-files-found: error
+          retention-days: 30
+
+  native-linux-arm64-ubsan:
+    name: Linux ARM64 native UBSan block-harness gate
+    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    needs: native-linux-arm64-crypto
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    env:
+      ARM64_HOST: aarch64-linux-gnu
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout and native architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(uname -m)" = "aarch64"
+
+      - name: Install native build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            automake bison build-essential cmake gettext gperf libtool \
+            pkg-config python3
+
+      - name: Restore pinned native dependency cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: depends/built
+          key: native-linux-arm64-${{ hashFiles('depends/*.mk', 'depends/packages/*', 'depends/patches/**/*') }}
+
+      - name: Build pinned native dependencies
+        run: |
+          make -j "$MAKEJOBS" -C depends HOST="$ARM64_HOST" \
+            NO_WALLET=1 NO_QT=1 NO_UPNP=1 NO_NATPMP=1
+
+      - name: Configure native UBSan harness build
+        run: |
+          ./autogen.sh
+          ./configure \
+            --prefix="$PWD/depends/$ARM64_HOST" \
+            --disable-wallet --with-gui=no --disable-bench --disable-zmq \
+            --enable-fuzz-binary --with-sanitizers=undefined
+
+      - name: Run unaligned CRC and initialized block-harness regressions
+        shell: bash
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1:report_error_type=1
+        run: |
+          set -euo pipefail
+          make -C src -j "$MAKEJOBS" test/test_blackcoin test/fuzz/fuzz
+          src/test/test_blackcoin \
+            --run_test=dbwrapper_tests/crc32c_accepts_unaligned_arm64_input \
+            --log_level=test_suite
+          src/test/test_blackcoin \
+            --run_test=crypto_hardening_tests \
+            --log_level=test_suite
+          mkdir -p "$RUNNER_TEMP/fuzz-corpus/block"
+          python3 test/fuzz/test_runner.py \
+            --par=1 "$RUNNER_TEMP/fuzz-corpus" block
+
+  windows-crypto-cross-build:
+    name: Build pinned Windows x86_64 vector binaries
+    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      WINDOWS_HOST: x86_64-w64-mingw32
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+
+      - name: Install Windows cross-build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            automake bison build-essential cmake gettext gperf libtool \
+            pkg-config python3 g++-mingw-w64-x86-64-posix \
+            binutils-mingw-w64-x86-64
+
+      - name: Build pinned Windows dependencies
+        run: |
+          make -j "$MAKEJOBS" -C depends HOST="$WINDOWS_HOST" \
+            NO_WALLET=1 NO_QT=1 NO_UPNP=1 NO_NATPMP=1
+
+      - name: Configure and compile Windows vectors
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./autogen.sh
+          ./configure \
+            --prefix="$PWD/depends/$WINDOWS_HOST" \
+            --disable-wallet --with-gui=no --enable-bench --disable-zmq \
+            --disable-shared \
+            LDFLAGS="-static -static-libgcc -static-libstdc++"
+          make -C src -j "$MAKEJOBS" \
+            test/test_blackcoin.exe bench/bench_blackcoin.exe
+          mkdir -p ci/scratch
+          cxx=$(sed -n 's/^CXX = //p' src/Makefile)
+          "$cxx" --version | sed -n '1p' > ci/scratch/windows-cross-compiler.txt
+          for binary in src/test/test_blackcoin.exe src/bench/bench_blackcoin.exe; do
+            "$WINDOWS_HOST-objdump" -f "$binary" |
+              grep -Fq 'architecture: i386:x86-64'
+            "$WINDOWS_HOST-objdump" -p "$binary" > "$binary.imports"
+            if grep -Eiq \
+              'DLL Name: (libstdc\+\+-6|libgcc_s_[^ ]+|libwinpthread-1|libssp-0)\.dll' \
+              "$binary.imports"; then
+              echo "Non-system runtime DLL imported by $binary" >&2
+              grep -i 'DLL Name:' "$binary.imports" >&2
+              exit 1
+            fi
+          done
+
+      - name: Upload exact Windows vector binaries
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-native-vector-inputs-${{ env.TARGET_SHA }}
+          path: |
+            src/test/test_blackcoin.exe
+            src/bench/bench_blackcoin.exe
+            src/Makefile
+            ci/scratch/windows-cross-compiler.txt
+          if-no-files-found: error
+          retention-days: 3
+
+  native-windows-crypto:
+    name: Windows x86_64 native cryptographic vectors and resources
+    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    needs: windows-crypto-cross-build
+    runs-on: windows-2025
+    timeout-minutes: 180
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.TARGET_SHA }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout and native architecture
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD) -ne $env:TARGET_SHA) { throw "source mismatch" }
+          if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") { throw "not native x86_64" }
+          if ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture -ne "X64") {
+            throw "runtime architecture is not x86_64"
+          }
+
+      - name: Download exact Windows vector binaries
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: windows-native-vector-inputs-${{ env.TARGET_SHA }}
+          path: .
+
+      - name: Run native Windows vectors and resource measurements
+        shell: bash
+        run: |
+          set -euo pipefail
+          for suite in dbwrapper_tests crypto_hardening_tests demurrage_tests shadow_tests; do
+            src/test/test_blackcoin.exe \
+              --run_test="$suite" --log_level=test_suite
+          done
+          raw=quantum-resource-windows-x86_64-nanobench.json
+          evidence=quantum-resource-windows-x86_64-evidence.json
+          cxx=$(sed -n 's/^CXX = //p' src/Makefile)
+          cxxflags=$(sed -n 's/^CXXFLAGS = //p' src/Makefile)
+          toolchain=$(tr -d '\r\n' < ci/scratch/windows-cross-compiler.txt)
+          test -n "$cxx"
+          test -n "$cxxflags"
+          test -n "$toolchain"
+          src/bench/bench_blackcoin.exe \
+            -filter='Quantum(Argon2id|MLDSA44|LargeBlock|SyntheticState).*' \
+            -min-time=250 \
+            -output-json="$raw"
+          python ci/release/generate_resource_benchmark_evidence.py \
+            --nanobench-json "$raw" \
+            --binary src/bench/bench_blackcoin.exe \
+            --source-sha "$TARGET_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repo-root . \
+            --platform windows \
+            --architecture x86_64 \
+            --toolchain "$cxx; $toolchain" \
+            --compiler-flags="$cxxflags" \
+            --build-profile mingw-pinned-native-windows \
+            --minimum-runtime-ms 250 \
+            --provenance-manifest contrib/devtools/quantum-crypto-provenance.json \
+            --require-domain crypto \
+            --require-domain large-block \
+            --require-domain synthetic-state \
+            --output "$evidence"
+
+      - name: Upload native Windows resource evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: quantum-resource-benchmarks-windows-x86_64-${{ env.TARGET_SHA }}
+          path: quantum-resource-windows-x86_64-*.json
+          if-no-files-found: error
+          retention-days: 30
+
   native-macos-crypto:
     name: ${{ matrix.name }} native cryptographic vectors
     if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
