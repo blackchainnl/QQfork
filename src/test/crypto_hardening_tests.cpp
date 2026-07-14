@@ -27,6 +27,7 @@
 #include <array>
 #include <atomic>
 #include <cstdlib>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -253,6 +254,128 @@ BOOST_AUTO_TEST_CASE(shadow_argon2_faults_are_typed_retryable_and_canonical)
                 ShadowPowGrindResult::FOUND);
 }
 
+BOOST_AUTO_TEST_CASE(shadow_qqp2_exact_encoding_boundaries)
+{
+    ShadowPowWork work;
+    work.valid = true;
+    work.target = CScript{} << OP_TRUE;
+    work.quantum_payout_script = GetScriptForDestination(
+        WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION,
+                       std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x24)});
+    work.height = SHADOW_REWARD_START_HEIGHT;
+    work.prev_hash = uint256::ONE;
+    work.bits = 0;
+
+    std::vector<unsigned char> proof;
+    BOOST_REQUIRE(GrindShadowPowWorkDetailed(work, 0, 1, 1, proof) ==
+                  ShadowPowGrindResult::FOUND);
+    BOOST_REQUIRE(ValidateShadowPowProofForWorkDetailed(work, proof) ==
+                  ShadowProofValidationResult::VALID);
+
+    const size_t prefix_size = GetShadowPrefix().size();
+    constexpr size_t MAGIC_SIZE{4};
+    constexpr size_t MODE_SIZE{1};
+    constexpr size_t NONCE_SIZE{8};
+    constexpr size_t LENGTH_SIZE{2};
+    const size_t target_length_offset = prefix_size + MAGIC_SIZE + MODE_SIZE + NONCE_SIZE;
+    const size_t target_offset = target_length_offset + LENGTH_SIZE;
+    const size_t payout_length_offset = target_offset + work.target.size();
+    const size_t payout_offset = payout_length_offset + LENGTH_SIZE;
+    BOOST_REQUIRE_EQUAL(payout_offset + work.quantum_payout_script.size(), proof.size());
+
+    const auto write_length = [](std::vector<unsigned char>& bytes, size_t offset, uint16_t value) {
+        bytes[offset] = static_cast<unsigned char>(value);
+        bytes[offset + 1] = static_cast<unsigned char>(value >> 8);
+    };
+    const auto check_invalid = [&work](const std::vector<unsigned char>& candidate) {
+        BOOST_CHECK(ValidateShadowPowProofForWorkDetailed(work, candidate) ==
+                    ShadowProofValidationResult::INVALID);
+    };
+
+    // Every strict prefix is truncated and must fail before Argon2 evaluation.
+    for (size_t size = 0; size < proof.size(); ++size) {
+        check_invalid(std::vector<unsigned char>{proof.begin(), proof.begin() + size});
+    }
+
+    for (size_t magic_index = 0; magic_index < MAGIC_SIZE; ++magic_index) {
+        std::vector<unsigned char> malformed = proof;
+        malformed[prefix_size + magic_index] ^= 0x01;
+        check_invalid(malformed);
+    }
+
+    std::vector<unsigned char> malformed = proof;
+    malformed[prefix_size + MAGIC_SIZE] = 0xff;
+    check_invalid(malformed);
+
+    malformed = proof;
+    write_length(malformed, target_length_offset, 0);
+    check_invalid(malformed);
+    malformed = proof;
+    write_length(malformed, target_length_offset,
+                 static_cast<uint16_t>(work.target.size() + 1));
+    check_invalid(malformed);
+    malformed = proof;
+    write_length(malformed, target_length_offset, std::numeric_limits<uint16_t>::max());
+    check_invalid(malformed);
+
+    malformed = proof;
+    write_length(malformed, payout_length_offset, 0);
+    check_invalid(malformed);
+    malformed = proof;
+    write_length(malformed, payout_length_offset,
+                 static_cast<uint16_t>(work.quantum_payout_script.size() - 1));
+    check_invalid(malformed);
+    malformed = proof;
+    write_length(malformed, payout_length_offset,
+                 static_cast<uint16_t>(work.quantum_payout_script.size() + 1));
+    check_invalid(malformed);
+    malformed = proof;
+    write_length(malformed, payout_length_offset, std::numeric_limits<uint16_t>::max());
+    check_invalid(malformed);
+
+    malformed = proof;
+    malformed[payout_offset] = OP_15;
+    check_invalid(malformed);
+    malformed = proof;
+    malformed.push_back(0);
+    check_invalid(malformed);
+
+    // The 520-byte script-element ceiling is inclusive. Construct a valid
+    // byte-exact QQP2 proof at the ceiling, then prove one additional byte is
+    // rejected before it can reach Argon2.
+    const size_t fixed_size = proof.size() - work.target.size() - work.quantum_payout_script.size();
+    BOOST_REQUIRE_LT(fixed_size + work.quantum_payout_script.size(), MAX_SCRIPT_ELEMENT_SIZE);
+    const size_t boundary_target_size =
+        MAX_SCRIPT_ELEMENT_SIZE - fixed_size - work.quantum_payout_script.size();
+    ShadowPowWork boundary_work = work;
+    boundary_work.target.clear();
+    boundary_work.target.insert(boundary_work.target.end(), boundary_target_size,
+                                static_cast<unsigned char>(OP_TRUE));
+    std::vector<unsigned char> boundary_proof;
+    BOOST_REQUIRE(GrindShadowPowWorkDetailed(boundary_work, 0, 1, 1, boundary_proof) ==
+                  ShadowPowGrindResult::FOUND);
+    BOOST_REQUIRE_EQUAL(boundary_proof.size(), MAX_SCRIPT_ELEMENT_SIZE);
+    BOOST_CHECK(ValidateShadowPowProofForWorkDetailed(boundary_work, boundary_proof) ==
+                ShadowProofValidationResult::VALID);
+
+    std::vector<unsigned char> oversized = boundary_proof;
+    oversized.push_back(0);
+    BOOST_REQUIRE_EQUAL(oversized.size(), MAX_SCRIPT_ELEMENT_SIZE + 1);
+    BOOST_CHECK(ValidateShadowPowProofForWorkDetailed(boundary_work, oversized) ==
+                ShadowProofValidationResult::INVALID);
+
+    // Lengths are canonical little-endian integers. Reversing a multi-byte
+    // target length must not select an alternate parse of the same bytes.
+    const size_t boundary_target_length_offset =
+        prefix_size + MAGIC_SIZE + MODE_SIZE + NONCE_SIZE;
+    std::vector<unsigned char> wrong_endian = boundary_proof;
+    std::swap(wrong_endian[boundary_target_length_offset],
+              wrong_endian[boundary_target_length_offset + 1]);
+    BOOST_REQUIRE(wrong_endian != boundary_proof);
+    BOOST_CHECK(ValidateShadowPowProofForWorkDetailed(boundary_work, wrong_endian) ==
+                ShadowProofValidationResult::INVALID);
+}
+
 BOOST_AUTO_TEST_CASE(shadow_argon2_concurrent_stress)
 {
     ShadowArgon2FailureGuard guard;
@@ -313,7 +436,19 @@ BOOST_AUTO_TEST_CASE(mldsa_wycheproof_positive_negative_and_boundaries)
     BOOST_CHECK(ML_DSA::VerifyDetailed(pubkey, valid_message.data(), valid_message.size(), short_signature) == MLDSAVerifyResult::INVALID);
     BOOST_CHECK(ML_DSA::VerifyDetailed(pubkey, valid_message.data(), valid_message.size(), long_signature) == MLDSAVerifyResult::INVALID);
     BOOST_CHECK(ML_DSA::VerifyDetailed(pubkey, valid_message.data(), valid_message.size() - 1, valid_signature) == MLDSAVerifyResult::INVALID);
+    BOOST_CHECK(ML_DSA::VerifyDetailed(pubkey.data(), pubkey.size(), valid_message.data(), valid_message.size() + 1,
+                                      valid_signature.data(), valid_signature.size()) == MLDSAVerifyResult::INVALID);
     BOOST_CHECK(ML_DSA::VerifyDetailed(nullptr, pubkey.size(), valid_message.data(), valid_message.size(), valid_signature.data(), valid_signature.size()) == MLDSAVerifyResult::INVALID);
+    BOOST_CHECK(ML_DSA::VerifyDetailed(pubkey.data(), pubkey.size(), nullptr, valid_message.size(),
+                                      valid_signature.data(), valid_signature.size()) == MLDSAVerifyResult::INVALID);
+    BOOST_CHECK(ML_DSA::VerifyDetailed(pubkey.data(), pubkey.size(), valid_message.data(), valid_message.size(),
+                                      nullptr, valid_signature.size()) == MLDSAVerifyResult::INVALID);
+    BOOST_CHECK(ML_DSA::VerifyDetailed(pubkey.data(), 0, valid_message.data(), valid_message.size(),
+                                      valid_signature.data(), valid_signature.size()) == MLDSAVerifyResult::INVALID);
+    BOOST_CHECK(ML_DSA::VerifyDetailed(pubkey.data(), pubkey.size(), valid_message.data(), 0,
+                                      valid_signature.data(), valid_signature.size()) == MLDSAVerifyResult::INVALID);
+    BOOST_CHECK(ML_DSA::VerifyDetailed(pubkey.data(), pubkey.size(), valid_message.data(), valid_message.size(),
+                                      valid_signature.data(), 0) == MLDSAVerifyResult::INVALID);
 }
 
 BOOST_AUTO_TEST_CASE(mldsa_faults_are_internal_and_retryable)
@@ -341,7 +476,13 @@ BOOST_AUTO_TEST_CASE(mldsa_faults_are_internal_and_retryable)
     BOOST_CHECK(ML_DSA::KeyGenDetailed(unused_pubkey, unused_privkey) == MLDSAOperationResult::SUCCESS);
 
     std::vector<uint8_t> short_key(privkey.begin(), privkey.end() - 1);
+    std::vector<uint8_t> long_key{privkey};
+    long_key.push_back(0);
     BOOST_CHECK(ML_DSA::SignDetailed(short_key, message.begin(), uint256::size(), signature) == MLDSAOperationResult::INVALID_INPUT);
+    BOOST_CHECK(ML_DSA::SignDetailed(long_key, message.begin(), uint256::size(), signature) == MLDSAOperationResult::INVALID_INPUT);
+    BOOST_CHECK(ML_DSA::SignDetailed(privkey, nullptr, uint256::size(), signature) == MLDSAOperationResult::INVALID_INPUT);
+    BOOST_CHECK(ML_DSA::SignDetailed(privkey, message.begin(), uint256::size() - 1, signature) == MLDSAOperationResult::INVALID_INPUT);
+    BOOST_CHECK(ML_DSA::SignDetailed(privkey, message.begin(), uint256::size() + 1, signature) == MLDSAOperationResult::INVALID_INPUT);
 }
 
 BOOST_AUTO_TEST_CASE(mldsa_concurrent_keygen_sign_verify_stress)
