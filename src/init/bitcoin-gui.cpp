@@ -27,6 +27,7 @@ public:
     {
         m_node.args = &gArgs;
         m_node.init = this;
+        m_node.gui_process = true;
     }
     std::unique_ptr<interfaces::Node> makeNode() override { return interfaces::MakeNode(m_node); }
     std::unique_ptr<interfaces::Chain> makeChain() override { return interfaces::MakeChain(m_node); }

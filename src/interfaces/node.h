@@ -37,6 +37,7 @@ enum class TransactionError;
 struct CNodeStateStats;
 struct bilingual_str;
 namespace node {
+enum class ChainstateRebuildStatus;
 struct NodeContext;
 } // namespace node
 namespace wallet {
@@ -94,6 +95,9 @@ public:
 
     //! Get exit status.
     virtual int getExitStatus() = 0;
+
+    //! Get mandatory chainstate-upgrade state for the GUI startup assistant.
+    virtual node::ChainstateRebuildStatus getChainstateRebuildStatus() = 0;
 
     // Get log flags.
     virtual uint32_t getLogCategories() = 0;

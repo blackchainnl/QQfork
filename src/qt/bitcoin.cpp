@@ -18,10 +18,12 @@
 #include <interfaces/node.h>
 #include <logging.h>
 #include <node/context.h>
+#include <node/chainstate_rebuild.h>
 #include <node/interface_ui.h>
 #include <noui.h>
 #include <qt/bitcoingui.h>
 #include <qt/clientmodel.h>
+#include <qt/chainstaterebuildassistant.h>
 #include <qt/guiconstants.h>
 #include <qt/guiutil.h>
 #include <qt/initexecutor.h>
@@ -57,7 +59,9 @@
 #include <QLocale>
 #include <QMessageBox>
 #include <QProgressDialog>
+#include <QProcess>
 #include <QPushButton>
+#include <QFileInfo>
 #include <QSettings>
 #include <QThread>
 #include <QTimer>
@@ -320,6 +324,22 @@ void BitcoinApplication::setupPlatformStyle()
     assert(platformStyle);
 }
 
+void BitcoinApplication::configureChainstateRebuild(
+    const QString& executable, const QStringList& original_arguments,
+    const QString& phase)
+{
+    m_executable = executable;
+    m_original_arguments = original_arguments;
+    m_chainstate_rebuild_phase = phase;
+}
+
+void BitcoinApplication::scheduleChainstateRelaunch(const QString& phase)
+{
+    using namespace ChainstateRebuildAssistant;
+    m_relaunch_arguments = BuildRelaunchArguments(
+        m_original_arguments, ParsePhase(phase));
+}
+
 BitcoinApplication::~BitcoinApplication()
 {
     m_executor.reset();
@@ -398,7 +418,19 @@ void BitcoinApplication::startThread()
 
     /*  communication to and from thread */
     connect(&m_executor.value(), &InitExecutor::initializeResult, this, &BitcoinApplication::initializeResult);
-    connect(&m_executor.value(), &InitExecutor::shutdownResult, this, [] {
+    connect(&m_executor.value(), &InitExecutor::shutdownResult, this, [this] {
+        if (!m_relaunch_arguments.isEmpty()) {
+            const bool started = QProcess::startDetached(
+                m_executable, m_relaunch_arguments,
+                QFileInfo{m_executable}.absolutePath());
+            if (!started) {
+                QMessageBox::critical(
+                    nullptr, PACKAGE_NAME,
+                    tr("Blackcoin shut down safely, but the replacement process could not be started. Reopen Blackcoin manually with the command shown in the upgrade guide."));
+                QCoreApplication::exit(EXIT_FAILURE);
+                return;
+            }
+        }
         QCoreApplication::exit(0);
     });
     connect(&m_executor.value(), &InitExecutor::runawayException, this, &BitcoinApplication::handleRunawayException);
@@ -425,6 +457,18 @@ void BitcoinApplication::requestInitialize()
 
 void BitcoinApplication::requestShutdown()
 {
+    if (m_shutdown_in_progress) return;
+    m_shutdown_in_progress = true;
+
+    // Relaunch only after the durable COMMIT_READY transition. An interrupted
+    // BUILDING journal exits without spawning a verifier and is recovered by
+    // the existing journal rollback path on the next launch.
+    if (m_chainstate_rebuild_phase == QLatin1String("rebuild") &&
+        node::GetChainstateRebuildJournalStatus(gArgs.GetDataDirNet()) ==
+            node::ChainstateRebuildJournalStatus::VERIFICATION_PENDING) {
+        scheduleChainstateRelaunch(QStringLiteral("verify"));
+    }
+
     for (const auto w : QGuiApplication::topLevelWindows()) {
         w->hide();
     }
@@ -480,6 +524,26 @@ void BitcoinApplication::initializeResult(interfaces::AppInitResult result, inte
         return;
     }
     if (result == interfaces::AppInitResult::FAILURE) {
+        using namespace ChainstateRebuildAssistant;
+        const node::ChainstateRebuildStatus status =
+            node().getChainstateRebuildStatus();
+        if (status == node::ChainstateRebuildStatus::REQUIRED &&
+            m_chainstate_rebuild_phase.isEmpty()) {
+            const Action action = ResolveAction(
+                Condition::REBUILD_REQUIRED, PromptForRebuild(nullptr));
+            if (action == Action::RELAUNCH_CHAINSTATE_REBUILD) {
+                scheduleChainstateRelaunch(QStringLiteral("rebuild"));
+            } else {
+                ShowManualRebuildInstructions(
+                    nullptr, m_executable, m_original_arguments);
+            }
+        } else if (status == node::ChainstateRebuildStatus::FULL_REINDEX_REQUIRED) {
+            ShowFullReindexInstructions(
+                nullptr, m_executable, m_original_arguments);
+        } else if (status == node::ChainstateRebuildStatus::REBUILD_COMMITTED &&
+                   m_chainstate_rebuild_phase == QLatin1String("rebuild")) {
+            scheduleChainstateRelaunch(QStringLiteral("verify"));
+        }
         requestShutdown();
         return;
     }
@@ -575,6 +639,7 @@ static void SetupUIArgs(ArgsManager& argsman)
     argsman.AddArg("-resetguisettings", "Reset all settings changed in the GUI", ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-splash", strprintf("Show splash screen on startup (default: %u)", DEFAULT_SPLASHSCREEN), ArgsManager::ALLOW_ANY, OptionsCategory::GUI);
     argsman.AddArg("-uiplatform", strprintf("Select platform to customize UI for (one of windows, macosx, other; default: %s)", BitcoinGUI::DEFAULT_UIPLATFORM), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::GUI);
+    argsman.AddHiddenArgs({"-gui-chainstate-rebuild=<phase>"});
 }
 
 int GuiMain(int argc, char* argv[])
@@ -627,6 +692,11 @@ int GuiMain(int argc, char* argv[])
             // message cannot be translated because translations have not been initialized
             QString::fromStdString("Error parsing command line arguments: %1.").arg(QString::fromStdString(error)));
         return EXIT_FAILURE;
+    }
+
+    QStringList original_arguments;
+    for (int i = 1; i < argc; ++i) {
+        original_arguments.push_back(QString::fromUtf8(argv[i]));
     }
 
     // Now that the QApplication is setup and we have parsed our parameters, we can set the platform style
@@ -714,6 +784,44 @@ int GuiMain(int argc, char* argv[])
         app.createPaymentServer();
     }
 #endif // ENABLE_WALLET
+
+    QString rebuild_phase = QString::fromStdString(
+        gArgs.GetArg("-gui-chainstate-rebuild", ""));
+    const node::ChainstateRebuildJournalStatus journal_status =
+        node::GetChainstateRebuildJournalStatus(gArgs.GetDataDirNet());
+    // A crash after COMMIT_READY must still enter the protected verification
+    // process even though the one-shot internal argv marker was not persisted.
+    if (journal_status ==
+        node::ChainstateRebuildJournalStatus::VERIFICATION_PENDING) {
+        rebuild_phase = QStringLiteral("verify");
+        gArgs.ForceSetArg("-gui-chainstate-rebuild", "verify");
+    }
+    const auto parsed_rebuild_phase =
+        ChainstateRebuildAssistant::ParsePhase(rebuild_phase);
+    if (!rebuild_phase.isEmpty() &&
+        parsed_rebuild_phase == ChainstateRebuildAssistant::Phase::NONE) {
+        QMessageBox::critical(nullptr, PACKAGE_NAME,
+            QObject::tr("Invalid internal chainstate rebuild phase. No data was changed."));
+        return EXIT_FAILURE;
+    }
+    if (parsed_rebuild_phase == ChainstateRebuildAssistant::Phase::REBUILD &&
+        !gArgs.GetBoolArg("-reindex-chainstate", false)) {
+        QMessageBox::critical(nullptr, PACKAGE_NAME,
+            QObject::tr("The protected rebuild phase requires the one-shot -reindex-chainstate option. No data was changed."));
+        return EXIT_FAILURE;
+    }
+    if (parsed_rebuild_phase == ChainstateRebuildAssistant::Phase::VERIFY &&
+        journal_status != node::ChainstateRebuildJournalStatus::VERIFICATION_PENDING) {
+        QMessageBox::critical(nullptr, PACKAGE_NAME,
+            QObject::tr("No committed chainstate rebuild is awaiting verification. No data was changed."));
+        return EXIT_FAILURE;
+    }
+    if (parsed_rebuild_phase != ChainstateRebuildAssistant::Phase::NONE) {
+        node::SetChainstateRebuildSafetyOverrides(gArgs, true);
+    }
+    app.configureChainstateRebuild(
+        QCoreApplication::applicationFilePath(), original_arguments,
+        rebuild_phase);
 
     /// 9. Main GUI initialization
     // Install global event filter that makes sure that out-of-focus labels do not contain text cursor.

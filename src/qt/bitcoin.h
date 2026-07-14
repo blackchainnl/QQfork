@@ -17,6 +17,8 @@
 #include <optional>
 
 #include <QApplication>
+#include <QString>
+#include <QStringList>
 
 class BitcoinGUI;
 class ClientModel;
@@ -66,6 +68,11 @@ public:
     /// Setup platform style
     void setupPlatformStyle();
 
+    /// Preserve executable and argv for the one-shot rebuild handoff.
+    void configureChainstateRebuild(const QString& executable,
+                                    const QStringList& original_arguments,
+                                    const QString& phase);
+
     interfaces::Node& node() const { assert(m_node); return *m_node; }
 
 public Q_SLOTS:
@@ -103,8 +110,14 @@ private:
     std::unique_ptr<QWidget> shutdownWindow;
     SplashScreen* m_splash = nullptr;
     std::unique_ptr<interfaces::Node> m_node;
+    QString m_executable;
+    QStringList m_original_arguments;
+    QString m_chainstate_rebuild_phase;
+    QStringList m_relaunch_arguments;
+    bool m_shutdown_in_progress{false};
 
     void startThread();
+    void scheduleChainstateRelaunch(const QString& phase);
 };
 
 int GuiMain(int argc, char* argv[]);

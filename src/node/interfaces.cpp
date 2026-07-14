@@ -99,6 +99,10 @@ public:
     void initParameterInteraction() override { InitParameterInteraction(args()); }
     bilingual_str getWarnings() override { return GetWarnings(true); }
     int getExitStatus() override { return Assert(m_context)->exit_status.load(); }
+    ChainstateRebuildStatus getChainstateRebuildStatus() override
+    {
+        return Assert(m_context)->chainstate_rebuild_status.load();
+    }
     uint32_t getLogCategories() override { return LogInstance().GetCategoryMask(); }
     bool baseInitialize() override
     {
@@ -117,6 +121,12 @@ public:
     {
         const interfaces::AppInitResult result = AppInitMain(*m_context, tip_info);
         if (result != interfaces::AppInitResult::FAILURE) return result;
+        if (m_context->chainstate_rebuild_status.load() !=
+            ChainstateRebuildStatus::NONE) {
+            // The GUI assistant deliberately stops before wallets load or at
+            // COMMIT_READY. These are safe upgrade handoffs, not crashes.
+            return result;
+        }
         // Error during initialization, set exit status before continue
         m_context->exit_status.store(EXIT_FAILURE);
         return result;
