@@ -419,9 +419,12 @@ jobs:
             feature_quantum_redelegation_auto.py \
             feature_quantum_coldstaking.py \
             wallet_quantum_coin_selection.py \
+            'wallet_quantum_key_safety.py --legacy-wallet' \
+            'wallet_quantum_key_safety.py --descriptors' \
             wallet_pos_multiwallet_staking.py \
             wallet_backup.py \
             wallet_encryption.py \
+            feature_dbcrash.py \
             feature_reindex.py \
             feature_shutdown.py
 
