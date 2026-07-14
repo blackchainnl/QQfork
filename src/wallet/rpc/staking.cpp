@@ -707,7 +707,7 @@ static RPCHelpMan listquantumstakeoutputs()
 static RPCHelpMan fundquantumstakeaddress()
 {
     return RPCHelpMan{"fundquantumstakeaddress",
-        "\nFunds a wallet-backed bonded quantum staking address from legacy wallet coins.\n" + HELP_REQUIRING_PASSPHRASE,
+        "\nFunds a wallet-backed bonded quantum staking address from direct quantum wallet coins.\n" + HELP_REQUIRING_PASSPHRASE,
         {
             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-backed bonded quantum staking address."},
             {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount to bond."},

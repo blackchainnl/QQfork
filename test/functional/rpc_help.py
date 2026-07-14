@@ -130,6 +130,9 @@ class HelpRpcTest(BitcoinTestFramework):
 
     def wallet_help(self):
         assert 'getnewaddress ( "label" "address_type" )' in self.nodes[0].help('getnewaddress')
+        stake_funding_help = self.nodes[0].help('fundquantumstakeaddress')
+        assert 'from direct quantum wallet coins' in stake_funding_help
+        assert 'from legacy wallet coins' not in stake_funding_help
         self.restart_node(0, extra_args=['-nowallet=1'])
         assert 'getnewaddress ( "label" "address_type" )' in self.nodes[0].help('getnewaddress')
 
