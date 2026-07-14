@@ -477,6 +477,14 @@ bool DecodeAuthenticatedGoldRushInventory(const COutPoint& inventory_outpoint,
                                           const Coin& inventory_coin,
                                           const CBlockIndex* pindex_tip,
                                           GoldRushInventoryInfo& info);
+/** Decode the authenticated reward-pool checkpoint from the same immutable
+ * UTXO snapshot used for aggregate accounting. */
+bool DecodeAuthenticatedShadowPool(const COutPoint& pool_outpoint,
+                                   const Coin& pool_coin,
+                                   const CBlockIndex* pindex_tip,
+                                   ShadowGoldRushInfo& info);
+bool IsShadowPoolMarkerOutpoint(const COutPoint& outpoint);
+bool IsGoldRushInventoryMarkerOutpoint(const COutPoint& outpoint);
 /** True only for the strict positive coin shape that consensus requires to
  * have authenticated synthetic provenance. */
 bool IsGoldRushPayoutCandidateCoin(const Coin& coin, const Consensus::Params& consensus);

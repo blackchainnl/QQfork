@@ -58,7 +58,10 @@
 #include <stdint.h>
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1000,6 +1003,48 @@ static RPCHelpMan gettxoutsetinfo()
     };
 }
 
+struct CirculatingSupplyBucket {
+    uint64_t count{0};
+    CAmount nominal{0};
+    CAmount effective{0};
+    CAmount burned{0};
+};
+
+static bool AddCirculatingSupplyAmount(CAmount& total, CAmount amount)
+{
+    if (!MoneyRange(total) || !MoneyRange(amount) || total > MAX_MONEY - amount) {
+        return false;
+    }
+    total += amount;
+    return true;
+}
+
+static bool AddCirculatingSupplyCount(uint64_t& total, uint64_t count = 1)
+{
+    if (total > std::numeric_limits<uint64_t>::max() - count) return false;
+    total += count;
+    return true;
+}
+
+static bool AddCirculatingSupplyBucket(CirculatingSupplyBucket& bucket,
+                                       const ValueLifecycleClassification& classification)
+{
+    return AddCirculatingSupplyCount(bucket.count) &&
+        AddCirculatingSupplyAmount(bucket.nominal, classification.nominal_amount) &&
+        AddCirculatingSupplyAmount(bucket.effective, classification.effective_amount) &&
+        AddCirculatingSupplyAmount(bucket.burned, classification.burned_amount);
+}
+
+static UniValue CirculatingSupplyBucketToJSON(const CirculatingSupplyBucket& bucket)
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("count", bucket.count);
+    result.pushKV("nominal_amount", ValueFromAmount(bucket.nominal));
+    result.pushKV("effective_amount", ValueFromAmount(bucket.effective));
+    result.pushKV("burned_amount", ValueFromAmount(bucket.burned));
+    return result;
+}
+
 static RPCHelpMan getcirculatingsupply()
 {
     return RPCHelpMan{"getcirculatingsupply",
@@ -1009,6 +1054,7 @@ static RPCHelpMan getcirculatingsupply()
         RPCResult{
             RPCResult::Type::OBJ, "", "",
             {
+                {RPCResult::Type::STR, "schema", "Versioned lifecycle-accounting schema"},
                 {RPCResult::Type::NUM, "height", "The active-chain height used for the scan"},
                 {RPCResult::Type::NUM, "evaluation_height", "The next-block height used for consensus spendability and demurrage"},
                 {RPCResult::Type::STR_HEX, "bestblock", "The active-chain block hash used for the scan"},
@@ -1023,20 +1069,56 @@ static RPCHelpMan getcirculatingsupply()
                 {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal UTXO-set amount before demurrage"},
                 {RPCResult::Type::STR_AMOUNT, "circulating_amount", "Consensus-spendable, demurrage-adjusted circulating amount"},
                 {RPCResult::Type::STR_AMOUNT, "decayed_amount", "Amount removed from effective value by demurrage"},
-                {RPCResult::Type::STR_AMOUNT, "goldrush_locked_payout_amount", "Gold Rush payout value not yet spendable before Migration"},
-                {RPCResult::Type::STR_AMOUNT, "immature_amount", "Coinbase/coinstake value not mature for the next block"},
+                {RPCResult::Type::STR_AMOUNT, "merkle_included_nominal_amount", "Nominal value represented by ordinary transaction-Merkle UTXOs"},
+                {RPCResult::Type::STR_AMOUNT, "synthetic_non_merkle_nominal_amount", "Unspent synthetic Gold Rush value outside transaction Merkle trees"},
+                {RPCResult::Type::STR_AMOUNT, "goldrush_synthetic_immature_amount", "Synthetic Gold Rush value awaiting generated-output maturity"},
+                {RPCResult::Type::STR_AMOUNT, "goldrush_locked_payout_amount", "Mature synthetic Gold Rush payout value still phase-locked before Migration"},
+                {RPCResult::Type::STR_AMOUNT, "immature_amount", "Non-synthetic coinbase/coinstake value not mature for the next block"},
                 {RPCResult::Type::STR_AMOUNT, "final_conditional_eutxo_amount", "Final-phase EUTXO value whose committed validator cannot be classified from the UTXO alone"},
                 {RPCResult::Type::STR_AMOUNT, "final_locked_legacy_amount", "Nominal legacy UTXO value permanently locked after Final activation"},
                 {RPCResult::Type::STR_AMOUNT, "final_locked_unmoved_goldrush_amount", "Deprecated compatibility field; always zero because matured Gold Rush payouts remain ordinary quantum UTXOs"},
+                {RPCResult::Type::STR_AMOUNT, "permanently_locked_amount", "Nominal UTXO value permanently locked by Final legacy lockout or zero-effective demurrage"},
+                {RPCResult::Type::STR_AMOUNT, "legacy_scheduled_final_lockout_amount", "Current legacy value scheduled for Final lockout"},
+                {RPCResult::Type::STR_AMOUNT, "requires_quantum_migration_amount", "Current legacy value requiring a first move to quantum before Final"},
                 {RPCResult::Type::STR_AMOUNT, "noncirculating_amount", "Nominal amount excluded from circulation by demurrage or Final legacy lockout"},
                 {RPCResult::Type::NUM, "txouts", "The number of scanned UTXOs"},
                 {RPCResult::Type::NUM, "decayed_txouts", "The number of non-exempt UTXOs with realized decay at this height"},
                 {RPCResult::Type::NUM, "locked_txouts", "The number of non-exempt UTXOs that have reached the 24-month lock"},
-                {RPCResult::Type::NUM, "goldrush_locked_payout_txouts", "The number of Gold Rush payout UTXOs not yet spendable before Migration"},
-                {RPCResult::Type::NUM, "immature_txouts", "The number of coinbase/coinstake UTXOs not mature for the next block"},
+                {RPCResult::Type::NUM, "goldrush_synthetic_immature_txouts", "The number of immature synthetic Gold Rush payout UTXOs"},
+                {RPCResult::Type::NUM, "goldrush_locked_payout_txouts", "The number of mature synthetic Gold Rush payout UTXOs still phase-locked before Migration"},
+                {RPCResult::Type::NUM, "immature_txouts", "The number of non-synthetic coinbase/coinstake UTXOs not mature for the next block"},
                 {RPCResult::Type::NUM, "final_conditional_eutxo_txouts", "The number of Final-phase EUTXOs excluded from guaranteed circulating supply"},
                 {RPCResult::Type::NUM, "final_locked_legacy_txouts", "The number of legacy UTXOs permanently locked by Final consensus"},
                 {RPCResult::Type::NUM, "final_locked_unmoved_goldrush_txouts", "Deprecated compatibility field; always zero"},
+                {RPCResult::Type::OBJ_DYN, "categories", "Mutually exclusive next-block lifecycle buckets", {
+                    {RPCResult::Type::OBJ, "category", "One lifecycle category", {
+                        {RPCResult::Type::NUM, "count", "UTXO count"},
+                        {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal value"},
+                        {RPCResult::Type::STR_AMOUNT, "effective_amount", "Demurrage-adjusted value"},
+                        {RPCResult::Type::STR_AMOUNT, "burned_amount", "Value removed by demurrage"},
+                    }},
+                }},
+                {RPCResult::Type::OBJ, "shadow", "Authenticated non-Merkle issuance, schedule, and outstanding-pool reconciliation", {
+                    {RPCResult::Type::BOOL, "synthetic", "Always true for Gold Rush shadow payouts"},
+                    {RPCResult::Type::BOOL, "merkle_included", "Always false for Gold Rush shadow payouts"},
+                    {RPCResult::Type::NUM, "issued_count", "Authenticated issued payout count"},
+                    {RPCResult::Type::STR_AMOUNT, "issued_nominal_amount", "Authenticated issued payout value"},
+                    {RPCResult::Type::NUM, "spent_count", "Authenticated spent payout count"},
+                    {RPCResult::Type::STR_AMOUNT, "spent_nominal_amount", "Authenticated spent payout nominal value"},
+                    {RPCResult::Type::NUM, "unspent_count", "Authenticated unspent payout count"},
+                    {RPCResult::Type::STR_AMOUNT, "unspent_nominal_amount", "Authenticated unspent payout value"},
+                    {RPCResult::Type::STR_AMOUNT, "scheduled_total_amount", "Exact total Gold Rush schedule"},
+                    {RPCResult::Type::STR_AMOUNT, "scheduled_through_height_amount", "Exact schedule accrued through the snapshot height"},
+                    {RPCResult::Type::STR_AMOUNT, "claimed_amount", "Issued payout value removed from the reward pool"},
+                    {RPCResult::Type::STR_AMOUNT, "pow_outstanding_amount", "Outstanding proof-of-work pool"},
+                    {RPCResult::Type::STR_AMOUNT, "pos_outstanding_amount", "Outstanding proof-of-stake pool"},
+                    {RPCResult::Type::STR_AMOUNT, "outstanding_amount", "Combined outstanding proof-of-work and proof-of-stake pools"},
+                    {RPCResult::Type::BOOL, "claimable_next_block", "Whether outstanding pool value remains claimable in the next block"},
+                    {RPCResult::Type::STR_AMOUNT, "claimable_outstanding_amount", "Pool value claimable in the next block"},
+                    {RPCResult::Type::STR_AMOUNT, "expired_unissued_amount", "Unclaimed pool value permanently expired after the reward window"},
+                    {RPCResult::Type::STR, "payout_expiration_policy", "Issued-payout expiration policy"},
+                    {RPCResult::Type::STR, "pool_expiration_policy", "Unclaimed-pool expiration policy"},
+                }},
             }
         },
         RPCExamples{
@@ -1065,106 +1147,281 @@ static RPCHelpMan getcirculatingsupply()
         cursor = coins_db.Cursor();
     }
 
+    if (tip->nHeight == std::numeric_limits<int>::max()) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Active chain height cannot be evaluated safely");
+    }
+    const int64_t tip_mtp = tip->GetMedianTimePast();
+    const int evaluation_height = tip->nHeight + 1;
+
     std::map<uint256, Consensus::DemurrageAttestationState> attestation_states;
+    std::map<COutPoint, GoldRushPayoutMarkerInfo> payout_markers;
+    std::optional<GoldRushInventoryInfo> inventory;
+    std::optional<ShadowGoldRushInfo> pool;
+    uint64_t payout_marker_count{0};
+    CAmount payout_marker_nominal{0};
     COutPoint marker_key;
     Coin marker_coin;
     while (marker_cursor->Valid()) {
         node.rpc_interruption_point();
-        if (marker_cursor->GetKey(marker_key) && marker_cursor->GetValue(marker_coin) && !marker_coin.IsSpent()) {
+        if (!marker_cursor->GetKey(marker_key) || !marker_cursor->GetValue(marker_coin)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read lifecycle marker snapshot");
+        }
+        if (!marker_coin.IsSpent()) {
             uint256 pubkey_hash;
             Consensus::DemurrageAttestationState state;
             if (Consensus::DecodeAuthenticatedDemurrageLatestState(
                     marker_key, marker_coin, tip, pubkey_hash, state)) {
-                attestation_states[pubkey_hash] = state;
+                if (!attestation_states.emplace(pubkey_hash, state).second) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                       "Duplicate authenticated demurrage state in snapshot");
+                }
+            }
+
+            GoldRushPayoutMarkerInfo payout_info;
+            if (DecodeAuthenticatedGoldRushPayoutMarker(
+                    marker_key, marker_coin, tip, payout_info)) {
+                if (!payout_markers.emplace(payout_info.payout_outpoint, payout_info).second ||
+                    !AddCirculatingSupplyCount(payout_marker_count) ||
+                    !AddCirculatingSupplyAmount(payout_marker_nominal,
+                                                payout_info.nominal_amount)) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                       "Gold Rush payout-marker inventory is inconsistent");
+                }
+            }
+
+            if (IsGoldRushInventoryMarkerOutpoint(marker_key)) {
+                GoldRushInventoryInfo decoded;
+                if (inventory || !DecodeAuthenticatedGoldRushInventory(
+                        marker_key, marker_coin, tip, decoded)) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                       "Gold Rush inventory checkpoint is corrupt");
+                }
+                inventory = decoded;
+            }
+            if (IsShadowPoolMarkerOutpoint(marker_key)) {
+                ShadowGoldRushInfo decoded;
+                if (pool || !DecodeAuthenticatedShadowPool(
+                        marker_key, marker_coin, tip, decoded)) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                       "Gold Rush reward-pool checkpoint is corrupt");
+                }
+                pool = decoded;
             }
         }
         marker_cursor->Next();
     }
 
+    constexpr size_t CATEGORY_COUNT =
+        static_cast<size_t>(ValueLifecycleCategory::COUNT);
+    std::array<CirculatingSupplyBucket, CATEGORY_COUNT> buckets{};
+    auto bucket = [&](ValueLifecycleCategory category) -> CirculatingSupplyBucket& {
+        return buckets.at(static_cast<size_t>(category));
+    };
+
     CAmount nominal{0};
-    CAmount circulating{0};
+    CAmount total_effective{0};
     CAmount demurrage_decayed{0};
-    CAmount goldrush_locked_payout{0};
-    CAmount immature{0};
-    CAmount final_conditional_eutxo{0};
-    CAmount final_locked_legacy{0};
-    CAmount final_locked_unmoved_goldrush{0};
-    int64_t txouts{0};
-    int64_t decayed_txouts{0};
-    int64_t locked_txouts{0};
-    int64_t goldrush_locked_payout_txouts{0};
-    int64_t immature_txouts{0};
-    int64_t final_conditional_eutxo_txouts{0};
-    int64_t final_locked_legacy_txouts{0};
-    int64_t final_locked_unmoved_goldrush_txouts{0};
-    const int64_t tip_mtp = tip->GetMedianTimePast();
-    const int evaluation_height = tip->nHeight + 1;
-    const bool quantum_spend_active = IsQuantumWitnessSpendActive(consensus, tip_mtp, evaluation_height);
-    const bool final_lockout = consensus.IsQuantumFinalLockout(tip_mtp, evaluation_height);
+    CAmount circulating{0};
+    CAmount merkle_included_nominal{0};
+    CAmount synthetic_unspent_nominal{0};
+    CAmount permanently_locked{0};
+    CAmount legacy_scheduled_final_lockout{0};
+    CAmount requires_quantum_migration{0};
+    uint64_t txouts{0};
+    uint64_t synthetic_unspent_count{0};
+    uint64_t decayed_txouts{0};
     COutPoint key;
     Coin coin;
     while (cursor->Valid()) {
         node.rpc_interruption_point();
-        if (cursor->GetKey(key) && cursor->GetValue(coin)) {
-            if (coin.out.nValue == 0 &&
-                (IsAuthenticatedShadowMarkerOutpoint(key, coin, tip) ||
-                 Consensus::IsAuthenticatedDemurrageStateOutpoint(key, coin, tip))) {
-                cursor->Next();
-                continue;
+        if (!cursor->GetKey(key) || !cursor->GetValue(coin)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read lifecycle UTXO snapshot");
+        }
+        if (coin.IsSpent()) {
+            cursor->Next();
+            continue;
+        }
+        if (coin.out.nValue == 0 &&
+            (IsAuthenticatedShadowMarkerOutpoint(key, coin, tip) ||
+             Consensus::IsAuthenticatedDemurrageStateOutpoint(key, coin, tip))) {
+            cursor->Next();
+            continue;
+        }
+
+        const bool candidate = IsGoldRushPayoutCandidateCoin(coin, consensus);
+        const auto payout_it = payout_markers.find(key);
+        const bool authenticated_synthetic = payout_it != payout_markers.end();
+        if (candidate && !authenticated_synthetic) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Gold Rush payout candidate lacks authenticated provenance");
+        }
+        if (authenticated_synthetic) {
+            const GoldRushPayoutMarkerInfo& payout = payout_it->second;
+            if (payout.nominal_amount != coin.out.nValue ||
+                payout.payout_script != coin.out.scriptPubKey ||
+                payout.origin_height != coin.nHeight ||
+                payout.origin_block_time != coin.nTime) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                   "Gold Rush payout coin disagrees with authenticated provenance");
             }
-            ++txouts;
-            nominal += coin.out.nValue;
-            std::optional<Consensus::DemurrageAttestationState> latest_attestation;
-            if (const std::optional<uint256> controlling_key =
-                    Consensus::DemurrageControllingKeyHashForScript(coin.out.scriptPubKey)) {
-                const auto state_it = attestation_states.find(*controlling_key);
-                if (state_it != attestation_states.end()) latest_attestation = state_it->second;
+        }
+
+        std::optional<Consensus::DemurrageAttestationState> latest_attestation;
+        if (const std::optional<uint256> controlling_key =
+                Consensus::DemurrageControllingKeyHashForScript(coin.out.scriptPubKey)) {
+            const auto state_it = attestation_states.find(*controlling_key);
+            if (state_it != attestation_states.end()) latest_attestation = state_it->second;
+        }
+        ValueLifecycleClassification classification;
+        const ValueLifecycleResult classification_result = ClassifyValueLifecycle(
+            coin, authenticated_synthetic, consensus, evaluation_height, tip_mtp,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation
+                ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)}
+                : std::nullopt,
+            classification);
+        if (classification_result != ValueLifecycleResult::OK ||
+            static_cast<size_t>(classification.category) >= CATEGORY_COUNT ||
+            !AddCirculatingSupplyCount(txouts) ||
+            !AddCirculatingSupplyAmount(nominal, classification.nominal_amount) ||
+            !AddCirculatingSupplyAmount(total_effective, classification.effective_amount) ||
+            !AddCirculatingSupplyAmount(demurrage_decayed, classification.burned_amount) ||
+            !AddCirculatingSupplyBucket(bucket(classification.category), classification)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "UTXO lifecycle classification is out of range");
+        }
+        if (classification.ordinary_spendable &&
+            !AddCirculatingSupplyAmount(circulating, classification.effective_amount)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Circulating supply is out of range");
+        }
+        if (classification.synthetic) {
+            if (classification.merkle_included ||
+                !AddCirculatingSupplyCount(synthetic_unspent_count) ||
+                !AddCirculatingSupplyAmount(synthetic_unspent_nominal,
+                                            classification.nominal_amount)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                   "Synthetic payout classification is inconsistent");
             }
-            const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
-                coin, consensus, evaluation_height, tip_mtp,
-                latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
-                latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
-            const std::optional<QuantumStakeTierProgram> payout_tier =
-                GetQuantumStakeTierProgram(coin.out.scriptPubKey);
-            const bool goldrush_payout_output = coin.out.nValue > 0 && coin.fCoinBase &&
-                !coin.fCoinStake &&
-                coin.nHeight >= static_cast<uint32_t>(SHADOW_REWARD_START_HEIGHT) &&
-                coin.nHeight <= static_cast<uint32_t>(SHADOW_REWARD_END_HEIGHT) &&
-                coin.nHeight > static_cast<uint32_t>(consensus.nLastPOWBlock) &&
-                payout_tier && !payout_tier->tiered && !payout_tier->cold_stake;
-            const bool goldrush_locked_payout_output = goldrush_payout_output && !quantum_spend_active;
-            const bool final_locked_legacy_output = final_lockout && coin.out.nValue > 0 &&
-                !IsQuantumMigrationScript(coin.out.scriptPubKey) &&
-                !IsQuantumColdStakeScript(coin.out.scriptPubKey) &&
-                !IsEUTXOScript(coin.out.scriptPubKey);
-            const bool final_conditional_eutxo_output = final_lockout && coin.out.nValue > 0 &&
-                IsEUTXOScript(coin.out.scriptPubKey);
-            const bool immature_output = coin.out.nValue > 0 &&
-                (coin.IsCoinBase() || coin.IsCoinStake()) &&
-                evaluation_height - static_cast<int>(coin.nHeight) < consensus.nCoinbaseMaturity;
-            if (goldrush_locked_payout_output) {
-                goldrush_locked_payout += coin.out.nValue;
-                ++goldrush_locked_payout_txouts;
-            } else if (final_locked_legacy_output) {
-                final_locked_legacy += coin.out.nValue;
-                ++final_locked_legacy_txouts;
-            } else if (final_conditional_eutxo_output) {
-                final_conditional_eutxo += coin.out.nValue;
-                ++final_conditional_eutxo_txouts;
-            } else if (immature_output) {
-                immature += coin.out.nValue;
-                ++immature_txouts;
-            } else {
-                circulating += eval.effective_value;
-                demurrage_decayed += eval.burned_value;
-                if (eval.locked) ++locked_txouts;
-                if (eval.burned_value > 0) ++decayed_txouts;
-            }
+        } else if (!classification.merkle_included ||
+                   !AddCirculatingSupplyAmount(merkle_included_nominal,
+                                               classification.nominal_amount)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Merkle-included supply classification is inconsistent");
+        }
+        if (classification.permanently_locked &&
+            !AddCirculatingSupplyAmount(permanently_locked,
+                                        classification.nominal_amount)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Permanent lock total is out of range");
+        }
+        if (classification.legacy_scheduled_final_lockout &&
+            !AddCirculatingSupplyAmount(legacy_scheduled_final_lockout,
+                                        classification.nominal_amount)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Scheduled Final lockout total is out of range");
+        }
+        if (classification.requires_quantum_migration &&
+            !AddCirculatingSupplyAmount(requires_quantum_migration,
+                                        classification.nominal_amount)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Required quantum migration total is out of range");
+        }
+        if (classification.burned_amount > 0 &&
+            !AddCirculatingSupplyCount(decayed_txouts)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Decayed UTXO count overflow");
         }
         cursor->Next();
     }
 
+    CAmount reconciled_value{0};
+    if (!AddCirculatingSupplyAmount(reconciled_value, total_effective) ||
+        !AddCirculatingSupplyAmount(reconciled_value, demurrage_decayed) ||
+        reconciled_value != nominal) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Nominal, effective, and demurrage-burn totals do not reconcile");
+    }
+    CAmount represented_nominal{0};
+    if (!AddCirculatingSupplyAmount(represented_nominal, merkle_included_nominal) ||
+        !AddCirculatingSupplyAmount(represented_nominal, synthetic_unspent_nominal) ||
+        represented_nominal != nominal || circulating > nominal) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Merkle and synthetic UTXO totals do not reconcile");
+    }
+
+    GoldRushInventoryInfo exact_inventory;
+    ShadowGoldRushInfo exact_pool;
+    if (tip->nHeight >= SHADOW_REWARD_START_HEIGHT) {
+        if (!inventory) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Gold Rush inventory checkpoint is missing");
+        }
+        exact_inventory = *inventory;
+        if (pool) exact_pool = *pool;
+    } else if (inventory || pool || payout_marker_count != 0) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Gold Rush accounting exists before its reward schedule");
+    }
+    if (exact_inventory.spent_count > exact_inventory.issued_count ||
+        exact_inventory.spent_nominal > exact_inventory.issued_nominal ||
+        payout_marker_count != exact_inventory.issued_count ||
+        payout_marker_nominal != exact_inventory.issued_nominal ||
+        synthetic_unspent_count != exact_inventory.issued_count - exact_inventory.spent_count ||
+        synthetic_unspent_nominal != exact_inventory.issued_nominal - exact_inventory.spent_nominal ||
+        exact_pool.claimed_amount != exact_inventory.issued_nominal) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Gold Rush marker, inventory, pool, and UTXO totals do not reconcile");
+    }
+
+    const std::optional<CAmount> scheduled_total =
+        GetScheduledShadowEmissionThrough(SHADOW_REWARD_END_HEIGHT);
+    const std::optional<CAmount> scheduled_through =
+        GetScheduledShadowEmissionThrough(tip->nHeight);
+    CAmount outstanding_pool{0};
+    CAmount accrued{0};
+    if (!scheduled_total || !scheduled_through || *scheduled_total > SHADOW_MAX_EMISSION ||
+        !AddCirculatingSupplyAmount(outstanding_pool, exact_pool.pow_amount) ||
+        !AddCirculatingSupplyAmount(outstanding_pool, exact_pool.pos_amount) ||
+        !AddCirculatingSupplyAmount(accrued, exact_pool.claimed_amount) ||
+        !AddCirculatingSupplyAmount(accrued, outstanding_pool) ||
+        accrued != *scheduled_through || *scheduled_through > *scheduled_total) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Gold Rush reward schedule and outstanding pools do not reconcile");
+    }
+    const bool pool_claimable_next_block = IsShadowGoldRushRewardActive(
+        consensus, tip_mtp, evaluation_height);
+    const bool reward_window_ended = evaluation_height > SHADOW_REWARD_END_HEIGHT;
+    const CAmount claimable_pool = pool_claimable_next_block ? outstanding_pool : 0;
+    const CAmount expired_pool = reward_window_ended ? outstanding_pool : 0;
+
+    auto summed_bucket = [&](std::initializer_list<ValueLifecycleCategory> categories) {
+        CirculatingSupplyBucket result;
+        for (const ValueLifecycleCategory category : categories) {
+            const CirculatingSupplyBucket& source = bucket(category);
+            if (!AddCirculatingSupplyCount(result.count, source.count) ||
+                !AddCirculatingSupplyAmount(result.nominal, source.nominal) ||
+                !AddCirculatingSupplyAmount(result.effective, source.effective) ||
+                !AddCirculatingSupplyAmount(result.burned, source.burned)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Lifecycle bucket sum is out of range");
+            }
+        }
+        return result;
+    };
+    const CirculatingSupplyBucket immature = summed_bucket({
+        ValueLifecycleCategory::IMMATURE_LEGACY,
+        ValueLifecycleCategory::IMMATURE_OTHER});
+    const CirculatingSupplyBucket& synthetic_immature =
+        bucket(ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_IMMATURE);
+    const CirculatingSupplyBucket& synthetic_locked =
+        bucket(ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_MATURE_LOCKED);
+    const CirculatingSupplyBucket& final_conditional =
+        bucket(ValueLifecycleCategory::FINAL_CONDITIONAL_EUTXO);
+    const CirculatingSupplyBucket& final_legacy =
+        bucket(ValueLifecycleCategory::FINAL_LOCKED_LEGACY);
+    const CirculatingSupplyBucket& demurrage_locked =
+        bucket(ValueLifecycleCategory::DEMURRAGE_LOCKED);
+    const CAmount noncirculating = nominal - circulating;
+
     UniValue ret(UniValue::VOBJ);
+    ret.pushKV("schema", "blackcoin.supply.lifecycle.v2");
     ret.pushKV("height", tip->nHeight);
     ret.pushKV("evaluation_height", evaluation_height);
     ret.pushKV("bestblock", tip->GetBlockHash().GetHex());
@@ -1179,20 +1436,57 @@ static RPCHelpMan getcirculatingsupply()
     ret.pushKV("nominal_amount", ValueFromAmount(nominal));
     ret.pushKV("circulating_amount", ValueFromAmount(circulating));
     ret.pushKV("decayed_amount", ValueFromAmount(demurrage_decayed));
-    ret.pushKV("goldrush_locked_payout_amount", ValueFromAmount(goldrush_locked_payout));
-    ret.pushKV("immature_amount", ValueFromAmount(immature));
-    ret.pushKV("final_conditional_eutxo_amount", ValueFromAmount(final_conditional_eutxo));
-    ret.pushKV("final_locked_legacy_amount", ValueFromAmount(final_locked_legacy));
-    ret.pushKV("final_locked_unmoved_goldrush_amount", ValueFromAmount(final_locked_unmoved_goldrush));
-    ret.pushKV("noncirculating_amount", ValueFromAmount(nominal - circulating));
+    ret.pushKV("merkle_included_nominal_amount", ValueFromAmount(merkle_included_nominal));
+    ret.pushKV("synthetic_non_merkle_nominal_amount", ValueFromAmount(synthetic_unspent_nominal));
+    ret.pushKV("goldrush_synthetic_immature_amount", ValueFromAmount(synthetic_immature.nominal));
+    ret.pushKV("goldrush_locked_payout_amount", ValueFromAmount(synthetic_locked.nominal));
+    ret.pushKV("immature_amount", ValueFromAmount(immature.nominal));
+    ret.pushKV("final_conditional_eutxo_amount", ValueFromAmount(final_conditional.nominal));
+    ret.pushKV("final_locked_legacy_amount", ValueFromAmount(final_legacy.nominal));
+    ret.pushKV("final_locked_unmoved_goldrush_amount", ValueFromAmount(0));
+    ret.pushKV("permanently_locked_amount", ValueFromAmount(permanently_locked));
+    ret.pushKV("legacy_scheduled_final_lockout_amount", ValueFromAmount(legacy_scheduled_final_lockout));
+    ret.pushKV("requires_quantum_migration_amount", ValueFromAmount(requires_quantum_migration));
+    ret.pushKV("noncirculating_amount", ValueFromAmount(noncirculating));
     ret.pushKV("txouts", txouts);
     ret.pushKV("decayed_txouts", decayed_txouts);
-    ret.pushKV("locked_txouts", locked_txouts);
-    ret.pushKV("goldrush_locked_payout_txouts", goldrush_locked_payout_txouts);
-    ret.pushKV("immature_txouts", immature_txouts);
-    ret.pushKV("final_conditional_eutxo_txouts", final_conditional_eutxo_txouts);
-    ret.pushKV("final_locked_legacy_txouts", final_locked_legacy_txouts);
-    ret.pushKV("final_locked_unmoved_goldrush_txouts", final_locked_unmoved_goldrush_txouts);
+    ret.pushKV("locked_txouts", demurrage_locked.count);
+    ret.pushKV("goldrush_synthetic_immature_txouts", synthetic_immature.count);
+    ret.pushKV("goldrush_locked_payout_txouts", synthetic_locked.count);
+    ret.pushKV("immature_txouts", immature.count);
+    ret.pushKV("final_conditional_eutxo_txouts", final_conditional.count);
+    ret.pushKV("final_locked_legacy_txouts", final_legacy.count);
+    ret.pushKV("final_locked_unmoved_goldrush_txouts", 0);
+
+    UniValue category_json(UniValue::VOBJ);
+    for (size_t i = 0; i < CATEGORY_COUNT; ++i) {
+        const auto category = static_cast<ValueLifecycleCategory>(i);
+        category_json.pushKV(ValueLifecycleCategoryName(category),
+                             CirculatingSupplyBucketToJSON(buckets[i]));
+    }
+    ret.pushKV("categories", std::move(category_json));
+
+    UniValue shadow(UniValue::VOBJ);
+    shadow.pushKV("synthetic", true);
+    shadow.pushKV("merkle_included", false);
+    shadow.pushKV("issued_count", exact_inventory.issued_count);
+    shadow.pushKV("issued_nominal_amount", ValueFromAmount(exact_inventory.issued_nominal));
+    shadow.pushKV("spent_count", exact_inventory.spent_count);
+    shadow.pushKV("spent_nominal_amount", ValueFromAmount(exact_inventory.spent_nominal));
+    shadow.pushKV("unspent_count", synthetic_unspent_count);
+    shadow.pushKV("unspent_nominal_amount", ValueFromAmount(synthetic_unspent_nominal));
+    shadow.pushKV("scheduled_total_amount", ValueFromAmount(*scheduled_total));
+    shadow.pushKV("scheduled_through_height_amount", ValueFromAmount(*scheduled_through));
+    shadow.pushKV("claimed_amount", ValueFromAmount(exact_pool.claimed_amount));
+    shadow.pushKV("pow_outstanding_amount", ValueFromAmount(exact_pool.pow_amount));
+    shadow.pushKV("pos_outstanding_amount", ValueFromAmount(exact_pool.pos_amount));
+    shadow.pushKV("outstanding_amount", ValueFromAmount(outstanding_pool));
+    shadow.pushKV("claimable_next_block", pool_claimable_next_block);
+    shadow.pushKV("claimable_outstanding_amount", ValueFromAmount(claimable_pool));
+    shadow.pushKV("expired_unissued_amount", ValueFromAmount(expired_pool));
+    shadow.pushKV("payout_expiration_policy", "issued_gold_rush_payouts_do_not_expire");
+    shadow.pushKV("pool_expiration_policy", "unclaimed_pool_value_expires_after_the_reward_window");
+    ret.pushKV("shadow", std::move(shadow));
     return ret;
 },
     };

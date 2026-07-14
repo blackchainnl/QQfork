@@ -1489,12 +1489,13 @@ enum class ShadowPoolReadResult {
 
 bool ShadowObligationWithinCap(const ShadowPoolState& pool);
 
-ShadowPoolReadResult ReadPoolState(const CCoinsViewCache& view, ShadowPoolState& pool)
+ShadowPoolReadResult DecodePoolCoin(const Coin& coin, ShadowPoolState& pool)
 {
     pool = {};
-    Coin coin;
-    if (!view.GetCoin(PoolOutpoint(), coin) || coin.IsSpent()) return ShadowPoolReadResult::MISSING;
+    if (coin.IsSpent()) return ShadowPoolReadResult::MISSING;
     if (coin.out.nValue != 0 || !coin.fCoinBase || coin.fCoinStake ||
+        SHADOW_REWARD_START_HEIGHT < 0 ||
+        SHADOW_REWARD_END_HEIGHT < SHADOW_REWARD_START_HEIGHT ||
         coin.nHeight < static_cast<uint32_t>(SHADOW_REWARD_START_HEIGHT) ||
         coin.nHeight > static_cast<uint32_t>(SHADOW_REWARD_END_HEIGHT) ||
         coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE) {
@@ -1539,6 +1540,16 @@ ShadowPoolReadResult ReadPoolState(const CCoinsViewCache& view, ShadowPoolState&
     if (pool.last_pow_height > coin.nHeight || pool.last_pos_height > coin.nHeight ||
         !ShadowObligationWithinCap(pool)) return ShadowPoolReadResult::INVALID;
     return ShadowPoolReadResult::VALID;
+}
+
+ShadowPoolReadResult ReadPoolState(const CCoinsViewCache& view, ShadowPoolState& pool)
+{
+    Coin coin;
+    if (!view.GetCoin(PoolOutpoint(), coin) || coin.IsSpent()) {
+        pool = {};
+        return ShadowPoolReadResult::MISSING;
+    }
+    return DecodePoolCoin(coin, pool);
 }
 
 ShadowPoolState ReadPool(const CCoinsViewCache& view, bool* state_valid = nullptr)
@@ -4721,6 +4732,43 @@ bool DecodeAuthenticatedGoldRushInventory(const COutPoint& inventory_outpoint,
     return true;
 }
 
+bool DecodeAuthenticatedShadowPool(const COutPoint& pool_outpoint,
+                                   const Coin& pool_coin,
+                                   const CBlockIndex* pindex_tip,
+                                   ShadowGoldRushInfo& info)
+{
+    info = {};
+    ShadowPoolState pool;
+    if (pool_outpoint != PoolOutpoint() ||
+        !IsAuthenticatedShadowMarkerOutpoint(pool_outpoint, pool_coin, pindex_tip) ||
+        DecodePoolCoin(pool_coin, pool) != ShadowPoolReadResult::VALID) {
+        return false;
+    }
+    info.pow_amount = pool.pow_amount;
+    info.pos_amount = pool.pos_amount;
+    info.claimed_amount = pool.claimed_amount;
+    info.pow_count = pool.pow_count;
+    info.pos_count = pool.pos_count;
+    info.last_pow_height = pool.last_pow_height;
+    info.last_pos_height = pool.last_pos_height;
+    info.recent_count = pool.recent_count;
+    info.recent_modes = pool.recent_modes;
+    info.pow_target_bits = pindex_tip
+        ? RetargetedBits(ShadowProofMode::POW, pool, pindex_tip->nHeight + 1)
+        : RetargetedBits(ShadowProofMode::POW, pool, 0);
+    return true;
+}
+
+bool IsShadowPoolMarkerOutpoint(const COutPoint& outpoint)
+{
+    return outpoint == PoolOutpoint();
+}
+
+bool IsGoldRushInventoryMarkerOutpoint(const COutPoint& outpoint)
+{
+    return outpoint == GoldRushInventoryOutpoint();
+}
+
 bool IsGoldRushPayoutCandidateCoin(const Coin& coin, const Consensus::Params& consensus)
 {
     if (SHADOW_REWARD_START_HEIGHT < 0 ||
@@ -4781,8 +4829,13 @@ ValueLifecycleResult ClassifyValueLifecycle(
         IsQuantumColdStakeScript(coin.out.scriptPubKey);
     const bool eutxo = IsEUTXOScript(coin.out.scriptPubKey);
     const bool legacy = !direct_quantum && !quantum_contract && !eutxo;
-    if (authenticated_synthetic_goldrush &&
-        (!direct_quantum || !IsGoldRushPayoutCandidateCoin(coin, consensus))) {
+    const bool authenticated_synthetic_shape = direct_quantum &&
+        coin.fCoinBase && !coin.fCoinStake && coin.out.nValue > 0 &&
+        SHADOW_REWARD_START_HEIGHT >= 0 &&
+        SHADOW_REWARD_END_HEIGHT >= SHADOW_REWARD_START_HEIGHT &&
+        static_cast<int64_t>(coin.nHeight) >= SHADOW_REWARD_START_HEIGHT &&
+        static_cast<int64_t>(coin.nHeight) <= SHADOW_REWARD_END_HEIGHT;
+    if (authenticated_synthetic_goldrush && !authenticated_synthetic_shape) {
         return ValueLifecycleResult::INVALID_SYNTHETIC_PROVENANCE;
     }
 

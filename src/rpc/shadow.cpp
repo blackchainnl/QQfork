@@ -263,54 +263,46 @@ bool SumShadowAmountsEquals(CAmount first, CAmount second, CAmount expected)
 
 CAmount ScheduledShadowAmountThrough(int last_height)
 {
-    if (SHADOW_REWARD_START_HEIGHT < 0 ||
-        SHADOW_REWARD_END_HEIGHT < SHADOW_REWARD_START_HEIGHT ||
-        SHADOW_PHASE1_END_HEIGHT < SHADOW_REWARD_START_HEIGHT ||
-        SHADOW_HALVING_INTERVAL_BLOCKS < 1) {
-        throw JSONRPCError(RPC_INTERNAL_ERROR, "Configured shadow reward schedule is invalid");
+    const std::optional<CAmount> total = GetScheduledShadowEmissionThrough(last_height);
+    if (!total) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Configured shadow reward schedule is invalid or out of range");
     }
-
-    CAmount total{0};
-    const int end = std::min(last_height, SHADOW_REWARD_END_HEIGHT);
-    int height = SHADOW_REWARD_START_HEIGHT;
-    const int phase_one_end = std::min(end, SHADOW_PHASE1_END_HEIGHT);
-    while (height <= phase_one_end) {
-        const int64_t halvings =
-            (static_cast<int64_t>(height) - SHADOW_REWARD_START_HEIGHT) /
-            SHADOW_HALVING_INTERVAL_BLOCKS;
-        const CAmount reward = halvings >= std::numeric_limits<CAmount>::digits
-            ? 0 : (580 * COIN) >> halvings;
-        const int64_t next_boundary = std::min<int64_t>(
-            static_cast<int64_t>(phase_one_end) + 1,
-            static_cast<int64_t>(SHADOW_REWARD_START_HEIGHT) +
-                (halvings + 1) * SHADOW_HALVING_INTERVAL_BLOCKS);
-        const int64_t block_count = next_boundary - height;
-        if (reward < 0 || block_count < 1 ||
-            block_count > MAX_MONEY / std::max<CAmount>(reward, 1) ||
-            next_boundary > std::numeric_limits<int>::max() ||
-            !AddShadowAmount(total, reward * block_count)) {
-            throw JSONRPCError(RPC_INTERNAL_ERROR, "Configured shadow reward schedule is out of range");
-        }
-        height = static_cast<int>(next_boundary);
-    }
-    if (height <= end) {
-        const int64_t block_count = static_cast<int64_t>(end) - height + 1;
-        if (block_count < 1 || block_count > MAX_MONEY / (463 * COIN) ||
-            !AddShadowAmount(total, (463 * COIN) * block_count)) {
-            throw JSONRPCError(RPC_INTERNAL_ERROR, "Configured shadow reward schedule is out of range");
-        }
-    }
-    return total;
+    return *total;
 }
 
-struct ShadowLifecycleSupply {
-    uint64_t locked_count{0};
-    CAmount locked_nominal{0};
-    CAmount locked_effective{0};
-    uint64_t spendable_count{0};
-    CAmount spendable_nominal{0};
-    CAmount spendable_effective{0};
+struct ShadowLifecycleBucket {
+    uint64_t count{0};
+    CAmount nominal{0};
+    CAmount effective{0};
+    CAmount burned{0};
 };
+
+struct ShadowLifecycleSupply {
+    ShadowLifecycleBucket immature;
+    ShadowLifecycleBucket phase_locked;
+    ShadowLifecycleBucket demurrage_locked;
+    ShadowLifecycleBucket spendable;
+};
+
+bool AddShadowLifecycleValue(ShadowLifecycleBucket& bucket,
+                             const ValueLifecycleClassification& classification)
+{
+    return AddShadowCount(bucket.count, 1) &&
+        AddShadowAmount(bucket.nominal, classification.nominal_amount) &&
+        AddShadowAmount(bucket.effective, classification.effective_amount) &&
+        AddShadowAmount(bucket.burned, classification.burned_amount);
+}
+
+UniValue ShadowLifecycleBucketToJSON(const ShadowLifecycleBucket& bucket)
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("count", bucket.count);
+    result.pushKV("nominal_amount", ValueFromAmount(bucket.nominal));
+    result.pushKV("effective_amount", ValueFromAmount(bucket.effective));
+    result.pushKV("burned_amount", ValueFromAmount(bucket.burned));
+    return result;
+}
 
 std::string PowClaimDispositionName(ShadowPowClaimDisposition disposition)
 {
@@ -369,16 +361,8 @@ UniValue ShadowRecordToJSON(const ShadowIndexRecord& record,
 {
     const int evaluation_height = tip.nHeight + 1;
     const int64_t evaluation_mtp = tip.GetMedianTimePast();
-    const int maturity_height = static_cast<int>(record.origin_height) + consensus.nCoinbaseMaturity;
-    const int phase_unlock_height = consensus.UsesHeightLifecycle()
-        ? consensus.nGoldRushEndHeight + 1
-        : SHADOW_REWARD_END_HEIGHT + 1;
-    const int earliest_spend_height = std::max(maturity_height, phase_unlock_height);
-    const bool mature = evaluation_height >= maturity_height;
-    const bool gold_rush_locked = !IsQuantumWitnessSpendActive(
-        consensus, evaluation_mtp, evaluation_height);
-
     Consensus::DemurrageEvaluation evaluation;
+    ValueLifecycleClassification classification;
     if (record.spent) {
         evaluation.nominal_value = record.nominal_amount;
         evaluation.effective_value = record.effective_amount_at_spend;
@@ -398,15 +382,26 @@ UniValue ShadowRecordToJSON(const ShadowIndexRecord& record,
         evaluation = Consensus::EvaluateDemurrage(
             coin, consensus, evaluation_height, evaluation_mtp,
             latest_height, coverage_start);
+        if (ClassifyValueLifecycle(
+                coin, /*authenticated_synthetic_goldrush=*/true, consensus,
+                evaluation_height, evaluation_mtp, latest_height, coverage_start,
+                classification) != ValueLifecycleResult::OK) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Unable to classify indexed shadow payout lifecycle");
+        }
     }
 
-    const bool spendable = !record.spent && mature && !gold_rush_locked && !evaluation.locked;
     std::string status;
     if (record.spent) status = "spent";
-    else if (gold_rush_locked) status = "gold_rush_locked";
-    else if (!mature) status = "immature";
-    else if (evaluation.locked) status = "demurrage_locked";
-    else status = "unspent";
+    else if (classification.category ==
+             ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_IMMATURE) status = "immature";
+    else if (classification.category ==
+             ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_MATURE_LOCKED) status = "gold_rush_locked";
+    else if (classification.category == ValueLifecycleCategory::DEMURRAGE_LOCKED) status = "demurrage_locked";
+    else if (classification.category ==
+             ValueLifecycleCategory::MIGRATION_SPENDABLE_DIRECT_QUANTUM) status = "unspent";
+    else throw JSONRPCError(RPC_INTERNAL_ERROR,
+                            "Indexed shadow payout entered an impossible lifecycle category");
 
     UniValue result(UniValue::VOBJ);
     result.pushKV("synthetic", true);
@@ -415,6 +410,8 @@ UniValue ShadowRecordToJSON(const ShadowIndexRecord& record,
     result.pushKV("vout", record.outpoint.n);
     result.pushKV("mode", record.proof_of_work ? "pow" : "pos");
     result.pushKV("status", status);
+    result.pushKV("lifecycle_category", record.spent
+        ? "spent" : ValueLifecycleCategoryName(classification.category));
     result.pushKV("nominal_amount", ValueFromAmount(record.nominal_amount));
     result.pushKV("effective_amount", ValueFromAmount(evaluation.effective_value));
     result.pushKV("decayed_amount", ValueFromAmount(evaluation.burned_value));
@@ -439,12 +436,28 @@ UniValue ShadowRecordToJSON(const ShadowIndexRecord& record,
 
     UniValue lifecycle(UniValue::VOBJ);
     lifecycle.pushKV("coinbase_maturity", consensus.nCoinbaseMaturity);
-    lifecycle.pushKV("maturity_height", maturity_height);
-    lifecycle.pushKV("mature", mature);
-    lifecycle.pushKV("gold_rush_phase_locked", gold_rush_locked);
-    lifecycle.pushKV("earliest_spend_height", earliest_spend_height);
-    lifecycle.pushKV("earliest_spend_height_exact", consensus.UsesHeightLifecycle());
-    lifecycle.pushKV("spendable_next_block", spendable);
+    lifecycle.pushKV("maturity_height", record.spent
+        ? UniValue{} : UniValue(classification.maturity_height));
+    lifecycle.pushKV("mature", record.spent
+        ? UniValue{} : UniValue(classification.mature));
+    lifecycle.pushKV("gold_rush_phase_locked", !record.spent &&
+        classification.category == ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_MATURE_LOCKED);
+    lifecycle.pushKV("earliest_spend_height", !record.spent &&
+        classification.earliest_spend_height >= 0
+            ? UniValue(classification.earliest_spend_height) : UniValue{});
+    lifecycle.pushKV("earliest_spend_mtp", !record.spent &&
+        classification.earliest_spend_mtp >= 0
+            ? UniValue(classification.earliest_spend_mtp) : UniValue{});
+    lifecycle.pushKV("earliest_spend_height_exact", !record.spent &&
+        classification.earliest_spend_height >= 0);
+    lifecycle.pushKV("consensus_spendable_next_block", !record.spent &&
+        classification.consensus_spendable);
+    lifecycle.pushKV("ordinary_spendable_next_block", !record.spent &&
+        classification.ordinary_spendable);
+    lifecycle.pushKV("spendable_next_block", !record.spent &&
+        classification.ordinary_spendable);
+    lifecycle.pushKV("permanently_locked", !record.spent &&
+        classification.permanently_locked);
     result.pushKV("lifecycle", std::move(lifecycle));
 
     UniValue demurrage(UniValue::VOBJ);
@@ -1382,17 +1395,14 @@ RPCHelpMan getshadowsupply()
                 static_cast<int64_t>(evaluation_height) >=
                 static_cast<int64_t>(SHADOW_REWARD_END_HEIGHT) +
                     consensus.nCoinbaseMaturity;
-            const bool lifecycle_scan_required = quantum_spends_active &&
-                (demurrage_active || !all_payouts_mature);
-            if (!quantum_spends_active) {
-                lifecycle.locked_count = unspent_count;
-                lifecycle.locked_nominal = unspent_nominal;
-                lifecycle.locked_effective = unspent_nominal;
+            if (unspent_count == 0) {
                 lifecycle_exact = true;
-            } else if (!lifecycle_scan_required) {
-                lifecycle.spendable_count = unspent_count;
-                lifecycle.spendable_nominal = unspent_nominal;
-                lifecycle.spendable_effective = unspent_nominal;
+            } else if (!include_effective && !demurrage_active && all_payouts_mature) {
+                ShadowLifecycleBucket& aggregate = quantum_spends_active
+                    ? lifecycle.spendable : lifecycle.phase_locked;
+                aggregate.count = unspent_count;
+                aggregate.nominal = unspent_nominal;
+                aggregate.effective = unspent_nominal;
                 lifecycle_exact = true;
             } else if (include_effective) {
                 bool complete{false};
@@ -1410,32 +1420,41 @@ RPCHelpMan getshadowsupply()
                                   static_cast<int>(record.origin_height),
                                   /*coinbase=*/true, /*coinstake=*/false,
                                   static_cast<int>(record.origin_block_time)};
-                        const Consensus::DemurrageEvaluation evaluation = Consensus::EvaluateDemurrage(
-                            coin, consensus, evaluation_height, evaluation_mtp,
-                            latest_height, coverage_start);
-                        if (!MoneyRange(record.nominal_amount) ||
-                            !SumShadowAmountsEquals(evaluation.effective_value,
-                                                    evaluation.burned_value,
+                        ValueLifecycleClassification classification;
+                        if (ClassifyValueLifecycle(
+                                coin, /*authenticated_synthetic_goldrush=*/true,
+                                consensus, evaluation_height, evaluation_mtp,
+                                latest_height, coverage_start, classification) !=
+                                ValueLifecycleResult::OK ||
+                            !SumShadowAmountsEquals(classification.effective_amount,
+                                                    classification.burned_amount,
                                                     record.nominal_amount) ||
-                            !AddShadowAmount(scanned_effective, evaluation.effective_value) ||
-                            !AddShadowAmount(scanned_decayed, evaluation.burned_value)) {
+                            !AddShadowAmount(scanned_effective,
+                                             classification.effective_amount) ||
+                            !AddShadowAmount(scanned_decayed,
+                                             classification.burned_amount)) {
                             return false;
                         }
-                        const bool mature = static_cast<int64_t>(evaluation_height) >=
-                            static_cast<int64_t>(record.origin_height) +
-                                consensus.nCoinbaseMaturity;
-                        uint64_t& count = mature && !evaluation.locked
-                            ? lifecycle.spendable_count : lifecycle.locked_count;
-                        CAmount& nominal = mature && !evaluation.locked
-                            ? lifecycle.spendable_nominal : lifecycle.locked_nominal;
-                        CAmount& effective = mature && !evaluation.locked
-                            ? lifecycle.spendable_effective : lifecycle.locked_effective;
-                        if (count == std::numeric_limits<uint64_t>::max() ||
-                            !AddShadowAmount(nominal, record.nominal_amount) ||
-                            !AddShadowAmount(effective, evaluation.effective_value)) {
+                        ShadowLifecycleBucket* destination{nullptr};
+                        switch (classification.category) {
+                        case ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_IMMATURE:
+                            destination = &lifecycle.immature;
+                            break;
+                        case ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_MATURE_LOCKED:
+                            destination = &lifecycle.phase_locked;
+                            break;
+                        case ValueLifecycleCategory::MIGRATION_SPENDABLE_DIRECT_QUANTUM:
+                            destination = &lifecycle.spendable;
+                            break;
+                        case ValueLifecycleCategory::DEMURRAGE_LOCKED:
+                            destination = &lifecycle.demurrage_locked;
+                            break;
+                        default:
                             return false;
                         }
-                        ++count;
+                        if (!AddShadowLifecycleValue(*destination, classification)) {
+                            return false;
+                        }
                         return true;
                     },
                     scanned_records, complete);
@@ -1447,15 +1466,22 @@ RPCHelpMan getshadowsupply()
                     uint64_t classified_count{0};
                     CAmount classified_nominal{0};
                     CAmount classified_effective{0};
-                    if (!AddShadowCount(classified_count, lifecycle.locked_count) ||
-                        !AddShadowCount(classified_count, lifecycle.spendable_count) ||
-                        !AddShadowAmount(classified_nominal, lifecycle.locked_nominal) ||
-                        !AddShadowAmount(classified_nominal, lifecycle.spendable_nominal) ||
-                        !AddShadowAmount(classified_effective, lifecycle.locked_effective) ||
-                        !AddShadowAmount(classified_effective, lifecycle.spendable_effective) ||
-                        classified_count != unspent_count ||
+                    CAmount classified_burned{0};
+                    for (const ShadowLifecycleBucket* source : {
+                             &lifecycle.immature, &lifecycle.phase_locked,
+                             &lifecycle.demurrage_locked, &lifecycle.spendable}) {
+                        if (!AddShadowCount(classified_count, source->count) ||
+                            !AddShadowAmount(classified_nominal, source->nominal) ||
+                            !AddShadowAmount(classified_effective, source->effective) ||
+                            !AddShadowAmount(classified_burned, source->burned)) {
+                            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                               "Shadow lifecycle bucket total is out of range");
+                        }
+                    }
+                    if (classified_count != unspent_count ||
                         classified_nominal != unspent_nominal ||
                         classified_effective != scanned_effective ||
+                        classified_burned != scanned_decayed ||
                         !SumShadowAmountsEquals(scanned_effective,
                                                 scanned_decayed,
                                                 unspent_nominal)) {
@@ -1463,13 +1489,30 @@ RPCHelpMan getshadowsupply()
                                            "Shadow lifecycle buckets do not reconcile with indexed supply");
                     }
                 }
-                if (demurrage_active) {
-                    effective_exact = complete;
-                    effective_unspent = complete ? scanned_effective : 0;
-                    decayed_unspent = complete ? scanned_decayed : 0;
-                }
+                effective_exact = !demurrage_active || complete;
+                effective_unspent = effective_exact
+                    ? (complete ? scanned_effective : unspent_nominal) : 0;
+                decayed_unspent = complete ? scanned_decayed : 0;
                 if (!complete) {
                     lifecycle = {};
+                }
+            }
+
+            uint64_t locked_count{0};
+            CAmount locked_nominal{0};
+            CAmount locked_effective{0};
+            CAmount locked_burned{0};
+            if (lifecycle_exact) {
+                for (const ShadowLifecycleBucket* source : {
+                         &lifecycle.immature, &lifecycle.phase_locked,
+                         &lifecycle.demurrage_locked}) {
+                    if (!AddShadowCount(locked_count, source->count) ||
+                        !AddShadowAmount(locked_nominal, source->nominal) ||
+                        !AddShadowAmount(locked_effective, source->effective) ||
+                        !AddShadowAmount(locked_burned, source->burned)) {
+                        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                           "Shadow locked lifecycle total is out of range");
+                    }
                 }
             }
 
@@ -1528,17 +1571,29 @@ RPCHelpMan getshadowsupply()
             lifecycle_bucket.pushKV("classification_exact", lifecycle_exact);
             lifecycle_bucket.pushKV("records_scanned", static_cast<uint64_t>(scanned_records));
             lifecycle_bucket.pushKV("locked_count", lifecycle_exact
-                ? UniValue(lifecycle.locked_count) : UniValue{});
+                ? UniValue(locked_count) : UniValue{});
             lifecycle_bucket.pushKV("locked_nominal_amount", lifecycle_exact
-                ? UniValue(ValueFromAmount(lifecycle.locked_nominal)) : UniValue{});
+                ? UniValue(ValueFromAmount(locked_nominal)) : UniValue{});
             lifecycle_bucket.pushKV("locked_effective_amount", lifecycle_exact
-                ? UniValue(ValueFromAmount(lifecycle.locked_effective)) : UniValue{});
+                ? UniValue(ValueFromAmount(locked_effective)) : UniValue{});
+            lifecycle_bucket.pushKV("locked_burned_amount", lifecycle_exact
+                ? UniValue(ValueFromAmount(locked_burned)) : UniValue{});
             lifecycle_bucket.pushKV("spendable_count", lifecycle_exact
-                ? UniValue(lifecycle.spendable_count) : UniValue{});
+                ? UniValue(lifecycle.spendable.count) : UniValue{});
             lifecycle_bucket.pushKV("spendable_nominal_amount", lifecycle_exact
-                ? UniValue(ValueFromAmount(lifecycle.spendable_nominal)) : UniValue{});
+                ? UniValue(ValueFromAmount(lifecycle.spendable.nominal)) : UniValue{});
             lifecycle_bucket.pushKV("spendable_effective_amount", lifecycle_exact
-                ? UniValue(ValueFromAmount(lifecycle.spendable_effective)) : UniValue{});
+                ? UniValue(ValueFromAmount(lifecycle.spendable.effective)) : UniValue{});
+            lifecycle_bucket.pushKV("spendable_burned_amount", lifecycle_exact
+                ? UniValue(ValueFromAmount(lifecycle.spendable.burned)) : UniValue{});
+            lifecycle_bucket.pushKV("synthetic_immature", lifecycle_exact
+                ? ShadowLifecycleBucketToJSON(lifecycle.immature) : UniValue{});
+            lifecycle_bucket.pushKV("synthetic_mature_gold_rush_locked", lifecycle_exact
+                ? ShadowLifecycleBucketToJSON(lifecycle.phase_locked) : UniValue{});
+            lifecycle_bucket.pushKV("migration_spendable_direct_quantum", lifecycle_exact
+                ? ShadowLifecycleBucketToJSON(lifecycle.spendable) : UniValue{});
+            lifecycle_bucket.pushKV("demurrage_locked", lifecycle_exact
+                ? ShadowLifecycleBucketToJSON(lifecycle.demurrage_locked) : UniValue{});
             lifecycle_bucket.pushKV("expired_payout_count", 0);
             lifecycle_bucket.pushKV("expired_payout_nominal_amount", ValueFromAmount(0));
             lifecycle_bucket.pushKV("payout_expiration_policy", "gold_rush_payouts_do_not_expire");
