@@ -696,6 +696,26 @@ class ConfArgsTest(BitcoinTestFramework):
         assert_equal((concurrent_default_datadir / "wallet.dat").read_text(encoding="utf8"), "concurrent blackmore wallet\n")
         assert self._migration_marker(concurrent_default_datadir).exists()
 
+        self.log.info("Test a running legacy daemon's root datadir lock blocks every migration write")
+        source_lock_env, source_lock_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_source_lock_home"))
+        source_lock_blackmore = self._legacy_datadir_for_env(source_lock_env)
+        self._write_legacy_datadir(source_lock_blackmore, wallet_text="source-locked blackmore wallet\n")
+        source_lock_path = source_lock_blackmore / ".lock"
+        with source_lock_path.open("a+") as source_lock:
+            fcntl.lockf(source_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._assert_default_datadir_start_error(
+                node,
+                source_lock_env,
+                source_lock_default_datadir,
+                expected_msg=r"legacy source datadir is already locked at .*\.blackmore/\.lock",
+            )
+            assert not source_lock_default_datadir.exists()
+            assert_equal((source_lock_blackmore / "wallet.dat").read_text(encoding="utf8"), "source-locked blackmore wallet\n")
+            assert_equal(self._backup_dirs(source_lock_default_datadir, "blackmore"), [])
+        self._run_default_datadir_node_once(node, source_lock_env, source_lock_default_datadir)
+        assert_equal((source_lock_default_datadir / "wallet.dat").read_text(encoding="utf8"), "source-locked blackmore wallet\n")
+        assert self._migration_marker(source_lock_default_datadir).exists()
+
         self.log.info("Test a locked legacy network subdatadir blocks migration without a partial destination")
         network_lock_env, network_lock_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_network_lock_home"))
         network_lock_blackmore = self._legacy_datadir_for_env(network_lock_env)
