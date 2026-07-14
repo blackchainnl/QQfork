@@ -199,6 +199,10 @@ class WalletDumpTest(BitcoinTestFramework):
 
         # Restart node with new wallet, and test importwallet
         self.restart_node(0)
+        # The scheduler's periodic wallet flush is elapsed-time based. Resume
+        # real time after the earlier timestamped dump assertions so its
+        # two-second threshold can advance after restart.
+        self.nodes[0].setmocktime(0)
         self.nodes[0].createwallet("w2")
 
         # Make sure the address is not IsMine before import

@@ -35,6 +35,7 @@ class GoldRushPosSingleUtxoTest(BitcoinTestFramework):
         self.extra_args = [[
             "-txindex=1",
             "-staketimio=50",
+            "-autostartstaking=0",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=500",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
