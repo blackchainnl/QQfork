@@ -403,6 +403,7 @@ jobs:
             feature_goldrush_shadow_replay.py \
             feature_goldrush_reorg.py \
             feature_goldrush_pow_miner_e2e.py \
+            feature_goldrush_pow_claim_singleflight.py \
             feature_goldrush_pos_signal.py \
             feature_goldrush_pos_single_utxo.py \
             feature_goldrush_pos_unrestricted.py \
@@ -528,6 +529,7 @@ jobs:
             environment: ci/test/00_setup_env_native_asan.sh
             functional_tests: >-
               feature_goldrush_shadow_replay.py
+              feature_goldrush_pow_claim_singleflight.py
               feature_goldrush_pos_signal.py
               feature_goldrush_pos_signal_recovery.py
               wallet_pos_multiwallet_staking.py
@@ -537,6 +539,7 @@ jobs:
           - name: thread-sanitizer
             environment: ci/test/00_setup_env_native_tsan.sh
             functional_tests: >-
+              feature_goldrush_pow_claim_singleflight.py
               feature_goldrush_pos_signal.py
               feature_goldrush_pos_signal_recovery.py
               wallet_pos_multiwallet_staking.py

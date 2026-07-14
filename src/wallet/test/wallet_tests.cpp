@@ -12,7 +12,9 @@
 #include <iterator>
 #include <memory>
 #include <stdint.h>
+#include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include <addresstype.h>
@@ -70,6 +72,56 @@ BOOST_AUTO_TEST_CASE(abandon_unknown_transaction_is_safe)
 {
     CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
     BOOST_CHECK(!wallet.AbandonTransaction(uint256::ONE));
+}
+
+BOOST_AUTO_TEST_CASE(shadow_pow_claim_submission_guard_is_single_flight_and_exception_safe)
+{
+    CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+
+    constexpr size_t worker_count{16};
+    std::promise<void> start;
+    std::shared_future<void> start_future = start.get_future().share();
+    std::promise<void> release_winner;
+    std::shared_future<void> release_future = release_winner.get_future().share();
+    std::atomic<size_t> ready{0};
+    std::atomic<size_t> attempted{0};
+    std::atomic<size_t> acquired{0};
+    std::vector<std::future<bool>> workers;
+    workers.reserve(worker_count);
+    for (size_t i = 0; i < worker_count; ++i) {
+        workers.emplace_back(std::async(std::launch::async, [&] {
+            ++ready;
+            start_future.wait();
+            ShadowPowClaimSubmissionGuard guard(wallet);
+            ++attempted;
+            if (!guard) return false;
+            ++acquired;
+            release_future.wait();
+            return true;
+        }));
+    }
+
+    while (ready.load() != worker_count) std::this_thread::yield();
+    start.set_value();
+    while (attempted.load() != worker_count) std::this_thread::yield();
+    BOOST_CHECK_EQUAL(acquired.load(), 1U);
+    release_winner.set_value();
+
+    size_t successful_workers{0};
+    for (auto& worker : workers) {
+        if (worker.get()) ++successful_workers;
+    }
+    BOOST_CHECK_EQUAL(successful_workers, 1U);
+
+    try {
+        ShadowPowClaimSubmissionGuard guard(wallet);
+        BOOST_REQUIRE(static_cast<bool>(guard));
+        throw std::runtime_error("injected claim submission failure");
+    } catch (const std::runtime_error&) {
+    }
+
+    ShadowPowClaimSubmissionGuard after_exception(wallet);
+    BOOST_CHECK(static_cast<bool>(after_exception));
 }
 
 static CMutableTransaction TestSimpleSpend(const CTransaction& from, uint32_t index, const CKey& key, const CScript& pubkey)
