@@ -14,18 +14,24 @@
 #include <crypto/argon2/argon2.h>
 #include <crypto/mldsa.h>
 #include <crypto/mldsa_kat.h>
+#include <hash.h>
 #include <primitives/block.h>
 #include <script/interpreter.h>
 #include <serialize.h>
 #include <shadow.h>
 #include <test/util/setup_common.h>
+#include <undo.h>
 #include <util/strencodings.h>
 #include <validation.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <set>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -47,11 +53,19 @@ constexpr size_t MAX_BLOCK_MLDSA_VERIFICATIONS{
     Consensus::MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK + 1}; // PoS block signature
 constexpr size_t MAXIMUM_QUANTUM_BENCHMARK_BLOCK_WEIGHT{31'997'596};
 constexpr size_t MAXIMUM_QUANTUM_BENCHMARK_SERIALIZED_SIZE{30'988'642};
+// Height 5,945,000 permanently fixes the mainnet whitelist at 687 entries.
+// The post-activation production maximum is therefore 687 PoS records plus
+// the existing 64-proof PoW evaluation budget.
+constexpr uint32_t MAINNET_AUTHENTICATED_WHITELIST_ENTRIES{687};
+constexpr uint32_t MAXIMUM_MAINNET_SYNTHETIC_CLAIMS{
+    MAINNET_AUTHENTICATED_WHITELIST_ENTRIES + MAX_SHADOW_POW_EVALS_PER_BLOCK};
 static_assert(MIN_QUANTUM_INPUT_NONWITNESS_BYTES == 41);
 static_assert(MIN_QUANTUM_INPUT_WITNESS_BYTES == 3739);
 static_assert(MIN_QUANTUM_INPUT_WEIGHT == 3903);
 static_assert(MAX_WEIGHT_BOUND_QUANTUM_INPUTS == 8198);
 static_assert(MAX_BLOCK_MLDSA_VERIFICATIONS == 8215);
+static_assert(MAINNET_SHADOW_WHITELIST_HEIGHT == 5'945'000);
+static_assert(MAXIMUM_MAINNET_SYNTHETIC_CLAIMS == 751);
 
 struct MaximumQuantumBlock
 {
@@ -80,6 +94,462 @@ MLDSAVector LoadMLDSAVector()
     }
     return vector;
 }
+
+void RequireSyntheticFixture(bool condition, const std::string& message)
+{
+    if (!condition) throw std::runtime_error(message);
+}
+
+void InitSyntheticIndex(CBlockIndex& index, int height, CBlockIndex* previous,
+                        uint256& hash_storage)
+{
+    CBlockHeader header;
+    header.nVersion = 7;
+    header.hashPrevBlock = previous ? previous->GetBlockHash() : uint256{};
+    header.nTime = SHADOW_EQUAL_FOOTING_TIME +
+                   (height - SHADOW_WHITELIST_HEIGHT) * 64;
+    header.nBits = 1;
+    header.nNonce = height;
+    hash_storage = header.GetHash();
+    index.nVersion = header.nVersion;
+    index.hashMerkleRoot = header.hashMerkleRoot;
+    index.nTime = header.nTime;
+    index.nBits = header.nBits;
+    index.nNonce = header.nNonce;
+    index.phashBlock = &hash_storage;
+    index.pprev = previous;
+    index.nHeight = height;
+    // The fixture intentionally starts at the authenticated whitelist height,
+    // not genesis. Leave pskip empty so ancestor traversal stays on the
+    // contiguous pprev chain represented below.
+}
+
+CScript SyntheticLegacyTarget(uint32_t ordinal)
+{
+    std::vector<unsigned char> key_hash(20);
+    WriteLE32(key_hash.data(), ordinal + 1);
+    key_hash.back() = 0x51;
+    return CScript{} << OP_DUP << OP_HASH160 << key_hash
+                     << OP_EQUALVERIFY << OP_CHECKSIG;
+}
+
+CScript SyntheticQuantumPayout(uint32_t ordinal)
+{
+    std::vector<unsigned char> program(QUANTUM_MIGRATION_PROGRAM_SIZE);
+    WriteLE32(program.data(), ordinal + 1);
+    program.back() = 0xa5;
+    return GetScriptForDestination(WitnessUnknown{
+        QUANTUM_MIGRATION_WITNESS_VERSION, std::move(program)});
+}
+
+CTransactionRef MakeSyntheticCoinbase()
+{
+    CMutableTransaction transaction;
+    transaction.vin.resize(1);
+    transaction.vin[0].prevout.SetNull();
+    transaction.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+    return MakeTransactionRef(std::move(transaction));
+}
+
+CTransactionRef MakeSyntheticCoinstake(const CScript& target)
+{
+    CMutableTransaction transaction;
+    transaction.vin.emplace_back(COutPoint{uint256::ONE, 1});
+    transaction.vout.emplace_back(0, CScript{});
+    transaction.vout.emplace_back(COIN, target);
+    return MakeTransactionRef(std::move(transaction));
+}
+
+CTransactionRef MakeSyntheticSignal(const CScript& target,
+                                    const std::vector<unsigned char>& signal,
+                                    uint32_t ordinal)
+{
+    CMutableTransaction transaction;
+    transaction.vin.emplace_back(COutPoint{uint256{3}, ordinal});
+    transaction.vout.emplace_back(COIN, target);
+    transaction.vout.emplace_back(0, CScript{} << OP_RETURN << signal);
+    return MakeTransactionRef(std::move(transaction));
+}
+
+CTransactionRef MakeSyntheticPowClaim(const CScript& target,
+                                      const std::vector<unsigned char>& proof,
+                                      uint32_t ordinal)
+{
+    CMutableTransaction transaction;
+    transaction.vin.emplace_back(COutPoint{uint256{2}, ordinal});
+    transaction.vout.emplace_back(COIN, target);
+    transaction.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
+    return MakeTransactionRef(std::move(transaction));
+}
+
+CBlockUndo MakeSyntheticUndo(const CBlock& block,
+                             const std::vector<CScript>& input_scripts)
+{
+    RequireSyntheticFixture(!block.vtx.empty(),
+                            "synthetic benchmark block has no coinbase");
+    RequireSyntheticFixture(input_scripts.size() + 1 == block.vtx.size(),
+                            "synthetic benchmark undo/script count mismatch");
+    CBlockUndo undo;
+    undo.vtxundo.resize(block.vtx.size() - 1);
+    for (size_t tx_index = 1; tx_index < block.vtx.size(); ++tx_index) {
+        RequireSyntheticFixture(block.vtx[tx_index]->vin.size() == 1,
+                                "synthetic benchmark transaction input count changed");
+        Coin coin;
+        coin.out = CTxOut{10'000 * COIN, input_scripts[tx_index - 1]};
+        coin.nHeight = SHADOW_WHITELIST_HEIGHT;
+        coin.nTime = SHADOW_EQUAL_FOOTING_TIME;
+        undo.vtxundo[tx_index - 1].vprevout.push_back(std::move(coin));
+    }
+    return undo;
+}
+
+bool EqualShadowPoolInfo(const ShadowGoldRushInfo& lhs,
+                         const ShadowGoldRushInfo& rhs)
+{
+    return lhs.pow_amount == rhs.pow_amount &&
+           lhs.pos_amount == rhs.pos_amount &&
+           lhs.claimed_amount == rhs.claimed_amount &&
+           lhs.pow_count == rhs.pow_count &&
+           lhs.pos_count == rhs.pos_count &&
+           lhs.last_pow_height == rhs.last_pow_height &&
+           lhs.last_pos_height == rhs.last_pos_height &&
+           lhs.recent_count == rhs.recent_count &&
+           lhs.recent_modes == rhs.recent_modes &&
+           lhs.pow_target_bits == rhs.pow_target_bits;
+}
+
+uint256 SyntheticStateIdentity(const CCoinsViewCache& view,
+                               const CBlockIndex* parent)
+{
+    const ShadowGoldRushInfo pool = GetShadowGoldRushInfo(view, parent);
+    const std::map<CScript, CScript> signals =
+        GetActiveShadowSignalPayouts(view, parent);
+
+    bool inventory_found{false};
+    GoldRushInventoryInfo inventory;
+    std::unique_ptr<CCoinsViewCursor> cursor(view.Cursor());
+    while (cursor->Valid()) {
+        COutPoint outpoint;
+        Coin coin;
+        if (cursor->GetKey(outpoint) && cursor->GetValue(coin) &&
+            !coin.IsSpent() && IsGoldRushInventoryMarkerOutpoint(outpoint)) {
+            RequireSyntheticFixture(!inventory_found,
+                                    "duplicate synthetic inventory marker");
+            RequireSyntheticFixture(
+                DecodeAuthenticatedGoldRushInventory(outpoint, coin, parent,
+                                                     inventory),
+                "synthetic inventory marker failed authentication");
+            inventory_found = true;
+        }
+        cursor->Next();
+    }
+    RequireSyntheticFixture(inventory_found,
+                            "synthetic inventory marker is missing");
+
+    CHashWriter writer;
+    writer << std::string("Quantum Quasar Synthetic Benchmark Identity v1")
+           << pool.pow_amount << pool.pos_amount << pool.claimed_amount
+           << pool.pow_count << pool.pos_count << pool.last_pow_height
+           << pool.last_pos_height << pool.recent_count << pool.recent_modes
+           << pool.pow_target_bits << signals
+           << inventory.tip_height << inventory.tip_hash
+           << inventory.issued_count << inventory.issued_nominal
+           << inventory.spent_count << inventory.spent_nominal;
+    return writer.GetHash();
+}
+
+class MaximumSyntheticStateFixture
+{
+public:
+    MaximumSyntheticStateFixture()
+        : m_hashes(MAINNET_AUTHENTICATED_WHITELIST_ENTRIES + 3),
+          m_indexes(MAINNET_AUTHENTICATED_WHITELIST_ENTRIES + 3),
+          m_bridge_hashes(SHADOW_REWARD_START_HEIGHT -
+                          SHADOW_WHITELIST_HEIGHT - 1),
+          m_bridge_indexes(SHADOW_REWARD_START_HEIGHT -
+                           SHADOW_WHITELIST_HEIGHT - 1)
+    {
+        RequireSyntheticFixture(
+            SHADOW_WHITELIST_HEIGHT == MAINNET_SHADOW_WHITELIST_HEIGHT &&
+                SHADOW_REWARD_START_HEIGHT ==
+                    MAINNET_SHADOW_REWARD_START_HEIGHT,
+            "synthetic benchmark requires the pinned mainnet shadow schedule");
+        RequireSyntheticFixture(
+            Params().GetConsensus().IsShadowCompetingClaimsActive(
+                SHADOW_REWARD_START_HEIGHT),
+            "synthetic benchmark test chain must activate bounded claims");
+
+        m_targets.reserve(MAINNET_AUTHENTICATED_WHITELIST_ENTRIES);
+        m_payouts.reserve(MAINNET_AUTHENTICATED_WHITELIST_ENTRIES);
+        m_signals.reserve(MAINNET_AUTHENTICATED_WHITELIST_ENTRIES);
+        for (uint32_t ordinal = 0;
+             ordinal < MAINNET_AUTHENTICATED_WHITELIST_ENTRIES; ++ordinal) {
+            m_targets.push_back(SyntheticLegacyTarget(ordinal));
+            m_payouts.push_back(SyntheticQuantumPayout(ordinal));
+            uint256 txid;
+            WriteLE64(txid.begin(), ordinal + 1);
+            Coin coin;
+            coin.out = CTxOut{10'000 * COIN, m_targets.back()};
+            coin.nHeight = SHADOW_WHITELIST_HEIGHT;
+            coin.nTime = SHADOW_EQUAL_FOOTING_TIME;
+            m_view.AddCoin(COutPoint{txid, 0}, std::move(coin), false);
+        }
+
+        for (auto& index : m_indexes) index = std::make_unique<CBlockIndex>();
+        InitSyntheticIndex(*m_indexes[0], SHADOW_WHITELIST_HEIGHT, nullptr,
+                           m_hashes[0]);
+        const std::set<CScript> whitelist = BuildLegacyWhitelist(m_view);
+        RequireSyntheticFixture(
+            whitelist.size() == MAINNET_AUTHENTICATED_WHITELIST_ENTRIES &&
+                std::all_of(m_targets.begin(), m_targets.end(),
+                            [&](const CScript& target) {
+                                return whitelist.count(target) == 1;
+                            }),
+            "synthetic benchmark does not reproduce the 687-entry mainnet snapshot bound");
+        RequireSyntheticFixture(
+            ApplyLegacyWhitelistSnapshot(m_view, m_indexes[0].get()),
+            "cannot build maximum synthetic benchmark whitelist");
+        RequireSyntheticFixture(
+            GetShadowSyntheticClaimLimit(
+                Params().GetConsensus(), SHADOW_REWARD_START_HEIGHT,
+                MAINNET_AUTHENTICATED_WHITELIST_ENTRIES) ==
+                MAXIMUM_MAINNET_SYNTHETIC_CLAIMS,
+            "synthetic claim limit no longer matches the pinned mainnet bound");
+
+        CBlockIndex* previous = m_indexes[0].get();
+        // CBlockIndex::GetAncestor assumes a contiguous pprev chain. Preserve
+        // the production height gap between the whitelist snapshot and reward
+        // start with header-only indexes so skip-list traversal is authentic.
+        for (size_t position = 0; position < m_bridge_indexes.size(); ++position) {
+            m_bridge_indexes[position] = std::make_unique<CBlockIndex>();
+            InitSyntheticIndex(*m_bridge_indexes[position],
+                               SHADOW_WHITELIST_HEIGHT + position + 1,
+                               previous, m_bridge_hashes[position]);
+            previous = m_bridge_indexes[position].get();
+        }
+        for (uint32_t ordinal = 0;
+             ordinal < MAINNET_AUTHENTICATED_WHITELIST_ENTRIES; ++ordinal) {
+            const size_t index_position = ordinal + 1;
+            InitSyntheticIndex(*m_indexes[index_position],
+                               SHADOW_REWARD_START_HEIGHT + ordinal, previous,
+                               m_hashes[index_position]);
+            CBlock solve_block;
+            solve_block.vtx = {
+                MakeSyntheticCoinbase(),
+                MakeSyntheticCoinstake(m_targets[ordinal]),
+            };
+            const CBlockUndo solve_undo =
+                MakeSyntheticUndo(solve_block, {m_targets[ordinal]});
+            RequireSyntheticFixture(
+                ApplyShadowBlock(m_view, solve_block,
+                                 m_indexes[index_position].get(),
+                                 &solve_undo) &&
+                    AdvanceGoldRushInventoryTip(
+                        m_view, m_indexes[index_position].get()),
+                "cannot seed synthetic benchmark solver state");
+            std::vector<unsigned char> signal;
+            RequireSyntheticFixture(
+                BuildShadowSignalData(
+                    m_targets[ordinal], m_payouts[ordinal],
+                    m_indexes[index_position]->nHeight,
+                    m_indexes[index_position]->GetBlockHash(), signal),
+                "cannot build synthetic benchmark signal");
+            m_signals.push_back(std::move(signal));
+            previous = m_indexes[index_position].get();
+        }
+
+        const size_t signal_index_position =
+            MAINNET_AUTHENTICATED_WHITELIST_ENTRIES + 1;
+        InitSyntheticIndex(*m_indexes[signal_index_position],
+                           previous->nHeight + 1, previous,
+                           m_hashes[signal_index_position]);
+        CBlock signal_block;
+        signal_block.vtx.push_back(MakeSyntheticCoinbase());
+        // A non-whitelisted coinstake records all signals without consuming the
+        // accumulated PoS pool. The timed block can then exercise 687 payouts.
+        signal_block.vtx.push_back(
+            MakeSyntheticCoinstake(CScript{} << OP_2));
+        std::vector<CScript> signal_undo_scripts{CScript{} << OP_2};
+        signal_undo_scripts.reserve(
+            MAINNET_AUTHENTICATED_WHITELIST_ENTRIES + 1);
+        for (uint32_t ordinal = 0;
+             ordinal < MAINNET_AUTHENTICATED_WHITELIST_ENTRIES; ++ordinal) {
+            signal_block.vtx.push_back(MakeSyntheticSignal(
+                m_targets[ordinal], m_signals[ordinal], ordinal));
+            signal_undo_scripts.push_back(m_targets[ordinal]);
+        }
+        const CBlockUndo signal_undo =
+            MakeSyntheticUndo(signal_block, signal_undo_scripts);
+        RequireSyntheticFixture(
+            ApplyShadowBlock(m_view, signal_block,
+                             m_indexes[signal_index_position].get(),
+                             &signal_undo) &&
+                AdvanceGoldRushInventoryTip(
+                    m_view, m_indexes[signal_index_position].get()),
+            "cannot seed maximum synthetic active-signal state");
+        RequireSyntheticFixture(
+            GetActiveShadowSignalCount(
+                m_view, m_indexes[signal_index_position].get()) ==
+                MAINNET_AUTHENTICATED_WHITELIST_ENTRIES,
+            "synthetic active-signal fixture is not maximal");
+
+        const size_t target_index_position = signal_index_position + 1;
+        InitSyntheticIndex(*m_indexes[target_index_position],
+                           m_indexes[signal_index_position]->nHeight + 1,
+                           m_indexes[signal_index_position].get(),
+                           m_hashes[target_index_position]);
+        m_parent = m_indexes[signal_index_position].get();
+        m_target = m_indexes[target_index_position].get();
+
+        const CScript pow_target = CScript{} << OP_3;
+        std::vector<unsigned char> pow_proof;
+        RequireSyntheticFixture(
+            MineShadowProofData(pow_target, m_payouts.front(), m_parent,
+                                m_view, 1'000'000, pow_proof),
+            "cannot mine synthetic benchmark PoW proof");
+
+        m_block.vtx.push_back(MakeSyntheticCoinbase());
+        m_block.vtx.push_back(MakeSyntheticCoinstake(m_targets.front()));
+        std::vector<CScript> target_undo_scripts{m_targets.front()};
+        target_undo_scripts.reserve(
+            1 + MAINNET_AUTHENTICATED_WHITELIST_ENTRIES +
+            MAX_SHADOW_POW_EVALS_PER_BLOCK);
+        // Refreshing every signal in the measured block exercises the maximum
+        // active-state manifest, shards, and undo shards at the same time as
+        // the maximum authenticated claim family.
+        for (uint32_t ordinal = 0;
+             ordinal < MAINNET_AUTHENTICATED_WHITELIST_ENTRIES; ++ordinal) {
+            m_block.vtx.push_back(MakeSyntheticSignal(
+                m_targets[ordinal], m_signals[ordinal], ordinal));
+            target_undo_scripts.push_back(m_targets[ordinal]);
+        }
+        for (uint32_t ordinal = 0;
+             ordinal < MAX_SHADOW_POW_EVALS_PER_BLOCK; ++ordinal) {
+            m_block.vtx.push_back(MakeSyntheticPowClaim(
+                pow_target, pow_proof, ordinal));
+            target_undo_scripts.push_back(pow_target);
+        }
+        m_undo = MakeSyntheticUndo(m_block, target_undo_scripts);
+        m_parent_pool = GetShadowGoldRushInfo(m_view, m_parent);
+        m_parent_signals = GetActiveShadowSignalPayouts(m_view, m_parent);
+        RequireSyntheticFixture(
+            m_parent_signals.size() ==
+                MAINNET_AUTHENTICATED_WHITELIST_ENTRIES,
+            "synthetic benchmark parent signal set changed");
+        m_parent_identity = SyntheticStateIdentity(m_view, m_parent);
+    }
+
+    bool ApplyAndUndoCold()
+    {
+        // A fresh child cache on every timed iteration includes first-touch
+        // marker/tombstone allocation. It cannot become artificially cheaper
+        // because a prior iteration retained warmed synthetic entries.
+        {
+            CCoinsViewCache transition_view{&m_view, true};
+            if (!ApplyAndUndo(transition_view)) return false;
+        }
+        return m_view.GetCacheSize() == m_parent_cache_size &&
+               m_view.DynamicMemoryUsage() == m_parent_cache_memory;
+    }
+
+    void VerifyMaximumTransition()
+    {
+        CCoinsViewCache transition_view{&m_view, true};
+        RequireSyntheticFixture(
+            ApplyShadowBlockResult(transition_view, m_block, m_target, &m_undo) ==
+                    ShadowApplyResult::OK &&
+                AdvanceGoldRushInventoryTip(transition_view, m_target),
+            "maximum synthetic benchmark apply failed");
+        const std::vector<ShadowSyntheticPayoutTransaction> payouts =
+            GetAppliedShadowClaimPayoutTransactionRecords(
+                transition_view, m_target->nHeight, m_target->GetBlockHash(),
+                m_target->GetBlockTime());
+        RequireSyntheticFixture(
+            payouts.size() == MAXIMUM_MAINNET_SYNTHETIC_CLAIMS,
+            "maximum synthetic benchmark claim count changed");
+        RequireSyntheticFixture(
+            std::count_if(
+                payouts.begin(), payouts.end(),
+                [](const ShadowSyntheticPayoutTransaction& payout) {
+                    return payout.proof_of_work;
+                }) == MAX_SHADOW_POW_EVALS_PER_BLOCK,
+            "maximum synthetic benchmark PoW claim count changed");
+        RequireSyntheticFixture(
+            UndoShadowBlock(transition_view, m_block, m_target, &m_undo) &&
+                RewindGoldRushInventoryTip(transition_view, m_target),
+            "maximum synthetic benchmark undo failed");
+        RequireSyntheticFixture(
+            SyntheticStateIdentity(transition_view, m_parent) == m_parent_identity,
+            "maximum synthetic benchmark apply/undo changed parent state");
+
+        // Independently prove that a production-style persistent cache reaches
+        // a fixed point after its first connect/disconnect. Repeated cycles may
+        // not accumulate tombstones or allocator growth.
+        CCoinsViewCache persistent_view{&m_view, true};
+        RequireSyntheticFixture(
+            ApplyAndUndo(persistent_view),
+            "persistent synthetic benchmark preflight failed");
+        const unsigned int stable_cache_size = persistent_view.GetCacheSize();
+        const size_t stable_cache_memory = persistent_view.DynamicMemoryUsage();
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            RequireSyntheticFixture(
+                ApplyAndUndo(persistent_view) &&
+                    persistent_view.GetCacheSize() == stable_cache_size &&
+                    persistent_view.DynamicMemoryUsage() == stable_cache_memory,
+                "repeated synthetic apply/undo grew persistent cache state");
+        }
+
+        // The timed path uses disposable children. Record the immutable parent
+        // cache after preflight so every measured iteration proves isolation.
+        m_parent_cache_size = m_view.GetCacheSize();
+        m_parent_cache_memory = m_view.DynamicMemoryUsage();
+    }
+
+    void VerifyFinalIdentity() const
+    {
+        RequireSyntheticFixture(
+            SyntheticStateIdentity(m_view, m_parent) == m_parent_identity &&
+                m_view.GetCacheSize() == m_parent_cache_size &&
+                m_view.DynamicMemoryUsage() == m_parent_cache_memory,
+            "repeated synthetic benchmark transitions changed parent state");
+    }
+
+private:
+    bool ApplyAndUndo(CCoinsViewCache& view) const
+    {
+        if (ApplyShadowBlockResult(view, m_block, m_target, &m_undo) !=
+                ShadowApplyResult::OK ||
+            !AdvanceGoldRushInventoryTip(view, m_target) ||
+            !UndoShadowBlock(view, m_block, m_target, &m_undo) ||
+            !RewindGoldRushInventoryTip(view, m_target)) {
+            return false;
+        }
+        return EqualShadowPoolInfo(
+                   GetShadowGoldRushInfo(view, m_parent), m_parent_pool) &&
+               GetActiveShadowSignalPayouts(view, m_parent) ==
+                   m_parent_signals &&
+               SyntheticStateIdentity(view, m_parent) == m_parent_identity;
+    }
+
+    CCoinsView m_base;
+    CCoinsViewCache m_view{&m_base, true};
+    std::vector<uint256> m_hashes;
+    std::vector<std::unique_ptr<CBlockIndex>> m_indexes;
+    std::vector<uint256> m_bridge_hashes;
+    std::vector<std::unique_ptr<CBlockIndex>> m_bridge_indexes;
+    std::vector<CScript> m_targets;
+    std::vector<CScript> m_payouts;
+    std::vector<std::vector<unsigned char>> m_signals;
+    CBlockIndex* m_parent{nullptr};
+    CBlockIndex* m_target{nullptr};
+    CBlock m_block;
+    CBlockUndo m_undo;
+    ShadowGoldRushInfo m_parent_pool;
+    std::map<CScript, CScript> m_parent_signals;
+    uint256 m_parent_identity;
+    unsigned int m_parent_cache_size{0};
+    size_t m_parent_cache_memory{0};
+};
 
 MaximumQuantumBlock BuildMaximumQuantumBlock(
     const std::vector<uint8_t>& public_key,
@@ -303,8 +773,29 @@ static void QuantumLargeBlockValidation32MiB(benchmark::Bench& bench)
     });
 }
 
+static void QuantumSyntheticStateApplyUndoMaxMarkers(benchmark::Bench& bench)
+{
+    const auto testing_setup =
+        MakeNoLogFileContext<const TestingSetup>(ChainType::REGTEST);
+    MaximumSyntheticStateFixture fixture;
+    // Prove the fixture reaches the exact 687 PoS + 64 PoW mainnet maximum and
+    // restores the authenticated parent before nanobench starts timing it.
+    fixture.VerifyMaximumTransition();
+    bench.batch(1).unit("state-transition").run([&] {
+        const bool success = fixture.ApplyAndUndoCold();
+        if (!success) {
+            throw std::runtime_error(
+                "maximum synthetic state apply/undo benchmark failed");
+        }
+        ankerl::nanobench::doNotOptimizeAway(success);
+    });
+    fixture.VerifyFinalIdentity();
+}
+
 BENCHMARK(QuantumArgon2id1MiB, benchmark::PriorityLevel::HIGH);
 BENCHMARK(QuantumArgon2id64ClaimBlock, benchmark::PriorityLevel::HIGH);
 BENCHMARK(QuantumMLDSA44Verify, benchmark::PriorityLevel::HIGH);
 BENCHMARK(QuantumMLDSA44MaxWeightBlock, benchmark::PriorityLevel::HIGH);
 BENCHMARK(QuantumLargeBlockValidation32MiB, benchmark::PriorityLevel::HIGH);
+BENCHMARK(QuantumSyntheticStateApplyUndoMaxMarkers,
+          benchmark::PriorityLevel::HIGH);

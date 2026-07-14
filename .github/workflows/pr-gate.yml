@@ -232,8 +232,6 @@ jobs:
 
       - name: Run source-bound worst-case benchmarks
         shell: bash
-        env:
-          RELEASE_MODE: ${{ inputs.release_mode == true }}
         run: |
           set -euo pipefail
           binary=src/bench/bench_blackcoin
@@ -245,16 +243,9 @@ jobs:
           test -n "$cxxflags"
           chmod +x "$binary"
           "$binary" \
-            -filter='Quantum(Argon2id|MLDSA44|LargeBlock).*' \
+            -filter='Quantum(Argon2id|MLDSA44|LargeBlock|SyntheticState).*' \
             -min-time=250 \
             -output-json="$raw"
-          requirements=(--require-domain crypto --require-domain large-block)
-          if [[ "$RELEASE_MODE" == "true" ]]; then
-            # Maximum-marker apply/undo evidence remains a production-only
-            # gate. Crypto and 32,000,000-weight validation are mandatory on
-            # every pull request and candidate.
-            requirements+=(--require-domain synthetic-state)
-          fi
           python3 ci/release/generate_resource_benchmark_evidence.py \
             --nanobench-json "$raw" \
             --binary "$binary" \
@@ -268,7 +259,9 @@ jobs:
             --build-profile native-debug-lockorder \
             --minimum-runtime-ms 250 \
             --provenance-manifest contrib/devtools/quantum-crypto-provenance.json \
-            "${requirements[@]}" \
+            --require-domain crypto \
+            --require-domain large-block \
+            --require-domain synthetic-state \
             --output "$evidence"
 
       - name: Upload measured resource evidence
@@ -343,7 +336,7 @@ jobs:
           test -n "$cxx"
           test -n "$cxxflags"
           src/bench/bench_blackcoin \
-            -filter='Quantum(Argon2id|MLDSA44|LargeBlock).*' \
+            -filter='Quantum(Argon2id|MLDSA44|LargeBlock|SyntheticState).*' \
             -min-time=250 \
             -output-json="$raw"
           python3 ci/release/generate_resource_benchmark_evidence.py \
@@ -361,6 +354,7 @@ jobs:
             --provenance-manifest contrib/devtools/quantum-crypto-provenance.json \
             --require-domain crypto \
             --require-domain large-block \
+            --require-domain synthetic-state \
             --output "$evidence"
 
       - name: Upload native resource evidence

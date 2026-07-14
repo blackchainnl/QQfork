@@ -82,6 +82,11 @@ class ReleaseToolTests(unittest.TestCase):
                     "QuantumMLDSA44MaxWeightBlock", "signature", 0.41075, 8215
                 ),
                 result("QuantumLargeBlockValidation32MiB", "block", 0.75),
+                result(
+                    "QuantumSyntheticStateApplyUndoMaxMarkers",
+                    "state-transition",
+                    0.2,
+                ),
             ]
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -106,12 +111,12 @@ class ReleaseToolTests(unittest.TestCase):
                     TOOLS.parent.parent /
                     "contrib" / "devtools" / "quantum-crypto-provenance.json"
                 ),
-                required_domains={"crypto", "large-block"},
+                required_domains={"crypto", "large-block", "synthetic-state"},
             )
             self.assertTrue(evidence["coverage"]["crypto"])
             self.assertTrue(evidence["coverage"]["large-block"])
-            self.assertFalse(evidence["coverage"]["synthetic-state"])
-            self.assertFalse(evidence["release_resource_evidence_complete"])
+            self.assertTrue(evidence["coverage"]["synthetic-state"])
+            self.assertTrue(evidence["release_resource_evidence_complete"])
             argon_bound = evidence["derived_upper_bounds"]["shadow_pow_argon2_block"]
             mldsa_bound = evidence["derived_upper_bounds"]["quantum_mldsa_block"]
             self.assertEqual(
@@ -148,6 +153,50 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertEqual(
                 evidence["consensus_limits"]["minimum_quantum_input_weight"], 3903
             )
+            synthetic_bound = evidence["derived_upper_bounds"][
+                "synthetic_state_apply_undo"
+            ]
+            self.assertEqual(
+                synthetic_bound["authenticated_whitelist_snapshot_height"],
+                5_945_000,
+            )
+            self.assertEqual(
+                synthetic_bound["authenticated_whitelist_entries"], 687
+            )
+            self.assertEqual(synthetic_bound["maximum_pow_claims"], 64)
+            self.assertEqual(synthetic_bound["maximum_synthetic_claims"], 751)
+            self.assertEqual(synthetic_bound["maximum_claim_family_coins"], 2253)
+            self.assertEqual(synthetic_bound["maximum_muhash_insertions"], 1502)
+            self.assertEqual(synthetic_bound["measured_median_seconds"], 0.2)
+            self.assertEqual(
+                synthetic_bound["measured_maximum_epoch_seconds"], 0.2
+            )
+            self.assertEqual(synthetic_bound["maximum_allowed_seconds"], 2.0)
+
+            synthetic_result = document["results"].pop()
+            raw.write_text(json.dumps(document), encoding="utf-8")
+            partial_evidence = generator.generate_evidence(
+                nanobench_json=raw,
+                binary=binary,
+                source_sha=source_sha,
+                repo_root=repository,
+                repository="Blackcoin-Dev/Blackcoin",
+                platform="linux",
+                architecture="x86_64",
+                toolchain="GCC 11.4.0",
+                compiler_flags="-O2 -g",
+                build_profile="native-test",
+                minimum_runtime_ms=250,
+                provenance_manifest=(
+                    TOOLS.parent.parent /
+                    "contrib" / "devtools" / "quantum-crypto-provenance.json"
+                ),
+                required_domains={"crypto", "large-block"},
+            )
+            self.assertFalse(partial_evidence["coverage"]["synthetic-state"])
+            self.assertFalse(
+                partial_evidence["release_resource_evidence_complete"]
+            )
             with self.assertRaisesRegex(RuntimeError, "synthetic-state"):
                 generator.generate_evidence(
                     nanobench_json=raw,
@@ -167,35 +216,109 @@ class ReleaseToolTests(unittest.TestCase):
                     ),
                     required_domains={"crypto", "large-block", "synthetic-state"},
                 )
+            document["results"].append(synthetic_result)
+
+            rejected_seconds = 2.000001
+            synthetic_result["median(elapsed)"] = rejected_seconds
+            synthetic_result["totalTime"] = rejected_seconds * 11
+            for measurement in synthetic_result["measurements"]:
+                measurement["elapsed"] = rejected_seconds
+            raw.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "exceeds the enforced"):
+                generator.generate_evidence(
+                    nanobench_json=raw,
+                    binary=binary,
+                    source_sha=source_sha,
+                    repo_root=repository,
+                    repository="Blackcoin-Dev/Blackcoin",
+                    platform="linux",
+                    architecture="x86_64",
+                    toolchain="GCC 11.4.0",
+                    compiler_flags="-O2 -g",
+                    build_profile="native-test",
+                    minimum_runtime_ms=250,
+                    provenance_manifest=(
+                        TOOLS.parent.parent /
+                        "contrib" / "devtools" /
+                        "quantum-crypto-provenance.json"
+                    ),
+                    required_domains={
+                        "crypto", "large-block", "synthetic-state"
+                    },
+                )
+            synthetic_result["median(elapsed)"] = 0.2
+            synthetic_result["totalTime"] = 0.2 * 11
+            for measurement in synthetic_result["measurements"]:
+                measurement["elapsed"] = 0.2
+
+            # A fast median cannot hide one transition beyond the hard ceiling.
+            rejected_seconds = 2.000001
+            synthetic_result["measurements"][0]["elapsed"] = rejected_seconds
+            synthetic_result["totalTime"] = rejected_seconds + 0.2 * 10
+            raw.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "maximum epoch"):
+                generator.generate_evidence(
+                    nanobench_json=raw,
+                    binary=binary,
+                    source_sha=source_sha,
+                    repo_root=repository,
+                    repository="Blackcoin-Dev/Blackcoin",
+                    platform="linux",
+                    architecture="x86_64",
+                    toolchain="GCC 11.4.0",
+                    compiler_flags="-O2 -g",
+                    build_profile="native-test",
+                    minimum_runtime_ms=250,
+                    provenance_manifest=(
+                        TOOLS.parent.parent /
+                        "contrib" / "devtools" /
+                        "quantum-crypto-provenance.json"
+                    ),
+                    required_domains={
+                        "crypto", "large-block", "synthetic-state"
+                    },
+                )
+            synthetic_result["measurements"][0]["elapsed"] = 0.2
+            synthetic_result["totalTime"] = 0.2 * 11
 
             document["results"].append(document["results"][0])
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "duplicate nanobench result"):
-                generator.parse_measurements(raw, {"crypto", "large-block"}, 250)
+                generator.parse_measurements(
+                    raw, {"crypto", "large-block", "synthetic-state"}, 250
+                )
 
             document["results"].pop()
             document["results"][1]["batch"] = 63
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "expected 64"):
-                generator.parse_measurements(raw, {"crypto", "large-block"}, 250)
+                generator.parse_measurements(
+                    raw, {"crypto", "large-block", "synthetic-state"}, 250
+                )
 
             document["results"][1]["batch"] = 64
             document["results"][0]["median(elapsed)"] *= 2
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "median does not match"):
-                generator.parse_measurements(raw, {"crypto", "large-block"}, 250)
+                generator.parse_measurements(
+                    raw, {"crypto", "large-block", "synthetic-state"}, 250
+                )
 
             document["results"][0]["median(elapsed)"] /= 2
             document["results"][0]["totalTime"] *= 2
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "total time does not match"):
-                generator.parse_measurements(raw, {"crypto", "large-block"}, 250)
+                generator.parse_measurements(
+                    raw, {"crypto", "large-block", "synthetic-state"}, 250
+                )
 
             document["results"][0]["totalTime"] /= 2
             document["results"].append(result("UnexpectedQuantumBenchmark", "op", 1.0))
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "benchmark set mismatch"):
-                generator.parse_measurements(raw, {"crypto", "large-block"}, 250)
+                generator.parse_measurements(
+                    raw, {"crypto", "large-block", "synthetic-state"}, 250
+                )
 
             with self.assertRaisesRegex(RuntimeError, "repository must be exactly"):
                 generator.verify_source_checkout(repository, "fork/Blackcoin", source_sha)
@@ -266,6 +389,7 @@ class ReleaseToolTests(unittest.TestCase):
             "QuantumMLDSA44Verify",
             "QuantumMLDSA44MaxWeightBlock",
             "QuantumLargeBlockValidation32MiB",
+            "QuantumSyntheticStateApplyUndoMaxMarkers",
         ):
             with self.subTest(benchmark=benchmark):
                 self.assertIn(f"BENCHMARK({benchmark}", benchmark_source)
@@ -282,12 +406,12 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("Argon2 single-operation benchmark failed", benchmark_source)
         self.assertIn("ML-DSA single-operation benchmark failed", benchmark_source)
         self.assertIn("resource-benchmarks-linux:", gate)
-        self.assertIn(
-            "requirements=(--require-domain crypto --require-domain large-block)",
-            gate,
-        )
         self.assertIn("--require-domain large-block", gate)
         self.assertIn("--require-domain synthetic-state", gate)
+        self.assertIn("MAXIMUM_MAINNET_SYNTHETIC_CLAIMS == 751", benchmark_source)
+        self.assertIn("ApplyShadowBlockResult", benchmark_source)
+        self.assertIn("UndoShadowBlock", benchmark_source)
+        self.assertIn("SyntheticStateIdentity", benchmark_source)
         self.assertIn("quantum-resource-benchmarks-macos-", gate)
         self.assertIn('--compiler-flags="$cxxflags"', gate)
         self.assertIn('--repository "$GITHUB_REPOSITORY"', gate)

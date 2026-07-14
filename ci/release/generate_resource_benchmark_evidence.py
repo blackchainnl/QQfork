@@ -27,6 +27,25 @@ V4_MAX_BLOCK_WEIGHT = 32_000_000
 V4_MAX_BLOCK_SERIALIZED_SIZE = 32_000_000
 MAXIMUM_QUANTUM_BENCHMARK_BLOCK_WEIGHT = 31_997_596
 MAXIMUM_QUANTUM_BENCHMARK_SERIALIZED_SIZE = 30_988_642
+# Mainnet permanently authenticated this count in the snapshot manifest at the
+# protocol-pinned whitelist height. The benchmark independently reconstructs
+# and authenticates the same count before deriving its 687 + 64 claim bound.
+MAINNET_SHADOW_WHITELIST_HEIGHT = 5_945_000
+MAINNET_AUTHENTICATED_WHITELIST_ENTRIES = 687
+MAXIMUM_MAINNET_SYNTHETIC_CLAIMS = (
+    MAINNET_AUTHENTICATED_WHITELIST_ENTRIES + MAX_SHADOW_POW_EVALS_PER_BLOCK
+)
+MAXIMUM_MAINNET_SYNTHETIC_CLAIM_FAMILY_COINS = (
+    MAXIMUM_MAINNET_SYNTHETIC_CLAIMS * 3
+)
+MAXIMUM_MAINNET_SYNTHETIC_MUHASH_INSERTIONS = (
+    MAXIMUM_MAINNET_SYNTHETIC_CLAIMS * 2
+)
+# The source-bound Apple-silicon baseline is documented alongside the
+# benchmark. Two seconds leaves a substantial cross-run/platform margin while
+# still bounding the complete apply+checkpoint+undo+rewind transition to less
+# than 1/32 of Blackcoin's 64-second target spacing.
+MAXIMUM_SYNTHETIC_STATE_APPLY_UNDO_SECONDS = 2.0
 
 DOMAIN_BENCHMARKS = {
     "crypto": {
@@ -322,6 +341,39 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
             "measured_seconds": measurements[
                 "QuantumLargeBlockValidation32MiB"
             ]["median_seconds"],
+        }
+    if coverage["synthetic-state"]:
+        synthetic_measurement = measurements[
+            "QuantumSyntheticStateApplyUndoMaxMarkers"
+        ]
+        synthetic_seconds = synthetic_measurement["median_seconds"]
+        synthetic_maximum_seconds = synthetic_measurement[
+            "maximum_seconds_per_batch"
+        ]
+        if synthetic_maximum_seconds > MAXIMUM_SYNTHETIC_STATE_APPLY_UNDO_SECONDS:
+            raise RuntimeError(
+                "QuantumSyntheticStateApplyUndoMaxMarkers maximum epoch "
+                f"{synthetic_maximum_seconds:.9f}s exceeds the enforced "
+                f"{MAXIMUM_SYNTHETIC_STATE_APPLY_UNDO_SECONDS:.9f}s threshold"
+            )
+        derived["synthetic_state_apply_undo"] = {
+            "authenticated_whitelist_snapshot_height":
+                MAINNET_SHADOW_WHITELIST_HEIGHT,
+            "authenticated_whitelist_entries":
+                MAINNET_AUTHENTICATED_WHITELIST_ENTRIES,
+            "maximum_pow_claims": MAX_SHADOW_POW_EVALS_PER_BLOCK,
+            "maximum_synthetic_claims": MAXIMUM_MAINNET_SYNTHETIC_CLAIMS,
+            "maximum_claim_family_coins":
+                MAXIMUM_MAINNET_SYNTHETIC_CLAIM_FAMILY_COINS,
+            "maximum_muhash_insertions":
+                MAXIMUM_MAINNET_SYNTHETIC_MUHASH_INSERTIONS,
+            "measured_seconds": synthetic_seconds,
+            "measured_median_seconds": synthetic_seconds,
+            "measured_maximum_epoch_seconds": synthetic_maximum_seconds,
+            "maximum_allowed_seconds":
+                MAXIMUM_SYNTHETIC_STATE_APPLY_UNDO_SECONDS,
+            "maximum_fraction_of_target_spacing":
+                MAXIMUM_SYNTHETIC_STATE_APPLY_UNDO_SECONDS / 64.0,
         }
 
     return {
