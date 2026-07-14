@@ -83,7 +83,7 @@ $(BITCOIN_WIN_INSTALLER): all-recursive $(WINDOWS_PACKAGING) $(top_builddir)/sha
 	STRIPPROG="$(STRIP)" $(INSTALL_STRIP_PROGRAM) $(BITCOIN_WALLET_BIN) $(top_builddir)/release
 	STRIPPROG="$(STRIP)" $(INSTALL_STRIP_PROGRAM) $(BITCOIN_UTIL_BIN) $(top_builddir)/release
 	@test -x "$(MAKENSIS)" || { echo "error: makensis is required to build $@" >&2; exit 1; }
-	$(MAKENSIS) -V2 -DBLACKCOIN_OUTPUT_FILE="$@" $(top_builddir)/share/setup.nsi
+	$(MAKENSIS) -V2 -DBLACKCOIN_OUTPUT_FILE="$(abspath $@)" $(top_builddir)/share/setup.nsi
 	@test -s "$@" || { echo "error: could not build $@" >&2; exit 1; }
 	@echo built $@
 

@@ -1093,6 +1093,23 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("${BLACKCOIN_PAYLOAD_DIR}", template)
         self.assertIn("${BLACKCOIN_OUTPUT_FILE}", template)
 
+    def test_windows_installer_build_uses_absolute_output_and_sequential_goals(self):
+        root = TOOLS.parent.parent
+        makefile = (root / "Makefile.am").read_text(encoding="utf-8")
+        workflow = (root / ".github" / "workflows" / "build.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(
+            '-DBLACKCOIN_OUTPUT_FILE="$(abspath $@)"',
+            makefile,
+        )
+        self.assertIn(
+            'BITCOIN_WIN_INSTALLER=$PWD/blackcoin-$CONFIGURED_VERSION-win64-setup.exe',
+            workflow,
+        )
+        self.assertIn('for goal in ${{ matrix.goal }}; do', workflow)
+        self.assertNotIn('make -j "$MAKEJOBS" ${{ matrix.goal }}', workflow)
+
     def test_sbom_and_provenance_are_bound_to_artifacts_and_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
