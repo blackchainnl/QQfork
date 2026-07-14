@@ -5,22 +5,29 @@
 #include <addresstype.h>
 #include <coins.h>
 #include <consensus/amount.h>
+#include <consensus/merkle.h>
 #include <crypto/argon2_selftest.h>
 #include <crypto/mldsa.h>
 #include <crypto/mldsa_kat.h>
 #include <crypto/sha256.h>
+#include <node/kernel_notifications.h>
 #include <primitives/transaction.h>
 #include <script/interpreter.h>
 #include <shadow.h>
+#include <streams.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
 #include <util/strencodings.h>
+#include <util/translation.h>
 #include <validation.h>
+#include <warnings.h>
 
 #include <boost/test/unit_test.hpp>
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -39,6 +46,37 @@ class ShadowArgon2FailureGuard
 public:
     ShadowArgon2FailureGuard() { ClearShadowArgon2FailuresForTesting(); }
     ~ShadowArgon2FailureGuard() { ClearShadowArgon2FailuresForTesting(); }
+};
+
+class FatalErrorTestGuard
+{
+public:
+    explicit FatalErrorTestGuard(node::NodeContext& node)
+        : m_node{node},
+          m_previous_shutdown_on_fatal{node.notifications->m_shutdown_on_fatal_error},
+          m_previous_exit_status{node.exit_status.load()}
+    {
+        m_node.notifications->m_shutdown_on_fatal_error = false;
+        ClearExpectedFatal();
+    }
+
+    ~FatalErrorTestGuard()
+    {
+        m_node.notifications->m_shutdown_on_fatal_error = m_previous_shutdown_on_fatal;
+        m_node.exit_status.store(m_previous_exit_status);
+        SetMiscWarning(Untranslated(""));
+    }
+
+    void ClearExpectedFatal()
+    {
+        m_node.exit_status.store(EXIT_SUCCESS);
+        SetMiscWarning(Untranslated(""));
+    }
+
+private:
+    node::NodeContext& m_node;
+    const bool m_previous_shutdown_on_fatal;
+    const int m_previous_exit_status;
 };
 
 std::vector<unsigned char> ProgramForPubkey(const std::vector<uint8_t>& pubkey)
@@ -74,6 +112,76 @@ QuantumSpend BuildQuantumSpend(const std::vector<uint8_t>& pubkey,
     tx.vin[0].scriptWitness.stack.emplace_back(signature.begin(), signature.end());
     tx.vin[0].scriptWitness.stack.emplace_back(pubkey.begin(), pubkey.end());
     return {spent_output, CTransaction{tx}};
+}
+
+CBlock BuildQuantumSignedBlock(const std::vector<uint8_t>& pubkey,
+                               const std::vector<uint8_t>& privkey,
+                               const uint256& previous_block)
+{
+    CMutableTransaction coinbase;
+    coinbase.nVersion = 2;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript{} << OP_0 << OP_0;
+    coinbase.vout.emplace_back(0, CScript{});
+
+    CMutableTransaction coinstake;
+    coinstake.nVersion = 2;
+    coinstake.vin.emplace_back(COutPoint{uint256::ONE, 0});
+    coinstake.vout.emplace_back(0, CScript{});
+    coinstake.vout.emplace_back(
+        0, CScript{} << OP_RETURN << std::vector<unsigned char>{pubkey.begin(), pubkey.end()});
+
+    CBlock block;
+    block.nVersion = 7;
+    block.hashPrevBlock = previous_block;
+    block.nTime = 16;
+    block.nBits = 0x207fffff;
+    block.vtx.emplace_back(MakeTransactionRef(std::move(coinbase)));
+    block.vtx.emplace_back(MakeTransactionRef(std::move(coinstake)));
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+
+    const uint256 block_hash = block.GetHash();
+    if (!ML_DSA::Sign(privkey, block_hash.begin(), uint256::size(), block.vchBlockSig)) {
+        throw std::runtime_error("failed to sign quantum test block");
+    }
+    return block;
+}
+
+CBlock ReplayBlockBytes(const CBlock& block)
+{
+    CDataStream stream{SER_NETWORK};
+    stream << TX_WITH_WITNESS(block);
+    CBlock replay;
+    stream >> TX_WITH_WITNESS(replay);
+    return replay;
+}
+
+void CheckShadowInfoEqual(const ShadowGoldRushInfo& expected, const ShadowGoldRushInfo& actual)
+{
+    BOOST_CHECK_EQUAL(actual.pow_amount, expected.pow_amount);
+    BOOST_CHECK_EQUAL(actual.pos_amount, expected.pos_amount);
+    BOOST_CHECK_EQUAL(actual.claimed_amount, expected.claimed_amount);
+    BOOST_CHECK_EQUAL(actual.pow_count, expected.pow_count);
+    BOOST_CHECK_EQUAL(actual.pos_count, expected.pos_count);
+    BOOST_CHECK_EQUAL(actual.last_pow_height, expected.last_pow_height);
+    BOOST_CHECK_EQUAL(actual.last_pos_height, expected.last_pos_height);
+    BOOST_CHECK_EQUAL(actual.recent_count, expected.recent_count);
+    BOOST_CHECK_EQUAL(actual.recent_modes, expected.recent_modes);
+    BOOST_CHECK_EQUAL(actual.pow_target_bits, expected.pow_target_bits);
+}
+
+void CheckShadowReplayEqual(const ShadowReplayStateInfo& expected, const ShadowReplayStateInfo& actual)
+{
+    BOOST_CHECK_EQUAL(actual.schema, expected.schema);
+    BOOST_CHECK_EQUAL(actual.required_for_tip, expected.required_for_tip);
+    BOOST_CHECK_EQUAL(actual.present, expected.present);
+    BOOST_CHECK_EQUAL(actual.marker_valid, expected.marker_valid);
+    BOOST_CHECK_EQUAL(actual.valid_for_tip, expected.valid_for_tip);
+    BOOST_CHECK_EQUAL(actual.marker_height, expected.marker_height);
+    BOOST_CHECK_EQUAL(actual.marker_time, expected.marker_time);
+    BOOST_CHECK(actual.marker_block_hash == expected.marker_block_hash);
+    BOOST_CHECK(actual.commitment == expected.commitment);
 }
 
 } // namespace
@@ -308,6 +416,202 @@ BOOST_FIXTURE_TEST_CASE(script_internal_failure_is_not_consensus_invalid_or_cach
             SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_QUANTUM_ML_DSA,
             /*cacheSigStore=*/true, /*cacheFullScriptStore=*/true, txdata));
         BOOST_CHECK(state.IsValid());
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(block_signature_internal_failure_is_fail_stop_retryable_and_not_cached, RegTestingSetup)
+{
+    MLDSAFailureGuard mldsa_guard;
+    FatalErrorTestGuard fatal_guard{m_node};
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+
+    uint256 tip_hash;
+    uint256 coins_tip_hash;
+    ShadowGoldRushInfo active_shadow_before;
+    ShadowReplayStateInfo active_replay_before;
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip = chainstate.m_chain.Tip();
+        BOOST_REQUIRE(tip != nullptr);
+        tip_hash = tip->GetBlockHash();
+        coins_tip_hash = chainstate.CoinsTip().GetBestBlock();
+        active_shadow_before = GetShadowGoldRushInfo(chainstate.CoinsTip(), tip);
+        active_replay_before = GetShadowReplayStateInfo(
+            chainstate.CoinsTip(), Params().GetConsensus(), tip);
+    }
+
+    std::vector<uint8_t> pubkey;
+    std::vector<uint8_t> privkey;
+    BOOST_REQUIRE(ML_DSA::KeyGen(pubkey, privkey));
+    const CBlock signed_block = BuildQuantumSignedBlock(pubkey, privkey, tip_hash);
+    const uint256 signed_block_hash = signed_block.GetHash();
+
+    // CheckBlock must preserve the distinction before either caller handles it.
+    CBlock context_free = ReplayBlockBytes(signed_block);
+    ML_DSA::SetFailureForTesting(MLDSATestFailure::VERIFY);
+    BlockValidationState check_state;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!CheckBlock(context_free, check_state, Params().GetConsensus(), chainstate));
+    }
+    BOOST_CHECK(check_state.IsError());
+    BOOST_CHECK_EQUAL(check_state.GetResult(), BlockValidationResult::BLOCK_RESULT_UNSET);
+    BOOST_CHECK_EQUAL(check_state.GetRejectReason(), "local-mldsa-block-signature-verification-error");
+    BOOST_CHECK(!context_free.fChecked);
+    BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_SUCCESS);
+
+    // Reconstructing the same network bytes models a clean restart/replay: no
+    // in-memory validation bit survives, and the cleared local fault is retried.
+    CBlock replayed = ReplayBlockBytes(signed_block);
+    BlockValidationState replay_state;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(CheckBlock(replayed, replay_state, Params().GetConsensus(), chainstate));
+    }
+    BOOST_CHECK(replay_state.IsValid());
+    BOOST_CHECK(replayed.fChecked);
+
+    // Network ingress must fail-stop locally before AcceptBlock can create or
+    // poison a block-index entry.
+    CBlock ingress = ReplayBlockBytes(signed_block);
+    auto ingress_ptr = std::make_shared<const CBlock>(std::move(ingress));
+    ML_DSA::SetFailureForTesting(MLDSATestFailure::VERIFY);
+    bool new_block{true};
+    BOOST_CHECK(!chainman.ProcessNewBlock(
+        ingress_ptr, /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+    BOOST_CHECK(!new_block);
+    BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_FAILURE);
+    BOOST_CHECK(!ingress_ptr->fChecked);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(chainman.m_blockman.LookupBlockIndex(signed_block_hash) == nullptr);
+        BOOST_REQUIRE(chainstate.m_chain.Tip() != nullptr);
+        BOOST_CHECK(chainstate.m_chain.Tip()->GetBlockHash() == tip_hash);
+        BOOST_CHECK(chainstate.CoinsTip().GetBestBlock() == coins_tip_hash);
+        CheckShadowInfoEqual(active_shadow_before,
+                             GetShadowGoldRushInfo(chainstate.CoinsTip(), chainstate.m_chain.Tip()));
+        CheckShadowReplayEqual(active_replay_before,
+                               GetShadowReplayStateInfo(chainstate.CoinsTip(), Params().GetConsensus(),
+                                                        chainstate.m_chain.Tip()));
+    }
+    fatal_guard.ClearExpectedFatal();
+
+    // ConnectBlock is the disk replay/reindex path. Its local view, candidate
+    // status, active tip, and authenticated shadow state must remain unchanged.
+    CBlock reconnect = ReplayBlockBytes(signed_block);
+    uint256 reconnect_hash = reconnect.GetHash();
+    CBlockIndex reconnect_index{reconnect.GetBlockHeader()};
+    std::unique_ptr<CCoinsViewCache> reconnect_view;
+    CBlockIndex* active_tip{nullptr};
+    ShadowGoldRushInfo reconnect_shadow_before;
+    ShadowReplayStateInfo reconnect_replay_before;
+    uint256 reconnect_view_best;
+    unsigned int reconnect_cache_size{0};
+    {
+        LOCK(cs_main);
+        active_tip = chainstate.m_chain.Tip();
+        BOOST_REQUIRE(active_tip != nullptr);
+        reconnect_view = std::make_unique<CCoinsViewCache>(&chainstate.CoinsTip());
+        reconnect_index.pprev = active_tip;
+        reconnect_index.nHeight = active_tip->nHeight + 1;
+        reconnect_index.phashBlock = &reconnect_hash;
+        reconnect_index.SetProofOfStake();
+        reconnect_shadow_before = GetShadowGoldRushInfo(*reconnect_view, active_tip);
+        reconnect_replay_before = GetShadowReplayStateInfo(
+            *reconnect_view, Params().GetConsensus(), active_tip);
+        reconnect_view_best = reconnect_view->GetBestBlock();
+        reconnect_cache_size = reconnect_view->GetCacheSize();
+    }
+
+    ML_DSA::SetFailureForTesting(MLDSATestFailure::VERIFY);
+    BlockValidationState reconnect_state;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!chainstate.ConnectBlock(reconnect, reconnect_state, &reconnect_index,
+                                             *reconnect_view, /*fJustCheck=*/true,
+                                             /*fCheckBlockSig=*/true));
+    }
+    BOOST_CHECK(reconnect_state.IsError());
+    BOOST_CHECK_EQUAL(reconnect_state.GetResult(), BlockValidationResult::BLOCK_RESULT_UNSET);
+    BOOST_CHECK_EQUAL(reconnect_state.GetRejectReason(), "local-mldsa-block-signature-verification-error");
+    BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_FAILURE);
+    BOOST_CHECK(!reconnect.fChecked);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK((reconnect_index.nStatus & BLOCK_FAILED_MASK) == 0);
+        BOOST_CHECK(chainman.m_blockman.LookupBlockIndex(reconnect_hash) == nullptr);
+        BOOST_REQUIRE(chainstate.m_chain.Tip() != nullptr);
+        BOOST_CHECK(chainstate.m_chain.Tip()->GetBlockHash() == tip_hash);
+        BOOST_CHECK(reconnect_view->GetBestBlock() == reconnect_view_best);
+        BOOST_CHECK_EQUAL(reconnect_view->GetCacheSize(), reconnect_cache_size);
+        CheckShadowInfoEqual(reconnect_shadow_before,
+                             GetShadowGoldRushInfo(*reconnect_view, active_tip));
+        CheckShadowReplayEqual(reconnect_replay_before,
+                               GetShadowReplayStateInfo(*reconnect_view, Params().GetConsensus(), active_tip));
+    }
+
+    // Once the injected fault is gone, ConnectBlock re-evaluates the same bytes
+    // and reaches their real contextual result. At this early regtest height the
+    // quantum signing carrier is genuinely premature, so it is invalid rather
+    // than a sticky local error; neither result mutates chain or shadow state.
+    fatal_guard.ClearExpectedFatal();
+    BlockValidationState reconnect_retry_state;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!chainstate.ConnectBlock(reconnect, reconnect_retry_state, &reconnect_index,
+                                             *reconnect_view, /*fJustCheck=*/true,
+                                             /*fCheckBlockSig=*/true));
+    }
+    BOOST_CHECK(reconnect_retry_state.IsInvalid());
+    BOOST_CHECK_EQUAL(reconnect_retry_state.GetResult(), BlockValidationResult::BLOCK_CONSENSUS);
+    BOOST_CHECK_EQUAL(reconnect_retry_state.GetRejectReason(), "bad-blk-signature");
+    BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_SUCCESS);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK((reconnect_index.nStatus & BLOCK_FAILED_MASK) == 0);
+        BOOST_CHECK(chainstate.m_chain.Tip()->GetBlockHash() == tip_hash);
+        BOOST_CHECK(reconnect_view->GetBestBlock() == reconnect_view_best);
+        BOOST_CHECK_EQUAL(reconnect_view->GetCacheSize(), reconnect_cache_size);
+        CheckShadowInfoEqual(reconnect_shadow_before,
+                             GetShadowGoldRushInfo(*reconnect_view, active_tip));
+        CheckShadowReplayEqual(reconnect_replay_before,
+                               GetShadowReplayStateInfo(*reconnect_view, Params().GetConsensus(), active_tip));
+    }
+
+    // A cryptographically bad signature remains deterministic consensus-invalid
+    // and must not be promoted to a local fatal error.
+    CBlock invalid = ReplayBlockBytes(signed_block);
+    BOOST_REQUIRE(!invalid.vchBlockSig.empty());
+    invalid.vchBlockSig[0] ^= 0x01;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        BlockValidationState invalid_state;
+        {
+            LOCK(cs_main);
+            BOOST_CHECK(!CheckBlock(invalid, invalid_state, Params().GetConsensus(), chainstate));
+        }
+        BOOST_CHECK(invalid_state.IsInvalid());
+        BOOST_CHECK_EQUAL(invalid_state.GetResult(), BlockValidationResult::BLOCK_CONSENSUS);
+        BOOST_CHECK_EQUAL(invalid_state.GetRejectReason(), "bad-blk-signature");
+        BOOST_CHECK(!invalid.fChecked);
+    }
+
+    auto invalid_ptr = std::make_shared<const CBlock>(ReplayBlockBytes(invalid));
+    new_block = true;
+    BOOST_CHECK(!chainman.ProcessNewBlock(
+        invalid_ptr, /*force_processing=*/true, /*min_pow_checked=*/true, &new_block));
+    BOOST_CHECK(!new_block);
+    BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_SUCCESS);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(chainman.m_blockman.LookupBlockIndex(signed_block_hash) == nullptr);
+        BOOST_CHECK(chainstate.m_chain.Tip()->GetBlockHash() == tip_hash);
+        BOOST_CHECK(chainstate.CoinsTip().GetBestBlock() == coins_tip_hash);
+        CheckShadowInfoEqual(active_shadow_before,
+                             GetShadowGoldRushInfo(chainstate.CoinsTip(), chainstate.m_chain.Tip()));
+        CheckShadowReplayEqual(active_replay_before,
+                               GetShadowReplayStateInfo(chainstate.CoinsTip(), Params().GetConsensus(),
+                                                        chainstate.m_chain.Tip()));
     }
 }
 

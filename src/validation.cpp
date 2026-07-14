@@ -3655,6 +3655,15 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // re-enforce that rule here (at least until we make it impossible for
     // m_adjusted_time_callback() to go backward).
     if (!CheckBlock(block, state, params.GetConsensus(), *this, !fJustCheck, !fJustCheck, fCheckBlockSig)) {
+        if (state.IsError()) {
+            // A local cryptographic/runtime failure is not evidence that the
+            // block violates consensus. Stop this node without poisoning the
+            // block index so the identical bytes can be retried after restart.
+            return FatalError(m_chainman.GetNotifications(), state,
+                strprintf("Local block validation failed while reconnecting block %s at height %d; the block was not marked invalid",
+                          block_hash.ToString(), pindex->nHeight),
+                _("A local block verification failed. Blackcoin stopped without rejecting the block; restart after checking system memory and the linked cryptographic libraries."));
+        }
         if (state.GetResult() == BlockValidationResult::BLOCK_MUTATED) {
             // We don't write down blocks to disk if they may have been
             // corrupted, so this should be impossible unless we're having hardware
@@ -6116,6 +6125,15 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
             return error("%s: AcceptBlock FAILED (%s)", __func__, "bad block signature encoding");
         }
         bool ret = CheckBlock(*block, state, GetConsensus(), ActiveChainstate());
+        if (!ret && state.IsError()) {
+            // CheckBlock reports local ML-DSA/runtime failures as errors, not
+            // invalidity. Fail closed locally, but do not call AcceptBlock or
+            // create a failed block-index entry for these retryable bytes.
+            FatalError(GetNotifications(), state,
+                strprintf("Local block validation failed before accepting block %s; the block was not marked invalid",
+                          block->GetHash().ToString()),
+                _("A local block verification failed. Blackcoin stopped without rejecting the block; restart after checking system memory and the linked cryptographic libraries."));
+        }
         if (ret) {
             // Store to disk
             ret = AcceptBlock(block, state, &pindex, force_processing, nullptr, new_block, min_pow_checked);
