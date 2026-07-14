@@ -7,10 +7,10 @@ on:
         description: Full 40-character commit SHA to build
         required: true
         type: string
-      version:
-        description: Release version without the leading v
+      package_label:
+        description: Explicit unpublished prerelease label (must match source RC)
         required: true
-        default: 30.1.1
+        default: 30.1.1-alpha1
         type: string
       target:
         description: Build target to run (manual runs never publish)
@@ -44,6 +44,10 @@ jobs:
       target_sha: ${{ steps.resolve.outputs.target_sha }}
       source_date_epoch: ${{ steps.resolve.outputs.source_date_epoch }}
       version: ${{ steps.resolve.outputs.version }}
+      package_label: ${{ steps.resolve.outputs.package_label }}
+      configured_version: ${{ steps.resolve.outputs.configured_version }}
+      release_candidate: ${{ steps.resolve.outputs.release_candidate }}
+      asset_prefix: ${{ steps.resolve.outputs.asset_prefix }}
       target: ${{ steps.resolve.outputs.target }}
       publish: ${{ steps.resolve.outputs.publish }}
       tag: ${{ steps.resolve.outputs.tag }}
@@ -76,13 +80,28 @@ jobs:
         shell: bash
         env:
           REQUESTED_SHA: ${{ inputs.target_sha }}
-          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_PACKAGE_LABEL: ${{ inputs.package_label }}
           REQUESTED_TARGET: ${{ inputs.target }}
           RELEASE_GPG_FINGERPRINT: ${{ vars.RELEASE_GPG_FINGERPRINT }}
         run: |
           set -euo pipefail
           TARGET_SHA=$(git rev-parse HEAD)
           [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          MAJOR=$(sed -n "s/^define(_CLIENT_VERSION_MAJOR, \([0-9]*\))$/\1/p" configure.ac)
+          MINOR=$(sed -n "s/^define(_CLIENT_VERSION_MINOR, \([0-9]*\))$/\1/p" configure.ac)
+          BUILD=$(sed -n "s/^define(_CLIENT_VERSION_BUILD, \([0-9]*\))$/\1/p" configure.ac)
+          RC=$(sed -n "s/^define(_CLIENT_VERSION_RC, \([0-9]*\))$/\1/p" configure.ac)
+          IS_RELEASE=$(sed -n "s/^define(_CLIENT_VERSION_IS_RELEASE, \(.*\))$/\1/p" configure.ac)
+          BASE_VERSION="$MAJOR.$MINOR.$BUILD"
+          test "$BASE_VERSION" = "30.1.1" || {
+            echo "::error::This workflow is locked to the v30.1.1 source line"
+            exit 1
+          }
+          [[ "$RC" =~ ^[0-9]+$ ]]
+          CONFIGURED_VERSION="$BASE_VERSION"
+          if [[ "$RC" != "0" ]]; then
+            CONFIGURED_VERSION="${BASE_VERSION}rc${RC}"
+          fi
 
           if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
             [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
@@ -90,7 +109,22 @@ jobs:
               exit 1
             }
             test "$TARGET_SHA" = "$REQUESTED_SHA"
-            VERSION="$REQUESTED_VERSION"
+            [[ "$REQUESTED_PACKAGE_LABEL" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha[1-9][0-9]*$ ]] || {
+              echo "::error::Manual builds require an explicit major.minor.patch-alphaN package label"
+              exit 1
+            }
+            [[ "$RC" =~ ^[1-9][0-9]*$ ]]
+            test "$IS_RELEASE" = "false" || {
+              echo "::error::Manual alpha builds require CLIENT_VERSION_IS_RELEASE=false"
+              exit 1
+            }
+            test "$REQUESTED_PACKAGE_LABEL" = "$BASE_VERSION-alpha$RC" || {
+              echo "::error::Package label must match the source version and RC: $BASE_VERSION-alpha$RC"
+              exit 1
+            }
+            VERSION="$BASE_VERSION"
+            PACKAGE_LABEL="$REQUESTED_PACKAGE_LABEL"
+            ASSET_PREFIX="Blackcoin-$PACKAGE_LABEL-$TARGET_SHA"
             TARGET="$REQUESTED_TARGET"
             TAG=""
             PUBLISH=false
@@ -102,6 +136,8 @@ jobs:
           else
             TAG="$GITHUB_REF_NAME"
             VERSION="${TAG#v}"
+            PACKAGE_LABEL="$VERSION"
+            ASSET_PREFIX="Blackcoin-$VERSION"
             TARGET=all
             PUBLISH=true
             python3 ci/release/verify_source_identity.py \
@@ -114,16 +150,7 @@ jobs:
               --signing-fingerprint "$RELEASE_GPG_FINGERPRINT"
           fi
 
-          test "$VERSION" = "30.1.1" || {
-            echo "::error::This workflow is locked to v30.1.1"
-            exit 1
-          }
-          MAJOR=$(sed -n "s/^define(_CLIENT_VERSION_MAJOR, \([0-9]*\))$/\1/p" configure.ac)
-          MINOR=$(sed -n "s/^define(_CLIENT_VERSION_MINOR, \([0-9]*\))$/\1/p" configure.ac)
-          BUILD=$(sed -n "s/^define(_CLIENT_VERSION_BUILD, \([0-9]*\))$/\1/p" configure.ac)
-          RC=$(sed -n "s/^define(_CLIENT_VERSION_RC, \([0-9]*\))$/\1/p" configure.ac)
-          IS_RELEASE=$(sed -n "s/^define(_CLIENT_VERSION_IS_RELEASE, \(.*\))$/\1/p" configure.ac)
-          test "$VERSION" = "$MAJOR.$MINOR.$BUILD"
+          test "$VERSION" = "$BASE_VERSION"
           if [[ "$PUBLISH" == true ]]; then
             test "$RC" = "0"
             test "$IS_RELEASE" = "true" || {
@@ -139,15 +166,16 @@ jobs:
               echo "::error::Release notes are still marked non-final"
               exit 1
             }
-          else
-            [[ "$RC" =~ ^[0-9]+$ ]]
-            [[ "$IS_RELEASE" == "true" || "$IS_RELEASE" == "false" ]]
           fi
 
           {
             echo "target_sha=$TARGET_SHA"
             echo "source_date_epoch=$(git show -s --format=%ct "$TARGET_SHA")"
             echo "version=$VERSION"
+            echo "package_label=$PACKAGE_LABEL"
+            echo "configured_version=$CONFIGURED_VERSION"
+            echo "release_candidate=$RC"
+            echo "asset_prefix=$ASSET_PREFIX"
             echo "target=$TARGET"
             echo "publish=$PUBLISH"
             echo "tag=$TAG"
@@ -236,6 +264,9 @@ jobs:
       SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
       TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
       VERSION: ${{ needs.resolve-target.outputs.version }}
+      PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
+      CONFIGURED_VERSION: ${{ needs.resolve-target.outputs.configured_version }}
+      ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
     strategy:
       fail-fast: false
       matrix:
@@ -363,13 +394,13 @@ jobs:
               normalize_tree "depends/$HOST/bin"
               mapfile -t files < <(cd "depends/$HOST/bin" && find . -maxdepth 1 -type f -name 'blackcoin*' -printf '%P\n' | sort)
               test "${#files[@]}" -gt 0
-              deterministic_tar "depends/$HOST/bin" "$OUT/Blackcoin-$VERSION-Linux-x86_64.tar.gz" "${files[@]}"
+              deterministic_tar "depends/$HOST/bin" "$OUT/$ASSET_PREFIX-Linux-x86_64.tar.gz" "${files[@]}"
               ;;
             linux-arm-64-bit)
               normalize_tree "depends/$HOST/bin"
               mapfile -t files < <(cd "depends/$HOST/bin" && find . -maxdepth 1 -type f -name 'blackcoin*' -printf '%P\n' | sort)
               test "${#files[@]}" -gt 0
-              deterministic_tar "depends/$HOST/bin" "$OUT/Blackcoin-$VERSION-Linux-ARM64.tar.gz" "${files[@]}"
+              deterministic_tar "depends/$HOST/bin" "$OUT/$ASSET_PREFIX-Linux-ARM64.tar.gz" "${files[@]}"
               ;;
             windows-64-bit)
               normalize_tree "depends/$HOST/bin"
@@ -377,31 +408,31 @@ jobs:
               for file in "${files[@]}"; do
                 test -f "depends/$HOST/bin/$file" && test ! -L "depends/$HOST/bin/$file"
               done
-              (cd "depends/$HOST/bin" && printf '%s\n' "${files[@]}" | zip -X -9j "$OUT/Blackcoin-$VERSION-Windows-x86_64-Portable.zip" -@)
+              (cd "depends/$HOST/bin" && printf '%s\n' "${files[@]}" | zip -X -9j "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip" -@)
               python3 ci/release/verify_windows_payload.py archive \
-                "$OUT/Blackcoin-$VERSION-Windows-x86_64-Portable.zip"
-              mapfile -t installers < <(find . -maxdepth 1 -type f -name "blackcoin-$VERSION*-win64-setup.exe" -printf '%P\n' | sort)
+                "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
+              mapfile -t installers < <(find . -maxdepth 1 -type f -name "blackcoin-$CONFIGURED_VERSION-win64-setup.exe" -printf '%P\n' | sort)
               test "${#installers[@]}" -eq 1
-              cp "${installers[0]}" "$OUT/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
-              touch -d "@$SOURCE_DATE_EPOCH" "$OUT/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
+              cp "${installers[0]}" "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+              touch -d "@$SOURCE_DATE_EPOCH" "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
               ;;
             macos-64-bit)
               normalize_tree dist/blackcoin-qt.app
-              (cd dist && find blackcoin-qt.app -print | sort | zip -X -9 -y "$OUT/Blackcoin-$VERSION-macOS-Intel-x86_64-Qt-app.zip" -@)
-              deterministic_tar dist "$OUT/Blackcoin-$VERSION-macOS-Intel-x86_64-Qt-app.tar.gz" blackcoin-qt.app
+              (cd dist && find blackcoin-qt.app -print | sort | zip -X -9 -y "$OUT/$ASSET_PREFIX-macOS-Intel-x86_64-Qt-app.zip" -@)
+              deterministic_tar dist "$OUT/$ASSET_PREFIX-macOS-Intel-x86_64-Qt-app.tar.gz" blackcoin-qt.app
               ;;
             macos-arm-64-bit)
               normalize_tree dist/blackcoin-qt.app
-              (cd dist && find blackcoin-qt.app -print | sort | zip -X -9 -y "$OUT/Blackcoin-$VERSION-macOS-Apple-Silicon-ARM64-Qt-app.zip" -@)
-              deterministic_tar dist "$OUT/Blackcoin-$VERSION-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz" blackcoin-qt.app
+              (cd dist && find blackcoin-qt.app -print | sort | zip -X -9 -y "$OUT/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.zip" -@)
+              deterministic_tar dist "$OUT/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz" blackcoin-qt.app
               ;;
           esac
-          printf '%s\n' "$TARGET_SHA" > "$OUT/Blackcoin-$VERSION-${{ matrix.name }}-SOURCE_COMMIT.txt"
+          printf '%s\n' "$TARGET_SHA" > "$OUT/$ASSET_PREFIX-${{ matrix.name }}-SOURCE_COMMIT.txt"
 
       - name: Upload release assets
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-${{ matrix.name }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
+          name: release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.name }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
@@ -410,7 +441,7 @@ jobs:
         if: ${{ matrix.name == 'windows-64-bit' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: windows-installer-recipe-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
+          name: windows-installer-recipe-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
           path: share/setup.nsi
           if-no-files-found: error
           retention-days: 7
@@ -425,6 +456,10 @@ jobs:
     env:
       TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
       VERSION: ${{ needs.resolve-target.outputs.version }}
+      PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
+      CONFIGURED_VERSION: ${{ needs.resolve-target.outputs.configured_version }}
+      RELEASE_CANDIDATE: ${{ needs.resolve-target.outputs.release_candidate }}
+      ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
     steps:
       - name: Checkout immutable verification code
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
@@ -436,26 +471,30 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
-          pattern: release-*-${{ needs.resolve-target.outputs.target_sha }}
+          pattern: release-${{ needs.resolve-target.outputs.package_label }}-*-${{ needs.resolve-target.outputs.target_sha }}
 
       - name: Compare every target byte for byte
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          primaries=(artifacts/release-*-primary-"$TARGET_SHA")
-          verifiers=(artifacts/release-*-verifier-"$TARGET_SHA")
+          primaries=(artifacts/release-"$PACKAGE_LABEL"-*-primary-"$TARGET_SHA")
+          verifiers=(artifacts/release-"$PACKAGE_LABEL"-*-verifier-"$TARGET_SHA")
           test "${#primaries[@]}" -gt 0
           test "${#primaries[@]}" -eq "${#verifiers[@]}"
           mkdir -p release-assets
-          report="release-assets/Blackcoin-$VERSION-REPRODUCIBILITY.txt"
-          : > "$report"
+          report="release-assets/$ASSET_PREFIX-REPRODUCIBILITY.txt"
+          {
+            printf 'package_label=%s\n' "$PACKAGE_LABEL"
+            printf 'configured_version=%s\n' "$CONFIGURED_VERSION"
+          } > "$report"
           for primary in "${primaries[@]}"; do
             artifact_name=$(basename "$primary")
-            target="${artifact_name#release-}"
+            artifact_prefix="release-$PACKAGE_LABEL-"
+            target="${artifact_name#"$artifact_prefix"}"
             suffix="-primary-$TARGET_SHA"
             target="${target%"$suffix"}"
-            verifier="artifacts/release-$target-verifier-$TARGET_SHA"
+            verifier="artifacts/release-$PACKAGE_LABEL-$target-verifier-$TARGET_SHA"
             test -d "$verifier"
             python3 ci/release/verify_reproducible.py \
               --primary "$primary" --verifier "$verifier"
@@ -472,7 +511,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: installer-recipes
-          pattern: windows-installer-recipe-*-${{ needs.resolve-target.outputs.target_sha }}
+          pattern: windows-installer-recipe-${{ needs.resolve-target.outputs.package_label }}-*-${{ needs.resolve-target.outputs.target_sha }}
 
       - name: Verify the Windows installer recipe is reproducible
         if: ${{ needs.select-targets.outputs.windows_selected == 'true' }}
@@ -480,13 +519,83 @@ jobs:
         run: |
           set -euo pipefail
           python3 ci/release/verify_reproducible.py \
-            --primary "installer-recipes/windows-installer-recipe-primary-$TARGET_SHA" \
-            --verifier "installer-recipes/windows-installer-recipe-verifier-$TARGET_SHA"
+            --primary "installer-recipes/windows-installer-recipe-$PACKAGE_LABEL-primary-$TARGET_SHA" \
+            --verifier "installer-recipes/windows-installer-recipe-$PACKAGE_LABEL-verifier-$TARGET_SHA"
+
+      - name: Assemble conspicuously unsigned exact-SHA canary bundle
+        if: ${{ needs.resolve-target.outputs.publish != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p canary-assets
+          primaries=(artifacts/release-"$PACKAGE_LABEL"-*-primary-"$TARGET_SHA")
+          test "${#primaries[@]}" -gt 0
+          for primary in "${primaries[@]}"; do
+            while IFS= read -r -d '' source; do
+              test -f "$source" && test ! -L "$source"
+              destination="canary-assets/$(basename "$source")"
+              test ! -e "$destination"
+              cp "$source" "$destination"
+            done < <(find "$primary" -mindepth 1 -maxdepth 1 -print0)
+          done
+          cp "release-assets/$ASSET_PREFIX-REPRODUCIBILITY.txt" canary-assets/
+
+          marker="canary-assets/$ASSET_PREFIX-UNSIGNED-CANARY.txt"
+          {
+            echo 'UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE'
+            echo
+            echo "package_label=$PACKAGE_LABEL"
+            echo "source_version=$VERSION"
+            echo "configured_version=$CONFIGURED_VERSION"
+            echo "source_commit=$TARGET_SHA"
+            echo "workflow_run_id=$GITHUB_RUN_ID"
+            echo 'signed=false'
+            echo 'notarized=false'
+            echo 'published=false'
+            echo
+            echo 'These exact-SHA alpha artifacts are for controlled canary testing only.'
+            echo 'They are not signed, notarized, tagged, or published as a production release.'
+            echo 'Verify the unsigned SHA256 manifest before testing.'
+          } > "$marker"
+
+          manifest="canary-assets/$ASSET_PREFIX-MANIFEST-UNSIGNED.json"
+          python3 ci/release/generate_canary_manifest.py \
+            --artifacts canary-assets \
+            --package-label "$PACKAGE_LABEL" \
+            --source-version "$VERSION" \
+            --configured-version "$CONFIGURED_VERSION" \
+            --source-sha "$TARGET_SHA" \
+            --release-candidate "$RELEASE_CANDIDATE" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --output "$manifest"
+
+          sums="canary-assets/$ASSET_PREFIX-SHA256SUMS-UNSIGNED.txt"
+          sums_name=$(basename "$sums")
+          mapfile -t checksum_files < <(
+            cd canary-assets
+            find . -maxdepth 1 -type f ! -name "$sums_name" -printf '%P\n' | sort
+          )
+          test "${#checksum_files[@]}" -gt 0
+          : > "$sums"
+          for file in "${checksum_files[@]}"; do
+            (cd canary-assets && sha256sum "$file") >> "$sums"
+          done
+          (cd canary-assets && sha256sum --check --strict "$sums_name")
+
+      - name: Upload unsigned exact-SHA canary bundle
+        if: ${{ needs.resolve-target.outputs.publish != 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: unsigned-canary-${{ needs.resolve-target.outputs.package_label }}-${{ needs.resolve-target.outputs.target_sha }}
+          path: canary-assets/*
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Upload reproducibility evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-reproducibility-${{ needs.resolve-target.outputs.target_sha }}
+          name: release-${{ needs.resolve-target.outputs.package_label }}-reproducibility-${{ needs.resolve-target.outputs.target_sha }}
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
@@ -551,6 +660,8 @@ jobs:
     env:
       TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
       VERSION: ${{ needs.resolve-target.outputs.version }}
+      PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
+      ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
       SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
       WINDOWS_CERTIFICATE_PFX_B64: ${{ secrets.WINDOWS_CERTIFICATE_PFX_B64 }}
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
@@ -570,13 +681,13 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
-          pattern: release-windows-64-bit-primary-${{ needs.resolve-target.outputs.target_sha }}
+          pattern: release-${{ needs.resolve-target.outputs.package_label }}-windows-64-bit-primary-${{ needs.resolve-target.outputs.target_sha }}
 
       - name: Download reproducible Windows installer recipe
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: installer-recipe
-          name: windows-installer-recipe-primary-${{ needs.resolve-target.outputs.target_sha }}
+          name: windows-installer-recipe-${{ needs.resolve-target.outputs.package_label }}-primary-${{ needs.resolve-target.outputs.target_sha }}
 
       - name: Install signing tools
         run: |
@@ -625,7 +736,7 @@ jobs:
           python3 ci/release/verify_windows_payload.py directory work/payload
 
           find work/payload -type f -name '*.exe' -exec touch -d "@$SOURCE_DATE_EPOCH" {} +
-          signed_portable="release-assets/Blackcoin-$VERSION-Windows-x86_64-Portable.zip"
+          signed_portable="release-assets/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
           (cd work/payload && printf '%s\n' "${executable_names[@]}" | zip -X -9j "../../$signed_portable" -@)
           python3 ci/release/verify_windows_payload.py archive "$signed_portable"
           mkdir work/portable-verification
@@ -664,14 +775,14 @@ jobs:
           osslsigncode verify -CAfile release-cert.pem -in "$unsigned_installer"
           verify_installer_payload "$unsigned_installer" work/installer-after-outer-signing
 
-          cp "$unsigned_installer" "release-assets/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
-          printf '%s\n' "$TARGET_SHA" > "release-assets/Blackcoin-$VERSION-windows-64-bit-SOURCE_COMMIT.txt"
+          cp "$unsigned_installer" "release-assets/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+          printf '%s\n' "$TARGET_SHA" > "release-assets/$ASSET_PREFIX-windows-64-bit-SOURCE_COMMIT.txt"
           rm -f release-cert.pfx release-cert.pem
 
       - name: Upload signed Windows artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-windows-signed-${{ needs.resolve-target.outputs.target_sha }}
+          name: release-${{ needs.resolve-target.outputs.package_label }}-windows-signed-${{ needs.resolve-target.outputs.target_sha }}
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
@@ -689,6 +800,8 @@ jobs:
     env:
       TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
       VERSION: ${{ needs.resolve-target.outputs.version }}
+      PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
+      ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
       MACOS_CERTIFICATE_P12_B64: ${{ secrets.MACOS_CERTIFICATE_P12_B64 }}
       MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
       MACOS_CERTIFICATE_SHA256: ${{ vars.MACOS_CERTIFICATE_SHA256 }}
@@ -702,7 +815,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
-          pattern: release-macos-*-primary-${{ needs.resolve-target.outputs.target_sha }}
+          pattern: release-${{ needs.resolve-target.outputs.package_label }}-macos-*-primary-${{ needs.resolve-target.outputs.target_sha }}
 
       - name: Import the exact Developer ID certificate
         shell: bash
@@ -746,11 +859,11 @@ jobs:
           trap 'security delete-keychain "$KEYCHAIN_PATH" >/dev/null 2>&1 || true; rm -f release-cert.p12 release-cert.pem AuthKey_*.p8' EXIT
           mkdir -p release-assets work
           shopt -s nullglob
-          archives=(artifacts/release-macos-*-primary-"$TARGET_SHA"/*-Qt-app.tar.gz)
+          archives=(artifacts/release-"$PACKAGE_LABEL"-macos-*-primary-"$TARGET_SHA"/*-Qt-app.tar.gz)
           test "${#archives[@]}" -eq 2
           for archive in "${archives[@]}"; do
             base=$(basename "$archive")
-            prefix="Blackcoin-$VERSION-macOS-"
+            prefix="$ASSET_PREFIX-macOS-"
             label="${base#"$prefix"}"
             label="${label%-Qt-app.tar.gz}"
             rm -rf work/*
@@ -763,7 +876,7 @@ jobs:
             codesign --display --verbose=4 "$app" 2>&1 |
               grep -F "TeamIdentifier=$APPLE_TEAM_ID"
 
-            submit_zip="work/Blackcoin-$VERSION-$label-notary.zip"
+            submit_zip="work/$ASSET_PREFIX-$label-notary.zip"
             ditto -c -k --sequesterRsrc --keepParent "$app" "$submit_zip"
             xcrun notarytool submit "$submit_zip" \
               --key "AuthKey_$APPLE_NOTARY_KEY_ID.p8" \
@@ -773,8 +886,8 @@ jobs:
             spctl --assess --type execute --verbose=2 "$app"
 
             ditto -c -k --sequesterRsrc --keepParent "$app" \
-              "release-assets/Blackcoin-$VERSION-macOS-$label-Qt-app.zip"
-            dmg="release-assets/Blackcoin-$VERSION-macOS-$label.dmg"
+              "release-assets/$ASSET_PREFIX-macOS-$label-Qt-app.zip"
+            dmg="release-assets/$ASSET_PREFIX-macOS-$label.dmg"
             hdiutil create -volname "Blackcoin $VERSION" -srcfolder "$app" -ov -format UDZO "$dmg"
             codesign --force --timestamp --sign "$MACOS_SIGNING_IDENTITY" "$dmg"
             codesign --verify --strict --verbose=2 "$dmg"
@@ -786,10 +899,10 @@ jobs:
             spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
           done
 
-          UNIVERSAL_ROOT="Blackcoin-$VERSION-macOS-Universal-Qt-apps"
+          UNIVERSAL_ROOT="$ASSET_PREFIX-macOS-Universal-Qt-apps"
           mkdir -p "universal/$UNIVERSAL_ROOT/Intel-x86_64" \
             "universal/$UNIVERSAL_ROOT/Apple-Silicon-ARM64"
-          for archive in "release-assets/Blackcoin-$VERSION-macOS-"*-Qt-app.zip; do
+          for archive in "release-assets/$ASSET_PREFIX-macOS-"*-Qt-app.zip; do
             rm -rf universal-work
             mkdir -p universal-work
             ditto -x -k "$archive" universal-work
@@ -804,12 +917,12 @@ jobs:
           test -d "universal/$UNIVERSAL_ROOT/Apple-Silicon-ARM64/blackcoin-qt.app"
           ditto -c -k --sequesterRsrc --keepParent "universal/$UNIVERSAL_ROOT" \
             "release-assets/$UNIVERSAL_ROOT.zip"
-          printf '%s\n' "$TARGET_SHA" > "release-assets/Blackcoin-$VERSION-macos-SOURCE_COMMIT.txt"
+          printf '%s\n' "$TARGET_SHA" > "release-assets/$ASSET_PREFIX-macos-SOURCE_COMMIT.txt"
 
       - name: Upload signed and notarized macOS artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-macos-signed-${{ needs.resolve-target.outputs.target_sha }}
+          name: release-${{ needs.resolve-target.outputs.package_label }}-macos-signed-${{ needs.resolve-target.outputs.target_sha }}
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
@@ -834,6 +947,8 @@ jobs:
     env:
       TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
       VERSION: ${{ needs.resolve-target.outputs.version }}
+      PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
+      ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
       TAG: ${{ needs.resolve-target.outputs.tag }}
       SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
       RELEASE_GPG_PRIVATE_KEY_B64: ${{ secrets.RELEASE_GPG_PRIVATE_KEY_B64 }}
@@ -849,7 +964,7 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
-          pattern: release-*-${{ needs.resolve-target.outputs.target_sha }}
+          pattern: release-${{ needs.resolve-target.outputs.package_label }}-*-${{ needs.resolve-target.outputs.target_sha }}
 
       - name: Install release packaging tools
         run: |
@@ -883,21 +998,21 @@ jobs:
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
           mkdir -p dist
-          find artifacts/release-linux-*-primary-"$TARGET_SHA" -type f -exec cp {} dist/ \;
-          find artifacts/release-windows-signed-"$TARGET_SHA" -type f -exec cp {} dist/ \;
-          find artifacts/release-macos-signed-"$TARGET_SHA" -type f -exec cp {} dist/ \;
-          find artifacts/release-reproducibility-"$TARGET_SHA" -type f -exec cp {} dist/ \;
+          find artifacts/release-"$PACKAGE_LABEL"-linux-*-primary-"$TARGET_SHA" -type f -exec cp {} dist/ \;
+          find artifacts/release-"$PACKAGE_LABEL"-windows-signed-"$TARGET_SHA" -type f -exec cp {} dist/ \;
+          find artifacts/release-"$PACKAGE_LABEL"-macos-signed-"$TARGET_SHA" -type f -exec cp {} dist/ \;
+          find artifacts/release-"$PACKAGE_LABEL"-reproducibility-"$TARGET_SHA" -type f -exec cp {} dist/ \;
 
-          test -s "dist/Blackcoin-$VERSION-Linux-x86_64.tar.gz"
-          test -s "dist/Blackcoin-$VERSION-Linux-ARM64.tar.gz"
-          test -s "dist/Blackcoin-$VERSION-Windows-x86_64-Portable.zip"
-          test -s "dist/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
-          test -s "dist/Blackcoin-$VERSION-macOS-Intel-x86_64-Qt-app.zip"
-          test -s "dist/Blackcoin-$VERSION-macOS-Apple-Silicon-ARM64-Qt-app.zip"
-          test -s "dist/Blackcoin-$VERSION-macOS-Intel-x86_64.dmg"
-          test -s "dist/Blackcoin-$VERSION-macOS-Apple-Silicon-ARM64.dmg"
-          test -s "dist/Blackcoin-$VERSION-macOS-Universal-Qt-apps.zip"
-          test -s "dist/Blackcoin-$VERSION-REPRODUCIBILITY.txt"
+          test -s "dist/$ASSET_PREFIX-Linux-x86_64.tar.gz"
+          test -s "dist/$ASSET_PREFIX-Linux-ARM64.tar.gz"
+          test -s "dist/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
+          test -s "dist/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+          test -s "dist/$ASSET_PREFIX-macOS-Intel-x86_64-Qt-app.zip"
+          test -s "dist/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.zip"
+          test -s "dist/$ASSET_PREFIX-macOS-Intel-x86_64.dmg"
+          test -s "dist/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64.dmg"
+          test -s "dist/$ASSET_PREFIX-macOS-Universal-Qt-apps.zip"
+          test -s "dist/$ASSET_PREFIX-REPRODUCIBILITY.txt"
           printf '%s\n' "$TARGET_SHA" > dist/SOURCE_COMMIT.txt
           gpg --batch --armor --export "$RELEASE_GPG_FINGERPRINT" > \
             "dist/Blackcoin-$VERSION-RELEASE-KEY.asc"
