@@ -7,9 +7,10 @@
 #ifndef BITCOIN_RPC_RAWTRANSACTION_UTIL_H
 #define BITCOIN_RPC_RAWTRANSACTION_UTIL_H
 
+#include <cstdint>
 #include <map>
-#include <string>
 #include <optional>
+#include <string>
 
 struct bilingual_str;
 class FillableSigningProvider;
