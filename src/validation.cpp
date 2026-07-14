@@ -6181,7 +6181,7 @@ bool TestBlockValidity(BlockValidationState& state,
     if (block.IsProofOfStake()) {
         indexDummy.SetProofOfStake();
     } else {
-        indexDummy.nFlags &= ~CBlockIndex::BLOCK_PROOF_OF_STAKE;
+        indexDummy.nFlags &= ~static_cast<unsigned int>(CBlockIndex::BLOCK_PROOF_OF_STAKE);
     }
 
     // NOTE: CheckBlockHeader is called by CheckBlock
