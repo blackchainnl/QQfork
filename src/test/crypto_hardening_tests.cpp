@@ -119,6 +119,22 @@ private:
     const int m_previous_exit_status;
 };
 
+class QuantumScriptQueueTestingSetup : public TestChain100Setup
+{
+public:
+    QuantumScriptQueueTestingSetup()
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-regtest",
+              "-shadowwhitelistheight=99",
+              "-shadowgoldrushstartheight=100",
+              "-shadowgoldrushendheight=100",
+              "-qqgoldrushendheight=100",
+              "-qqmigrationendheight=200",
+          }}
+    {
+    }
+};
+
 class BlockCheckedCatcher final : public CValidationInterface
 {
 public:
@@ -709,6 +725,147 @@ BOOST_FIXTURE_TEST_CASE(script_internal_failure_is_not_consensus_invalid_or_cach
             SCRIPT_VERIFY_P2SH | SCRIPT_VERIFY_WITNESS | SCRIPT_VERIFY_QUANTUM_ML_DSA,
             /*cacheSigStore=*/true, /*cacheFullScriptStore=*/true, txdata));
         BOOST_CHECK(state.IsValid());
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(script_queue_internal_failure_is_fail_stop_retryable_and_not_cached,
+                        QuantumScriptQueueTestingSetup)
+{
+    MLDSAFailureGuard mldsa_guard;
+    FatalErrorTestGuard fatal_guard{m_node};
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+
+    // Advance one block past Gold Rush. The disposable overlay below then
+    // models a non-coinbase Migration output so the candidate reaches the
+    // quantum script-verification path.
+    mineBlocks(1);
+
+    CBlockIndex* parent{nullptr};
+    uint256 durable_tip_hash;
+    uint256 durable_coins_hash;
+    {
+        LOCK(cs_main);
+        parent = chainstate.m_chain.Tip();
+        BOOST_REQUIRE(parent != nullptr);
+        BOOST_REQUIRE_EQUAL(parent->nHeight, 101);
+        durable_tip_hash = parent->GetBlockHash();
+        durable_coins_hash = chainstate.CoinsTip().GetBestBlock();
+    }
+
+    std::vector<uint8_t> pubkey;
+    std::vector<uint8_t> privkey;
+    BOOST_REQUIRE(ML_DSA::KeyGen(pubkey, privkey));
+    const QuantumSpend spend = BuildQuantumSpend(
+        pubkey, privkey, Params().GetConsensus().nQuantumSighashChainId);
+
+    CMutableTransaction coinbase;
+    coinbase.nVersion = 2;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript{} << parent->nHeight + 1 << OP_0;
+    coinbase.vout.emplace_back(0, CScript{} << OP_TRUE);
+
+    CBlock block;
+    block.nVersion = 7;
+    block.hashPrevBlock = parent->GetBlockHash();
+    block.nTime = parent->GetBlockTime() + 1;
+    block.nBits = GetNextTargetRequired(
+        parent, Params().GetConsensus(), /*fProofOfStake=*/false);
+    block.vtx = {
+        MakeTransactionRef(std::move(coinbase)),
+        MakeTransactionRef(CTransaction{spend.transaction}),
+    };
+    chainman.GenerateCoinbaseCommitment(block, parent);
+    block.hashMerkleRoot = BlockMerkleRoot(block);
+
+    uint256 block_hash = block.GetHash();
+    CBlockIndex candidate_index{block.GetBlockHeader()};
+    candidate_index.phashBlock = &block_hash;
+    candidate_index.pprev = parent;
+    candidate_index.nHeight = parent->nHeight + 1;
+
+    const auto make_overlay = [&]() {
+        auto view = std::make_unique<CCoinsViewCache>(
+            &chainstate.CoinsTip());
+        view->AddCoin(
+            spend.transaction.vin[0].prevout,
+            Coin{spend.spent_output, parent->nHeight,
+                 /*coinbase=*/false, /*coinstake=*/false,
+                 static_cast<int>(parent->GetBlockTime())},
+            /*possible_overwrite=*/false);
+        return view;
+    };
+
+    std::unique_ptr<CCoinsViewCache> failed_view;
+    {
+        LOCK(cs_main);
+        failed_view = make_overlay();
+    }
+
+    // ChainTestingSetup starts two script-check workers. The injected failure
+    // is consumed by the queued quantum script check, after ConnectBlock has
+    // staged ordinary transaction and auxiliary-state writes in this overlay.
+    ML_DSA::SetFailureForTesting(MLDSATestFailure::VERIFY);
+    BlockValidationState failure_state;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!chainstate.ConnectBlock(
+            block, failure_state, &candidate_index, *failed_view,
+            /*fJustCheck=*/true, /*fCheckBlockSig=*/false));
+    }
+    BOOST_CHECK(failure_state.IsError());
+    BOOST_CHECK(!failure_state.IsInvalid());
+    BOOST_CHECK_EQUAL(failure_state.GetResult(),
+                      BlockValidationResult::BLOCK_RESULT_UNSET);
+    BOOST_CHECK(failure_state.GetRejectReason().find("script-check queue") !=
+                std::string::npos);
+    BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_FAILURE);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK((candidate_index.nStatus & BLOCK_FAILED_MASK) == 0);
+        BOOST_REQUIRE(chainstate.m_chain.Tip() != nullptr);
+        BOOST_CHECK(chainstate.m_chain.Tip()->GetBlockHash() ==
+                    durable_tip_hash);
+        BOOST_CHECK(chainstate.CoinsTip().GetBestBlock() ==
+                    durable_coins_hash);
+        BOOST_CHECK(!chainstate.CoinsTip().HaveCoin(
+            spend.transaction.vin[0].prevout));
+        BOOST_CHECK(!chainstate.CoinsTip().HaveCoin(
+            COutPoint{spend.transaction.GetHash(), 0}));
+    }
+
+    // ConnectBlock's contract requires a failed overlay to be discarded. A
+    // clean restart/replay therefore rebuilds from the same durable parent.
+    failed_view.reset();
+    fatal_guard.ClearExpectedFatal();
+    std::unique_ptr<CCoinsViewCache> retry_view;
+    {
+        LOCK(cs_main);
+        retry_view = make_overlay();
+    }
+    BlockValidationState retry_state;
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE_MESSAGE(
+            chainstate.ConnectBlock(
+                block, retry_state, &candidate_index, *retry_view,
+                /*fJustCheck=*/true, /*fCheckBlockSig=*/false),
+            retry_state.ToString());
+    }
+    BOOST_CHECK(retry_state.IsValid());
+    BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_SUCCESS);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!retry_view->HaveCoin(
+            spend.transaction.vin[0].prevout));
+        BOOST_CHECK(retry_view->HaveCoin(
+            COutPoint{spend.transaction.GetHash(), 0}));
+        BOOST_CHECK((candidate_index.nStatus & BLOCK_FAILED_MASK) == 0);
+        BOOST_CHECK(chainstate.m_chain.Tip()->GetBlockHash() ==
+                    durable_tip_hash);
+        BOOST_CHECK(chainstate.CoinsTip().GetBestBlock() ==
+                    durable_coins_hash);
     }
 }
 
