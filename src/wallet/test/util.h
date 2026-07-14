@@ -107,6 +107,7 @@ class MockableDatabase : public WalletDatabase
 public:
     MockableData m_records;
     bool m_pass{true};
+    bool m_fail_begin{false};
     std::optional<size_t> m_fail_write_at;
     size_t m_write_calls{0};
     bool m_fail_commit{false};

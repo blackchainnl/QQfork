@@ -1194,6 +1194,30 @@ BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)
     BOOST_REQUIRE(ML_DSA::KeyGen(public_key, generated_private_key));
     const CKeyingMaterial private_key(generated_private_key.begin(), generated_private_key.end());
 
+    // A transaction that cannot begin must not change either the live wallet
+    // or the database image a restarted process would load.
+    {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        const MockableData initial_records = database.m_records;
+        database.m_fail_begin = true;
+
+        auto result = wallet.AddQuantumKey(public_key, private_key, "atomic-quantum", GetTime(), /*record_as_receive=*/true);
+        BOOST_CHECK(!result);
+        BOOST_CHECK(database.m_records == initial_records);
+        {
+            LOCK(wallet.cs_wallet);
+            BOOST_CHECK(wallet.ListQuantumKeyInfos().empty());
+            BOOST_CHECK(!wallet.IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
+        }
+
+        CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        LOCK(reloaded.cs_wallet);
+        BOOST_CHECK(reloaded.ListQuantumKeyInfos().empty());
+    }
+
     // A receive key is one transaction containing the private key, initial
     // unverified-backup marker, wallet flags, address purpose, and label.
     // Fail each write in turn and prove neither memory nor a crash-style
@@ -1217,6 +1241,37 @@ BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)
 
         CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
         BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        LOCK(reloaded.cs_wallet);
+        BOOST_CHECK(reloaded.ListQuantumKeyInfos().empty());
+    }
+
+    // An encrypted receive key has one additional database operation: write
+    // the encrypted record, erase a possible plaintext record, then write the
+    // backup marker, wallet flags, purpose, and label. Exercise every one of
+    // those six boundaries while the wallet is normally unlocked.
+    for (size_t fail_write = 0; fail_write < 6; ++fail_write) {
+        CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
+        BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+        BOOST_REQUIRE(wallet.EncryptWallet("pass"));
+        BOOST_REQUIRE(wallet.Unlock("pass"));
+
+        MockableDatabase& database = GetMockableDatabase(wallet);
+        const MockableData initial_records = database.m_records;
+        database.m_fail_write_at = fail_write;
+
+        auto result = wallet.AddQuantumKey(public_key, private_key, "atomic-encrypted-quantum", GetTime(), /*record_as_receive=*/true);
+        BOOST_CHECK(!result);
+        BOOST_CHECK(database.m_last_txn_durable);
+        BOOST_CHECK(database.m_records == initial_records);
+        {
+            LOCK(wallet.cs_wallet);
+            BOOST_CHECK(wallet.ListQuantumKeyInfos().empty());
+            BOOST_CHECK(!wallet.IsWalletFlagSet(WALLET_FLAG_QUANTUM_KEYS));
+        }
+
+        CWallet reloaded(/*chain=*/nullptr, "", DuplicateMockDatabase(database));
+        BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+        BOOST_REQUIRE(reloaded.Unlock("pass"));
         LOCK(reloaded.cs_wallet);
         BOOST_CHECK(reloaded.ListQuantumKeyInfos().empty());
     }
@@ -1618,6 +1673,39 @@ BOOST_AUTO_TEST_CASE(QuantumWalletEncryptedBackupAndOldWalletCompatibility)
             BOOST_CHECK(info->durably_stored);
             BOOST_CHECK(!info->backup_verified);
             CheckQuantumKeyChallenge(*wallet, old_destination);
+        }
+
+        // The v30.1.0 compatibility path also applies to encrypted records.
+        // Remove only the v30.1.1 per-key backup marker and prove the old key
+        // still loads, unlocks, and signs while remaining conservatively
+        // unverified.
+        const std::string old_encrypted_name{strprintf("quantum-wallet-old-encrypted-key-%i", format)};
+        CTxDestination old_encrypted_destination;
+        std::vector<unsigned char> old_encrypted_program;
+        {
+            auto wallet{TestLoadQuantumWallet(old_encrypted_name, format)};
+            auto created = wallet->GetNewQuantumDestination("old-encrypted-key");
+            BOOST_REQUIRE(created);
+            old_encrypted_destination = *created;
+            const auto* witness = std::get_if<WitnessUnknown>(&old_encrypted_destination);
+            BOOST_REQUIRE(witness);
+            old_encrypted_program = witness->GetWitnessProgram();
+            BOOST_REQUIRE(wallet->EncryptWallet("old-pass"));
+
+            auto batch = wallet->GetDatabase().MakeBatch();
+            BOOST_REQUIRE(batch->Erase(std::make_pair(DBKeys::QUANTUM_KEY_BACKUP_STATE, old_encrypted_program)));
+        }
+        {
+            auto wallet{TestLoadQuantumWallet(old_encrypted_name, format)};
+            LOCK(wallet->cs_wallet);
+            const auto info = wallet->GetQuantumKeyInfo(old_encrypted_destination);
+            BOOST_REQUIRE(info.has_value());
+            BOOST_CHECK(info->encrypted);
+            BOOST_CHECK(info->durably_stored);
+            BOOST_CHECK(!info->backup_verified);
+            BOOST_CHECK(wallet->IsLocked());
+            BOOST_REQUIRE(wallet->Unlock("old-pass"));
+            CheckQuantumKeyChallenge(*wallet, old_encrypted_destination);
         }
     }
 }

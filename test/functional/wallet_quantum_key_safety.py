@@ -134,6 +134,7 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert_raises_rpc_error(-4, "Unlock this wallet", wallet.backupwallet, current_backup)
         assert_equal(current_backup.read_bytes(), known_good)
         locked_key_count = wallet.getquantumkeyinventory()["total"]
+        assert_raises_rpc_error(-13, "walletpassphrase", wallet.getnewquantumaddress, "locked-blocked")
         assert_raises_rpc_error(-4, "requires an unlocked wallet", wallet.setpowmining, True, 1, 1)
         assert_equal(wallet.getquantumkeyinventory()["total"], locked_key_count)
 
@@ -230,9 +231,13 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert "warning" not in pow_result
         pow_wallet.setpowmining(False)
 
-        self.log.info("Private key material is absent from the daemon log, including RPC debug logging")
+        self.log.info("Every wallet quantum secret is absent from the daemon log, including RPC debug logging")
+        for entry in wallet.getquantumkeyinventory()["keys"]:
+            private_material.append(wallet.dumpquantumkey(entry["address"])["private_key"])
+        for entry in pow_wallet.getquantumkeyinventory()["keys"]:
+            private_material.append(pow_wallet.dumpquantumkey(entry["address"])["private_key"])
         debug_log = node.debug_log_path.read_text(encoding="utf8", errors="replace")
-        if any(secret in debug_log for secret in private_material):
+        if any(secret in debug_log for secret in set(private_material)):
             raise AssertionError("Private quantum key material was written to debug.log")
 
 

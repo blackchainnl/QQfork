@@ -222,7 +222,7 @@ std::unique_ptr<DatabaseCursor> MockableBatch::GetNewPrefixCursor(Span<const std
 
 bool MockableBatch::TxnBegin(bool durable)
 {
-    if (!m_database.m_pass || m_transaction_records) return false;
+    if (!m_database.m_pass || m_database.m_fail_begin || m_transaction_records) return false;
     m_database.m_write_calls = 0;
     m_database.m_last_txn_durable = durable;
     m_transaction_records = m_database.m_records;
