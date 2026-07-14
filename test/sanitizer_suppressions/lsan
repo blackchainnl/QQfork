@@ -1,2 +1,10 @@
-# Suppress warnings triggered in dependencies
+# Suppress warnings triggered in dynamically linked Qt dependencies.
 leak:libQt5Widgets
+
+# The sanitizer build links Qt statically, so dependency frames are attributed
+# to the test executable instead of libQt modules. These process-lifetime Qt
+# caches are outside Blackcoin ownership; keep the suppressions scoped to the
+# exact dependency functions rather than disabling leak detection for Qt tests.
+leak:QDBusConnectionPrivate::QDBusConnectionPrivate
+leak:QDBusConnectionManager::executeConnectionRequest
+leak:QLayoutPrivate::createWidgetItem

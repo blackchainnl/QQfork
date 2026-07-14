@@ -90,6 +90,10 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     // Start thread
     worker = new WalletWorker(this);
     worker->moveToThread(&(t));
+    // WalletWorker has thread affinity and deliberately has no QObject parent.
+    // Retire it on its own thread when the event loop finishes instead of
+    // leaking one worker for every WalletModel lifetime.
+    connect(&t, &QThread::finished, worker, &QObject::deleteLater);
     t.start();
 
     subscribeToCoreSignals();
@@ -678,5 +682,9 @@ void WalletModel::join()
             worker->disconnect(this);
         t.quit();
         t.wait();
+        // The finished-to-deleteLater connection destroys the worker in its
+        // owning thread before wait() returns. Avoid retaining a dangling
+        // pointer when join() is called again during WalletModel destruction.
+        worker = nullptr;
     }
 }
