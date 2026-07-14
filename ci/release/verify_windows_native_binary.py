@@ -21,6 +21,7 @@ PE_MACHINE_AMD64 = 0x8664
 PE32_PLUS_MAGIC = 0x020B
 IMPORT_DIRECTORY_INDEX = 1
 DELAY_IMPORT_DIRECTORY_INDEX = 13
+MAX_IMPORT_DESCRIPTORS = 1024
 
 # Exact Windows system DLL names accepted by the walletless vector binaries.
 # Third-party runtimes and libraries must be statically linked.
@@ -156,6 +157,10 @@ def inspect_pe(path: Path) -> dict:
             f"{path.name}: delay imports are not permitted")
     require(import_rva != 0 and import_size >= 40,
             f"{path.name}: PE import directory is missing")
+    require(import_size % 20 == 0,
+            f"{path.name}: PE import directory size is not descriptor-aligned")
+    require(import_size <= MAX_IMPORT_DESCRIPTORS * 20,
+            f"{path.name}: PE import directory exceeds the reviewed descriptor limit")
 
     imports = set()
     terminated = False

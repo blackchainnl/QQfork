@@ -74,7 +74,7 @@ class ReleaseToolTests(unittest.TestCase):
 
     def write_windows_test_pe(self, path, imports=("KERNEL32.dll",),
                               machine=0x8664, optional_magic=0x020B,
-                              delay_imports=False):
+                              delay_imports=False, import_directory_size=None):
         data = bytearray(0x800)
         pe_offset = 0x80
         optional_offset = pe_offset + 24
@@ -93,7 +93,7 @@ class ReleaseToolTests(unittest.TestCase):
         struct.pack_into("<H", data, optional_offset, optional_magic)
         struct.pack_into("<I", data, optional_offset + 60, section_raw)
         struct.pack_into("<I", data, optional_offset + 108, 16)
-        import_size = (len(imports) + 1) * 20
+        import_size = import_directory_size or (len(imports) + 1) * 20
         struct.pack_into(
             "<II", data, optional_offset + 112 + 8,
             section_rva, import_size,
@@ -250,6 +250,18 @@ class ReleaseToolTests(unittest.TestCase):
 
             self.write_windows_test_pe(bench_binary, delay_imports=True)
             with self.assertRaisesRegex(RuntimeError, "delay imports"):
+                verifier.build_manifest(paths, source_sha, repository)
+
+            self.write_windows_test_pe(
+                bench_binary,
+                import_directory_size=(verifier.MAX_IMPORT_DESCRIPTORS + 1) * 20,
+            )
+            with self.assertRaisesRegex(RuntimeError, "descriptor limit"):
+                verifier.build_manifest(paths, source_sha, repository)
+
+            self.write_windows_test_pe(bench_binary)
+            bench_binary.write_bytes(bench_binary.read_bytes()[:0x190])
+            with self.assertRaisesRegex(RuntimeError, "section table is truncated"):
                 verifier.build_manifest(paths, source_sha, repository)
 
     def test_resource_benchmark_evidence_is_source_bound_and_fail_closed(self):
