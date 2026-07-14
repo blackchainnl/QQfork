@@ -23,8 +23,8 @@ This soak runs BOTH together on two nodes and asserts, at every phase boundary, 
     node validates as an end-to-end staking proof.
   - Both nodes agree on FULL state, not just the tip: gettxoutsetinfo muhash,
     getcirculatingsupply, and getgoldrushstate are identical across node[0] and node[1].
-  - Dormant actors decay to lock; active actors refresh (sweeping effective value) and never
-    lock; cold-stake principal stays exempt and fully intact.
+  - Dormant and cold-stake actors decay to lock; active actors refresh (sweeping effective
+    value) and never lock. Delegation is not a demurrage exemption.
   - dumptxoutset over the live demurrage+shadow+coldstake UTXO set succeeds (A5 marker-skip).
 
 The helper set is intentionally shared with the focused demurrage and staking
@@ -45,7 +45,6 @@ GOLD_RUSH_END_TIME = 2_000_000_000
 MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 5_008
 GOLD_RUSH_END_HEIGHT = 11
 MIGRATION_END_HEIGHT = 26
-DEMURRAGE_ACTIVATION_HEIGHT = 27
 COIN = 100_000_000
 SHADOW_MAX_EMISSION = 51_437_700 * COIN          # src/shadow.h cap constant (verified)
 DEMURRAGE_PPM = 1_000_000
@@ -88,7 +87,6 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
             f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
             "-qqstaketierheight=1",
             "-qqstakesplitheight=1",
-            f"-qqdemurrageheight={DEMURRAGE_ACTIVATION_HEIGHT}",
             "-qqdemurrageblockspermonth=4",
         ]
         self.extra_args = [args, args]
@@ -239,13 +237,16 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
             cursor += size
         return pushes
 
-    def _quantum_key_hash_for_script(self, script_hex):
+    def _quantum_demurrage_identity(self, script_hex):
         script = bytes.fromhex(script_hex)
-        if len(script) == 34 and script[0] == 0x60 and script[1] == 0x20:
-            return script[2:34]
+        if len(script) == 34 and script[1] == 0x20 and script[0] in (0x5e, 0x5f, 0x60):
+            # Only direct v16 outputs have a separate liveness-attestation
+            # identity. v14 cold stake and frozen v15 EUTXO are still subject
+            # to the same height decay, but refresh only by spending/recreating.
+            return True, script[2:34] if script[0] == 0x60 else None
         if len(script) == 42 and script[0] == 0x60 and script[1] == 0x28:
-            return script[10:42]
-        return None
+            return True, None
+        return False, None
 
     def _attestation_key_hash(self, script_hex):
         pushes = self._read_script_pushes(script_hex)
@@ -269,6 +270,7 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
     def _replay_supply_oracle(self, supply):
         node = self.nodes[0]
         height = supply["height"]
+        evaluation_height = supply["evaluation_height"]
         effective_activation = supply["demurrage_effective_activation_height"]
         utxos = {}
         latest_attestation = {}
@@ -295,11 +297,11 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         for coin in utxos.values():
             nominal += coin["value"]
             effective = coin["value"]
-            key_hash = self._quantum_key_hash_for_script(coin["script"])
-            if supply["demurrage_active"] and key_hash is not None:
+            demurrage_applies, key_hash = self._quantum_demurrage_identity(coin["script"])
+            if supply["demurrage_active"] and demurrage_applies:
                 effective_last_active = max(coin["height"], effective_activation,
-                                            latest_attestation.get(key_hash, 0))
-                inactive_blocks = max(0, height - effective_last_active)
+                                            latest_attestation.get(key_hash, 0) if key_hash is not None else 0)
+                inactive_blocks = max(0, evaluation_height - effective_last_active)
                 remaining = self._remaining_ppm(inactive_blocks)
                 effective = (coin["value"] * remaining) // DEMURRAGE_PPM
                 if remaining == 0:
@@ -325,6 +327,9 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         )
         replay = self._replay_supply_oracle(supply)
         assert_equal(Decimal(supply["nominal_amount"]), replay["nominal_amount"])
+        assert_equal(Decimal(supply["decayed_amount"]), replay["decayed_amount"])
+        assert_equal(supply["decayed_txouts"], replay["decayed_txouts"])
+        assert_equal(supply["locked_txouts"], replay["locked_txouts"])
         self.log.info(f"  [{label}] oracle ok: nominal={supply['nominal_amount']} "
                       f"decayed={supply['decayed_amount']} locked={supply['locked_txouts']}")
 
@@ -456,7 +461,7 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
                 self._assert_shadow_cap(f"soak-{step}")
                 self._assert_nodes_agree()
 
-        self.log.info("Phase 6: dormant locked; active whole; cold-stake principal exempt + intact")
+        self.log.info("Phase 6: dormant and cold-stake locked; active actors remain whole")
         info = funder.getdemurragewalletinfo()
         assert_equal(info["demurrage_active"], True)
         for address in dormant:
@@ -471,6 +476,8 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         for actor in cold:
             txout = node.gettxout(actor["utxo"]["txid"], actor["utxo"]["vout"], False)
             assert txout is not None
+            # Nominal UTXO value remains serialized, while the consensus
+            # evaluator removes unattended delegated value from circulation.
             assert_equal(Decimal(str(txout["value"])), actor["amount"])
         # a locked dormant coin cannot be spent (hard 24-month lock)
         locked_utxo = self._one_output(funder, dormant[0])
@@ -485,7 +492,7 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         assert_raises_rpc_error(-26, "bad-txns-spends-locked-coin", node.sendrawtransaction, locked_spend["hex"])
 
         supply = node.getcirculatingsupply()
-        assert_greater_than(supply["locked_txouts"], N_DORMANT - 1)
+        assert_greater_than(supply["locked_txouts"], N_DORMANT + N_COLD - 1)
         assert_greater_than(Decimal(supply["decayed_amount"]), Decimal("0"))
         self._assert_supply_matches_txoutset("final")
         self._assert_shadow_cap("final")
