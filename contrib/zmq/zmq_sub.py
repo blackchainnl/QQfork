@@ -15,7 +15,9 @@
                 -zmqpubrawblock=tcp://127.0.0.1:28332 \
                 -zmqpubhashtx=tcp://127.0.0.1:28332 \
                 -zmqpubhashblock=tcp://127.0.0.1:28332 \
-                -zmqpubsequence=tcp://127.0.0.1:28332
+                -zmqpubsequence=tcp://127.0.0.1:28332 \
+                -shadowindex=1 \
+                -zmqpubshadow=tcp://127.0.0.1:28332
 
     We use the asyncio library here.  `self.handle()` installs itself as a
     future at the end of the function.  Since it never returns with the event
@@ -27,11 +29,13 @@
 """
 
 import asyncio
-import zmq
-import zmq.asyncio
+import json
 import signal
 import struct
 import sys
+
+import zmq
+import zmq.asyncio
 
 if (sys.version_info.major, sys.version_info.minor) < (3, 5):
     print("This example only works with Python 3.5 and greater")
@@ -43,6 +47,7 @@ class ZMQHandler():
     def __init__(self):
         self.loop = asyncio.get_event_loop()
         self.zmqContext = zmq.asyncio.Context()
+        self.next_sequence = {}
 
         self.zmqSubSocket = self.zmqContext.socket(zmq.SUB)
         self.zmqSubSocket.setsockopt(zmq.RCVHWM, 0)
@@ -51,31 +56,42 @@ class ZMQHandler():
         self.zmqSubSocket.setsockopt_string(zmq.SUBSCRIBE, "rawblock")
         self.zmqSubSocket.setsockopt_string(zmq.SUBSCRIBE, "rawtx")
         self.zmqSubSocket.setsockopt_string(zmq.SUBSCRIBE, "sequence")
+        self.zmqSubSocket.setsockopt_string(zmq.SUBSCRIBE, "shadow")
         self.zmqSubSocket.connect("tcp://127.0.0.1:%i" % port)
 
     async def handle(self) :
         topic, body, seq = await self.zmqSubSocket.recv_multipart()
-        sequence = "Unknown"
+        sequence = None
         if len(seq) == 4:
-            sequence = str(struct.unpack('<I', seq)[-1])
+            sequence = struct.unpack('<I', seq)[-1]
+            expected = self.next_sequence.get(topic)
+            if expected is not None and sequence != expected:
+                print("ZMQ sequence gap on %s: expected %d, received %d; reconcile by RPC" % (
+                    topic.decode("ascii", errors="replace"), expected, sequence))
+            self.next_sequence[topic] = (sequence + 1) & 0xffffffff
+        sequence_label = "Unknown" if sequence is None else str(sequence)
         if topic == b"hashblock":
-            print('- HASH BLOCK ('+sequence+') -')
+            print('- HASH BLOCK ('+sequence_label+') -')
             print(body.hex())
         elif topic == b"hashtx":
-            print('- HASH TX  ('+sequence+') -')
+            print('- HASH TX  ('+sequence_label+') -')
             print(body.hex())
         elif topic == b"rawblock":
-            print('- RAW BLOCK HEADER ('+sequence+') -')
+            print('- RAW BLOCK HEADER ('+sequence_label+') -')
             print(body[:80].hex())
         elif topic == b"rawtx":
-            print('- RAW TX ('+sequence+') -')
+            print('- RAW TX ('+sequence_label+') -')
             print(body.hex())
         elif topic == b"sequence":
             hash = body[:32].hex()
             label = chr(body[32])
             mempool_sequence = None if len(body) != 32+1+8 else struct.unpack("<Q", body[32+1:])[0]
-            print('- SEQUENCE ('+sequence+') -')
+            print('- SEQUENCE ('+sequence_label+') -')
             print(hash, label, mempool_sequence)
+        elif topic == b"shadow":
+            event = json.loads(body.decode("utf-8"))
+            print('- SHADOW %s (%s) -' % (event["event"], sequence_label))
+            print(json.dumps(event, indent=2, sort_keys=True))
         # schedule ourselves to receive the next message
         asyncio.ensure_future(self.handle())
 

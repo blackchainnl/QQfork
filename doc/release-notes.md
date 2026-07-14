@@ -118,10 +118,11 @@ Notable changes
   recover their actual base fee up to 0.01 BLK from the fixed pool, the canonical
   winner receives the remainder, and authenticated shadow replay commits to the
   activation boundary under schema 11.
-- Optional shadowindex schema 6 and coinstatsindex schema 3 automatically
-  invalidate and rebuild prerelease index records derived with the superseded
-  height-5,950,000 competing-claim boundary or incomplete proof-mode
-  classification.
+- Optional shadowindex schema 7 and coinstatsindex schema 3 automatically
+  invalidate and rebuild incompatible prerelease records derived with the
+  superseded height-5,950,000 competing-claim boundary or incomplete
+  proof-mode and spend-anchor classification. Shadowindex schema 7 persists
+  ordered spend anchors for bounded event construction.
 - ML-DSA quantum spends, EUTXO spends, larger post-quantum script elements, and
   expanded block limits are deferred until after the Gold Rush reward-height
   window, during the migration/final-lockout phases.
@@ -136,6 +137,14 @@ Notable changes
   outpoint, address, and exact-script history. `getshadowsupply` adds an
   explicitly synthetic lifecycle contract for scheduled, pooled, issued,
   locked, spendable, expired-unissued, nominal, effective, and burned value.
+- `-zmqpubshadow` publishes versioned, deterministic connected/disconnected
+  synthetic-ledger deltas after atomic index updates. The transport has fixed
+  record/body bounds, preserves exact reorg order, and requires RPC bootstrap
+  and reconciliation because synthetic transactions are not base-block Merkle
+  members and are absent from ordinary compact filters.
+- Shadow explorer RPCs reject concurrent and equal-tip ABA reorganizations
+  instead of returning mixed-branch supply, script, outpoint, or negative
+  lookup results.
 - Wallet code includes migration and safety checks for the quantum transition
   path.
 

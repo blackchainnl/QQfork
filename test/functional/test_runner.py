@@ -211,6 +211,7 @@ BASE_SCRIPTS = [
     'wallet_keypool_topup.py --descriptors',
     'wallet_fast_rescan.py --descriptors',
     'interface_zmq.py',
+    'interface_zmq_shadow.py',
     'rpc_invalid_address_message.py',
     'rpc_validateaddress.py',
     'interface_bitcoin_cli.py --legacy-wallet',

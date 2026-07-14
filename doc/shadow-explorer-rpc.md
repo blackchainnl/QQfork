@@ -21,15 +21,15 @@ index can continue following new blocks on a pruned node, but a later rebuild
 cannot cross deleted block data. Explorer operators should therefore use
 `-prune=0`. `-reindex` wipes and deterministically rebuilds the index.
 
-v30.1.1 uses shadowindex schema 6. It automatically discards and rebuilds
-prerelease schema-4 data, which classified historical claims under the
-superseded height-5,950,000 activation, and schema-5 data, which lacked exact
-wrong/unknown QQSPROOF mode dispositions. Coinstatsindex schema 3 performs the
-same invalidation for prerelease schema-2 synthetic-payout statistics. This
-index-only rebuild does not require a full block or chainstate reindex when all
-active-chain block files remain available. A pruned operator without the
-required history must disable the affected index or restore the history with a
-full `-reindex`.
+v30.1.1 uses shadowindex schema 7. Schema 5 invalidated prerelease data built
+with the superseded height-5,950,000 claim boundary, schema 6 added proof-mode
+classification, and schema 7 adds ordered spend anchors used by the bounded
+event transport. Any recognized older shadowindex schema is discarded and
+rebuilt automatically. Coinstatsindex schema 3 likewise invalidates its
+prerelease schema-2 synthetic-payout statistics. These auxiliary-index rebuilds
+do not require a full block or chainstate reindex when all active-chain block
+files remain available. A pruned operator without the required history must
+disable the affected index or restore the history with a full `-reindex`.
 
 ## Data model
 
@@ -63,6 +63,15 @@ coinstake is the only PoS credit path.
 Amounts are JSON numbers denominated in BLK with eight decimal places. Internal
 accounting remains integer atomic units.
 
+Every `getshadow*` response is bound to one active-tip and shadowindex
+generation. The RPC captures the active hash, height, and monotonic live-index
+revision before reading, then verifies the same values after assembling the
+result. This rejects same-height and equal-total ABA reorganizations that would
+otherwise look consistent. A concurrent connect, disconnect, or index rewind
+returns an explicit `retry the request` error. Negative transaction/outpoint
+lookups perform the same final check before returning “not found,” so a reorg
+cannot create a silent false negative.
+
 ## RPCs
 
 ### `getshadowblock hash_or_height ( offset count claim_offset claim_count )`
@@ -78,12 +87,11 @@ anchor hash is rejected or no longer matches `getblockhash(height)`.
 `pow_claim_accounting` reports winner, reimbursed-loser, and rejection counts,
 plus exact winner, reimbursement, and combined credited totals. Stable claim
 dispositions are `invalid_location`, `malformed_transaction`, `invalid_proof`,
-`input_mismatch`, `invalid_base_fee`, `evaluation_limit`, `winner`, and
-`reimbursed_loser`, with `wrong_mode_pos` and `unknown_mode` identifying the
-two type-specific non-credit outcomes. A positive winner or reimbursed-loser
-credit carries the exact synthetic transaction ID. Zero-fee valid losers
-remain visible as `reimbursed_loser` records with zero credit and no synthetic
-output.
+`wrong_mode_pos`, `unknown_mode`, `input_mismatch`, `invalid_base_fee`,
+`evaluation_limit`, `winner`, and `reimbursed_loser`. A positive winner or
+reimbursed-loser credit carries the exact synthetic transaction ID. Zero-fee
+valid losers remain visible as `reimbursed_loser` records with zero credit and
+no synthetic output.
 
 On mainnet this canonical per-claim classification begins at height 5,993,200.
 Earlier Gold Rush blocks intentionally reproduce the v30.1.0 first-valid-claim
@@ -137,7 +145,8 @@ resolved by the persisted spent-outpoint index and retains the exact spending
 block, transaction, transaction position, and input position. The
 `lookup_index` field reports which index served the result. Disconnecting the
 spend atomically changes the lookup back to `synthetic_transaction`; a restart
-or index rebuild restores the same result for the active chain.
+or index rebuild restores the same result for the active chain. Top-level
+`height` and `bestblock` bind the lookup to the exact snapshot that served it.
 
 ### `getshadowsupply ( include_effective max_records )`
 
@@ -222,28 +231,67 @@ test. It:
 5. reconciles the enumerated count and nominal amount with `getshadowsupply`;
 6. verifies spend metadata;
 7. disconnects and reconnects origin and spend blocks; and
-8. repeats the checks after restart, `-reindex`, and `-reindex-chainstate`.
+8. repeats the checks after restart, incompatible-schema rebuild, `-reindex`,
+   and `-reindex-chainstate`; and
+9. forces an equal-tip ABA reorg while supply, script, and outpoint RPCs are in
+   progress and requires an explicit retry instead of a mixed-branch result.
 
-This polling contract is the v1 event interface. An explorer treats a new
-`(height, blockhash)` pair as `shadow.block.connected` and a changed hash at an
-already ingested height as disconnect events down to the common ancestor,
-followed by connected events for the replacement branch. Event consumers must
-key idempotency by block hash plus synthetic transaction ID. A future ZMQ topic
-may transport the same schema, but v30.1.1 does not advertise a notification it
-cannot yet deliver reliably.
+`interface_zmq_shadow.py` is the executable event-ingestion test. Enable the
+transport with:
+
+```text
+shadowindex=1
+prune=0
+zmqpubshadow=tcp://127.0.0.1:28334
+```
+
+The multipart topic is `shadow`. Its body is deterministic UTF-8 JSON with schema
+`blackcoin.shadow.event.v1`; the final frame is the notifier's little-endian
+uint32 sequence. One event is emitted only after the index has atomically
+applied or rewound the block. `shadow.block.connected` and
+`shadow.block.disconnected` use the same block, credit, spend, provenance, and
+exact-atomic-amount payload except for `event`, so disconnect is an exact
+inverse. Credits are ordered by claim index. Spends are ordered by transaction
+index and input index. Reorganizations publish former-branch disconnects from
+tip to ancestor, followed by replacement-branch connects from ancestor to tip.
+
+The transport does not replay history during startup, initial index build,
+restart, or reindex. A reference consumer therefore:
+
+1. subscribes to `shadow` and records the per-topic sequence;
+2. bootstraps active block pages and cumulative supply through RPC;
+3. applies only a connected event whose parent equals its stored tip;
+4. applies disconnect events as exact inverse deltas;
+5. keys idempotency by block hash plus synthetic transaction/outpoint; and
+6. replays RPC pages from the last common ancestor after any sequence gap,
+   reconnect, restart, parent mismatch, or periodic supply mismatch.
+
+The in-memory ZMQ sequence restarts with the notifier. A publish failure removes
+only that failed notifier. An over-limit or inconsistent delta is logged and
+omitted. None of those failures rolls back the index, rejects the base block,
+or changes consensus validity, so RPC reconciliation is mandatory rather than
+an optional error-recovery enhancement.
 
 Base-block BIP158 compact filters and ordinary Electrum transaction histories
 cannot discover synthetic payout transaction IDs because those virtual
 transactions are not members of the base block or its transaction Merkle tree.
 A negative compact-filter match is therefore not evidence that a quantum
-address received no Gold Rush credit. Light-client and explorer integrations
-must ingest `getshadowblock` and use `getshadowaddress` or `getshadowscript`
-until a separately versioned synthetic event/filter transport is implemented.
+address received no Gold Rush credit. The v1 `shadow` topic closes that
+discovery false negative without pretending that a synthetic credit has a base
+transaction Merkle proof. Electrum servers and light-client backends must ingest
+the topic, persist its separate synthetic history, and reconcile it with
+`getshadowblock`, `getshadowaddress`, or `getshadowscript`. Base compact filters
+remain unchanged and authoritative only for transactions actually serialized
+in the base block.
 
 ## Resource and failure boundaries
 
 - Block payout and claim-accounting pages are independently capped at 1,000.
 - Effective-supply scans are caller-controlled and hard capped.
+- Live event construction reads persisted delta anchors and point records; it
+  never scans chainstate or the historical index. One event is capped at 4,096
+  combined credits/spends and a 16 MiB JSON body. A valid block above that
+  transport bound remains indexed and queryable by RPC.
 - Synthetic payout records begin at the configured Gold Rush reward start
   height; earlier blocks return an empty shadow page. Quantum witness history
   begins at genesis.
