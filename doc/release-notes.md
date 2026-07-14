@@ -39,9 +39,20 @@ blackcoind -datadir=/path/to/data -networkactive=0 -staking=0 \
 `-reindex-chainstate` reads local block files and does not fetch history removed
 by pruning. If block files are pruned or incomplete, set `prune=0` and use a
 full `-reindex` to redownload missing history and rebuild both the block index
-and chainstate. The client checks known block availability before wiping and
+and chainstate. The client checks known block availability before staging and
 leaves the existing chainstate intact when a chainstate-only rebuild is not
 possible. Preserve wallet files and all available block files.
+
+Reconstruction is journaled. The first process retains the original chainstate
+backup after committing the rebuilt state. Stop it cleanly and start once
+without a reindex option; that separate process reopens and verifies the
+replacement before retiring the backup. A full `-reindex` is intentionally
+refused while this verification restart is pending.
+
+For this alpha, sudden-power-loss durability of directory renames is not yet
+claimed on Windows. Keep a cold datadir copy and stable power, and do not
+force-stop Windows during either rebuild start. Preserve the full datadir if a
+journal or backup-topology diagnostic appears.
 
 After synchronization, record `getblockchaininfo`, `gettxoutsetinfo muhash`, and
 `getgoldrushstate`. Stop cleanly, restart without a reindex option, and confirm

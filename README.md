@@ -68,8 +68,21 @@ the complete active-chain block data needed for the rebuild. If block files are
 pruned or incomplete, set `prune=0` and use a full `-reindex` so the missing
 history can be downloaded and the block index and chainstate rebuilt. Do not
 delete wallet files or available block files. v30.1.1 checks required block
-availability before wiping and leaves the existing chainstate intact if known
+availability before staging and leaves the existing chainstate intact if known
 pruned history makes a chainstate-only rebuild impossible.
+
+The rebuilding process preserves the original chainstate in a journaled backup
+and leaves that backup in place after reconstruction commits. Stop cleanly and
+start once more without either reindex option so a separate process can verify
+the replacement before retiring the backup. Do not request a full `-reindex`
+between those two starts; v30.1.1 refuses that transition rather than risking
+the preserved recovery point.
+
+The v30.1.1 alpha does not claim power-loss-atomic directory renames on Windows.
+Keep a cold datadir copy, use stable power, and do not force-stop or power-cycle
+Windows during the rebuild or its verification restart. If startup reports a
+chainstate-rebuild journal or backup-topology error, preserve the entire datadir
+and restore the cold copy instead of deleting recovery files individually.
 
 After synchronization, record and compare the height, best-block hash, UTXO
 MuHash, and Gold Rush totals across a clean restart:
