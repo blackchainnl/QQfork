@@ -81,6 +81,7 @@ class ReleaseToolTests(unittest.TestCase):
                 result(
                     "QuantumMLDSA44MaxWeightBlock", "signature", 0.41075, 8215
                 ),
+                result("QuantumLargeBlockValidation32MiB", "block", 0.75),
             ]
         }
         with tempfile.TemporaryDirectory() as temporary:
@@ -105,10 +106,10 @@ class ReleaseToolTests(unittest.TestCase):
                     TOOLS.parent.parent /
                     "contrib" / "devtools" / "quantum-crypto-provenance.json"
                 ),
-                required_domains={"crypto"},
+                required_domains={"crypto", "large-block"},
             )
             self.assertTrue(evidence["coverage"]["crypto"])
-            self.assertFalse(evidence["coverage"]["large-block"])
+            self.assertTrue(evidence["coverage"]["large-block"])
             self.assertFalse(evidence["coverage"]["synthetic-state"])
             self.assertFalse(evidence["release_resource_evidence_complete"])
             argon_bound = evidence["derived_upper_bounds"]["shadow_pow_argon2_block"]
@@ -118,6 +119,23 @@ class ReleaseToolTests(unittest.TestCase):
             )
             self.assertEqual(
                 mldsa_bound["maximum_verifications"], 8215
+            )
+            large_block_bound = evidence["derived_upper_bounds"][
+                "large_block_validation"
+            ]
+            self.assertEqual(large_block_bound["maximum_weight"], 32_000_000)
+            self.assertEqual(
+                large_block_bound["maximum_serialized_size"], 32_000_000
+            )
+            self.assertEqual(
+                large_block_bound["measured_fixture_quantum_inputs"], 8198
+            )
+            self.assertEqual(
+                large_block_bound["measured_fixture_weight"], 31_997_596
+            )
+            self.assertEqual(
+                large_block_bound["measured_fixture_serialized_size"],
+                30_988_642,
             )
             self.assertIn(evidence["runner"]["endianness"], ("little", "big"))
             self.assertEqual(evidence["build"]["compiler_flags"], "-O2 -g")
@@ -130,7 +148,7 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertEqual(
                 evidence["consensus_limits"]["minimum_quantum_input_weight"], 3903
             )
-            with self.assertRaisesRegex(RuntimeError, "large-block"):
+            with self.assertRaisesRegex(RuntimeError, "synthetic-state"):
                 generator.generate_evidence(
                     nanobench_json=raw,
                     binary=binary,
@@ -147,37 +165,37 @@ class ReleaseToolTests(unittest.TestCase):
                         TOOLS.parent.parent /
                         "contrib" / "devtools" / "quantum-crypto-provenance.json"
                     ),
-                    required_domains={"crypto", "large-block"},
+                    required_domains={"crypto", "large-block", "synthetic-state"},
                 )
 
             document["results"].append(document["results"][0])
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "duplicate nanobench result"):
-                generator.parse_measurements(raw, {"crypto"}, 250)
+                generator.parse_measurements(raw, {"crypto", "large-block"}, 250)
 
             document["results"].pop()
             document["results"][1]["batch"] = 63
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "expected 64"):
-                generator.parse_measurements(raw, {"crypto"}, 250)
+                generator.parse_measurements(raw, {"crypto", "large-block"}, 250)
 
             document["results"][1]["batch"] = 64
             document["results"][0]["median(elapsed)"] *= 2
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "median does not match"):
-                generator.parse_measurements(raw, {"crypto"}, 250)
+                generator.parse_measurements(raw, {"crypto", "large-block"}, 250)
 
             document["results"][0]["median(elapsed)"] /= 2
             document["results"][0]["totalTime"] *= 2
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "total time does not match"):
-                generator.parse_measurements(raw, {"crypto"}, 250)
+                generator.parse_measurements(raw, {"crypto", "large-block"}, 250)
 
             document["results"][0]["totalTime"] /= 2
             document["results"].append(result("UnexpectedQuantumBenchmark", "op", 1.0))
             raw.write_text(json.dumps(document), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "benchmark set mismatch"):
-                generator.parse_measurements(raw, {"crypto"}, 250)
+                generator.parse_measurements(raw, {"crypto", "large-block"}, 250)
 
             with self.assertRaisesRegex(RuntimeError, "repository must be exactly"):
                 generator.verify_source_checkout(repository, "fork/Blackcoin", source_sha)
@@ -185,6 +203,51 @@ class ReleaseToolTests(unittest.TestCase):
                 generator.verify_source_checkout(
                     repository, "Blackcoin-Dev/Blackcoin", "f" * 40
                 )
+
+    def test_resource_benchmark_source_checkout_rejects_dirty_inputs(self):
+        generator = load_module("generate_resource_benchmark_evidence")
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            subprocess.run(["git", "init", "-q", str(repository)], check=True)
+            tracked = repository / "tracked.cpp"
+            tracked.write_text("committed\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repository), "add", "tracked.cpp"], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", str(repository),
+                    "-c", "user.name=Blackcoin-Dev",
+                    "-c", "user.email=298119138+Blackcoin-Dev@users.noreply.github.com",
+                    "commit", "-q", "-m", "fixture",
+                ],
+                check=True,
+            )
+            source_sha = subprocess.run(
+                ["git", "-C", str(repository), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
+            generator.verify_source_checkout(
+                repository, "Blackcoin-Dev/Blackcoin", source_sha
+            )
+
+            tracked.write_text("modified\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "tracked changes"):
+                generator.verify_source_checkout(
+                    repository, "Blackcoin-Dev/Blackcoin", source_sha
+                )
+
+            tracked.write_text("committed\n", encoding="utf-8")
+            raw = repository / "nanobench.json"
+            raw.write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "unexpected untracked"):
+                generator.verify_source_checkout(
+                    repository, "Blackcoin-Dev/Blackcoin", source_sha
+                )
+            generator.verify_source_checkout(
+                repository, "Blackcoin-Dev/Blackcoin", source_sha,
+                allowed_untracked=(raw,),
+            )
 
     def test_resource_benchmark_workflow_measures_and_does_not_overclaim(self):
         root = TOOLS.parent.parent
@@ -202,6 +265,7 @@ class ReleaseToolTests(unittest.TestCase):
             "QuantumArgon2id64ClaimBlock",
             "QuantumMLDSA44Verify",
             "QuantumMLDSA44MaxWeightBlock",
+            "QuantumLargeBlockValidation32MiB",
         ):
             with self.subTest(benchmark=benchmark):
                 self.assertIn(f"BENCHMARK({benchmark}", benchmark_source)
@@ -213,9 +277,15 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("SHADOW_ARGON2_LANES", benchmark_source)
         self.assertIn("bench.batch(MAX_SHADOW_POW_EVALS_PER_BLOCK)", benchmark_source)
         self.assertIn("bench.batch(MAX_BLOCK_MLDSA_VERIFICATIONS)", benchmark_source)
+        self.assertIn("V4_MAX_BLOCK_WEIGHT - block_weight", benchmark_source)
+        self.assertIn("CheckInputScripts", benchmark_source)
         self.assertIn("Argon2 single-operation benchmark failed", benchmark_source)
         self.assertIn("ML-DSA single-operation benchmark failed", benchmark_source)
         self.assertIn("resource-benchmarks-linux:", gate)
+        self.assertIn(
+            "requirements=(--require-domain crypto --require-domain large-block)",
+            gate,
+        )
         self.assertIn("--require-domain large-block", gate)
         self.assertIn("--require-domain synthetic-state", gate)
         self.assertIn("quantum-resource-benchmarks-macos-", gate)

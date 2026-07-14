@@ -23,6 +23,10 @@ MIN_QUANTUM_INPUT_WEIGHT = 3903
 MAX_WEIGHT_BOUND_QUANTUM_INPUTS = 8198
 MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK = 16
 MAX_BLOCK_MLDSA_VERIFICATIONS = 8215
+V4_MAX_BLOCK_WEIGHT = 32_000_000
+V4_MAX_BLOCK_SERIALIZED_SIZE = 32_000_000
+MAXIMUM_QUANTUM_BENCHMARK_BLOCK_WEIGHT = 31_997_596
+MAXIMUM_QUANTUM_BENCHMARK_SERIALIZED_SIZE = 30_988_642
 
 DOMAIN_BENCHMARKS = {
     "crypto": {
@@ -35,9 +39,9 @@ DOMAIN_BENCHMARKS = {
             "signature", MAX_BLOCK_MLDSA_VERIFICATIONS
         ),
     },
-    # These names are reserved so production fails closed until dedicated
-    # 32 MiB block-validation and maximum-marker apply/undo benches land.
     "large-block": {"QuantumLargeBlockValidation32MiB": ("block", 1)},
+    # This name remains reserved so production fails closed until the
+    # maximum-marker apply/undo benchmark lands.
     "synthetic-state": {
         "QuantumSyntheticStateApplyUndoMaxMarkers": ("state-transition", 1)
     },
@@ -69,7 +73,8 @@ def checked_line(value: str, label: str) -> str:
 
 
 def verify_source_checkout(repo_root: Path, repository: str,
-                           source_sha: str) -> None:
+                           source_sha: str,
+                           allowed_untracked: tuple[Path, ...] = ()) -> None:
     if repository != EXPECTED_REPOSITORY:
         raise RuntimeError(
             f"source repository must be exactly {EXPECTED_REPOSITORY}, got {repository}"
@@ -81,11 +86,44 @@ def verify_source_checkout(repo_root: Path, repository: str,
             capture_output=True,
             text=True,
         ).stdout.strip()
+        tracked_status = subprocess.run(
+            ["git", "-C", str(repo_root), "diff", "--quiet", "HEAD", "--"],
+            check=False,
+        ).returncode
+        untracked_output = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "--others",
+             "--exclude-standard", "-z"],
+            check=True,
+            capture_output=True,
+        ).stdout
     except (OSError, subprocess.CalledProcessError) as error:
         raise RuntimeError(f"cannot verify benchmark source checkout: {error}") from error
     if actual != source_sha:
         raise RuntimeError(
             f"benchmark source commit mismatch: checkout is {actual}, expected {source_sha}"
+        )
+    if tracked_status not in (0, 1):
+        raise RuntimeError("cannot inspect tracked benchmark source state")
+    if tracked_status == 1:
+        raise RuntimeError("benchmark source checkout has tracked changes")
+
+    root = repo_root.resolve()
+    allowed = set()
+    for path in allowed_untracked:
+        candidate = path if path.is_absolute() else repo_root / path
+        try:
+            allowed.add(candidate.resolve().relative_to(root).as_posix())
+        except ValueError:
+            continue
+    untracked = {
+        entry.decode("utf-8")
+        for entry in untracked_output.split(b"\0") if entry
+    }
+    unexpected = sorted(untracked - allowed)
+    if unexpected:
+        raise RuntimeError(
+            "benchmark source checkout has unexpected untracked files: " +
+            ", ".join(unexpected)
         )
 
 
@@ -217,7 +255,10 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
                       required_domains: set[str]) -> dict:
     if not SHA1_RE.fullmatch(source_sha):
         raise RuntimeError("source SHA must be a full lowercase commit identifier")
-    verify_source_checkout(repo_root, repository, source_sha)
+    verify_source_checkout(
+        repo_root, repository, source_sha,
+        allowed_untracked=(nanobench_json,),
+    )
     if not LABEL_RE.fullmatch(platform) or not LABEL_RE.fullmatch(architecture):
         raise RuntimeError("platform and architecture must be simple stable labels")
     toolchain = checked_line(toolchain, "toolchain")
@@ -268,6 +309,20 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
                 "measured_seconds": mldsa_block,
             },
         }
+    if coverage["large-block"]:
+        derived["large_block_validation"] = {
+            "maximum_weight": V4_MAX_BLOCK_WEIGHT,
+            "maximum_serialized_size": V4_MAX_BLOCK_SERIALIZED_SIZE,
+            "measured_fixture_weight":
+                MAXIMUM_QUANTUM_BENCHMARK_BLOCK_WEIGHT,
+            "measured_fixture_serialized_size":
+                MAXIMUM_QUANTUM_BENCHMARK_SERIALIZED_SIZE,
+            "measured_fixture_quantum_inputs":
+                MAX_WEIGHT_BOUND_QUANTUM_INPUTS,
+            "measured_seconds": measurements[
+                "QuantumLargeBlockValidation32MiB"
+            ]["median_seconds"],
+        }
 
     return {
         "schema": 1,
@@ -299,6 +354,13 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
                 MAX_BLOCK_MLDSA_VERIFICATIONS,
             "maximum_shadow_argon2_evaluations_per_block":
                 MAX_SHADOW_POW_EVALS_PER_BLOCK,
+            "v4_maximum_block_weight": V4_MAX_BLOCK_WEIGHT,
+            "v4_maximum_block_serialized_size":
+                V4_MAX_BLOCK_SERIALIZED_SIZE,
+            "maximum_quantum_benchmark_block_weight":
+                MAXIMUM_QUANTUM_BENCHMARK_BLOCK_WEIGHT,
+            "maximum_quantum_benchmark_serialized_size":
+                MAXIMUM_QUANTUM_BENCHMARK_SERIALIZED_SIZE,
         },
         "coverage": coverage,
         "release_resource_evidence_complete": all(coverage.values()),

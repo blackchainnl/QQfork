@@ -245,14 +245,15 @@ jobs:
           test -n "$cxxflags"
           chmod +x "$binary"
           "$binary" \
-            -filter='Quantum(Argon2id|MLDSA44).*' \
+            -filter='Quantum(Argon2id|MLDSA44|LargeBlock).*' \
             -min-time=250 \
             -output-json="$raw"
-          requirements=(--require-domain crypto)
+          requirements=(--require-domain crypto --require-domain large-block)
           if [[ "$RELEASE_MODE" == "true" ]]; then
-            # Production remains fail-closed until these dedicated benchmarks
-            # exist. Alpha/canary publication does not claim those domains.
-            requirements+=(--require-domain large-block --require-domain synthetic-state)
+            # Maximum-marker apply/undo evidence remains a production-only
+            # gate. Crypto and 32,000,000-weight validation are mandatory on
+            # every pull request and candidate.
+            requirements+=(--require-domain synthetic-state)
           fi
           python3 ci/release/generate_resource_benchmark_evidence.py \
             --nanobench-json "$raw" \
@@ -342,7 +343,7 @@ jobs:
           test -n "$cxx"
           test -n "$cxxflags"
           src/bench/bench_blackcoin \
-            -filter='Quantum(Argon2id|MLDSA44).*' \
+            -filter='Quantum(Argon2id|MLDSA44|LargeBlock).*' \
             -min-time=250 \
             -output-json="$raw"
           python3 ci/release/generate_resource_benchmark_evidence.py \
@@ -359,6 +360,7 @@ jobs:
             --minimum-runtime-ms 250 \
             --provenance-manifest contrib/devtools/quantum-crypto-provenance.json \
             --require-domain crypto \
+            --require-domain large-block \
             --output "$evidence"
 
       - name: Upload native resource evidence
