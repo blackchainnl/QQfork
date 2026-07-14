@@ -75,7 +75,6 @@ static constexpr uint32_t MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK = (V4_MAX_BLOCK_WEI
 // unbounded memory-hashing on every validating node. Honest blocks carry a single claim,
 // so capping the number of proof evaluations per block at a generous constant bounds the
 // worst-case validation cost (<= cap * 1 MiB) without affecting legitimate claims.
-static constexpr unsigned int MAX_SHADOW_POW_EVALS_PER_BLOCK = 64;
 static_assert(static_cast<CAmount>(MAX_SHADOW_POW_EVALS_PER_BLOCK - 1) * CENT <
               (463 * COIN) / 2,
               "Gold Rush POW pool must exceed all capped loser reimbursements");

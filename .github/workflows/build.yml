@@ -972,6 +972,13 @@ jobs:
           path: gate-evidence/quantum-crypto
           name: quantum-crypto-provenance-${{ needs.resolve-target.outputs.target_sha }}
 
+      - name: Download exact-SHA resource benchmark evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: gate-evidence/resource-benchmarks
+          pattern: quantum-resource-benchmarks-*-${{ needs.resolve-target.outputs.target_sha }}
+          merge-multiple: true
+
       - name: Install release packaging tools
         run: |
           sudo apt-get update
@@ -1024,6 +1031,17 @@ jobs:
             "dist/Blackcoin-$VERSION-quantum-crypto-provenance.json"
           cp contrib/devtools/quantum-crypto-provenance.json \
             "dist/Blackcoin-$VERSION-quantum-crypto-manifest.json"
+          mapfile -t resource_evidence < <(
+            find gate-evidence/resource-benchmarks -maxdepth 1 -type f \
+              -name 'quantum-resource-*-evidence.json' -print | sort
+          )
+          mapfile -t resource_raw < <(
+            find gate-evidence/resource-benchmarks -maxdepth 1 -type f \
+              -name 'quantum-resource-*-nanobench.json' -print | sort
+          )
+          test "${#resource_evidence[@]}" -eq 3
+          test "${#resource_raw[@]}" -eq 3
+          cp "${resource_evidence[@]}" "${resource_raw[@]}" dist/
           printf '%s\n' "$TARGET_SHA" > dist/SOURCE_COMMIT.txt
           gpg --batch --armor --export "$RELEASE_GPG_FINGERPRINT" > \
             "dist/Blackcoin-$VERSION-RELEASE-KEY.asc"

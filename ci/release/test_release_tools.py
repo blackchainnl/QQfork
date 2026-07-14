@@ -48,6 +48,97 @@ def load_path(name, path):
 
 
 class ReleaseToolTests(unittest.TestCase):
+    def test_resource_benchmark_evidence_is_source_bound_and_fail_closed(self):
+        generator = load_module("generate_resource_benchmark_evidence")
+
+        def result(name, unit, median):
+            return {
+                "name": name,
+                "unit": unit,
+                "batch": 1,
+                "epochs": 11,
+                "median(elapsed)": median,
+                "medianAbsolutePercentError(elapsed)": 0.01,
+                "totalTime": median * 11,
+            }
+
+        document = {
+            "results": [
+                result("QuantumArgon2id1MiB", "op", 0.00025),
+                result("QuantumArgon2id64ClaimBlock", "block", 0.016),
+                result("QuantumMLDSA44Verify", "op", 0.00005),
+                result("QuantumMLDSA44MaxWeightBlock", "block", 0.41075),
+            ]
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            raw = root / "nanobench.json"
+            binary = root / "bench_blackcoin"
+            raw.write_text(json.dumps(document), encoding="utf-8")
+            binary.write_bytes(b"exact-benchmark-binary")
+            evidence = generator.generate_evidence(
+                nanobench_json=raw,
+                binary=binary,
+                source_sha=SOURCE_SHA,
+                platform="linux",
+                architecture="x86_64",
+                toolchain="GCC 11.4.0",
+                required_domains={"crypto"},
+            )
+            self.assertTrue(evidence["coverage"]["crypto"])
+            self.assertFalse(evidence["coverage"]["large-block"])
+            self.assertFalse(evidence["coverage"]["synthetic-state"])
+            self.assertFalse(evidence["release_resource_evidence_complete"])
+            argon_bound = evidence["derived_upper_bounds"]["shadow_pow_argon2_block"]
+            mldsa_bound = evidence["derived_upper_bounds"]["quantum_mldsa_block"]
+            self.assertEqual(
+                argon_bound["maximum_evaluations"], 64
+            )
+            self.assertEqual(
+                mldsa_bound["maximum_verifications"], 8215
+            )
+            with self.assertRaisesRegex(RuntimeError, "large-block"):
+                generator.generate_evidence(
+                    nanobench_json=raw,
+                    binary=binary,
+                    source_sha=SOURCE_SHA,
+                    platform="linux",
+                    architecture="x86_64",
+                    toolchain="GCC 11.4.0",
+                    required_domains={"crypto", "large-block"},
+                )
+
+            document["results"].append(document["results"][0])
+            raw.write_text(json.dumps(document), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "duplicate nanobench result"):
+                generator.parse_measurements(raw)
+
+    def test_resource_benchmark_workflow_measures_and_does_not_overclaim(self):
+        root = TOOLS.parent.parent
+        gate = (root / ".github" / "workflows" / "pr-gate.yml").read_text(
+            encoding="utf-8"
+        )
+        release = (root / ".github" / "workflows" / "build.yml").read_text(
+            encoding="utf-8"
+        )
+        benchmark_source = (root / "src" / "bench" / "quantum_crypto.cpp").read_text(
+            encoding="utf-8"
+        )
+        for benchmark in (
+            "QuantumArgon2id1MiB",
+            "QuantumArgon2id64ClaimBlock",
+            "QuantumMLDSA44Verify",
+            "QuantumMLDSA44MaxWeightBlock",
+        ):
+            with self.subTest(benchmark=benchmark):
+                self.assertIn(f"BENCHMARK({benchmark}", benchmark_source)
+        self.assertIn("resource-benchmarks-linux:", gate)
+        self.assertIn("--require-domain large-block", gate)
+        self.assertIn("--require-domain synthetic-state", gate)
+        self.assertIn("quantum-resource-benchmarks-macos-", gate)
+        self.assertIn("pattern: quantum-resource-benchmarks-*", release)
+        self.assertIn("test \"${#resource_evidence[@]}\" -eq 3", release)
+
     def test_quantum_crypto_provenance_is_mandatory_and_retained(self):
         root = TOOLS.parent.parent
         workflow = (root / ".github" / "workflows" / "pr-gate.yml").read_text(

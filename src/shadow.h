@@ -189,6 +189,7 @@ static constexpr unsigned int SHADOW_EQUAL_FOOTING_TIME = 1713938400;
 static constexpr CAmount SHADOW_WHITELIST_MIN_BALANCE = 10000 * COIN;
 static constexpr int SHADOW_SOLVER_ACTIVITY_SECONDS = 14 * 24 * 60 * 60;
 static constexpr int SHADOW_SOLVER_ACTIVITY_WINDOW = SHADOW_SOLVER_ACTIVITY_SECONDS / 64;
+static constexpr unsigned int MAX_SHADOW_POW_EVALS_PER_BLOCK = 64;
 
 /** Exact total value in the deterministic 180-day Gold Rush schedule.
  *  Direct payouts are bounded per block by ShadowBaseReward() and the coinstake
