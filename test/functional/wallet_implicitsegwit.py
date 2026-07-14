@@ -9,6 +9,7 @@
 
 import test_framework.address as address
 from test_framework.test_framework import BitcoinTestFramework
+from test_framework.util import assert_equal
 
 # TODO: Might be nice to test p2pk here too
 address_types = ('legacy', 'bech32', 'p2sh-segwit')
@@ -29,7 +30,9 @@ def send_a_to_b(receive_node, send_node):
         keys[a] = pubkey
         for b in address_types:
             b_address = key_to_address(pubkey, b)
-            send_node.sendtoaddress(address=b_address, amount=1)
+            txid = send_node.sendtoaddress(address=b_address, amount=1)
+            raw_tx = send_node.gettransaction(txid)["hex"]
+            assert_equal(receive_node.sendrawtransaction(raw_tx), txid)
     return keys
 
 def check_implicit_transactions(implicit_keys, implicit_node):
