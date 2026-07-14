@@ -4,11 +4,13 @@
 
 #include <index/shadowindex.h>
 
+#include <addresstype.h>
 #include <chain.h>
 #include <chainparams.h>
 #include <coins.h>
 #include <common/args.h>
 #include <consensus/demurrage.h>
+#include <consensus/quantum_witness.h>
 #include <hash.h>
 #include <interfaces/chain.h>
 #include <logging.h>
@@ -36,12 +38,20 @@ static constexpr uint8_t DB_QUANTUM_WITNESS_OUTPUT{'w'};
 static constexpr uint8_t DB_QUANTUM_WITNESS_BLOCK{'W'};
 static constexpr uint8_t DB_POW_CLAIM{'c'};
 static constexpr uint8_t DB_CUSTOM_TIP{'T'};
-// Schema 6 adds explicit wrong/unknown QQSPROOF mode dispositions. Rebuild
-// prerelease schema-5 data so restart and reindex cannot disagree about those
-// reasons. Historical numeric meanings remain unchanged, and the index is
-// auxiliary and fully reconstructible from active-chain block data.
-static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{6};
+// Schema 5 invalidated prerelease records built with the superseded claim
+// activation boundary. Schema 6 is reserved for the additive proof-mode
+// accounting update. Schema 7 persists ordered shadow-spend anchors for bounded
+// event construction. The index is auxiliary and fully reconstructible, so a
+// recognized older schema is wiped and rebuilt instead of being interpreted.
+static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{7};
 static constexpr size_t MAX_SCRIPT_QUERY_RESULTS{1000};
+static constexpr size_t DIRECT_QUANTUM_SCRIPT_SIZE{2 + QUANTUM_MIGRATION_PROGRAM_SIZE};
+
+bool IsBoundedShadowEventScript(const CScript& script)
+{
+    return script.size() == DIRECT_QUANTUM_SCRIPT_SIZE &&
+        IsQuantumMigrationScript(script);
+}
 
 uint256 ShadowScriptHash(const CScript& script)
 {
@@ -322,11 +332,17 @@ ShadowIndex::ShadowIndex(std::unique_ptr<interfaces::Chain> chain, size_t cache_
             "Unsupported newer shadowindex schema %u (maximum supported %u)",
             stored_version, SHADOW_INDEX_SCHEMA_VERSION));
     }
+    const bool mock_obsolete_schema = has_version &&
+        Params().GetChainType() == ChainType::REGTEST &&
+        gArgs.GetBoolArg("-shadowindexmockobsoleteschema", false);
+    const uint32_t compatibility_version = mock_obsolete_schema
+        ? SHADOW_INDEX_SCHEMA_VERSION - 1 : stored_version;
     const bool populated_unversioned_index = !has_version && !m_db->IsEmpty();
-    const bool obsolete_version = has_version && stored_version < SHADOW_INDEX_SCHEMA_VERSION;
+    const bool obsolete_version = has_version &&
+        compatibility_version < SHADOW_INDEX_SCHEMA_VERSION;
     if (!wipe && (populated_unversioned_index || obsolete_version)) {
         LogPrintf("ShadowIndex: rebuilding incompatible schema %s as version %u\n",
-                  populated_unversioned_index ? "without a version" : strprintf("version %u", stored_version),
+                  populated_unversioned_index ? "without a version" : strprintf("version %u", compatibility_version),
                   SHADOW_INDEX_SCHEMA_VERSION);
         m_db.reset();
         m_db = std::make_unique<ShadowIndex::DB>(cache_size, memory, /*wipe=*/true);
@@ -359,6 +375,11 @@ bool ShadowIndex::BuildBlockEvent(const CBlock& block, const CBlockIndex* pindex
     result.block_hash = pindex->GetBlockHash();
     result.previous_block_hash = pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{};
     result.block_time = indexed.block_time;
+    if (indexed.payout_txids.size() > MAX_SHADOW_EVENT_RECORDS ||
+        indexed.spent_outpoints.size() >
+            MAX_SHADOW_EVENT_RECORDS - indexed.payout_txids.size()) {
+        return false;
+    }
     result.credits.reserve(indexed.payout_txids.size());
     for (size_t claim_index = 0; claim_index < indexed.payout_txids.size(); ++claim_index) {
         ShadowIndexRecord record;
@@ -367,44 +388,62 @@ bool ShadowIndex::BuildBlockEvent(const CBlock& block, const CBlockIndex* pindex
             record.outpoint.hash != txid ||
             record.origin_height != static_cast<uint32_t>(pindex->nHeight) ||
             record.origin_block_hash != pindex->GetBlockHash() ||
-            record.claim_index != claim_index) {
+            record.claim_index != claim_index ||
+            !IsBoundedShadowEventScript(record.script_pub_key)) {
             return false;
         }
         result.credits.push_back(std::move(record));
     }
 
-    for (uint32_t tx_index = 0; tx_index < block.vtx.size(); ++tx_index) {
-        const CTransaction& tx = *block.vtx[tx_index];
-        for (uint32_t input_index = 0; input_index < tx.vin.size(); ++input_index) {
-            const COutPoint& prevout = tx.vin[input_index].prevout;
-            ShadowIndexRecord record;
-            if (!m_db->Read(DBSpentOutpointKey{prevout}, record)) {
-                if (m_db->Exists(DBSpentOutpointKey{prevout})) return false;
-                continue;
-            }
-            if (!record.spent || record.outpoint != prevout ||
-                record.spend_height != static_cast<uint32_t>(pindex->nHeight) ||
-                record.spend_block_hash != pindex->GetBlockHash() ||
-                record.spending_txid != tx.GetHash() ||
-                record.spend_tx_index != tx_index ||
-                record.spend_input_index != input_index) {
-                return false;
-            }
-            result.spends.push_back(std::move(record));
+    result.spends.reserve(indexed.spent_outpoints.size());
+    for (const COutPoint& prevout : indexed.spent_outpoints) {
+        ShadowIndexRecord record;
+        if (!m_db->Read(DBSpentOutpointKey{prevout}, record)) return false;
+        if (record.spend_tx_index >= block.vtx.size()) return false;
+        const CTransaction& spending_tx = *block.vtx[record.spend_tx_index];
+        if (record.spend_input_index >= spending_tx.vin.size() ||
+            spending_tx.vin[record.spend_input_index].prevout != prevout ||
+            !record.spent || record.outpoint != prevout ||
+            record.spend_height != static_cast<uint32_t>(pindex->nHeight) ||
+            record.spend_block_hash != pindex->GetBlockHash() ||
+            record.spending_txid != spending_tx.GetHash() ||
+            !IsBoundedShadowEventScript(record.script_pub_key)) {
+            return false;
         }
+        result.spends.push_back(std::move(record));
     }
 
     event = std::move(result);
     return true;
 }
 
+bool ShadowIndex::IndexMatchesActiveTip(const IndexSummary& summary) const
+{
+    LOCK(cs_main);
+    const CBlockIndex* active_tip = m_chainstate ? m_chainstate->m_chain.Tip() : nullptr;
+    return active_tip && summary.synced &&
+        summary.best_block_height == active_tip->nHeight &&
+        summary.best_block_hash == active_tip->GetBlockHash();
+}
+
 void ShadowIndex::BlockConnected(ChainstateRole role,
                                  const std::shared_ptr<const CBlock>& block,
                                  const CBlockIndex* pindex)
 {
+    const IndexSummary before = GetSummary();
+    const bool direct_transition = role == ChainstateRole::NORMAL && pindex && pindex->pprev &&
+        before.synced && before.best_block_height == pindex->pprev->nHeight &&
+        before.best_block_hash == pindex->pprev->GetBlockHash();
+    if (m_event_callback && role == ChainstateRole::NORMAL && pindex && !direct_transition) {
+        if (!m_event_stream_suppressed) {
+            LogPrintf("ShadowIndex: suppressing shadow events while reconciling a non-sequential connect at %s\n",
+                      pindex->GetBlockHash().ToString());
+        }
+        m_event_stream_suppressed = true;
+    }
+
     BaseIndex::BlockConnected(role, block, pindex);
-    if (!m_event_callback || role != ChainstateRole::NORMAL || !pindex ||
-        pindex->nHeight < SHADOW_REWARD_START_HEIGHT) {
+    if (role != ChainstateRole::NORMAL || !pindex) {
         return;
     }
 
@@ -413,6 +452,16 @@ void ShadowIndex::BlockConnected(ChainstateRole role,
         summary.best_block_hash != pindex->GetBlockHash()) {
         return;
     }
+    m_revision.fetch_add(1, std::memory_order_release);
+    if (m_event_stream_suppressed) {
+        if (IndexMatchesActiveTip(summary)) {
+            m_event_stream_suppressed = false;
+            LogPrintf("ShadowIndex: shadow event stream reconciled at %s; future live deltas will be published\n",
+                      pindex->GetBlockHash().ToString());
+        }
+        return;
+    }
+    if (!m_event_callback || pindex->nHeight < SHADOW_REWARD_START_HEIGHT) return;
 
     ShadowIndexBlockEvent event;
     if (!BuildBlockEvent(*block, pindex, event)) {
@@ -427,27 +476,44 @@ void ShadowIndex::BlockDisconnected(const std::shared_ptr<const CBlock>& block,
                                     const CBlockIndex* pindex)
 {
     std::optional<ShadowIndexBlockEvent> event;
-    if (m_event_callback && pindex && pindex->nHeight >= SHADOW_REWARD_START_HEIGHT) {
-        const IndexSummary before = GetSummary();
-        if (before.synced && before.best_block_height == pindex->nHeight &&
-            before.best_block_hash == pindex->GetBlockHash()) {
-            ShadowIndexBlockEvent candidate;
-            if (BuildBlockEvent(*block, pindex, candidate)) {
-                event = std::move(candidate);
-            } else {
-                LogPrintf("ShadowIndex: unable to construct disconnected event for %s; subscribers must reconcile by RPC\n",
-                          pindex->GetBlockHash().ToString());
-            }
+    const IndexSummary before = GetSummary();
+    const bool direct_transition = pindex && before.synced &&
+        before.best_block_height == pindex->nHeight &&
+        before.best_block_hash == pindex->GetBlockHash();
+    if (m_event_callback && pindex && !direct_transition) {
+        if (!m_event_stream_suppressed) {
+            LogPrintf("ShadowIndex: suppressing shadow events while reconciling a non-sequential disconnect at %s\n",
+                      pindex->GetBlockHash().ToString());
+        }
+        m_event_stream_suppressed = true;
+    }
+    if (m_event_callback && !m_event_stream_suppressed && direct_transition &&
+        pindex->nHeight >= SHADOW_REWARD_START_HEIGHT) {
+        ShadowIndexBlockEvent candidate;
+        if (BuildBlockEvent(*block, pindex, candidate)) {
+            event = std::move(candidate);
+        } else {
+            LogPrintf("ShadowIndex: unable to construct disconnected event for %s; subscribers must reconcile by RPC\n",
+                      pindex->GetBlockHash().ToString());
         }
     }
 
     BaseIndex::BlockDisconnected(block, pindex);
-    if (!event || !pindex || !pindex->pprev) return;
+    if (!pindex || !pindex->pprev) return;
 
     const IndexSummary after = GetSummary();
     if (after.synced && after.best_block_height == pindex->pprev->nHeight &&
         after.best_block_hash == pindex->pprev->GetBlockHash()) {
-        m_event_callback(/*connected=*/false, *event);
+        m_revision.fetch_add(1, std::memory_order_release);
+        if (m_event_stream_suppressed) {
+            if (IndexMatchesActiveTip(after)) {
+                m_event_stream_suppressed = false;
+                LogPrintf("ShadowIndex: shadow event stream reconciled at %s; future live deltas will be published\n",
+                          pindex->pprev->GetBlockHash().ToString());
+            }
+            return;
+        }
+        if (event) m_event_callback(/*connected=*/false, *event);
     }
 }
 
@@ -851,6 +917,7 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
             record.spend_input_index = input_index;
             record.effective_amount_at_spend = evaluation.effective_value;
             record.decayed_amount_at_spend = evaluation.burned_value;
+            block_record.spent_outpoints.push_back(prevout);
             changed_records[prevout.hash] = record;
             batch.Write(DBTransactionKey{prevout.hash}, record);
             batch.Write(DBSpentOutpointKey{prevout}, record);

@@ -7,6 +7,7 @@
 #include <chain.h>
 #include <chainparams.h>
 #include <coins.h>
+#include <common/args.h>
 #include <consensus/demurrage.h>
 #include <consensus/params.h>
 #include <core_io.h>
@@ -20,8 +21,10 @@
 #include <shadow.h>
 #include <univalue.h>
 #include <validation.h>
+#include <util/time.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -129,6 +132,68 @@ void EnsureShadowIndexReady()
     }
 }
 
+struct ShadowRPCSnapshot {
+    const CBlockIndex* tip{nullptr};
+    int height{-1};
+    uint256 hash;
+    uint64_t index_revision{0};
+};
+
+ShadowRPCSnapshot CaptureShadowRPCSnapshot(ChainstateManager& chainman)
+{
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        const uint64_t revision_before = g_shadow_index->GetRevision();
+        const IndexSummary index = g_shadow_index->GetSummary();
+        const CBlockIndex* tip = WITH_LOCK(cs_main, return chainman.ActiveChain().Tip());
+        const uint64_t revision_after = g_shadow_index->GetRevision();
+        if (tip && revision_before == revision_after && index.synced &&
+            index.best_block_height == tip->nHeight &&
+            index.best_block_hash == tip->GetBlockHash()) {
+            return ShadowRPCSnapshot{
+                tip, tip->nHeight, tip->GetBlockHash(), revision_after};
+        }
+        if (!g_shadow_index->BlockUntilSyncedToCurrentChain()) break;
+    }
+    throw JSONRPCError(
+        RPC_MISC_ERROR,
+        "Shadow index and active chain changed while starting the snapshot; retry the request");
+}
+
+void EnsureShadowRPCSnapshotUnchanged(ChainstateManager& chainman,
+                                      const ShadowRPCSnapshot& snapshot)
+{
+    const uint64_t revision_before = g_shadow_index->GetRevision();
+    const IndexSummary index = g_shadow_index->GetSummary();
+    bool active_tip_matches{false};
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip = chainman.ActiveChain().Tip();
+        active_tip_matches = tip && tip->nHeight == snapshot.height &&
+            tip->GetBlockHash() == snapshot.hash;
+    }
+    const uint64_t revision_after = g_shadow_index->GetRevision();
+    if (revision_before != snapshot.index_revision ||
+        revision_after != snapshot.index_revision || !active_tip_matches ||
+        !index.synced || index.best_block_height != snapshot.height ||
+        index.best_block_hash != snapshot.hash) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "Shadow index or active chain changed during the snapshot; retry the request");
+    }
+}
+
+void MaybeDelayShadowRPCSnapshot(const char* rpc_name,
+                                 const ShadowRPCSnapshot& snapshot)
+{
+    if (Params().GetChainType() != ChainType::REGTEST) return;
+    const int64_t delay_ms = std::clamp<int64_t>(
+        gArgs.GetIntArg("-shadowrpcsnapshotdelaymillis", 0), 0, 10000);
+    if (delay_ms == 0) return;
+    LogPrintf("Shadow RPC snapshot race barrier reached: rpc=%s height=%d hash=%s\n",
+              rpc_name, snapshot.height, snapshot.hash.GetHex());
+    UninterruptibleSleep(std::chrono::milliseconds{delay_ms});
+}
+
 const CBlockIndex* ParseActiveBlock(const UniValue& value, ChainstateManager& chainman)
 {
     LOCK(cs_main);
@@ -182,25 +247,47 @@ bool AddShadowAmount(CAmount& total, CAmount amount)
     return true;
 }
 
+bool AddShadowCount(uint64_t& total, uint64_t count)
+{
+    if (total > std::numeric_limits<uint64_t>::max() - count) return false;
+    total += count;
+    return true;
+}
+
+bool SumShadowAmountsEquals(CAmount first, CAmount second, CAmount expected)
+{
+    CAmount total{0};
+    return AddShadowAmount(total, first) &&
+        AddShadowAmount(total, second) && total == expected;
+}
+
 CAmount ScheduledShadowAmountThrough(int last_height)
 {
+    if (SHADOW_REWARD_START_HEIGHT < 0 ||
+        SHADOW_REWARD_END_HEIGHT < SHADOW_REWARD_START_HEIGHT ||
+        SHADOW_PHASE1_END_HEIGHT < SHADOW_REWARD_START_HEIGHT ||
+        SHADOW_HALVING_INTERVAL_BLOCKS < 1) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Configured shadow reward schedule is invalid");
+    }
+
     CAmount total{0};
     const int end = std::min(last_height, SHADOW_REWARD_END_HEIGHT);
     int height = SHADOW_REWARD_START_HEIGHT;
     const int phase_one_end = std::min(end, SHADOW_PHASE1_END_HEIGHT);
     while (height <= phase_one_end) {
-        const int halvings = (height - SHADOW_REWARD_START_HEIGHT) /
-            std::max(1, SHADOW_HALVING_INTERVAL_BLOCKS);
+        const int64_t halvings =
+            (static_cast<int64_t>(height) - SHADOW_REWARD_START_HEIGHT) /
+            SHADOW_HALVING_INTERVAL_BLOCKS;
         const CAmount reward = halvings >= std::numeric_limits<CAmount>::digits
             ? 0 : (580 * COIN) >> halvings;
         const int64_t next_boundary = std::min<int64_t>(
             static_cast<int64_t>(phase_one_end) + 1,
             static_cast<int64_t>(SHADOW_REWARD_START_HEIGHT) +
-                static_cast<int64_t>(halvings + 1) *
-                    std::max(1, SHADOW_HALVING_INTERVAL_BLOCKS));
+                (halvings + 1) * SHADOW_HALVING_INTERVAL_BLOCKS);
         const int64_t block_count = next_boundary - height;
         if (reward < 0 || block_count < 1 ||
             block_count > MAX_MONEY / std::max<CAmount>(reward, 1) ||
+            next_boundary > std::numeric_limits<int>::max() ||
             !AddShadowAmount(total, reward * block_count)) {
             throw JSONRPCError(RPC_INTERNAL_ERROR, "Configured shadow reward schedule is out of range");
         }
@@ -421,13 +508,14 @@ RPCHelpMan getshadowblock()
 
             EnsureShadowIndexReady();
             ChainstateManager& chainman = EnsureAnyChainman(request.context);
+            const ShadowRPCSnapshot snapshot = CaptureShadowRPCSnapshot(chainman);
             const CBlockIndex* pindex = ParseActiveBlock(request.params[0], chainman);
-            const CBlockIndex* tip = WITH_LOCK(cs_main, return chainman.ActiveChain().Tip());
-            if (!tip) throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Chain is not initialized");
+            const CBlockIndex* tip = snapshot.tip;
 
             ShadowIndexBlockRecord indexed;
             if (pindex->nHeight >= SHADOW_REWARD_START_HEIGHT) {
                 if (!g_shadow_index->LookupBlock(pindex->GetBlockHash(), indexed)) {
+                    EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                     throw JSONRPCError(RPC_INTERNAL_ERROR, "Block is not available in the synchronized shadowindex");
                 }
             } else {
@@ -442,6 +530,7 @@ RPCHelpMan getshadowblock()
             for (const uint256& txid : indexed.payout_txids) {
                 ShadowIndexRecord record;
                 if (!g_shadow_index->LookupTransaction(txid, record)) {
+                    EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                     throw JSONRPCError(RPC_INTERNAL_ERROR, "Shadow block references a missing synthetic transaction");
                 }
                 CAmount& mode_total = record.proof_of_work ? pow_total : pos_total;
@@ -463,6 +552,7 @@ RPCHelpMan getshadowblock()
             for (size_t i = begin; i < end; ++i) {
                 ShadowIndexRecord record;
                 if (!g_shadow_index->LookupTransaction(indexed.payout_txids[i], record)) {
+                    EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                     throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read synthetic transaction from shadowindex");
                 }
                 UniValue item = ShadowRecordToJSON(record, *tip, chainman.GetConsensus());
@@ -477,6 +567,7 @@ RPCHelpMan getshadowblock()
                     pindex->GetBlockHash(), static_cast<size_t>(claim_offset),
                     static_cast<size_t>(claim_count), indexed_claims,
                     next_claim_offset)) {
+                EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                 throw JSONRPCError(RPC_INTERNAL_ERROR,
                                    "Unable to read POW claim accounting from shadowindex");
             }
@@ -531,6 +622,7 @@ RPCHelpMan getshadowblock()
             result.pushKV("observed_signal_txids", std::move(observed_pos));
             result.pushKV("units", AmountUnits());
             result.pushKV("payouts", std::move(payouts));
+            EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
             return result;
         },
     };
@@ -551,24 +643,24 @@ RPCHelpMan getshadowtransaction()
         [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
             EnsureShadowIndexReady();
             const uint256 txid = ParseHashV(request.params[0], "synthetic_txid");
+            ChainstateManager& chainman = EnsureAnyChainman(request.context);
+            const ShadowRPCSnapshot snapshot = CaptureShadowRPCSnapshot(chainman);
             ShadowIndexRecord record;
             if (!g_shadow_index->LookupTransaction(txid, record)) {
+                EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                 throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Synthetic shadow transaction not found");
             }
-            ChainstateManager& chainman = EnsureAnyChainman(request.context);
-            const CBlockIndex* tip{nullptr};
-            {
-                LOCK(cs_main);
-                tip = chainman.ActiveChain().Tip();
-                const CBlockIndex* origin = tip ? tip->GetAncestor(record.origin_height) : nullptr;
-                if (!origin || origin->GetBlockHash() != record.origin_block_hash) {
-                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Synthetic transaction is not on the active chain");
-                }
+            const CBlockIndex* tip = snapshot.tip;
+            const CBlockIndex* origin = tip->GetAncestor(record.origin_height);
+            if (!origin || origin->GetBlockHash() != record.origin_block_hash) {
+                EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Synthetic transaction is not on the active chain");
             }
             UniValue result = ShadowRecordToJSON(record, *tip, chainman.GetConsensus());
             result.pushKV("schema", "blackcoin.shadow.transaction.v1");
             result.pushKV("confirmations", tip->nHeight - static_cast<int>(record.origin_height) + 1);
             result.pushKV("units", AmountUnits());
+            EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
             return result;
         },
     };
@@ -623,19 +715,22 @@ RPCHelpMan getshadowaddress()
 
             EnsureShadowIndexReady();
             ChainstateManager& chainman = EnsureAnyChainman(request.context);
-            const CBlockIndex* tip = WITH_LOCK(cs_main, return chainman.ActiveChain().Tip());
-            if (!tip) throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Chain is not initialized");
+            const ShadowRPCSnapshot snapshot = CaptureShadowRPCSnapshot(chainman);
+            MaybeDelayShadowRPCSnapshot("getshadowaddress", snapshot);
+            const CBlockIndex* tip = snapshot.tip;
 
             std::vector<ShadowIndexRecord> indexed;
             std::optional<ShadowIndexScriptCursor> next;
             if (!g_shadow_index->LookupScript(GetScriptForDestination(destination), after,
                                               static_cast<size_t>(count), indexed, next)) {
+                EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                 throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read shadow address history");
             }
             UniValue records(UniValue::VARR);
             for (const ShadowIndexRecord& record : indexed) {
                 const CBlockIndex* origin = tip->GetAncestor(record.origin_height);
                 if (!origin || origin->GetBlockHash() != record.origin_block_hash) {
+                    EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                     throw JSONRPCError(RPC_MISC_ERROR,
                                        "Shadow index changed during address lookup; retry the request");
                 }
@@ -658,6 +753,7 @@ RPCHelpMan getshadowaddress()
             result.pushKV("next_cursor", std::move(next_cursor));
             result.pushKV("units", AmountUnits());
             result.pushKV("records", std::move(records));
+            EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
             return result;
         },
     };
@@ -715,19 +811,22 @@ RPCHelpMan getshadowscript()
 
             EnsureShadowIndexReady();
             ChainstateManager& chainman = EnsureAnyChainman(request.context);
-            const CBlockIndex* tip = WITH_LOCK(cs_main, return chainman.ActiveChain().Tip());
-            if (!tip) throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Chain is not initialized");
+            const ShadowRPCSnapshot snapshot = CaptureShadowRPCSnapshot(chainman);
+            MaybeDelayShadowRPCSnapshot("getshadowscript", snapshot);
+            const CBlockIndex* tip = snapshot.tip;
 
             std::vector<ShadowIndexRecord> indexed;
             std::optional<ShadowIndexScriptCursor> next;
             if (!g_shadow_index->LookupScript(script_pub_key, after,
                                               static_cast<size_t>(count), indexed, next)) {
+                EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                 throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read shadow script history");
             }
             UniValue records(UniValue::VARR);
             for (const ShadowIndexRecord& record : indexed) {
                 const CBlockIndex* origin = tip->GetAncestor(record.origin_height);
                 if (!origin || origin->GetBlockHash() != record.origin_block_hash) {
+                    EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                     throw JSONRPCError(RPC_MISC_ERROR,
                                        "Shadow index changed during script lookup; retry the request");
                 }
@@ -754,6 +853,7 @@ RPCHelpMan getshadowscript()
             result.pushKV("merkle_included", false);
             result.pushKV("units", AmountUnits());
             result.pushKV("records", std::move(records));
+            EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
             return result;
         },
     };
@@ -784,37 +884,41 @@ RPCHelpMan getshadowoutpoint()
             const COutPoint outpoint{txid, static_cast<uint32_t>(vout)};
 
             EnsureShadowIndexReady();
+            ChainstateManager& chainman = EnsureAnyChainman(request.context);
+            const ShadowRPCSnapshot snapshot = CaptureShadowRPCSnapshot(chainman);
+            MaybeDelayShadowRPCSnapshot("getshadowoutpoint", snapshot);
             ShadowIndexRecord record;
             const bool spent_index_match = g_shadow_index->LookupSpentOutpoint(outpoint, record);
             if (!spent_index_match) {
                 if (!g_shadow_index->LookupTransaction(txid, record) || record.outpoint != outpoint) {
+                    EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                     throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
                                        "Synthetic shadow outpoint not found");
                 }
             } else if (record.outpoint != outpoint || !record.spent) {
+                EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                 throw JSONRPCError(RPC_INTERNAL_ERROR,
                                    "Spent shadow outpoint index is inconsistent");
             }
 
-            ChainstateManager& chainman = EnsureAnyChainman(request.context);
-            const CBlockIndex* tip{nullptr};
-            {
-                LOCK(cs_main);
-                tip = chainman.ActiveChain().Tip();
-                const CBlockIndex* origin = tip ? tip->GetAncestor(record.origin_height) : nullptr;
-                if (!origin || origin->GetBlockHash() != record.origin_block_hash) {
-                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
-                                       "Synthetic outpoint is not on the active chain");
-                }
+            const CBlockIndex* tip = snapshot.tip;
+            const CBlockIndex* origin = tip->GetAncestor(record.origin_height);
+            if (!origin || origin->GetBlockHash() != record.origin_block_hash) {
+                EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
+                throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                   "Synthetic outpoint is not on the active chain");
             }
 
             UniValue result = ShadowRecordToJSON(record, *tip, chainman.GetConsensus());
             result.pushKV("schema", "blackcoin.shadow.outpoint.v1");
             result.pushKV("lookup_index", spent_index_match
                 ? "spent_outpoint" : "synthetic_transaction");
+            result.pushKV("height", tip->nHeight);
+            result.pushKV("bestblock", tip->GetBlockHash().GetHex());
             result.pushKV("confirmations",
                           tip->nHeight - static_cast<int>(record.origin_height) + 1);
             result.pushKV("units", AmountUnits());
+            EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
             return result;
         },
     };
@@ -1197,24 +1301,46 @@ RPCHelpMan getshadowsupply()
 
             EnsureShadowIndexReady();
             ChainstateManager& chainman = EnsureAnyChainman(request.context);
-            const CBlockIndex* tip{nullptr};
+            const ShadowRPCSnapshot snapshot = CaptureShadowRPCSnapshot(chainman);
+            MaybeDelayShadowRPCSnapshot("getshadowsupply", snapshot);
+            const CBlockIndex* tip = snapshot.tip;
             ShadowGoldRushInfo pool;
             {
                 LOCK(cs_main);
-                tip = chainman.ActiveChain().Tip();
-                if (tip) {
-                    pool = GetShadowGoldRushInfo(chainman.ActiveChainstate().CoinsTip(), tip);
+                const CBlockIndex* active_tip = chainman.ActiveChain().Tip();
+                if (!active_tip || active_tip->nHeight != snapshot.height ||
+                    active_tip->GetBlockHash() != snapshot.hash) {
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        "Active chain changed while reading shadow reward state; retry the request");
                 }
+                pool = GetShadowGoldRushInfo(chainman.ActiveChainstate().CoinsTip(), tip);
             }
-            if (!tip) throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Chain is not initialized");
 
             ShadowIndexSupply supply;
             if (tip->nHeight >= SHADOW_REWARD_START_HEIGHT &&
                 !g_shadow_index->LookupSupply(tip->GetBlockHash(), supply)) {
+                EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                 throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read current shadow supply from shadowindex");
+            }
+            if (!MoneyRange(supply.issued_nominal) ||
+                !MoneyRange(supply.spent_nominal) ||
+                !MoneyRange(supply.spent_effective) ||
+                !MoneyRange(supply.spent_decayed) ||
+                supply.spent_count > supply.issued_count ||
+                supply.spent_nominal > supply.issued_nominal ||
+                !SumShadowAmountsEquals(supply.spent_effective,
+                                        supply.spent_decayed,
+                                        supply.spent_nominal)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                   "Indexed shadow supply is internally inconsistent");
             }
             const CAmount unspent_nominal = supply.issued_nominal - supply.spent_nominal;
             const uint64_t unspent_count = supply.issued_count - supply.spent_count;
+            if (tip->nHeight == std::numeric_limits<int>::max()) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                   "Active chain height cannot be evaluated safely");
+            }
             const int evaluation_height = tip->nHeight + 1;
             const int64_t evaluation_mtp = tip->GetMedianTimePast();
             const Consensus::Params& consensus = chainman.GetConsensus();
@@ -1253,7 +1379,9 @@ RPCHelpMan getshadowsupply()
             CAmount decayed_unspent{0};
             ShadowLifecycleSupply lifecycle;
             const bool all_payouts_mature =
-                evaluation_height >= SHADOW_REWARD_END_HEIGHT + consensus.nCoinbaseMaturity;
+                static_cast<int64_t>(evaluation_height) >=
+                static_cast<int64_t>(SHADOW_REWARD_END_HEIGHT) +
+                    consensus.nCoinbaseMaturity;
             const bool lifecycle_scan_required = quantum_spends_active &&
                 (demurrage_active || !all_payouts_mature);
             if (!quantum_spends_active) {
@@ -1285,12 +1413,17 @@ RPCHelpMan getshadowsupply()
                         const Consensus::DemurrageEvaluation evaluation = Consensus::EvaluateDemurrage(
                             coin, consensus, evaluation_height, evaluation_mtp,
                             latest_height, coverage_start);
-                        if (!AddShadowAmount(scanned_effective, evaluation.effective_value) ||
+                        if (!MoneyRange(record.nominal_amount) ||
+                            !SumShadowAmountsEquals(evaluation.effective_value,
+                                                    evaluation.burned_value,
+                                                    record.nominal_amount) ||
+                            !AddShadowAmount(scanned_effective, evaluation.effective_value) ||
                             !AddShadowAmount(scanned_decayed, evaluation.burned_value)) {
                             return false;
                         }
-                        const bool mature = evaluation_height >=
-                            static_cast<int>(record.origin_height) + consensus.nCoinbaseMaturity;
+                        const bool mature = static_cast<int64_t>(evaluation_height) >=
+                            static_cast<int64_t>(record.origin_height) +
+                                consensus.nCoinbaseMaturity;
                         uint64_t& count = mature && !evaluation.locked
                             ? lifecycle.spendable_count : lifecycle.locked_count;
                         CAmount& nominal = mature && !evaluation.locked
@@ -1310,12 +1443,25 @@ RPCHelpMan getshadowsupply()
                     throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to scan shadowindex valuation records");
                 }
                 lifecycle_exact = complete;
-                if (complete &&
-                    (lifecycle.locked_count + lifecycle.spendable_count != unspent_count ||
-                     lifecycle.locked_nominal + lifecycle.spendable_nominal != unspent_nominal ||
-                     scanned_effective + scanned_decayed != unspent_nominal)) {
-                    throw JSONRPCError(RPC_INTERNAL_ERROR,
-                                       "Shadow lifecycle buckets do not reconcile with indexed supply");
+                if (complete) {
+                    uint64_t classified_count{0};
+                    CAmount classified_nominal{0};
+                    CAmount classified_effective{0};
+                    if (!AddShadowCount(classified_count, lifecycle.locked_count) ||
+                        !AddShadowCount(classified_count, lifecycle.spendable_count) ||
+                        !AddShadowAmount(classified_nominal, lifecycle.locked_nominal) ||
+                        !AddShadowAmount(classified_nominal, lifecycle.spendable_nominal) ||
+                        !AddShadowAmount(classified_effective, lifecycle.locked_effective) ||
+                        !AddShadowAmount(classified_effective, lifecycle.spendable_effective) ||
+                        classified_count != unspent_count ||
+                        classified_nominal != unspent_nominal ||
+                        classified_effective != scanned_effective ||
+                        !SumShadowAmountsEquals(scanned_effective,
+                                                scanned_decayed,
+                                                unspent_nominal)) {
+                        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                           "Shadow lifecycle buckets do not reconcile with indexed supply");
+                    }
                 }
                 if (demurrage_active) {
                     effective_exact = complete;
@@ -1418,6 +1564,7 @@ RPCHelpMan getshadowsupply()
             result.pushKV("decay_paid_as_fee", false);
             result.pushKV("decay_redistributed", false);
             result.pushKV("units", AmountUnits());
+            EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
             return result;
         },
     };

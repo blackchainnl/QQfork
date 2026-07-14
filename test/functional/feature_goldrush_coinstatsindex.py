@@ -14,11 +14,13 @@ reconcile every observed credit against getshadowsupply.
 """
 
 from decimal import Decimal
+from threading import Thread
 import time
 
+from test_framework.authproxy import JSONRPCException
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal, assert_raises_rpc_error
+from test_framework.util import assert_equal, assert_raises_rpc_error, get_rpc_proxy
 
 
 GOLD_RUSH_END_TIME = 2_000_000_000
@@ -215,6 +217,46 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
             [{"public_key": key["public_key"], "private_key": key["private_key"]}],
         )
 
+    def _assert_shadow_snapshot_aba_retry(self, rpc_name, rpc_args, claim_block_hash, parent_hash):
+        """Force an equal-tip ABA reorg after snapshot capture and require retry."""
+        node = self.nodes[1]
+        barrier = f"Shadow RPC snapshot race barrier reached: rpc={rpc_name}"
+        log_offset = node.debug_log_size(encoding="utf-8")
+        outcome = []
+
+        def call_rpc():
+            rpc = get_rpc_proxy(node.url, 100, timeout=15, coveragedir=node.coverage_dir)
+            try:
+                outcome.append(("result", getattr(rpc, rpc_name)(*rpc_args)))
+            except JSONRPCException as error:
+                outcome.append(("error", error.error))
+            except Exception as error:
+                outcome.append(("exception", str(error)))
+
+        caller = Thread(target=call_rpc, name=f"{rpc_name}-aba-race", daemon=True)
+        caller.start()
+
+        def barrier_reached():
+            with open(node.debug_log_path, encoding="utf-8", errors="replace") as debug_log:
+                debug_log.seek(log_offset)
+                return barrier in debug_log.read()
+
+        self.wait_until(barrier_reached, timeout=10)
+        node.invalidateblock(claim_block_hash)
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(node.getbestblockhash(), parent_hash)
+        node.reconsiderblock(claim_block_hash)
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(node.getbestblockhash(), claim_block_hash)
+
+        caller.join(timeout=15)
+        assert not caller.is_alive(), f"{rpc_name} did not leave the forced snapshot race"
+        assert_equal(len(outcome), 1)
+        assert_equal(outcome[0][0], "error")
+        assert_equal(outcome[0][1]["code"], -1)
+        assert "changed" in outcome[0][1]["message"].lower()
+        assert "retry" in outcome[0][1]["message"].lower()
+
     def run_test(self):
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
 
@@ -346,6 +388,33 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         assert_equal(payout_inventory["current_utxos"]["excluded_synthetic_shadow"]["count"], 1)
         assert_equal(payout_inventory["history"]["created"]["count"], 0)
 
+        self.log.info("Rejecting equal-tip ABA reorgs across shadow supply, script, and outpoint snapshots")
+        race_args = self.extra_args[1] + [
+            "-shadowrpcsnapshotdelaymillis=1500",
+            f"-mocktime={self.mock_time}",
+        ]
+        self.restart_node(1, extra_args=race_args)
+        self.connect_nodes(0, 1)
+        self.sync_blocks()
+        self._wait_index_synced()
+        for rpc_name, rpc_args in (
+            ("getshadowsupply", []),
+            ("getshadowscript", [payout_script]),
+            ("getshadowoutpoint", [payout_utxo["txid"], payout_utxo["vout"]]),
+        ):
+            self._assert_shadow_snapshot_aba_retry(
+                rpc_name, rpc_args, claim_block_hash, parent_hash
+            )
+
+        self.restart_node(
+            1,
+            extra_args=self.extra_args[1] + [f"-mocktime={self.mock_time}"],
+        )
+        self.connect_nodes(0, 1)
+        self.sync_blocks()
+        self._wait_index_synced()
+        assert_equal(self.nodes[1].getbestblockhash(), claim_block_hash)
+
         self.log.info("Invalidating the claim block on the index node rewinds indexed shadow payouts")
         self.nodes[1].invalidateblock(claim_block_hash)
         self.wait_until(lambda: self.nodes[1].getbestblockhash() == parent_hash, timeout=30)
@@ -473,12 +542,20 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
 
         self.log.info("Restarting and rebuilding coinstatsindex preserves synthetic payout spend state")
         final_stats = self._live_stats(self.nodes[1])
-        for restart_args in (
-            self.extra_args[1],
-            self.extra_args[1] + ["-reindex"],
-            self.extra_args[1] + ["-reindex-chainstate"],
+        for restart_args, expected_shadow_log in (
+            (self.extra_args[1], None),
+            (self.extra_args[1] + ["-reindex"], None),
+            (self.extra_args[1] + ["-reindex-chainstate"], None),
+            (
+                self.extra_args[1] + ["-shadowindexmockobsoleteschema=1"],
+                "ShadowIndex: rebuilding incompatible schema version 6 as version 7",
+            ),
         ):
-            self.restart_node(1, extra_args=restart_args + [f"-mocktime={self.mock_time}"])
+            if expected_shadow_log:
+                with self.nodes[1].assert_debug_log([expected_shadow_log], timeout=60):
+                    self.restart_node(1, extra_args=restart_args + [f"-mocktime={self.mock_time}"])
+            else:
+                self.restart_node(1, extra_args=restart_args + [f"-mocktime={self.mock_time}"])
             self.nodes[1].setmocktime(self.mock_time)
             self.connect_nodes(0, 1)
             self.sync_blocks()

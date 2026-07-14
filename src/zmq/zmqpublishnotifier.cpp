@@ -61,15 +61,20 @@ namespace {
 
 const char* ShadowPowDispositionName(ShadowPowClaimDisposition disposition)
 {
-    switch (disposition) {
-    case ShadowPowClaimDisposition::INVALID_LOCATION: return "invalid_location";
-    case ShadowPowClaimDisposition::MALFORMED_TRANSACTION: return "malformed_transaction";
-    case ShadowPowClaimDisposition::INVALID_PROOF: return "invalid_proof";
-    case ShadowPowClaimDisposition::INPUT_MISMATCH: return "input_mismatch";
-    case ShadowPowClaimDisposition::INVALID_BASE_FEE: return "invalid_base_fee";
-    case ShadowPowClaimDisposition::EVALUATION_LIMIT: return "evaluation_limit";
-    case ShadowPowClaimDisposition::WINNER: return "winner";
-    case ShadowPowClaimDisposition::REIMBURSED_LOSER: return "reimbursed_loser";
+    switch (static_cast<uint8_t>(disposition)) {
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::INVALID_LOCATION): return "invalid_location";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::MALFORMED_TRANSACTION): return "malformed_transaction";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::INVALID_PROOF): return "invalid_proof";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::INPUT_MISMATCH): return "input_mismatch";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::INVALID_BASE_FEE): return "invalid_base_fee";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::EVALUATION_LIMIT): return "evaluation_limit";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::WINNER): return "winner";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::REIMBURSED_LOSER): return "reimbursed_loser";
+    // Persisted disposition values added by the proof-mode accounting update.
+    // Keep their wire names stable when this transport commit is applied
+    // before or after that additive enum change.
+    case 8: return "wrong_mode_pos";
+    case 9: return "unknown_mode";
     }
     return "unknown";
 }
@@ -433,6 +438,12 @@ bool CZMQPublishShadowNotifier::NotifyShadowBlock(bool connected,
     payload.pushKV("spends", std::move(spends));
 
     const std::string body = payload.write();
+    if (body.size() > MAX_SHADOW_EVENT_JSON_BYTES) {
+        LogPrintf("Shadow ZMQ event for %s exceeds the %u-byte transport bound; subscribers must reconcile by RPC\n",
+                  event.block_hash.GetHex(),
+                  static_cast<unsigned int>(MAX_SHADOW_EVENT_JSON_BYTES));
+        return true;
+    }
     LogPrint(BCLog::ZMQ,
              "Publish shadow %s height=%d block=%s credits=%u spends=%u to %s\n",
              connected ? "connect" : "disconnect", event.height,

@@ -13,6 +13,7 @@
 #include <shadow.h>
 #include <uint256.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -22,6 +23,9 @@
 #include <vector>
 
 static constexpr bool DEFAULT_SHADOWINDEX{false};
+/** Hard transport bounds; oversized deltas remain queryable through shadow RPCs. */
+static constexpr size_t MAX_SHADOW_EVENT_RECORDS{4096};
+static constexpr size_t MAX_SHADOW_EVENT_JSON_BYTES{16 * 1024 * 1024};
 
 /** Stable source provenance for one canonically classified QQSPROOF note. */
 struct ShadowIndexPowClaimSource {
@@ -165,6 +169,7 @@ struct ShadowIndexBlockRecord {
     uint32_t block_time{0};
     int64_t median_time_past{0};
     std::vector<uint256> payout_txids;
+    std::vector<COutPoint> spent_outpoints;
     std::vector<uint256> observed_pow_claim_txids;
     std::vector<uint256> observed_signal_txids;
     ShadowIndexPowClaimSummary pow_claims;
@@ -177,6 +182,7 @@ struct ShadowIndexBlockRecord {
         READWRITE(obj.block_time);
         READWRITE(obj.median_time_past);
         READWRITE(obj.payout_txids);
+        READWRITE(obj.spent_outpoints);
         READWRITE(obj.observed_pow_claim_txids);
         READWRITE(obj.observed_signal_txids);
         READWRITE(obj.pow_claims);
@@ -242,9 +248,12 @@ protected:
 private:
     std::unique_ptr<DB> m_db;
     ShadowIndexEventCallback m_event_callback;
+    std::atomic<uint64_t> m_revision{0};
+    bool m_event_stream_suppressed{false};
 
     bool BuildBlockEvent(const CBlock& block, const CBlockIndex* pindex,
                          ShadowIndexBlockEvent& event) const;
+    bool IndexMatchesActiveTip(const IndexSummary& summary) const;
 
 protected:
     void BlockConnected(ChainstateRole role, const std::shared_ptr<const CBlock>& block,
@@ -262,6 +271,9 @@ public:
                          bool memory = false, bool wipe = false,
                          ShadowIndexEventCallback event_callback = {});
     ~ShadowIndex() override;
+
+    /** Monotonic live-index generation used to reject cross-reorg RPC reads. */
+    uint64_t GetRevision() const { return m_revision.load(std::memory_order_acquire); }
 
     bool LookupBlock(const uint256& block_hash, ShadowIndexBlockRecord& record) const;
     bool LookupTransaction(const uint256& synthetic_txid, ShadowIndexRecord& record) const;
