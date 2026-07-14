@@ -373,7 +373,11 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         for node in self.nodes:
             node.setmocktime(late_time)
         self.nodes[REFERENCE].reconsiderblock(block.hash)
-        assert_equal(self.nodes[REFERENCE].submitblock(raw_block), None)
+        # reconsiderblock clears the cached failure and immediately runs
+        # ActivateBestChain.  The recovered block must therefore already be
+        # the reference tip; resubmitting it would correctly report a
+        # duplicate and would test RPC bookkeeping rather than validity.
+        assert_equal(self.nodes[REFERENCE].getbestblockhash(), block.hash)
         self.connect_nodes(CANDIDATE, REFERENCE)
         self.sync_blocks(self.normative_nodes, timeout=120)
         self.assert_normative_tip()
