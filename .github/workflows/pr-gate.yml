@@ -399,6 +399,7 @@ jobs:
             feature_goldrush_pow_miner_e2e.py \
             feature_goldrush_pow_claim_singleflight.py \
             feature_goldrush_pos_signal.py \
+            feature_goldrush_pos_multiwallet_stress.py \
             feature_goldrush_pos_single_utxo.py \
             feature_goldrush_pos_unrestricted.py \
             feature_goldrush_value_path.py \
@@ -525,6 +526,7 @@ jobs:
               feature_goldrush_shadow_replay.py
               feature_goldrush_pow_claim_singleflight.py
               feature_goldrush_pos_signal.py
+              feature_goldrush_pos_multiwallet_stress.py
               feature_goldrush_pos_signal_recovery.py
               wallet_pos_multiwallet_staking.py
               feature_quantum_lifecycle.py
@@ -535,6 +537,7 @@ jobs:
             functional_tests: >-
               feature_goldrush_pow_claim_singleflight.py
               feature_goldrush_pos_signal.py
+              feature_goldrush_pos_multiwallet_stress.py
               feature_goldrush_pos_signal_recovery.py
               wallet_pos_multiwallet_staking.py
               feature_shutdown.py

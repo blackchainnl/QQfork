@@ -1860,11 +1860,16 @@ bool CWallet::AbandonTransaction(const uint256& hashTx, bool automatic_shadow_st
         return false;
     }
 
-    // Persist provenance so a reorg may reopen only claims abandoned by the
-    // automatic stale-proof path. A manual abandon explicitly clears it and
-    // must never be reversed behind the user's back.
+    // Persist provenance so only an automatic Gold Rush cleanup may later
+    // reopen its exact claim or signal record. A manual abandon explicitly
+    // clears it and must never be reversed behind the user's back.
     bool provenance_changed{false};
-    if (automatic_shadow_stale && TransactionHasShadowProof(*origtx.tx)) {
+    const auto shadow_comment = origtx.mapValue.find("comment");
+    const bool automatic_shadow_signal =
+        TransactionHasShadowSignal(*origtx.tx) &&
+        shadow_comment != origtx.mapValue.end() && shadow_comment->second == "PoS Claim";
+    if (automatic_shadow_stale &&
+        (TransactionHasShadowProof(*origtx.tx) || automatic_shadow_signal)) {
         provenance_changed = origtx.mapValue[AUTO_SHADOW_STALE_KEY] != "1";
         origtx.mapValue[AUTO_SHADOW_STALE_KEY] = "1";
         provenance_changed = origtx.mapValue.erase(MANUAL_SHADOW_ABANDON_KEY) != 0 || provenance_changed;
@@ -3780,6 +3785,13 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
         Params().IsTestChain() && TransactionHasShadowProof(*tx) &&
         comment != mapValue.end() && comment->second == "PoW Claim" &&
         gArgs.GetBoolArg("-qqshadowpowbroadcastthrow", false);
+    const bool inject_shadow_signal_broadcast_exception =
+        Params().IsTestChain() && TransactionHasShadowSignal(*tx) &&
+        comment != mapValue.end() && comment->second == "PoS Claim" &&
+        gArgs.GetArg("-qqshadowsignalbroadcastthrowwallet", "") == GetName();
+    const bool automatic_shadow_signal_commit =
+        TransactionHasShadowSignal(*tx) && comment != mapValue.end() &&
+        comment->second == "PoS Claim";
 
     // Reject phase-ineligible quantum outputs before AddToWallet reserves
     // inputs or persists a transaction. Raw/PSBT construction remains
@@ -3794,9 +3806,43 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
         LOCK(cs_wallet);
         WalletLogPrintf("CommitTransaction:\n%s", tx->ToString()); // NOLINT(bitcoin-unterminated-logprintf)
 
+        bool reopen_automatic_shadow_signal{false};
+        if (automatic_shadow_signal_commit) {
+            const auto existing = mapWallet.find(tx->GetHash());
+            if (existing != mapWallet.end()) {
+                const auto automatic_provenance = existing->second.mapValue.find(AUTO_SHADOW_STALE_KEY);
+                const auto manual_provenance = existing->second.mapValue.find(MANUAL_SHADOW_ABANDON_KEY);
+                reopen_automatic_shadow_signal =
+                    existing->second.isAbandoned() &&
+                    automatic_provenance != existing->second.mapValue.end() &&
+                    automatic_provenance->second == "1" &&
+                    (manual_provenance == existing->second.mapValue.end() || manual_provenance->second != "1");
+                if (!reopen_automatic_shadow_signal) {
+                    if (broadcast_error) {
+                        *broadcast_error = manual_provenance != existing->second.mapValue.end() &&
+                                manual_provenance->second == "1"
+                            ? "manually abandoned Gold Rush PoS signal will not be reopened"
+                            : "transaction already exists in wallet";
+                    }
+                    return false;
+                }
+            }
+        }
+
         // Add tx to wallet, because if it has change it's also ours,
         // otherwise just for transaction history.
         CWalletTx* wtx = AddToWallet(tx, TxStateInactive{}, [&](CWalletTx& wtx, bool new_tx) {
+            if (!new_tx && reopen_automatic_shadow_signal) {
+                // An exceptional automatic broadcast can persist and then
+                // abandon a QQSIGNAL before time advances. Rebuilding it may
+                // produce the identical txid. Reopen that exact audit record
+                // only when its persisted automatic-cleanup provenance proves
+                // that this is not a user's explicit abandon request.
+                wtx.m_state = TxStateInactive{};
+                wtx.mapValue.erase(AUTO_SHADOW_STALE_KEY);
+                wtx.mapValue.erase(REORG_SHADOW_RESUBMIT_KEY);
+                return true;
+            }
             CHECK_NONFATAL(wtx.mapValue.empty());
             CHECK_NONFATAL(wtx.vOrderForm.empty());
             wtx.mapValue = std::move(mapValue);
@@ -3831,6 +3877,10 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
     if (inject_shadow_pow_broadcast_exception) {
         WalletLogPrintf("Injecting Gold Rush PoW broadcast exception for %s\n", tx->GetHash().ToString());
         throw std::runtime_error("injected Gold Rush PoW broadcast exception");
+    }
+    if (inject_shadow_signal_broadcast_exception) {
+        WalletLogPrintf("Injecting Gold Rush PoS signal broadcast exception for %s\n", tx->GetHash().ToString());
+        throw std::runtime_error("injected Gold Rush PoS signal broadcast exception");
     }
 
     std::string err_string;

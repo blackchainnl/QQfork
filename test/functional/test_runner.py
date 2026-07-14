@@ -157,6 +157,7 @@ BASE_SCRIPTS = [
     'feature_goldrush_pow_miner_e2e.py',
     'feature_goldrush_pow_claim_singleflight.py',
     'feature_goldrush_pos_signal.py',
+    'feature_goldrush_pos_multiwallet_stress.py',
     'feature_goldrush_pos_signal_recovery.py',
     'feature_goldrush_pos_single_utxo.py',
     'feature_goldrush_pos_unrestricted.py',

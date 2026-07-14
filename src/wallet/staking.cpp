@@ -1553,6 +1553,21 @@ int MaybeAutoShadowSignal(CWallet& wallet)
     AutoShadowSignalAttemptGuard attempt(wallet);
     if (!attempt || wallet.IsStakeClosing()) return 0;
 
+    if (Params().IsTestChain()) {
+        const int64_t delay_ms = std::clamp<int64_t>(
+            gArgs.GetIntArg("-qqshadowsignalsubmissiondelaymillis", 0), 0, 10000);
+        if (delay_ms > 0) {
+            wallet.WalletLogPrintf("Gold Rush PoS auto-signal test barrier reached; delaying %dms\n", delay_ms);
+            const auto deadline = SteadyClock::now() + std::chrono::milliseconds{delay_ms};
+            while (SteadyClock::now() < deadline) {
+                if (wallet.IsStakeClosing()) return 0;
+                std::this_thread::sleep_for(std::min(
+                    std::chrono::milliseconds{25},
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - SteadyClock::now())));
+            }
+        }
+    }
+
     std::string pending_retry_reason;
     const PendingShadowSignalState pending_state = ReconcilePendingShadowSignals(wallet, pending_retry_reason);
     if (pending_state == PendingShadowSignalState::LIVE) {
@@ -1645,7 +1660,10 @@ int MaybeAutoShadowSignal(CWallet& wallet)
         std::string broadcast_error;
         if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error)) {
             wallet.WalletLogPrintf("Broadcasting Gold Rush PoS signal failed: %s\n", broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error);
-            if (!wallet.AbandonTransaction(tx->GetHash())) {
+            // This is automatic cleanup, not a user abandon request. Avoid
+            // recording manual provenance so an identical safe retry may
+            // reopen the persisted transaction after a restart.
+            if (!wallet.AbandonTransaction(tx->GetHash(), /*automatic_shadow_stale=*/true)) {
                 wallet.WalletLogPrintf("Gold Rush PoS signal could not be abandoned after broadcast failure: txid=%s\n", tx->GetHash().ToString());
             }
             ScheduleAutoShadowSignalRetry(wallet, candidate.scan_height,
@@ -1655,7 +1673,7 @@ int MaybeAutoShadowSignal(CWallet& wallet)
     } catch (const std::exception& e) {
         wallet.WalletLogPrintf("Broadcasting Gold Rush PoS signal failed: %s\n", e.what());
         const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
-        if (added_to_wallet && !wallet.AbandonTransaction(tx->GetHash())) {
+        if (added_to_wallet && !wallet.AbandonTransaction(tx->GetHash(), /*automatic_shadow_stale=*/true)) {
             wallet.WalletLogPrintf("Gold Rush PoS signal could not be abandoned after broadcast exception: txid=%s\n",
                                    tx->GetHash().ToString());
         }

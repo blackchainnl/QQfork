@@ -66,6 +66,8 @@ void DummyWalletInit::AddWalletOptions(ArgsManager& argsman) const
         "-qqshadowsignalmaxretryfailures=<n>",
         "-qqshadowsignalretrybasemillis=<n>",
         "-qqshadowsignalcleanupdelaymillis=<n>",
+        "-qqshadowsignalsubmissiondelaymillis=<n>",
+        "-qqshadowsignalbroadcastthrowwallet=<name>",
         "-minstakingamount=<amt>",
         "-reservebalance=<amt>",
         "-donatetodevfund=<n>",

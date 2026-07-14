@@ -74,6 +74,151 @@ BOOST_AUTO_TEST_CASE(abandon_unknown_transaction_is_safe)
     BOOST_CHECK(!wallet.AbandonTransaction(uint256::ONE));
 }
 
+BOOST_AUTO_TEST_CASE(automatic_shadow_signal_retry_preserves_audit_record_and_manual_abandon)
+{
+    CWallet wallet(m_node.chain.get(), "signal-retry", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(wallet.LoadWallet(), DBErrors::LOAD_OK);
+    wallet.SetBroadcastTransactions(/*broadcast=*/false);
+
+    CScript quantum_payout_script;
+    {
+        LOCK(wallet.cs_wallet);
+        auto destination = wallet.GetNewQuantumDestination("signal-retry");
+        BOOST_REQUIRE(destination);
+        quantum_payout_script = GetScriptForDestination(*destination);
+    }
+
+    CKey legacy_key;
+    legacy_key.MakeNewKey(/*fCompressed=*/true);
+    const CScript legacy_target = GetScriptForRawPubKey(legacy_key.GetPubKey());
+    std::vector<unsigned char> signal_payload;
+    BOOST_REQUIRE(BuildShadowSignalData(
+        legacy_target, quantum_payout_script, /*solve_height=*/1, uint256::ONE, signal_payload));
+
+    auto add_funding = [&](uint64_t seed) {
+        CMutableTransaction funding;
+        funding.vin.emplace_back(COutPoint{uint256{static_cast<uint8_t>(seed)}, 0});
+        funding.vout.emplace_back(2 * COIN, legacy_target);
+        CTransactionRef ref = MakeTransactionRef(std::move(funding));
+        BOOST_REQUIRE(wallet.AddToWallet(ref, TxStateInactive{}));
+        return ref;
+    };
+    auto make_spend = [&](const CTransactionRef& funding, bool shadow_signal) {
+        CMutableTransaction spend;
+        spend.vin.emplace_back(COutPoint{funding->GetHash(), 0});
+        spend.vout.emplace_back(COIN, legacy_target);
+        if (shadow_signal) {
+            spend.vout.emplace_back(0, CScript{} << OP_RETURN << signal_payload);
+        }
+        return MakeTransactionRef(std::move(spend));
+    };
+
+    const CTransactionRef automatic_signal = make_spend(add_funding(/*seed=*/101), /*shadow_signal=*/true);
+    const mapValue_t audit_metadata{{"comment", "PoS Claim"}, {"retry-audit", "preserve-me"}};
+    const std::vector<std::pair<std::string, std::string>> audit_order{{"source", "automatic"}};
+    BOOST_REQUIRE(wallet.CommitTransaction(automatic_signal, audit_metadata, audit_order));
+    const CTransactionRef signal_descendant = make_spend(automatic_signal, /*shadow_signal=*/false);
+    const mapValue_t descendant_metadata{{"comment", "signal change descendant"}};
+    BOOST_REQUIRE(wallet.CommitTransaction(signal_descendant, descendant_metadata, {}));
+    BOOST_REQUIRE(wallet.AbandonTransaction(automatic_signal->GetHash(), /*automatic_shadow_stale=*/true));
+
+    int64_t original_order_pos{-1};
+    size_t original_wallet_size{0};
+    {
+        LOCK(wallet.cs_wallet);
+        const CWalletTx& stored = wallet.mapWallet.at(automatic_signal->GetHash());
+        BOOST_REQUIRE(stored.isAbandoned());
+        BOOST_CHECK_EQUAL(stored.mapValue.at("qq_auto_shadow_stale"), "1");
+        BOOST_CHECK(stored.mapValue.count("qq_manual_shadow_abandon") == 0);
+        BOOST_CHECK_EQUAL(stored.mapValue.at("comment"), "PoS Claim");
+        BOOST_CHECK_EQUAL(stored.mapValue.at("retry-audit"), "preserve-me");
+        BOOST_CHECK(stored.vOrderForm == audit_order);
+        const CWalletTx& descendant = wallet.mapWallet.at(signal_descendant->GetHash());
+        BOOST_CHECK(descendant.isAbandoned());
+        BOOST_CHECK(descendant.mapValue.count("qq_auto_shadow_stale") == 0);
+        BOOST_CHECK(descendant.mapValue.count("qq_manual_shadow_abandon") == 0);
+        original_order_pos = stored.nOrderPos;
+        original_wallet_size = wallet.mapWallet.size();
+    }
+
+    // Prove that the automatic provenance and audit metadata survive disk
+    // serialization before exercising the same-txid retry path.
+    CWallet reloaded(m_node.chain.get(), "signal-retry", DuplicateMockDatabase(wallet.GetDatabase()));
+    BOOST_REQUIRE_EQUAL(reloaded.LoadWallet(), DBErrors::LOAD_OK);
+    reloaded.SetBroadcastTransactions(/*broadcast=*/false);
+    std::string broadcast_error;
+    BOOST_REQUIRE(reloaded.CommitTransaction(
+        automatic_signal, audit_metadata, audit_order, &broadcast_error));
+    BOOST_CHECK(broadcast_error.empty());
+    {
+        LOCK(reloaded.cs_wallet);
+        const CWalletTx& stored = reloaded.mapWallet.at(automatic_signal->GetHash());
+        BOOST_CHECK(!stored.isAbandoned());
+        BOOST_CHECK_EQUAL(stored.nOrderPos, original_order_pos);
+        BOOST_CHECK_EQUAL(reloaded.mapWallet.size(), original_wallet_size);
+        BOOST_CHECK_EQUAL(stored.mapValue.at("comment"), "PoS Claim");
+        BOOST_CHECK_EQUAL(stored.mapValue.at("retry-audit"), "preserve-me");
+        BOOST_CHECK(stored.mapValue.count("qq_auto_shadow_stale") == 0);
+        BOOST_CHECK(stored.mapValue.count("qq_manual_shadow_abandon") == 0);
+        BOOST_CHECK(stored.vOrderForm == audit_order);
+        const CWalletTx& descendant = reloaded.mapWallet.at(signal_descendant->GetHash());
+        BOOST_CHECK(descendant.isAbandoned());
+        BOOST_CHECK(descendant.mapValue.count("qq_auto_shadow_stale") == 0);
+        BOOST_CHECK(descendant.mapValue.count("qq_manual_shadow_abandon") == 0);
+    }
+
+    // Once the user explicitly abandons the record, neither an identical
+    // retry nor a later automatic cleanup request may reopen it.
+    BOOST_REQUIRE(reloaded.AbandonTransaction(automatic_signal->GetHash()));
+    broadcast_error.clear();
+    BOOST_CHECK(!reloaded.CommitTransaction(
+        automatic_signal, audit_metadata, audit_order, &broadcast_error));
+    BOOST_CHECK_EQUAL(broadcast_error, "manually abandoned Gold Rush PoS signal will not be reopened");
+    BOOST_CHECK(!reloaded.AbandonTransaction(
+        automatic_signal->GetHash(), /*automatic_shadow_stale=*/true));
+    {
+        LOCK(reloaded.cs_wallet);
+        const CWalletTx& stored = reloaded.mapWallet.at(automatic_signal->GetHash());
+        BOOST_REQUIRE(stored.isAbandoned());
+        BOOST_CHECK_EQUAL(stored.nOrderPos, original_order_pos);
+        BOOST_CHECK_EQUAL(stored.mapValue.at("comment"), "PoS Claim");
+        BOOST_CHECK_EQUAL(stored.mapValue.at("retry-audit"), "preserve-me");
+        BOOST_CHECK_EQUAL(stored.mapValue.at("qq_manual_shadow_abandon"), "1");
+        BOOST_CHECK(stored.mapValue.count("qq_auto_shadow_stale") == 0);
+        BOOST_CHECK(stored.vOrderForm == audit_order);
+    }
+
+    // A signal without the exact automatic comment cannot enter the reopen
+    // path, even if an internal caller requests automatic cleanup.
+    const CTransactionRef non_automatic_signal = make_spend(add_funding(/*seed=*/102), /*shadow_signal=*/true);
+    const mapValue_t non_automatic_metadata{{"comment", "manual signal"}};
+    BOOST_REQUIRE(wallet.CommitTransaction(non_automatic_signal, non_automatic_metadata, {}));
+    BOOST_REQUIRE(wallet.AbandonTransaction(non_automatic_signal->GetHash(), /*automatic_shadow_stale=*/true));
+    {
+        LOCK(wallet.cs_wallet);
+        const CWalletTx& stored = wallet.mapWallet.at(non_automatic_signal->GetHash());
+        BOOST_CHECK(stored.isAbandoned());
+        BOOST_CHECK_EQUAL(stored.mapValue.at("comment"), "manual signal");
+        BOOST_CHECK(stored.mapValue.count("qq_auto_shadow_stale") == 0);
+        BOOST_CHECK(stored.mapValue.count("qq_manual_shadow_abandon") == 0);
+    }
+
+    // A non-QQSIGNAL transaction cannot opt into the reopen path merely by
+    // carrying the internal automatic comment.
+    const CTransactionRef ordinary_spend = make_spend(add_funding(/*seed=*/103), /*shadow_signal=*/false);
+    const mapValue_t misleading_metadata{{"comment", "PoS Claim"}};
+    BOOST_REQUIRE(wallet.CommitTransaction(ordinary_spend, misleading_metadata, {}));
+    BOOST_REQUIRE(wallet.AbandonTransaction(ordinary_spend->GetHash(), /*automatic_shadow_stale=*/true));
+    {
+        LOCK(wallet.cs_wallet);
+        const CWalletTx& stored = wallet.mapWallet.at(ordinary_spend->GetHash());
+        BOOST_CHECK(stored.isAbandoned());
+        BOOST_CHECK_EQUAL(stored.mapValue.at("comment"), "PoS Claim");
+        BOOST_CHECK(stored.mapValue.count("qq_auto_shadow_stale") == 0);
+        BOOST_CHECK(stored.mapValue.count("qq_manual_shadow_abandon") == 0);
+    }
+}
+
 BOOST_AUTO_TEST_CASE(shadow_pow_claim_submission_guard_is_single_flight_and_exception_safe)
 {
     CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());

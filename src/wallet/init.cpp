@@ -104,6 +104,8 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-qqshadowsignalmaxretryfailures=<n>", "Regtest/testnet-only Gold Rush PoS signal retry ceiling (default: 6)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
     argsman.AddArg("-qqshadowsignalretrybasemillis=<n>", "Regtest/testnet-only Gold Rush PoS signal retry base delay in milliseconds (default: 1000)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
     argsman.AddArg("-qqshadowsignalcleanupdelaymillis=<n>", "Regtest/testnet-only cleanup race-test barrier delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqshadowsignalsubmissiondelaymillis=<n>", "Regtest/testnet-only automatic QQSIGNAL single-flight race-test delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqshadowsignalbroadcastthrowwallet=<name>", "Regtest/testnet-only wallet name whose automatic QQSIGNAL broadcast throws after wallet persistence", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
     argsman.AddArg("-qqshadowpowclaimsubmissiondelaymillis=<n>", "Regtest/testnet-only PoW claim single-flight race-test delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
     argsman.AddArg("-qqshadowpowbroadcastthrow=<true/false>", "Regtest/testnet-only injected QQSPROOF broadcast exception after wallet persistence (default: false)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
 
