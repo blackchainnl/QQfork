@@ -3580,7 +3580,7 @@ RPCHelpMan importeutxostate()
     return RPCHelpMan{"importeutxostate",
         "\nPersist inspection-only EUTXO datum/validator metadata for a wallet-known output.\n"
         "If the outpoint is currently unspent, the live UTXO must match the supplied EUTXO commitment.\n"
-        "This does not authorize or enable v15 funding or spending; both are disabled in v30.1.1.\n",
+        "This does not authorize or enable v15 funding or spending; both are disabled in v30.1.1 because v15 lacks quantum ownership authorization.\n",
         {
             {"state", RPCArg::Type::OBJ, RPCArg::Optional::NO, "EUTXO state metadata",
              {

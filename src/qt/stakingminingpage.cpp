@@ -418,6 +418,7 @@ void StakingMiningPage::setupUi()
         tr("Staking & Mining system guide"),
         tr("<h3>What this page controls</h3>"
            "<p>This page brings together the new V30 staking, Gold Rush, quantum migration, cold-staking, RGB, and EUTXO inspection surfaces. The dashboard shows the current state first. The tabs below contain actions.</p>"
+           "<p>Mainnet uses exact height boundaries: Gold Rush 5,950,000-6,192,999; the emission-neutral competing-claim rule from 5,993,200; Migration 6,193,000-6,921,999; and Final Lockout plus automatic demurrage from 6,922,000. Nominal time forecasts and readiness signalling do not move these boundaries.</p>"
            "<h3>The safe order</h3>"
            "<ol>"
            "<li><b>Keep legacy staking online</b> while Gold Rush runs. Legacy staking secures the base chain and can also produce PoS Gold Rush eligibility.</li>"
@@ -433,7 +434,7 @@ void StakingMiningPage::setupUi()
         tr("Wallet safety checklist"),
         tr("<h3>Before using new V30 features</h3>"
            "<ul>"
-           "<li>Back up the wallet after creating any new quantum address, node key, or delegation address.</li>"
+           "<li>Quantum keys are non-HD and are not derived from the wallet seed. Back up the wallet after creating any new quantum address, node key, or delegation address; an older backup cannot recover a later key.</li>"
            "<li>Use <b>Unlock wallet for LEGACY staking only</b> only when you want ordinary legacy staking and no spending or quantum operations.</li>"
            "<li>Use <b>Unlock wallet for Quantum and Legacy Staking</b> when you want Gold Rush PoS signals, PoW claim transactions, migration, cold-staking setup, or quantum spends.</li>"
            "<li>Gold Rush reward outputs cannot be spent during Gold Rush. After Gold Rush and maturity, they can be sent, staked, bonded, or delegated directly; consolidation is optional.</li>"
@@ -1143,7 +1144,7 @@ void StakingMiningPage::setupUi()
            "<h3>EUTXO states</h3>"
            "<p>EUTXO records persisted metadata for the reserved witness-v15 datum/validator commitment shape.</p>"
            "<h3>Current workflow status</h3>"
-           "<p>The wallet can display known RGB state and EUTXO metadata. EUTXO v15 is frozen in v30.1.1: funding and spending are disabled, creation RPCs intentionally fail, and this table is inspection-only. Do not send BLK to a v15 address. RGB consignment workflows remain advanced console operations until guided screens are built.</p>"
+           "<p>The wallet can display known RGB state and EUTXO metadata. EUTXO v15 is frozen in v30.1.1 because it lacks quantum ownership authorization: funding and spending are disabled, creation RPCs intentionally fail, and this table is inspection-only. Do not send BLK to a v15 address. RGB consignment workflows remain advanced console operations until guided screens are built.</p>"
            "<h3>Safe use</h3>"
            "<p>Use the tables for inspection. Do not assume an RGB asset transfer is complete until the corresponding wallet or RPC workflow reports it as accepted and confirmed.</p>"),
         migrationBox);

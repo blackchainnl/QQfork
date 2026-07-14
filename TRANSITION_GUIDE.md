@@ -11,6 +11,7 @@ upgrade boundary for v30.1.0 chainstate data.
 - The whitelist snapshot is fixed at height 5,945,000.
 - Legacy rules remain active through height 5,949,999.
 - Gold Rush is height 5,950,000 through 6,192,999, inclusive.
+- The emission-neutral competing-claim rule begins at height 5,993,200.
 - Quantum witness spends activate at Migration height 6,193,000.
 - Migration is height 6,193,000 through 6,921,999, inclusive.
 - Final lockout and automatic demurrage begin at height 6,922,000.

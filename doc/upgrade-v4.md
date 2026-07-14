@@ -13,7 +13,13 @@ review. It is not a public-network activation notice.
 
 ## Transition Timeline
 
-The V4 transition is designed to run in phases.
+Mainnet uses a height-authoritative schedule. Gold Rush is height 5,950,000
+through 6,192,999. The emission-neutral competing-claim rule begins at height
+5,993,200. Migration is height 6,193,000 through 6,921,999. Final Lockout and
+automatic demurrage begin at height 6,922,000. Nominal time anchors do not move
+these production boundaries.
+
+The V4 transition runs in phases.
 
 1. Activation and bridge period.
    Upgraded nodes follow the legacy chain and accept legacy-compatible blocks.
@@ -86,6 +92,11 @@ addresses. During Gold Rush, users may create and back up quantum addresses and
 use dry-run planning, but ordinary quantum funding and spending remain
 disabled. Users should move funds during Migration, from height 6,193,000
 through 6,921,999, before Final Lockout.
+
+ML-DSA quantum keys are non-HD and are not derived from the wallet seed. Back
+up the wallet after creating every quantum migration, staking, operator, or
+cold-stake address. A backup made before a quantum key was created cannot
+recover that key.
 
 The primary wallet flow is:
 

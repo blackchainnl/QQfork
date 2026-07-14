@@ -133,7 +133,8 @@ RPCHelpMan getnewquantumaddress()
 {
     return RPCHelpMan{"getnewquantumaddress",
                 "\nReturns a new wallet-backed Blackcoin ML-DSA migration address.\n"
-                "The ML-DSA private key is stored in the wallet database and included in wallet backups.\n",
+                "The ML-DSA private key is stored in the wallet database and included in wallet backups.\n"
+                "Quantum keys are non-HD and are not derived from the wallet seed. Back up the wallet after creating this address; an older backup cannot recover this later key.\n",
                 {
                     {"label", RPCArg::Type::STR, RPCArg::Default{""}, "The label name for the address to be linked to."},
                 },

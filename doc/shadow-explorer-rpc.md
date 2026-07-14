@@ -17,6 +17,15 @@ retains base-chain witness-version inventory history for
 the new RPCs return an explicit error rather than silently returning partial
 history.
 
+Mainnet lifecycle boundaries are height-authoritative. Gold Rush is height
+5,950,000 through 6,192,999; the emission-neutral competing-claim rule begins
+at height 5,993,200; Migration is height 6,193,000 through 6,921,999; and Final
+Lockout plus automatic demurrage begin at height 6,922,000. Witness-v15 EUTXO
+funding and spending remain frozen because v15 lacks quantum ownership
+authorization. Demurrage decay realized by a valid spend is permanently burned
+and is never paid to a miner, staker, treasury, shadow pool, or claim
+participant.
+
 Explorer processes that fetch raw blocks or transactions must set
 `rpcserialversion=1`. Blackcoin's legacy-compatible default is `0`, which
 omits witness data from raw RPC serialization even though the witness

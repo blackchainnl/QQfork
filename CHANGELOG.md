@@ -6,6 +6,10 @@
   5,950,000-6,192,999, Migration is 6,193,000-6,921,999, and Final Lockout
   begins at 6,922,000. During Gold Rush, quantum address generation and dry-run
   planning are available, but ordinary v14/v16 funding and spending are not.
+- The emission-neutral competing-claim reimbursement rule begins at height
+  5,993,200. Earlier Gold Rush blocks retain the v30.1.0 first-valid-claim
+  allocation; upgraded shadow-ledger consumers intentionally derive the new
+  canonical allocation only at and after that boundary.
 - Demurrage activates automatically with the first Final block. Any
   nominal-minus-effective principal realized by a valid spend is permanently
   burned; it is not paid to a miner, staker, treasury, shadow pool, or claim
@@ -15,6 +19,8 @@
   not authenticate a quantum owner. The creation RPCs intentionally fail.
   Decode/verify RPCs and persisted wallet metadata remain available only for
   inspection; users must not send BLK to v15 addresses.
+- ML-DSA quantum keys are non-HD and are not derived from the wallet seed. A
+  wallet backup must be newer than every quantum key it is expected to recover.
 
 ## v30.1.0, Quantum Quasar production release
 

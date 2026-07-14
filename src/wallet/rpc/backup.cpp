@@ -1965,6 +1965,7 @@ RPCHelpMan backupwallet()
     return RPCHelpMan{"backupwallet",
                 "\nSafely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n"
                 "Wallets with non-HD quantum keys are staged separately, reopened, and required to sign and verify a fresh challenge with every key before the verified copy is atomically installed.\n"
+                "Quantum keys are not derived from the wallet seed; an older backup cannot recover a key created later.\n"
                 "The wallet records that verification event, but cannot detect if the external backup file is later moved or deleted.\n"
                 "An encrypted wallet must be unlocked so this private-material check can run.\n",
                 {

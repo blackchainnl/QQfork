@@ -22,6 +22,9 @@ QString CommonGuide()
 </ul>
 <p>The wallet separates these balances because a user should not have to guess which spend path will be used. If a screen says <b>legacy</b>, it means old-style spend authority. If it says <b>quantum</b>, it means the upgraded ML-DSA path.</p>
 
+<h3>Mainnet schedule</h3>
+<p>Mainnet lifecycle boundaries are height-authoritative. Gold Rush is height 5,950,000 through 6,192,999. The emission-neutral competing-claim rule begins at height 5,993,200. Migration is height 6,193,000 through 6,921,999. Final Lockout and automatic demurrage begin at height 6,922,000. Nominal time forecasts and readiness signalling do not move these boundaries.</p>
+
 <h3>Why Gold Rush uses small legacy-chain control transactions</h3>
 <p>Gold Rush participation is visible on the legacy chain through small control transactions. A PoS signal uses a QQSIGNAL record. A PoW claim uses a QQSPROOF record. These are ordinary fee-paying transactions that old nodes can carry, while upgraded nodes understand the extra meaning and credit quantum rewards.</p>
 <p>Example: a PoW miner finds a valid Argon2id proof. The wallet spends a small legacy UTXO and includes the proof plus the quantum payout address. A staker includes that transaction in a block. Upgraded nodes then credit the quantum reward to the payout address. Legacy nodes simply see a normal transaction with data.</p>
@@ -35,7 +38,7 @@ QString CommonGuide()
 <p>For everyday testing, wait at least several confirmations before judging a staking, mining, migration, or cold-staking setup. A wallet can display a transaction before it is mature enough to be used again.</p>
 
 <h3>Backups matter more after quantum address creation</h3>
-<p>Every new quantum address, operator key, staking address, or delegation address is wallet-backed key material. Back up the wallet after creating those addresses. A backup from before a quantum key was created may not contain the key needed to spend funds sent there.</p>
+<p>Every new quantum address, operator key, staking address, or delegation address is wallet-backed non-HD key material and is not derived from the wallet seed. Back up the wallet after creating those addresses. A backup from before a quantum key was created cannot recover the key needed to spend funds sent there.</p>
 
 <h3>How to read transaction names</h3>
 <ul>

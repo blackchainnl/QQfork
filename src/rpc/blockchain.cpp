@@ -1049,7 +1049,8 @@ static RPCHelpMan getcirculatingsupply()
 {
     return RPCHelpMan{"getcirculatingsupply",
         "\nScans a consistent UTXO-set snapshot and returns the demurrage-adjusted supply spendable in the next block.\n"
-        "This is computed on demand and may take some time. It does not use or maintain an in-block accumulator.\n",
+        "This is computed on demand and may take some time. It does not use or maintain an in-block accumulator.\n"
+        "Demurrage decay realized by a spend is permanently burned; it is not a transaction fee and is never paid to a miner, staker, treasury, shadow pool, or claim participant.\n",
         {},
         RPCResult{
             RPCResult::Type::OBJ, "", "",

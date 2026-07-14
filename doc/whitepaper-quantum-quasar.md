@@ -76,8 +76,8 @@ pillars below all serve that goal.
 
 - **Liveness demurrage instead of dead weight.** After the migration era, quantum
   holdings that remain inactive for more than six months begin a slow, capped decay.
-  Decayed principal is burned when spent; it is never added to transaction fees or paid
-  to a miner or staker. The point is to ensure that keys are alive
+  Decayed principal is permanently burned when spent; it is never added to transaction fees
+  or paid to a miner or staker. The point is to ensure that keys are alive
   and that the security weight of the supply reflects who is actually present. For an
   eligible direct or tiered v16 holding, the wallet can attempt a low-fee liveness
   attestation when staking is enabled, the wallet is normally unlocked, and a safe fee
@@ -886,6 +886,7 @@ the competing-claim boundary shown below.
 | `MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT` | 5,993,200 | Canonical competing-claim allocation begins | `shadow.h` |
 | `SHADOW_GOLD_RUSH_BLOCKS` | 243,000 (180 days) | Gold Rush length | `shadow_schedule.cpp` |
 | `SHADOW_REWARD_END_HEIGHT` | 6,192,999 | Gold Rush rewards end | `shadow_schedule.cpp` |
+| `MAINNET_QUANTUM_MIGRATION_END_HEIGHT` | 6,921,999 | Last height-authoritative Migration block | `shadow.h` |
 | `MAINNET_QUANTUM_FINAL_START_HEIGHT` | 6,922,000 | Height-authoritative Final Lockout and automatic demurrage begin | `shadow.h` |
 | `SHADOW_PHASE1_END_HEIGHT` | 6,187,599 | Halving phase ends | `shadow_schedule.cpp` |
 | `SHADOW_HALVING_INTERVAL_BLOCKS` | 43,200 (≈30 days) | Reward-halving period | `shadow_schedule.cpp` |
