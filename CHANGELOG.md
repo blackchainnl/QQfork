@@ -21,6 +21,13 @@
   inspection; users must not send BLK to v15 addresses.
 - ML-DSA quantum keys are non-HD and are not derived from the wallet seed. A
   wallet backup must be newer than every quantum key it is expected to recover.
+- Blackcoin Qt now detects an existing datadir that requires the mandatory
+  authenticated chainstate rebuild before loading wallets. Its modal upgrade
+  assistant can run the one-shot rebuild and verified normal restart
+  automatically, or exit with platform-correct manual instructions. Staking,
+  PoW, and autonomous quantum actions remain forced off until the replacement
+  is reopened and verified; fresh and already-upgraded datadirs are not
+  prompted.
 
 ## v30.1.0, Quantum Quasar production release
 

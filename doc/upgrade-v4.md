@@ -266,14 +266,26 @@ v30.1.1 changes the persisted shadow and demurrage state to authenticated
 schema 12, recomputes the
 canonical competing-claim result from height 5,993,200, and preserves v30.1.0
 block-time provenance for transaction outputs across live validation and replay.
-Operators upgrading from
-v30.1.0 must back up wallets, stop the daemon, and run one full
-`-reindex-chainstate` before relying on the node for staking or mining:
+Operators upgrading from v30.1.0 must back up wallets and stop the old process
+before relying on the node for staking or mining. Blackcoin Qt detects the
+mandatory rebuild before loading wallets and offers to complete the protected
+rebuild and verification restart automatically. Choosing the manual option
+exits without changing chainstate and displays a platform-correct command that
+preserves the selected datadir, network, and startup arguments.
+
+Headless operators run one `-reindex-chainstate` process:
 
 ```bash
 blackcoind -datadir=/path/to/data -networkactive=0 -staking=0 \
   -reindex-chainstate -daemonwait
 ```
+
+That process exits automatically at the durable `COMMIT_READY` transition.
+Start once normally without either reindex option. The second process verifies
+the recorded tip and complete Coin commitment, retires the preserved source,
+then restores the operator's automation settings before loading wallets. Do
+not persist `reindex-chainstate=1` or `reindex=1` in configuration or settings;
+v30.1.1 rejects both loop-forming configurations.
 
 The rebuild requires complete active-chain block data for every height it must
 replay. `-reindex-chainstate` uses local block files and does not fetch history
@@ -304,6 +316,14 @@ logical size plus a 50 MiB safety reserve. An unreadable or unstable source
 topology, including a symlink or special file, fails closed without moving the
 source.
 
+From rebuild start through verified cleanup, the process forces legacy
+staking, Gold Rush PoW, automatic QQSIGNAL, demurrage attestation,
+redelegation, and automatic quantum-key generation off in memory. It preserves
+the original command-line, configuration, and settings values and restores
+them only after the replacement passes verification. After `COMMIT_READY`, the
+rebuilding process also refuses any queued active-chain connect or disconnect
+until it exits, keeping the durable commitment stable for the verifier.
+
 After the rebuild, record these RPC results:
 
 ```bash
@@ -320,7 +340,8 @@ does not include zero-value internal markers; the replay commitment is the
 separate proof that the pool, signals, whitelist, Gold Rush inventory, and
 demurrage inventory match the same tip.
 
-Stop cleanly and restart offline without either reindex option. Confirm that
+The rebuild process stops itself at `COMMIT_READY`; restart offline without
+either reindex option. Confirm that
 height, best-block hash, UTXO MuHash, Gold Rush totals, and the complete
 `replay_state` object match byte-for-byte. For release-candidate qualification,
 repeat once more with `-reindex-chainstate` at the same pinned tip and compare

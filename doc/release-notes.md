@@ -77,12 +77,29 @@ is expected to recover. Shut down every old daemon or GUI using the datadir and
 wait for complete shutdown before replacing the binaries.
 
 An existing v30.1.0 datadir requires one explicit authenticated schema-12
-chainstate rebuild before staking or mining under v30.1.1:
+chainstate rebuild before staking or mining under v30.1.1. Blackcoin Qt detects this
+condition before loading any wallet and offers two fail-closed choices:
+
+- **Rebuild automatically** shuts down, launches exactly one protected
+  `-reindex-chainstate` process, then launches one normal verification process
+  after the durable commit. The datadir lock is released before each handoff.
+- **Exit and rebuild manually** changes no chainstate and displays a command
+  preserving the selected datadir, network, and other startup arguments.
+
+Fresh datadirs and datadirs that already contain authenticated schema 12 do not
+show the assistant. Headless operators can run the equivalent one-shot command:
 
 ```bash
 blackcoind -datadir=/path/to/data -networkactive=0 -staking=0 \
   -reindex-chainstate -daemonwait
 ```
+
+The rebuilding process exits automatically after it durably reaches
+`COMMIT_READY`. Start once normally, without `-reindex-chainstate` or
+`-reindex`; that process authenticates the replacement and retires the retained
+source before wallets load. Never put either reindex option in
+`blackcoin.conf` or `settings.json`; v30.1.1 rejects a persistent true value to
+prevent a rebuild loop.
 
 `-reindex-chainstate` reads local block files and does not fetch history removed
 by pruning. If block files are pruned or incomplete, set `prune=0` and use a
@@ -103,10 +120,18 @@ logical size plus the normal 50 MiB safety reserve. Failure leaves the existing
 chainstate at its original path.
 
 Reconstruction is journaled. The first process retains the original chainstate
-backup after committing the rebuilt state. Stop it cleanly and start once
-without a reindex option; that separate process reopens and verifies the
-replacement before retiring the backup. A full `-reindex` is intentionally
-refused while this verification restart is pending.
+backup after committing the rebuilt state and immediately begins orderly
+shutdown. The active chain and Coin set are immutable from that commit until
+exit, so queued validation cannot stale the recorded commitment. A separate
+process reopens and verifies the replacement before retiring the backup. A
+full `-reindex` is intentionally refused while this verification restart is
+pending.
+
+During both reconstruction and the pending verification restart, staking,
+Gold Rush PoW, automatic QQSIGNAL, demurrage attestation, redelegation, and
+automatic quantum-key creation are forced off in memory. Existing command-line
+and persistent values are restored only after verified cleanup and before
+normal wallet loading; the assistant never rewrites those settings.
 
 For this beta, sudden-power-loss durability of directory renames is not yet
 claimed on Windows. Keep a cold datadir copy and stable power, and do not
