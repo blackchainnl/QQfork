@@ -105,7 +105,7 @@ class ChainstateWriteCrashTest(BitcoinTestFramework):
         # and make sure that recovery happens.
         raise AssertionError(f"Unable to successfully restart node {node_index} in allotted time")
 
-    def submit_block_catch_error(self, node_index, block):
+    def submit_block_catch_error(self, node_index, block_hash, block):
         """Try submitting a block to the given node.
 
         Catch any exceptions that indicate the node has crashed.
@@ -113,7 +113,13 @@ class ChainstateWriteCrashTest(BitcoinTestFramework):
 
         try:
             result = self.nodes[node_index].submitblock(block)
-            if result is not None:
+            if result == "inconclusive":
+                # An equal-work side-chain block is stored but does not trigger
+                # BlockChecked until a descendant makes that branch active.
+                block_info = self.nodes[node_index].getblock(block_hash)
+                assert_equal(block_info["hash"], block_hash)
+                assert_equal(block_info["confirmations"], -1)
+            elif result is not None:
                 raise AssertionError(f"node {node_index} rejected block: {result}")
             return True
         except (http.client.CannotSendRequest, http.client.RemoteDisconnected) as e:
@@ -149,7 +155,7 @@ class ChainstateWriteCrashTest(BitcoinTestFramework):
             for (block_hash, block) in blocks:
                 # Get the block from node3, and submit to node_i
                 self.log.debug(f"submitting block {block_hash}")
-                if not self.submit_block_catch_error(i, block):
+                if not self.submit_block_catch_error(i, block_hash, block):
                     # TODO: more carefully check that the crash is due to -dbcrashratio
                     # (change the exit code perhaps, and check that here?)
                     self.wait_for_node_exit(i, timeout=30)
@@ -161,6 +167,8 @@ class ChainstateWriteCrashTest(BitcoinTestFramework):
                     # Clear it out after successful submitblock calls -- the cached
                     # utxo hash will no longer be correct
                     nodei_utxo_hash = None
+
+            assert_equal(self.nodes[i].getbestblockhash(), block_hashes[-1])
 
             # Check that the utxo hash matches node3's utxo set
             # NOTE: we only check the utxo set if we had to restart the node
