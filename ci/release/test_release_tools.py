@@ -8,6 +8,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,50 @@ def load_mixed_version_module(name):
 
 
 class ReleaseToolTests(unittest.TestCase):
+    def test_release_runbook_is_blackcoin_specific_and_covers_immutable_rollback(self):
+        root = TOOLS.parent.parent
+        runbook = (root / "doc" / "release-process.md").read_text(encoding="utf-8")
+        forbidden = (
+            "bitcoin-core/guix.sigs",
+            "bitcoin-detached-sigs",
+            "guix-codesign",
+            "bitcoincore.org/bin",
+        )
+        for stale_reference in forbidden:
+            with self.subTest(stale_reference=stale_reference):
+                self.assertNotIn(stale_reference, runbook.lower())
+
+        required = (
+            "signed annotated `v30.1.1` tag",
+            "production-release",
+            "independent rebuilder",
+            "signed `sha256sums.txt`",
+            "spdx sbom",
+            "in-toto provenance",
+            "release rollback and revocation",
+            "never delete,",
+            "or recreate the `v30.1.1` tag",
+            "human-held production credentials",
+        )
+        lowered = runbook.lower()
+        for release_control in required:
+            with self.subTest(release_control=release_control):
+                self.assertIn(release_control, lowered)
+
+    def test_every_third_party_workflow_action_is_commit_pinned(self):
+        workflows = TOOLS.parent.parent / ".github" / "workflows"
+        action = re.compile(r"^\s*uses:\s*([^\s#]+)")
+        immutable = re.compile(r"^[^/@\s]+/[^@\s]+@[0-9a-f]{40}$")
+        for workflow in sorted(workflows.glob("*.yml")):
+            for line_number, line in enumerate(
+                workflow.read_text(encoding="utf-8").splitlines(), start=1
+            ):
+                match = action.match(line)
+                if match is None or match.group(1).startswith("./"):
+                    continue
+                with self.subTest(workflow=workflow.name, line=line_number):
+                    self.assertRegex(match.group(1), immutable)
+
     def test_mixed_version_command_runner_executes_all_commands(self):
         builder = load_mixed_version_module("build_previous_releases")
         with tempfile.TemporaryDirectory() as temporary:
