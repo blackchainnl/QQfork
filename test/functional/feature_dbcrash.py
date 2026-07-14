@@ -58,6 +58,9 @@ class ChainstateWriteCrashTest(BitcoinTestFramework):
             "-limitdescendantsize=0",
             "-maxmempool=0",
             "-dbbatchsize=200000",
+            # This crash-recovery stress test deliberately creates arbitrary
+            # reorgs. Keep the rolling checkpoint policy out of its scope.
+            "-checkpoints=0",
         ]
 
         # Set different crash ratios and cache sizes.  Note that not all of
