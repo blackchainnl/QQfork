@@ -104,6 +104,10 @@ class GoldRushValuePathTest(BitcoinTestFramework):
     def _assert_no_quantum_utxo(self, wallet, address):
         assert_equal(self._get_quantum_utxos(wallet, address), [])
 
+    @staticmethod
+    def _is_abandoned(wallet, txid):
+        return any(detail.get("abandoned", False) for detail in wallet.gettransaction(txid)["details"])
+
     def _assert_no_onchain_block_output_to(self, block_hash, address):
         block = self.nodes[0].getblock(block_hash, 2)
         for tx in block["tx"]:
@@ -164,7 +168,7 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         assert claim_entries, "PoW claim target must be visible in wallet Gold Rush status"
         assert_equal(claim_entries[0]["whitelisted"], False)
 
-        self.log.info("A QQSPROOF mined by a proof-of-work block remains legacy-visible but earns no shadow credit")
+        self.log.info("A proof-of-work template excludes QQSPROOF so the claimant cannot pay for an ineligible claim")
         pow_block_payout = wallet.getnewquantumaddress()["address"]
         pow_block_state_before = node.getgoldrushstate()
         pow_block_claim = wallet.sendshadowpowclaim(claim_address, pow_block_payout, 500000)
@@ -172,7 +176,9 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         pow_block_hash = self.generatetoaddress(node, 1, node.get_deterministic_priv_key().address, sync_fun=self.no_op)[0]
         pow_block = node.getblock(pow_block_hash, 2)
         assert "proof-of-work" in pow_block["flags"]
-        assert pow_block_claim["txid"] in [tx["txid"] for tx in pow_block["tx"]]
+        assert pow_block_claim["txid"] not in [tx["txid"] for tx in pow_block["tx"]]
+        self.wait_until(lambda: pow_block_claim["txid"] not in node.getrawmempool(), timeout=10)
+        self.wait_until(lambda: self._is_abandoned(wallet, pow_block_claim["txid"]), timeout=10)
         self._assert_no_onchain_block_output_to(pow_block_hash, pow_block_payout)
         self._assert_no_quantum_utxo(wallet, pow_block_payout)
         pow_block_state_after = node.getgoldrushstate()
@@ -187,6 +193,8 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         assert_equal(node.getgoldrushstate()["claimed_amount"], pow_block_state_before["claimed_amount"])
         node.reconsiderblock(pow_block_hash)
         self.wait_until(lambda: node.getbestblockhash() == pow_block_hash)
+        self.wait_until(lambda: pow_block_claim["txid"] not in node.getrawmempool(), timeout=10)
+        self.wait_until(lambda: self._is_abandoned(wallet, pow_block_claim["txid"]), timeout=10)
         self._assert_no_quantum_utxo(wallet, pow_block_payout)
         pow_block_state_reconnected = node.getgoldrushstate()
         assert_equal(pow_block_state_reconnected["claimed_amount"], pow_block_state_after["claimed_amount"])
