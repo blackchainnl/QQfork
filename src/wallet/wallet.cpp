@@ -97,6 +97,7 @@
 #include <array>
 #include <cassert>
 #include <cerrno>
+#include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <exception>
@@ -8304,49 +8305,71 @@ bool IsShadowPowClaimConflict(const bilingual_str& error)
     return error.original.find("shadow-proof-mempool-conflict") != std::string::npos;
 }
 
-bool SelectShadowPowMiningTarget(CWallet& wallet, const CScript& quantum_payout_script, CScript& target, CTxDestination& dest, bilingual_str& error)
+} // namespace
+
+ShadowPowClaimInputSelectionResult CWallet::SelectShadowPowClaimInput(
+    const std::optional<CScript>& required_target,
+    const CScript& quantum_payout_script,
+    const std::vector<unsigned char>* proof,
+    const CCoinControl& coin_control,
+    ShadowPowClaimInput& selected,
+    bilingual_str& error) const
 {
     AssertLockHeld(::cs_main);
-    AssertLockHeld(wallet.cs_wallet);
-    CCoinControl coin_control;
-    coin_control.m_allow_other_inputs = false;
-    coin_control.m_avoid_address_reuse = false;
+    AssertLockHeld(cs_wallet);
     const int64_t current_time = GetAdjustedTimeSeconds();
-    const CFeeRate fee_rate = GetMinimumFeeRate(wallet, coin_control, current_time);
-    std::vector<unsigned char> dummy_proof(GetShadowPrefix().size() + 17 + quantum_payout_script.size(), 0);
-    std::copy(GetShadowPrefix().begin(), GetShadowPrefix().end(), dummy_proof.begin());
-    for (const COutput& output : AvailableCoins(wallet, &coin_control).All()) {
+    const CFeeRate fee_rate = GetMinimumFeeRate(*this, coin_control, current_time);
+    bool found{false};
+    bool fee_exceeded{false};
+    for (const COutput& output : AvailableCoins(*this, &coin_control).All()) {
         if (output.txout.nValue <= 0) continue;
         if (!IsShadowPowMiningTarget(output.txout.scriptPubKey)) continue;
         CTxDestination candidate_dest;
         if (!ExtractDestination(output.txout.scriptPubKey, candidate_dest) || !IsValidDestination(candidate_dest)) continue;
         const CScript canonical_target = CanonicalizeLegacyStakeScript(output.txout.scriptPubKey);
+        if (canonical_target.empty() || canonical_target.IsUnspendable()) continue;
+        if (required_target && canonical_target != *required_target) continue;
 
-        dummy_proof.resize(GetShadowPrefix().size() + 17 + canonical_target.size() + quantum_payout_script.size(), 0);
-        std::copy(GetShadowPrefix().begin(), GetShadowPrefix().end(), dummy_proof.begin());
+        std::vector<unsigned char> dummy_proof;
+        const std::vector<unsigned char>* candidate_proof = proof;
+        if (!candidate_proof) {
+            dummy_proof.assign(GetShadowPrefix().size() + 17 + canonical_target.size() + quantum_payout_script.size(), 0);
+            std::copy(GetShadowPrefix().begin(), GetShadowPrefix().end(), dummy_proof.begin());
+            candidate_proof = &dummy_proof;
+        }
         CMutableTransaction candidate;
         candidate.nVersion = CTransaction::CURRENT_VERSION;
         candidate.nTime = current_time;
         static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
         candidate.vin.emplace_back(output.outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
         candidate.vout.emplace_back(output.txout.nValue, canonical_target);
-        candidate.vout.emplace_back(0, CScript() << OP_RETURN << dummy_proof);
-        const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(candidate), &wallet, &coin_control);
+        candidate.vout.emplace_back(0, CScript() << OP_RETURN << *candidate_proof);
+        const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(candidate), this, &coin_control);
         if (tx_size.vsize <= 0) continue;
         const CAmount candidate_fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
         const CAmount candidate_change = output.txout.nValue - candidate_fee;
         CTxOut change_out(candidate_change, canonical_target);
-        if (!MoneyRange(candidate_change) || candidate_change <= 0 || IsDust(change_out, wallet.chain().relayDustFee())) continue;
-        if (candidate_fee > wallet.m_default_max_tx_fee) continue;
+        if (!MoneyRange(candidate_change) || candidate_change <= 0 || IsDust(change_out, chain().relayDustFee())) continue;
+        if (candidate_fee > m_default_max_tx_fee) {
+            fee_exceeded = true;
+            continue;
+        }
 
-        target = canonical_target;
-        dest = candidate_dest;
-        return true;
+        const auto candidate_key = std::make_pair(output.txout.nValue, output.outpoint);
+        const auto selected_key = std::make_pair(selected.value, selected.outpoint);
+        if (!found || candidate_key < selected_key) {
+            selected = ShadowPowClaimInput{output.outpoint, canonical_target, candidate_dest, output.txout.nValue};
+            found = true;
+        }
+    }
+    if (found) return ShadowPowClaimInputSelectionResult::SELECTED;
+    if (fee_exceeded) {
+        error = strprintf(_("Gold Rush PoW claim fee exceeds wallet max transaction fee (%s)."), FormatMoney(m_default_max_tx_fee));
+        return ShadowPowClaimInputSelectionResult::FEE_EXCEEDS_MAX;
     }
     error = _("No spendable legacy UTXO is available for Gold Rush PoW claim authentication.");
-    return false;
+    return ShadowPowClaimInputSelectionResult::NO_ELIGIBLE_INPUT;
 }
-} // namespace
 
 bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error, bool* created_payout)
 {
@@ -8506,16 +8529,30 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created)
     return true;
 }
 
-bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& dest, const std::vector<unsigned char>& proof, bilingual_str& error)
+void CWallet::MaybeDelayShadowPowClaimSubmissionForTest(const COutPoint& selected_outpoint)
+{
+    if (!Params().IsTestChain()) return;
+    const int64_t delay_ms = std::clamp<int64_t>(
+        gArgs.GetIntArg("-qqshadowpowclaimsubmissiondelaymillis", 0), 0, 10000);
+    if (delay_ms <= 0) return;
+    WalletLogPrintf("Gold Rush PoW claim submission test barrier reached; selected input=%s; delaying %dms\n",
+                    selected_outpoint.ToString(), static_cast<int>(delay_ms));
+    std::this_thread::sleep_for(std::chrono::milliseconds{delay_ms});
+}
+
+ShadowPowClaimSubmitResult CWallet::SubmitShadowPowClaim(
+    const ShadowPowClaimInput& selected_input,
+    const std::vector<unsigned char>& proof,
+    bilingual_str& error)
 {
     ShadowPowClaimSubmissionGuard submission_guard(*this);
     if (!submission_guard) {
         error = _("Another Gold Rush PoW claim submission is already in progress for this wallet.");
-        return false;
+        return ShadowPowClaimSubmitResult::FAILED;
     }
 
     CCoinControl coin_control;
-    coin_control.destChange = dest;
+    coin_control.destChange = selected_input.destination;
     coin_control.m_allow_other_inputs = false;
     coin_control.m_avoid_address_reuse = false;
 
@@ -8526,35 +8563,36 @@ bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& 
         LOCK2(::cs_main, cs_wallet);
         if (IsLocked()) {
             error = _("Wallet locked before the Gold Rush PoW claim could be signed.");
-            return false;
+            return ShadowPowClaimSubmitResult::FAILED;
         }
         if (m_wallet_unlock_staking_only) {
             error = _("Wallet switched to staking-only unlock before the Gold Rush PoW claim could be signed.");
-            return false;
+            return ShadowPowClaimSubmitResult::FAILED;
         }
 
         const int64_t current_time = GetAdjustedTimeSeconds();
         const CFeeRate fee_rate = GetMinimumFeeRate(*this, coin_control, current_time);
         for (const COutput& output : AvailableCoins(*this, &coin_control).All()) {
-            if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != target) continue;
+            if (output.outpoint != selected_input.outpoint) continue;
+            if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != selected_input.target) continue;
 
             CMutableTransaction candidate;
             candidate.nVersion = CTransaction::CURRENT_VERSION;
             candidate.nTime = current_time;
             static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
             candidate.vin.emplace_back(output.outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
-            candidate.vout.emplace_back(output.txout.nValue, target);
+            candidate.vout.emplace_back(output.txout.nValue, selected_input.target);
             candidate.vout.emplace_back(0, CScript() << OP_RETURN << proof);
 
             const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(candidate), this, &coin_control);
             if (tx_size.vsize <= 0) continue;
             const CAmount candidate_fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
             const CAmount candidate_change = output.txout.nValue - candidate_fee;
-            CTxOut change_out(candidate_change, target);
+            CTxOut change_out(candidate_change, selected_input.target);
             if (!MoneyRange(candidate_change) || candidate_change <= 0 || IsDust(change_out, chain().relayDustFee())) continue;
             if (candidate_fee > m_default_max_tx_fee) {
                 error = strprintf(_("Gold Rush PoW claim fee exceeds wallet max transaction fee (%s)."), FormatMoney(m_default_max_tx_fee));
-                return false;
+                return ShadowPowClaimSubmitResult::FAILED;
             }
 
             candidate.vout[0].nValue = candidate_change;
@@ -8571,8 +8609,8 @@ bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& 
     }
 
     if (claim_tx.vin.empty()) {
-        error = _("No spendable non-dust UTXO found for the Gold Rush PoW claim address.");
-        return false;
+        error = strprintf(_("Selected Gold Rush PoW claim input %s is no longer spendable; retry after the next tip."), selected_input.outpoint.ToString());
+        return ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE;
     }
 
     std::map<int, bilingual_str> input_errors;
@@ -8587,7 +8625,7 @@ bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& 
         } else {
             error = _("Signing Gold Rush PoW claim failed.");
         }
-        return false;
+        return ShadowPowClaimSubmitResult::FAILED;
     }
 
     CTransactionRef tx = MakeTransactionRef(std::move(claim_tx));
@@ -8597,7 +8635,7 @@ bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& 
         const MempoolAcceptResult accept = chainman.ProcessTransaction(tx, /*test_accept=*/true);
         if (accept.m_result_type != MempoolAcceptResult::ResultType::VALID) {
             error = strprintf(_("Gold Rush PoW claim rejected: %s"), accept.m_state.ToString());
-            return false;
+            return ShadowPowClaimSubmitResult::FAILED;
         }
     }
 
@@ -8610,7 +8648,7 @@ bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& 
             if (!AbandonTransaction(tx->GetHash())) {
                 WalletLogPrintf("Gold Rush PoW stale claim could not be abandoned: txid=%s\n", tx->GetHash().ToString());
             }
-            return false;
+            return ShadowPowClaimSubmitResult::FAILED;
         }
     } catch (const std::exception& e) {
         error = strprintf(_("Broadcasting Gold Rush PoW claim failed: %s"), e.what());
@@ -8624,7 +8662,7 @@ bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& 
                                 tx->GetHash().ToString());
             }
         }
-        return false;
+        return ShadowPowClaimSubmitResult::FAILED;
     } catch (...) {
         error = _("Broadcasting Gold Rush PoW claim failed with an unknown exception.");
         const bool added_to_wallet = WITH_LOCK(cs_wallet, return GetWalletTx(tx->GetHash()) != nullptr);
@@ -8632,10 +8670,10 @@ bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& 
             WalletLogPrintf("Gold Rush PoW claim %s could not be abandoned after unknown broadcast exception\n",
                             tx->GetHash().ToString());
         }
-        return false;
+        return ShadowPowClaimSubmitResult::FAILED;
     }
     WalletLogPrintf("Gold Rush PoW claim submitted: txid=%s fee=%s\n", tx->GetHash().ToString(), FormatMoney(fee));
-    return true;
+    return ShadowPowClaimSubmitResult::SUBMITTED;
 }
 
 void CWallet::ThreadShadowPoWMiner(int worker_id)
@@ -8683,14 +8721,22 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
         }
         const CScript quantum_payout_script = GetScriptForDestination(quantum_dest);
 
-        CScript target;
-        CTxDestination target_dest;
-        bool have_target{false};
+        CCoinControl selection_control;
+        selection_control.m_allow_other_inputs = false;
+        selection_control.m_avoid_address_reuse = false;
+        ShadowPowClaimInput selected_input;
+        ShadowPowClaimInputSelectionResult selection_result;
         {
             LOCK2(::cs_main, cs_wallet);
-            have_target = SelectShadowPowMiningTarget(*this, quantum_payout_script, target, target_dest, error);
+            selection_result = SelectShadowPowClaimInput(
+                /*required_target=*/std::nullopt,
+                quantum_payout_script,
+                /*proof=*/nullptr,
+                selection_control,
+                selected_input,
+                error);
         }
-        if (!have_target) {
+        if (selection_result != ShadowPowClaimInputSelectionResult::SELECTED) {
             m_pow_hashrate = 0.0;
             const bool claim_inflight = WITH_LOCK(m_pow_miner_mutex, return m_pow_claim_inflight);
             m_pow_state = claim_inflight
@@ -8746,7 +8792,7 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                         // Argon2id WITHOUT the lock below so the memory-hard work never stalls block
                         // validation, RPC, or the GUI.
                         nonce_start = m_pow_next_nonce.fetch_add(POW_MINER_BATCH_TRIES);
-                        work = PrepareShadowPowWork(target, quantum_payout_script, tip, chainman.ActiveChainstate().CoinsTip());
+                        work = PrepareShadowPowWork(selected_input.target, quantum_payout_script, tip, chainman.ActiveChainstate().CoinsTip());
                         should_grind = work.valid;
                         if (!should_grind) {
                             m_pow_hashrate = 0.0;
@@ -8793,7 +8839,9 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
                 if (m_pow_claim_inflight) continue;
                 m_pow_claim_inflight = true;
             }
-            if (SubmitShadowPowClaim(target, target_dest, proof, error)) {
+            MaybeDelayShadowPowClaimSubmissionForTest(selected_input.outpoint);
+            const ShadowPowClaimSubmitResult submit_result = SubmitShadowPowClaim(selected_input, proof, error);
+            if (submit_result == ShadowPowClaimSubmitResult::SUBMITTED) {
                 ++m_pow_claims_submitted;
                 m_pow_state = WalletPowMiningState::CLAIM_IN_FLIGHT;
                 while (!IsPowMiningClosing() && m_pow_mining_enabled.load()) {
@@ -8810,8 +8858,9 @@ void CWallet::ThreadShadowPoWMiner(int worker_id)
             } else {
                 const bool conflict = IsShadowPowClaimConflict(error);
                 WalletLogPrintf("Gold Rush PoW worker %d could not submit claim: %s\n", worker_id, error.original);
-                if (conflict) {
-                    m_pow_state = WalletPowMiningState::CLAIM_IN_FLIGHT;
+                const bool wait_for_next_tip = conflict || submit_result == ShadowPowClaimSubmitResult::INPUT_UNAVAILABLE;
+                if (wait_for_next_tip) {
+                    m_pow_state = conflict ? WalletPowMiningState::CLAIM_IN_FLIGHT : WalletPowMiningState::READY;
                     while (!IsPowMiningClosing() && m_pow_mining_enabled.load()) {
                         bool tip_changed = false;
                         {

@@ -5,7 +5,6 @@
 #include <addresstype.h>
 #include <chain.h>
 #include <coins.h>
-#include <common/args.h>
 #include <consensus/demurrage.h>
 #include <consensus/tx_verify.h>
 #include <core_io.h>
@@ -42,11 +41,9 @@
 
 #include <algorithm>
 #include <atomic>
-#include <chrono>
 #include <limits>
 #include <map>
 #include <optional>
-#include <thread>
 #include <vector>
 
 using node::BlockAssembler;
@@ -1359,14 +1356,6 @@ static RPCHelpMan sendshadowpowclaim()
         throw JSONRPCError(RPC_WALLET_ERROR,
                            "Another Gold Rush PoW claim submission is already in progress for this wallet");
     }
-    if (Params().IsTestChain()) {
-        const int64_t delay_ms = std::clamp<int64_t>(
-            gArgs.GetIntArg("-qqshadowpowclaimsubmissiondelaymillis", 0), 0, 10000);
-        if (delay_ms > 0) {
-            pwallet->WalletLogPrintf("Gold Rush PoW claim submission test barrier reached; delaying %dms\n", delay_ms);
-            std::this_thread::sleep_for(std::chrono::milliseconds{delay_ms});
-        }
-    }
 
     const std::string address = request.params[0].get_str();
     const CTxDestination dest = DecodeDestination(address);
@@ -1450,53 +1439,29 @@ static RPCHelpMan sendshadowpowclaim()
         }
     }
 
+    ShadowPowClaimInput selected_input;
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
-        const int64_t current_time = GetAdjustedTimeSeconds();
-        const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
+        const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, GetAdjustedTimeSeconds());
         if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
         }
-
-        // QQSPROOF payload size is deterministic for internally ground proofs:
-        // OP_RETURN data = prefix(8) + proof header(13) + target/payout length fields(4) + scripts.
-        std::vector<unsigned char> dummy_proof;
-        const std::vector<unsigned char>* fee_probe_proof = nullptr;
-        if (supplied_proof) {
-            fee_probe_proof = &*supplied_proof;
-        } else {
-            dummy_proof.assign(GetShadowPrefix().size() + 17 + target.size() + quantum_payout_script.size(), 0);
-            std::copy(GetShadowPrefix().begin(), GetShadowPrefix().end(), dummy_proof.begin());
-            fee_probe_proof = &dummy_proof;
+        bilingual_str selection_error;
+        const ShadowPowClaimInputSelectionResult selection_result = pwallet->SelectShadowPowClaimInput(
+            std::optional<CScript>{target},
+            quantum_payout_script,
+            supplied_proof ? &*supplied_proof : nullptr,
+            coin_control,
+            selected_input,
+            selection_error);
+        if (selection_result == ShadowPowClaimInputSelectionResult::FEE_EXCEEDS_MAX) {
+            throw JSONRPCError(RPC_WALLET_ERROR, selection_error.original);
         }
-        bool can_submit_claim = false;
-        for (const COutput& output : AvailableCoins(*pwallet, &coin_control).All()) {
-            if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != target) continue;
-
-            CMutableTransaction candidate;
-            candidate.nVersion = CTransaction::CURRENT_VERSION;
-            candidate.nTime = current_time;
-            static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
-            candidate.vin.emplace_back(output.outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
-            candidate.vout.emplace_back(output.txout.nValue, target);
-            candidate.vout.emplace_back(0, CScript() << OP_RETURN << *fee_probe_proof);
-
-            const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(candidate), pwallet.get(), &coin_control);
-            if (tx_size.vsize <= 0) continue;
-            const CAmount candidate_fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
-            const CAmount candidate_change = output.txout.nValue - candidate_fee;
-            CTxOut change_out(candidate_change, target);
-            if (!MoneyRange(candidate_change) || candidate_change <= 0 || IsDust(change_out, pwallet->chain().relayDustFee())) continue;
-            if (candidate_fee > pwallet->m_default_max_tx_fee) {
-                throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
-            }
-            can_submit_claim = true;
-            break;
-        }
-        if (!can_submit_claim) {
+        if (selection_result != ShadowPowClaimInputSelectionResult::SELECTED) {
             throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable non-dust UTXO found for the target address");
         }
     }
+    pwallet->MaybeDelayShadowPowClaimSubmissionForTest(selected_input.outpoint);
 
     std::vector<unsigned char> proof;
     if (supplied_proof) {
@@ -1528,21 +1493,22 @@ static RPCHelpMan sendshadowpowclaim()
             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
         }
         for (const COutput& output : AvailableCoins(*pwallet, &coin_control).All()) {
-            if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != target) continue;
+            if (output.outpoint != selected_input.outpoint) continue;
+            if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != selected_input.target) continue;
 
             CMutableTransaction candidate;
             candidate.nVersion = CTransaction::CURRENT_VERSION;
             candidate.nTime = current_time;
             static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
             candidate.vin.emplace_back(output.outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
-            candidate.vout.emplace_back(output.txout.nValue, target);
+            candidate.vout.emplace_back(output.txout.nValue, selected_input.target);
             candidate.vout.emplace_back(0, CScript() << OP_RETURN << proof);
 
             const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(candidate), pwallet.get(), &coin_control);
             if (tx_size.vsize <= 0) continue;
             const CAmount candidate_fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
             const CAmount candidate_change = output.txout.nValue - candidate_fee;
-            CTxOut change_out(candidate_change, target);
+            CTxOut change_out(candidate_change, selected_input.target);
             if (!MoneyRange(candidate_change) || candidate_change <= 0 || IsDust(change_out, pwallet->chain().relayDustFee())) continue;
             if (candidate_fee > pwallet->m_default_max_tx_fee) {
                 throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
@@ -1566,7 +1532,9 @@ static RPCHelpMan sendshadowpowclaim()
     }
 
     if (claim_tx.vin.empty()) {
-        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable non-dust UTXO found for the target address");
+        throw JSONRPCError(RPC_VERIFY_REJECTED,
+                           strprintf("Selected Gold Rush PoW claim input %s changed while grinding; retry the PoW claim",
+                                     selected_input.outpoint.ToString()));
     }
 
     CTransactionRef tx = MakeTransactionRef(std::move(claim_tx));

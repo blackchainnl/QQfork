@@ -24,6 +24,10 @@ GOLD_RUSH_END_TIME = 2_000_000_000
 QQSPROOF_HEX = "51515350524f4f46"
 MANUAL_WALLET = "pow_claim_manual"
 BUILTIN_WALLET = "pow_claim_builtin"
+POLICY_WALLET = "pow_claim_policy"
+BUILTIN_RACE_WALLET = "pow_claim_builtin_race"
+TIE_WALLET = "pow_claim_tie"
+LIVE_FEE_VALUES = (Decimal("0.991"), Decimal("501.747137"), Decimal("969.818832"))
 
 
 class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
@@ -83,6 +87,22 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
                 return parts[1]
         raise AssertionError(f"wallet claim {txid} has no decodable QQSPROOF payload")
 
+    def _claim_input(self, txid):
+        decoded = self.nodes[0].decoderawtransaction(self.nodes[0].getrawtransaction(txid))
+        assert_equal(len(decoded["vin"]), 1)
+        return {"txid": decoded["vin"][0]["txid"], "vout": decoded["vin"][0]["vout"]}
+
+    def _fund_live_fee_inputs(self, source_wallet, target_wallet, target_address, funding_address):
+        for amount in LIVE_FEE_VALUES:
+            source_wallet.sendtoaddress(target_address, amount)
+        self.generatetoaddress(self.nodes[0], 1, funding_address, sync_fun=self.no_op)
+        utxos = target_wallet.listunspent(1, 9999999, [target_address])
+        assert_equal(sorted(Decimal(str(utxo["amount"])) for utxo in utxos), sorted(LIVE_FEE_VALUES))
+        return {
+            Decimal(str(utxo["amount"])): {"txid": utxo["txid"], "vout": utxo["vout"]}
+            for utxo in utxos
+        }
+
     def _wait_for_new_abandoned_claim(self, wallet, before, timeout=180):
         self.wait_until(lambda: len(self._abandoned_claim_txids(wallet) - before) > 0, timeout=timeout)
         return sorted(self._abandoned_claim_txids(wallet) - before)[0]
@@ -95,12 +115,21 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
         node.createwallet(wallet_name=MANUAL_WALLET)
         node.createwallet(wallet_name=BUILTIN_WALLET)
+        node.createwallet(wallet_name=POLICY_WALLET)
+        node.createwallet(wallet_name=BUILTIN_RACE_WALLET)
+        node.createwallet(wallet_name=TIE_WALLET)
         manual = node.get_wallet_rpc(MANUAL_WALLET)
         builtin = node.get_wallet_rpc(BUILTIN_WALLET)
-        manual.staking(False)
-        builtin.staking(False)
+        policy = node.get_wallet_rpc(POLICY_WALLET)
+        builtin_race = node.get_wallet_rpc(BUILTIN_RACE_WALLET)
+        tie_wallet = node.get_wallet_rpc(TIE_WALLET)
+        for wallet in (manual, builtin, policy, builtin_race, tie_wallet):
+            wallet.staking(False)
         manual_address = manual.getnewaddress("claim-input", "legacy")
         builtin_address = builtin.getnewaddress("claim-input", "legacy")
+        policy_address = policy.getnewaddress("claim-input", "legacy")
+        builtin_race_address = builtin_race.getnewaddress("claim-input", "legacy")
+        tie_address = tie_wallet.getnewaddress("claim-input", "legacy")
         funding_address = default_wallet.getnewaddress("claim-test-funding", "legacy")
 
         self.log.info("Funding independent manual and built-in claim wallets")
@@ -110,6 +139,90 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(node.getquantumquasarinfo()["phase"], "gold_rush")
         assert_equal(len(manual.listunspent(1, 9999999, [manual_address])), 1)
         assert_equal(len(builtin.listunspent(1, 9999999, [builtin_address])), 1)
+
+        self.log.info("Funding live-scale same-script fee inputs for deterministic policy coverage")
+        policy_inputs = self._fund_live_fee_inputs(default_wallet, policy, policy_address, funding_address)
+        builtin_race_inputs = self._fund_live_fee_inputs(default_wallet, builtin_race, builtin_race_address, funding_address)
+
+        self.log.info("Manual claims choose the smallest sufficient same-script input")
+        policy_payout = policy.getnewquantumaddress("policy-payout")["address"]
+        policy_claim = policy.sendshadowpowclaim(policy_address, policy_payout, 500000)
+        assert_equal(self._claim_input(policy_claim["txid"]), policy_inputs[LIVE_FEE_VALUES[0]])
+        self.generateblock(node, output=funding_address, transactions=[])
+        self.wait_until(lambda: self._is_abandoned(policy, policy_claim["txid"]), timeout=20)
+
+        self.log.info("A selected input locked at the test barrier cannot fall back to a larger coin")
+        policy_before_race = self._claim_txids(policy)
+        policy_race_errors = []
+
+        def submit_policy_race():
+            wallet_url = f"{node.url}/wallet/{quote(POLICY_WALLET, safe='')}"
+            rpc = get_rpc_proxy(wallet_url, 92, timeout=300, coveragedir=node.coverage_dir)
+            try:
+                rpc.sendshadowpowclaim(policy_address, policy_payout, 500000)
+            except Exception as error:
+                policy_race_errors.append(str(error))
+
+        policy_race_thread = Thread(target=submit_policy_race, name="policy-input-race", daemon=True)
+        with node.wait_for_debug_log([b"Gold Rush PoW claim submission test barrier reached"], timeout=20):
+            policy_race_thread.start()
+        assert_equal(policy.lockunspent(False, [policy_inputs[LIVE_FEE_VALUES[0]]]), True)
+        policy_race_thread.join(timeout=300)
+        assert not policy_race_thread.is_alive(), "policy input race caller did not finish"
+        assert_equal(len(policy_race_errors), 1)
+        assert "Selected Gold Rush PoW claim input" in policy_race_errors[0]
+        assert "changed while grinding" in policy_race_errors[0]
+        assert_equal(self._claim_txids(policy), policy_before_race)
+
+        self.log.info("A coin already locked before selection is skipped deterministically")
+        locked_small_claim = policy.sendshadowpowclaim(policy_address, policy_payout, 500000)
+        assert_equal(self._claim_input(locked_small_claim["txid"]), policy_inputs[LIVE_FEE_VALUES[1]])
+        self.generateblock(node, output=funding_address, transactions=[])
+        self.wait_until(lambda: self._is_abandoned(policy, locked_small_claim["txid"]), timeout=20)
+        assert_equal(policy.lockunspent(True, [policy_inputs[LIVE_FEE_VALUES[0]]]), True)
+
+        self.log.info("Equal-value candidates use stable COutPoint ordering")
+        tie_value = Decimal("1.25000000")
+        default_wallet.sendtoaddress(tie_address, tie_value)
+        default_wallet.sendtoaddress(tie_address, tie_value)
+        self.generatetoaddress(node, 1, funding_address, sync_fun=self.no_op)
+        tie_inputs = tie_wallet.listunspent(1, 9999999, [tie_address])
+        assert_equal(len(tie_inputs), 2)
+        expected_tie_input = min(
+            ({"txid": utxo["txid"], "vout": utxo["vout"]} for utxo in tie_inputs),
+            key=lambda outpoint: (bytes.fromhex(outpoint["txid"])[::-1], outpoint["vout"]),
+        )
+        tie_payout = tie_wallet.getnewquantumaddress("tie-payout")["address"]
+        tie_claim = tie_wallet.sendshadowpowclaim(tie_address, tie_payout, 500000)
+        assert_equal(self._claim_input(tie_claim["txid"]), expected_tie_input)
+        self.generateblock(node, output=funding_address, transactions=[])
+        self.wait_until(lambda: self._is_abandoned(tie_wallet, tie_claim["txid"]), timeout=20)
+
+        self.log.info("The built-in miner waits for a new tip after its exact input becomes unavailable")
+        builtin_race_before = self._claim_txids(builtin_race)
+        with node.wait_for_debug_log([b"Gold Rush PoW claim submission test barrier reached"], timeout=180):
+            builtin_race.setpowmining(True, 1, 100)
+        with node.wait_for_debug_log([b"is no longer spendable; retry after the next tip"], timeout=20):
+            assert_equal(builtin_race.lockunspent(False, [builtin_race_inputs[LIVE_FEE_VALUES[0]]]), True)
+        try:
+            self.wait_until(lambda: builtin_race.getpowmininginfo()["state"] == "ready", timeout=10)
+            time.sleep(2)
+            assert_equal(self._claim_txids(builtin_race), builtin_race_before)
+            assert_equal(builtin_race.getpowmininginfo()["claims_submitted"], 0)
+        finally:
+            builtin_race.setpowmining(False)
+        assert_equal(builtin_race.lockunspent(True, [builtin_race_inputs[LIVE_FEE_VALUES[0]]]), True)
+
+        self.generateblock(node, output=funding_address, transactions=[])
+        builtin_race.setpowmining(True, 1, 100)
+        try:
+            self.wait_until(lambda: len(self._claim_txids(builtin_race) - builtin_race_before) == 1, timeout=180)
+            builtin_race_claim = sorted(self._claim_txids(builtin_race) - builtin_race_before)[0]
+        finally:
+            builtin_race.setpowmining(False)
+        assert_equal(self._claim_input(builtin_race_claim), builtin_race_inputs[LIVE_FEE_VALUES[0]])
+        self.generateblock(node, output=funding_address, transactions=[])
+        self.wait_until(lambda: self._is_abandoned(builtin_race, builtin_race_claim), timeout=20)
 
         self.log.info("Two concurrent RPC callers create at most one claim")
         manual_payout = manual.getnewquantumaddress("single-flight-payout")["address"]

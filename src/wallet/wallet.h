@@ -78,6 +78,26 @@ enum class WalletCommitStatus {
     REJECTED_ABANDONED,
 };
 
+/** Exact wallet input selected to authenticate one fee-paying Gold Rush PoW claim. */
+struct ShadowPowClaimInput {
+    COutPoint outpoint;
+    CScript target;
+    CTxDestination destination;
+    CAmount value{0};
+};
+
+enum class ShadowPowClaimInputSelectionResult {
+    SELECTED,
+    NO_ELIGIBLE_INPUT,
+    FEE_EXCEEDS_MAX,
+};
+
+enum class ShadowPowClaimSubmitResult {
+    SUBMITTED,
+    INPUT_UNAVAILABLE,
+    FAILED,
+};
+
 /** Block timing captured before taking cs_wallet. */
 struct WalletBlockTime {
     int64_t block_time{0};
@@ -1534,7 +1554,15 @@ public:
     {
         m_shadow_pow_claim_submission_inflight.store(false, std::memory_order_release);
     }
-    bool SubmitShadowPowClaim(const CScript& target, const CTxDestination& dest, const std::vector<unsigned char>& proof, bilingual_str& error);
+    ShadowPowClaimInputSelectionResult SelectShadowPowClaimInput(
+        const std::optional<CScript>& required_target,
+        const CScript& quantum_payout_script,
+        const std::vector<unsigned char>* proof,
+        const CCoinControl& coin_control,
+        ShadowPowClaimInput& selected,
+        bilingual_str& error) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    void MaybeDelayShadowPowClaimSubmissionForTest(const COutPoint& selected_outpoint);
+    ShadowPowClaimSubmitResult SubmitShadowPowClaim(const ShadowPowClaimInput& selected_input, const std::vector<unsigned char>& proof, bilingual_str& error);
     std::unique_ptr<std::vector<std::thread>> threadPowMinerGroup GUARDED_BY(m_pow_miner_mutex);
 
     //! Whether the (external) signer performs R-value signature grinding
