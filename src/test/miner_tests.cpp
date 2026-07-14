@@ -37,6 +37,7 @@ struct MinerTestingSetup : public RegTestingSetup {
     void TestPackageSelection(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void TestBasicMining(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst, int baseheight) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void TestPrioritisedMining(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void TestV2ParentChildTimeCanonicalization(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool TestSequenceLocks(const CTransaction& tx, CTxMemPool& tx_mempool) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
     {
         CCoinsViewMemPool view_mempool{&m_node.chainman->ActiveChainstate().CoinsTip(), tx_mempool};
@@ -73,6 +74,46 @@ BlockAssembler MinerTestingSetup::AssemblerForTest(CTxMemPool& tx_mempool)
     options.nBlockMaxWeight = MAX_BLOCK_WEIGHT;
     options.blockMinFeeRate = blockMinFeeRate;
     return BlockAssembler{m_node.chainman->ActiveChainstate(), &tx_mempool, options};
+}
+
+void MinerTestingSetup::TestV2ParentChildTimeCanonicalization(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst)
+{
+    CTxMemPool& tx_mempool{MakeMempool()};
+    LOCK(tx_mempool.cs);
+
+    const int64_t candidate_time{m_node.chainman->ActiveChain().Tip()->GetMedianTimePast()};
+    SetMockTime(candidate_time);
+
+    constexpr CAmount fee{10'000};
+    TestMemPoolEntryHelper entry;
+
+    CMutableTransaction parent;
+    parent.nVersion = 2;
+    parent.nTime = 0;
+    parent.vin.emplace_back(COutPoint{txFirst[0]->GetHash(), 0}, CScript() << OP_1);
+    parent.vout.emplace_back(txFirst[0]->vout[0].nValue - fee, CScript() << OP_TRUE);
+    const uint256 parent_hash{parent.GetHash()};
+    tx_mempool.addUnchecked(entry.Fee(fee).Time(Now<NodeSeconds>()).SpendsCoinbase(true).FromTx(parent));
+
+    // This value is omitted from the version-2 wire encoding, but a locally
+    // constructed immutable transaction can still retain it. The parent looks
+    // timestamp-free in the mempool view; once both transactions enter a block,
+    // its output receives the block time. The child must therefore be checked
+    // against that same block time, not this hidden construction-time value.
+    CMutableTransaction child;
+    child.nVersion = 2;
+    child.nTime = candidate_time;
+    child.vin.emplace_back(COutPoint{parent_hash, 0});
+    child.vout.emplace_back(parent.vout[0].nValue - fee, CScript() << OP_TRUE);
+    const uint256 child_hash{child.GetHash()};
+    tx_mempool.addUnchecked(entry.Fee(fee).Time(Now<NodeSeconds>()).SpendsCoinbase(false).FromTx(child));
+
+    std::unique_ptr<CBlockTemplate> block_template{AssemblerForTest(tx_mempool).CreateNewBlock(scriptPubKey)};
+    BOOST_REQUIRE(block_template);
+    BOOST_REQUIRE_EQUAL(block_template->block.vtx.size(), 3U);
+    BOOST_CHECK_EQUAL(block_template->block.vtx[1]->GetHash(), parent_hash);
+    BOOST_CHECK_EQUAL(block_template->block.vtx[2]->GetHash(), child_hash);
+    BOOST_CHECK_GT(block_template->block.nTime, child.nTime);
 }
 
 constexpr static struct {
@@ -681,6 +722,9 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
     }
 
     LOCK(cs_main);
+
+    TestV2ParentChildTimeCanonicalization(scriptPubKey, txFirst);
+    SetMockTime(MinerTestMockTime());
 
     TestBasicMining(scriptPubKey, txFirst, baseheight);
 
