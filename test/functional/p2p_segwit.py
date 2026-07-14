@@ -55,7 +55,6 @@ from test_framework.script import (
     CScriptNum,
     CScriptOp,
     MAX_SCRIPT_ELEMENT_SIZE,
-    V4_MAX_SCRIPT_ELEMENT_SIZE,
     OP_0,
     OP_1,
     OP_2,
@@ -1092,7 +1091,7 @@ class SegWitTest(BitcoinTestFramework):
 
     @subtest
     def test_max_witness_push_length(self):
-        """Test that witness stack elements cannot exceed the V4 push limit."""
+        """Test that witness-v0 stack elements cannot exceed the legacy push limit."""
 
         block = self.build_next_block()
 
@@ -1108,8 +1107,8 @@ class SegWitTest(BitcoinTestFramework):
         tx2.vin.append(CTxIn(COutPoint(tx.sha256, 0), b""))
         tx2.vout.append(CTxOut(tx.vout[0].nValue - 1000, CScript([OP_TRUE])))
         tx2.wit.vtxinwit.append(CTxInWitness())
-        # First try one byte over the V4 witness stack element limit.
-        tx2.wit.vtxinwit[0].scriptWitness.stack = [b'a' * (V4_MAX_SCRIPT_ELEMENT_SIZE + 1), witness_script]
+        # First try one byte over the witness-v0 stack element limit.
+        tx2.wit.vtxinwit[0].scriptWitness.stack = [b'a' * (MAX_SCRIPT_ELEMENT_SIZE + 1), witness_script]
         set_tx_fee(tx2, tx.vout[0].nValue)
 
         self.update_witness_block_with_transactions(block, [tx, tx2])
@@ -1117,7 +1116,7 @@ class SegWitTest(BitcoinTestFramework):
                            reason='Push value size limit exceeded')
 
         # Now reduce the length of the stack element
-        tx2.wit.vtxinwit[0].scriptWitness.stack[0] = b'a' * V4_MAX_SCRIPT_ELEMENT_SIZE
+        tx2.wit.vtxinwit[0].scriptWitness.stack[0] = b'a' * MAX_SCRIPT_ELEMENT_SIZE
 
         add_witness_commitment(block)
         block.solve()

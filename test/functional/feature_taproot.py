@@ -37,7 +37,7 @@ from test_framework.script import (
     LEAF_VERSION_TAPSCRIPT,
     LegacySignatureMsg,
     LOCKTIME_THRESHOLD,
-    V4_MAX_SCRIPT_ELEMENT_SIZE,
+    MAX_SCRIPT_ELEMENT_SIZE,
     OP_0,
     OP_1,
     OP_2,
@@ -983,10 +983,10 @@ def spenders_taproot_active():
         ("t23", CScript([OP_DROP] * 999 + [pubs[1], OP_CHECKSIG])),
         # 24) Script that expects an input stack of 1001 elements
         ("t24", CScript([OP_DROP] * 1000 + [pubs[1], OP_CHECKSIG])),
-        # 25) Script that pushes a V4_MAX_SCRIPT_ELEMENT_SIZE-bytes element
-        ("t25", CScript([random_bytes(V4_MAX_SCRIPT_ELEMENT_SIZE), OP_DROP, pubs[1], OP_CHECKSIG])),
-        # 26) Script that pushes a (V4_MAX_SCRIPT_ELEMENT_SIZE+1)-bytes element
-        ("t26", CScript([random_bytes(V4_MAX_SCRIPT_ELEMENT_SIZE+1), OP_DROP, pubs[1], OP_CHECKSIG])),
+        # 25) Script that pushes a MAX_SCRIPT_ELEMENT_SIZE-bytes element
+        ("t25", CScript([random_bytes(MAX_SCRIPT_ELEMENT_SIZE), OP_DROP, pubs[1], OP_CHECKSIG])),
+        # 26) Script that pushes a (MAX_SCRIPT_ELEMENT_SIZE+1)-bytes element
+        ("t26", CScript([random_bytes(MAX_SCRIPT_ELEMENT_SIZE+1), OP_DROP, pubs[1], OP_CHECKSIG])),
         # 27) CHECKSIGADD that must fail because numeric argument number is >4 bytes
         ("t27", CScript([CScriptNum(OVERSIZE_NUMBER), pubs[1], OP_CHECKSIGADD])),
         # 28) Pushes random CScriptNum value, checks OP_CHECKSIGADD result
@@ -1018,8 +1018,8 @@ def spenders_taproot_active():
         "key": secs[1],
         "tap": tap,
     }
-    # Test that V4_MAX_SCRIPT_ELEMENT_SIZE byte stack element inputs are valid, but not one more (and 80 bytes is standard but 81 is not).
-    add_spender(spenders, "tapscript/inputmaxlimit", leaf="t0", **common, standard=False, inputs=[getter("sign"), random_bytes(V4_MAX_SCRIPT_ELEMENT_SIZE)], failure={"inputs": [getter("sign"), random_bytes(V4_MAX_SCRIPT_ELEMENT_SIZE+1)]}, **ERR_PUSH_LIMIT)
+    # Test that MAX_SCRIPT_ELEMENT_SIZE byte stack element inputs are valid, but not one more (and 80 bytes is standard but 81 is not).
+    add_spender(spenders, "tapscript/inputmaxlimit", leaf="t0", **common, standard=False, inputs=[getter("sign"), random_bytes(MAX_SCRIPT_ELEMENT_SIZE)], failure={"inputs": [getter("sign"), random_bytes(MAX_SCRIPT_ELEMENT_SIZE+1)]}, **ERR_PUSH_LIMIT)
     add_spender(spenders, "tapscript/input80limit", leaf="t0", **common, inputs=[getter("sign"), random_bytes(80)])
     add_spender(spenders, "tapscript/input81limit", leaf="t0", **common, standard=False, inputs=[getter("sign"), random_bytes(81)])
     # Test that OP_CHECKMULTISIG and OP_CHECKMULTISIGVERIFY cause failure, but OP_CHECKSIG and OP_CHECKSIGVERIFY work.
@@ -1058,7 +1058,7 @@ def spenders_taproot_active():
     add_spender(spenders, "tapscript/1000stack", leaf="t21", **SINGLE_SIG, **common, failure={"leaf": "t22"}, **ERR_STACK_SIZE)
     # Test that an input stack size of 1000 elements is permitted, but 1001 isn't.
     add_spender(spenders, "tapscript/1000inputs", leaf="t23", **common, inputs=[getter("sign")] + [b'' for _ in range(999)], failure={"leaf": "t24", "inputs": [getter("sign")] + [b'' for _ in range(1000)]}, **ERR_STACK_SIZE)
-    # Test that pushing a V4_MAX_SCRIPT_ELEMENT_SIZE byte stack element is valid, but one longer is not.
+    # Test that pushing a MAX_SCRIPT_ELEMENT_SIZE byte stack element is valid, but one longer is not.
     add_spender(spenders, "tapscript/pushmaxlimit", leaf="t25", **common, **SINGLE_SIG, failure={"leaf": "t26"}, **ERR_PUSH_LIMIT)
     # Test that 999-of-999 multisig works (but 1000-of-1000 triggers stack size limits)
     add_spender(spenders, "tapscript/bigmulti", leaf="t33", **common, inputs=big_spend_inputs, num=999, failure={"leaf": "t34", "num": 1000}, **ERR_STACK_SIZE)
@@ -1137,8 +1137,8 @@ def spenders_taproot_active():
             ("return_unkver", CScript([OP_RETURN]), leafver),
             ("undecodable_c0", CScript([OP_PUSHDATA1])),
             ("undecodable_unkver", CScript([OP_PUSHDATA1]), leafver),
-            ("bigpush_c0", CScript([random_bytes(V4_MAX_SCRIPT_ELEMENT_SIZE+1), OP_DROP])),
-            ("bigpush_unkver", CScript([random_bytes(V4_MAX_SCRIPT_ELEMENT_SIZE+1), OP_DROP]), leafver),
+            ("bigpush_c0", CScript([random_bytes(MAX_SCRIPT_ELEMENT_SIZE+1), OP_DROP])),
+            ("bigpush_unkver", CScript([random_bytes(MAX_SCRIPT_ELEMENT_SIZE+1), OP_DROP]), leafver),
             ("1001push_c0", CScript([OP_0] * 1001)),
             ("1001push_unkver", CScript([OP_0] * 1001), leafver),
         ]
@@ -1166,8 +1166,8 @@ def spenders_taproot_active():
             ("undecodable_success", CScript([opcode, OP_PUSHDATA1])),
             ("undecodable_nop", CScript([OP_NOP, OP_PUSHDATA1])),
             ("undecodable_bypassed_success", CScript([OP_PUSHDATA1, OP_2, opcode])),
-            ("bigpush_success", CScript([random_bytes(V4_MAX_SCRIPT_ELEMENT_SIZE+1), OP_DROP, opcode])),
-            ("bigpush_nop", CScript([random_bytes(V4_MAX_SCRIPT_ELEMENT_SIZE+1), OP_DROP, OP_NOP])),
+            ("bigpush_success", CScript([random_bytes(MAX_SCRIPT_ELEMENT_SIZE+1), OP_DROP, opcode])),
+            ("bigpush_nop", CScript([random_bytes(MAX_SCRIPT_ELEMENT_SIZE+1), OP_DROP, OP_NOP])),
             ("1001push_success", CScript([OP_0] * 1001 + [opcode])),
             ("1001push_nop", CScript([OP_0] * 1001 + [OP_NOP])),
         ]
