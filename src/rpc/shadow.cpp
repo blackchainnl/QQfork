@@ -173,6 +173,58 @@ UniValue AmountUnits()
     return units;
 }
 
+bool AddShadowAmount(CAmount& total, CAmount amount)
+{
+    if (amount < 0 || !MoneyRange(amount) || total < 0 || total > MAX_MONEY - amount) {
+        return false;
+    }
+    total += amount;
+    return true;
+}
+
+CAmount ScheduledShadowAmountThrough(int last_height)
+{
+    CAmount total{0};
+    const int end = std::min(last_height, SHADOW_REWARD_END_HEIGHT);
+    int height = SHADOW_REWARD_START_HEIGHT;
+    const int phase_one_end = std::min(end, SHADOW_PHASE1_END_HEIGHT);
+    while (height <= phase_one_end) {
+        const int halvings = (height - SHADOW_REWARD_START_HEIGHT) /
+            std::max(1, SHADOW_HALVING_INTERVAL_BLOCKS);
+        const CAmount reward = halvings >= std::numeric_limits<CAmount>::digits
+            ? 0 : (580 * COIN) >> halvings;
+        const int64_t next_boundary = std::min<int64_t>(
+            static_cast<int64_t>(phase_one_end) + 1,
+            static_cast<int64_t>(SHADOW_REWARD_START_HEIGHT) +
+                static_cast<int64_t>(halvings + 1) *
+                    std::max(1, SHADOW_HALVING_INTERVAL_BLOCKS));
+        const int64_t block_count = next_boundary - height;
+        if (reward < 0 || block_count < 1 ||
+            block_count > MAX_MONEY / std::max<CAmount>(reward, 1) ||
+            !AddShadowAmount(total, reward * block_count)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Configured shadow reward schedule is out of range");
+        }
+        height = static_cast<int>(next_boundary);
+    }
+    if (height <= end) {
+        const int64_t block_count = static_cast<int64_t>(end) - height + 1;
+        if (block_count < 1 || block_count > MAX_MONEY / (463 * COIN) ||
+            !AddShadowAmount(total, (463 * COIN) * block_count)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Configured shadow reward schedule is out of range");
+        }
+    }
+    return total;
+}
+
+struct ShadowLifecycleSupply {
+    uint64_t locked_count{0};
+    CAmount locked_nominal{0};
+    CAmount locked_effective{0};
+    uint64_t spendable_count{0};
+    CAmount spendable_nominal{0};
+    CAmount spendable_effective{0};
+};
+
 std::string PowClaimDispositionName(ShadowPowClaimDisposition disposition)
 {
     switch (disposition) {
@@ -611,6 +663,163 @@ RPCHelpMan getshadowaddress()
     };
 }
 
+RPCHelpMan getshadowscript()
+{
+    return RPCHelpMan{
+        "getshadowscript",
+        "Returns cursor-paginated synthetic shadow-ledger payout history for one exact destination script.\n"
+        "The script is matched byte-for-byte; no address or descriptor normalization is applied.\n",
+        {
+            {"scriptPubKey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Exact destination script in hexadecimal"},
+            {"after_height", RPCArg::Type::NUM, RPCArg::DefaultHint{"null"}, "Exclusive cursor origin height; provide with after_txid"},
+            {"after_txid", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"null"}, "Exclusive cursor synthetic transaction id; provide with after_height"},
+            {"count", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_SHADOW_PAGE_SIZE}, "Maximum records to return (1-1000)"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Versioned exact-script history page",
+            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
+        RPCExamples{
+            HelpExampleCli("getshadowscript", "\"5120...\"") +
+            HelpExampleCli("getshadowscript", "\"5120...\" 5950003 \"txid\" 100")
+        },
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const std::vector<unsigned char> script_bytes = ParseHexV(
+                request.params[0], "scriptPubKey");
+            if (script_bytes.size() > static_cast<size_t>(MAX_SCRIPT_SIZE)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "scriptPubKey exceeds the 10000-byte script limit");
+            }
+            const CScript script_pub_key{script_bytes.begin(), script_bytes.end()};
+            const int count = request.params[3].isNull()
+                ? DEFAULT_SHADOW_PAGE_SIZE
+                : request.params[3].getInt<int>();
+            if (count < 1 || count > MAX_SHADOW_PAGE_SIZE) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "count must be between 1 and 1000");
+            }
+            const bool has_height = !request.params[1].isNull();
+            const bool has_txid = !request.params[2].isNull();
+            if (has_height != has_txid) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   "after_height and after_txid must be provided together");
+            }
+
+            std::optional<ShadowIndexScriptCursor> after;
+            if (has_height) {
+                const int64_t height = request.params[1].getInt<int64_t>();
+                if (height < 0 || height > std::numeric_limits<uint32_t>::max()) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "after_height is out of range");
+                }
+                after = ShadowIndexScriptCursor{
+                    static_cast<uint32_t>(height),
+                    ParseHashV(request.params[2], "after_txid")};
+            }
+
+            EnsureShadowIndexReady();
+            ChainstateManager& chainman = EnsureAnyChainman(request.context);
+            const CBlockIndex* tip = WITH_LOCK(cs_main, return chainman.ActiveChain().Tip());
+            if (!tip) throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Chain is not initialized");
+
+            std::vector<ShadowIndexRecord> indexed;
+            std::optional<ShadowIndexScriptCursor> next;
+            if (!g_shadow_index->LookupScript(script_pub_key, after,
+                                              static_cast<size_t>(count), indexed, next)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read shadow script history");
+            }
+            UniValue records(UniValue::VARR);
+            for (const ShadowIndexRecord& record : indexed) {
+                const CBlockIndex* origin = tip->GetAncestor(record.origin_height);
+                if (!origin || origin->GetBlockHash() != record.origin_block_hash) {
+                    throw JSONRPCError(RPC_MISC_ERROR,
+                                       "Shadow index changed during script lookup; retry the request");
+                }
+                records.push_back(ShadowRecordToJSON(record, *tip, chainman.GetConsensus()));
+            }
+
+            UniValue next_cursor;
+            if (next) {
+                next_cursor.setObject();
+                next_cursor.pushKV("height", next->height);
+                next_cursor.pushKV("txid", next->synthetic_txid.GetHex());
+            }
+            UniValue result(UniValue::VOBJ);
+            result.pushKV("schema", "blackcoin.shadow.script.v1");
+            result.pushKV("scriptPubKey", HexStr(script_pub_key));
+            CTxDestination destination;
+            result.pushKV("address", ExtractDestination(script_pub_key, destination)
+                ? UniValue(EncodeDestination(destination)) : UniValue{});
+            result.pushKV("height", tip->nHeight);
+            result.pushKV("bestblock", tip->GetBlockHash().GetHex());
+            result.pushKV("count", static_cast<uint64_t>(indexed.size()));
+            result.pushKV("next_cursor", std::move(next_cursor));
+            result.pushKV("synthetic", true);
+            result.pushKV("merkle_included", false);
+            result.pushKV("units", AmountUnits());
+            result.pushKV("records", std::move(records));
+            return result;
+        },
+    };
+}
+
+RPCHelpMan getshadowoutpoint()
+{
+    return RPCHelpMan{
+        "getshadowoutpoint",
+        "Returns one synthetic shadow-ledger payout by its original outpoint.\n"
+        "Spent payouts are resolved through the persisted spent-outpoint index and remain queryable.\n",
+        {
+            {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Synthetic payout transaction id"},
+            {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "Synthetic payout output index"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "Versioned synthetic outpoint record",
+            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
+        RPCExamples{
+            HelpExampleCli("getshadowoutpoint", "\"txid\" 0") +
+            HelpExampleRpc("getshadowoutpoint", "\"txid\", 0")
+        },
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            const uint256 txid = ParseHashV(request.params[0], "txid");
+            const int64_t vout = request.params[1].getInt<int64_t>();
+            if (vout < 0 || vout > std::numeric_limits<uint32_t>::max()) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "vout is out of range");
+            }
+            const COutPoint outpoint{txid, static_cast<uint32_t>(vout)};
+
+            EnsureShadowIndexReady();
+            ShadowIndexRecord record;
+            const bool spent_index_match = g_shadow_index->LookupSpentOutpoint(outpoint, record);
+            if (!spent_index_match) {
+                if (!g_shadow_index->LookupTransaction(txid, record) || record.outpoint != outpoint) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                       "Synthetic shadow outpoint not found");
+                }
+            } else if (record.outpoint != outpoint || !record.spent) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                   "Spent shadow outpoint index is inconsistent");
+            }
+
+            ChainstateManager& chainman = EnsureAnyChainman(request.context);
+            const CBlockIndex* tip{nullptr};
+            {
+                LOCK(cs_main);
+                tip = chainman.ActiveChain().Tip();
+                const CBlockIndex* origin = tip ? tip->GetAncestor(record.origin_height) : nullptr;
+                if (!origin || origin->GetBlockHash() != record.origin_block_hash) {
+                    throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
+                                       "Synthetic outpoint is not on the active chain");
+                }
+            }
+
+            UniValue result = ShadowRecordToJSON(record, *tip, chainman.GetConsensus());
+            result.pushKV("schema", "blackcoin.shadow.outpoint.v1");
+            result.pushKV("lookup_index", spent_index_match
+                ? "spent_outpoint" : "synthetic_transaction");
+            result.pushKV("confirmations",
+                          tip->nHeight - static_cast<int>(record.origin_height) + 1);
+            result.pushKV("units", AmountUnits());
+            return result;
+        },
+    };
+}
+
 RPCHelpMan getquantumwitnessinventory()
 {
     return RPCHelpMan{
@@ -965,11 +1174,11 @@ RPCHelpMan getshadowsupply()
 {
     return RPCHelpMan{
         "getshadowsupply",
-        "Returns exact indexed nominal shadow-ledger issuance/spend totals. "
-        "After demurrage activation, current effective unspent value is an optional bounded scan.\n",
+        "Returns exact indexed nominal shadow-ledger issuance/spend totals and stable schedule, pool, lock, spendability, and burn buckets. "
+        "Lifecycle and current effective values use a bounded scan only when they cannot be derived from the global phase.\n",
         {
-            {"include_effective", RPCArg::Type::BOOL, RPCArg::Default{true}, "Calculate current demurrage-adjusted unspent value when demurrage is active"},
-            {"max_records", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_EFFECTIVE_SCAN_LIMIT}, "Hard cap for an effective-value scan (1-10000000)"},
+            {"include_effective", RPCArg::Type::BOOL, RPCArg::Default{true}, "Run the bounded per-payout scan when current lifecycle or demurrage values require it"},
+            {"max_records", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_EFFECTIVE_SCAN_LIMIT}, "Hard cap for a lifecycle/effective-value scan (1-10000000)"},
         },
         RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing shadow supply record",
             {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
@@ -988,7 +1197,15 @@ RPCHelpMan getshadowsupply()
 
             EnsureShadowIndexReady();
             ChainstateManager& chainman = EnsureAnyChainman(request.context);
-            const CBlockIndex* tip = WITH_LOCK(cs_main, return chainman.ActiveChain().Tip());
+            const CBlockIndex* tip{nullptr};
+            ShadowGoldRushInfo pool;
+            {
+                LOCK(cs_main);
+                tip = chainman.ActiveChain().Tip();
+                if (tip) {
+                    pool = GetShadowGoldRushInfo(chainman.ActiveChainstate().CoinsTip(), tip);
+                }
+            }
             if (!tip) throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Chain is not initialized");
 
             ShadowIndexSupply supply;
@@ -1002,13 +1219,57 @@ RPCHelpMan getshadowsupply()
             const int64_t evaluation_mtp = tip->GetMedianTimePast();
             const Consensus::Params& consensus = chainman.GetConsensus();
             const bool demurrage_active = consensus.IsDemurrageActive(evaluation_height, evaluation_mtp);
+            const bool quantum_spends_active = IsQuantumWitnessSpendActive(
+                consensus, evaluation_mtp, evaluation_height);
+
+            CAmount pooled_amount{0};
+            CAmount accrued_amount{0};
+            if (!AddShadowAmount(pooled_amount, pool.pow_amount) ||
+                !AddShadowAmount(pooled_amount, pool.pos_amount) ||
+                !AddShadowAmount(accrued_amount, pool.claimed_amount) ||
+                !AddShadowAmount(accrued_amount, pooled_amount)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Shadow reward pool totals are out of range");
+            }
+            if (pool.claimed_amount != supply.issued_nominal) {
+                throw JSONRPCError(RPC_MISC_ERROR,
+                                   "Shadow index and active-chain reward pool changed; retry the request");
+            }
+            const CAmount scheduled_total = ScheduledShadowAmountThrough(SHADOW_REWARD_END_HEIGHT);
+            const CAmount scheduled_through_height = ScheduledShadowAmountThrough(tip->nHeight);
+            if (accrued_amount > scheduled_through_height || scheduled_through_height > scheduled_total) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                   "Shadow reward accounting exceeds the configured schedule");
+            }
+            const bool pool_claimable_next_block = IsShadowGoldRushRewardActive(
+                consensus, evaluation_mtp, evaluation_height);
+            const bool reward_window_ended = evaluation_height > SHADOW_REWARD_END_HEIGHT;
+            const CAmount claimable_pool_amount = pool_claimable_next_block ? pooled_amount : 0;
+            const CAmount expired_pool_amount = reward_window_ended ? pooled_amount : 0;
 
             bool effective_exact = !demurrage_active;
+            bool lifecycle_exact{false};
             size_t scanned_records{0};
             CAmount effective_unspent = effective_exact ? unspent_nominal : 0;
             CAmount decayed_unspent{0};
-            if (demurrage_active && include_effective) {
+            ShadowLifecycleSupply lifecycle;
+            const bool all_payouts_mature =
+                evaluation_height >= SHADOW_REWARD_END_HEIGHT + consensus.nCoinbaseMaturity;
+            const bool lifecycle_scan_required = quantum_spends_active &&
+                (demurrage_active || !all_payouts_mature);
+            if (!quantum_spends_active) {
+                lifecycle.locked_count = unspent_count;
+                lifecycle.locked_nominal = unspent_nominal;
+                lifecycle.locked_effective = unspent_nominal;
+                lifecycle_exact = true;
+            } else if (!lifecycle_scan_required) {
+                lifecycle.spendable_count = unspent_count;
+                lifecycle.spendable_nominal = unspent_nominal;
+                lifecycle.spendable_effective = unspent_nominal;
+                lifecycle_exact = true;
+            } else if (include_effective) {
                 bool complete{false};
+                CAmount scanned_effective{0};
+                CAmount scanned_decayed{0};
                 const bool scan_ok = g_shadow_index->ForEachTransaction(
                     static_cast<size_t>(max_records),
                     [&](const ShadowIndexRecord& record) {
@@ -1024,23 +1285,61 @@ RPCHelpMan getshadowsupply()
                         const Consensus::DemurrageEvaluation evaluation = Consensus::EvaluateDemurrage(
                             coin, consensus, evaluation_height, evaluation_mtp,
                             latest_height, coverage_start);
-                        effective_unspent += evaluation.effective_value;
-                        decayed_unspent += evaluation.burned_value;
-                        return MoneyRange(effective_unspent) && MoneyRange(decayed_unspent);
+                        if (!AddShadowAmount(scanned_effective, evaluation.effective_value) ||
+                            !AddShadowAmount(scanned_decayed, evaluation.burned_value)) {
+                            return false;
+                        }
+                        const bool mature = evaluation_height >=
+                            static_cast<int>(record.origin_height) + consensus.nCoinbaseMaturity;
+                        uint64_t& count = mature && !evaluation.locked
+                            ? lifecycle.spendable_count : lifecycle.locked_count;
+                        CAmount& nominal = mature && !evaluation.locked
+                            ? lifecycle.spendable_nominal : lifecycle.locked_nominal;
+                        CAmount& effective = mature && !evaluation.locked
+                            ? lifecycle.spendable_effective : lifecycle.locked_effective;
+                        if (count == std::numeric_limits<uint64_t>::max() ||
+                            !AddShadowAmount(nominal, record.nominal_amount) ||
+                            !AddShadowAmount(effective, evaluation.effective_value)) {
+                            return false;
+                        }
+                        ++count;
+                        return true;
                     },
                     scanned_records, complete);
                 if (!scan_ok) {
                     throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to scan shadowindex valuation records");
                 }
-                effective_exact = complete;
-                if (!complete) {
-                    effective_unspent = 0;
-                    decayed_unspent = 0;
+                lifecycle_exact = complete;
+                if (complete &&
+                    (lifecycle.locked_count + lifecycle.spendable_count != unspent_count ||
+                     lifecycle.locked_nominal + lifecycle.spendable_nominal != unspent_nominal ||
+                     scanned_effective + scanned_decayed != unspent_nominal)) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                       "Shadow lifecycle buckets do not reconcile with indexed supply");
                 }
+                if (demurrage_active) {
+                    effective_exact = complete;
+                    effective_unspent = complete ? scanned_effective : 0;
+                    decayed_unspent = complete ? scanned_decayed : 0;
+                }
+                if (!complete) {
+                    lifecycle = {};
+                }
+            }
+
+            CAmount projected_total_burn{0};
+            if (effective_exact &&
+                (!AddShadowAmount(projected_total_burn, supply.spent_decayed) ||
+                 !AddShadowAmount(projected_total_burn, decayed_unspent))) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Shadow burn total is out of range");
             }
 
             UniValue result(UniValue::VOBJ);
             result.pushKV("schema", "blackcoin.shadow.supply.v1");
+            result.pushKV("lifecycle_schema", "blackcoin.shadow.supply.lifecycle.v1");
+            result.pushKV("accounting_scope", "synthetic_gold_rush_payouts_only");
+            result.pushKV("synthetic", true);
+            result.pushKV("merkle_included", false);
             result.pushKV("height", tip->nHeight);
             result.pushKV("bestblock", tip->GetBlockHash().GetHex());
             result.pushKV("evaluation_height", evaluation_height);
@@ -1061,6 +1360,60 @@ RPCHelpMan getshadowsupply()
             result.pushKV("unspent_effective_amount", effective_exact ? UniValue(ValueFromAmount(effective_unspent)) : UniValue{});
             result.pushKV("unspent_decayed_amount", effective_exact ? UniValue(ValueFromAmount(decayed_unspent)) : UniValue{});
             result.pushKV("unspent_projected_burn_amount", effective_exact ? UniValue(ValueFromAmount(decayed_unspent)) : UniValue{});
+            UniValue schedule(UniValue::VOBJ);
+            schedule.pushKV("start_height", SHADOW_REWARD_START_HEIGHT);
+            schedule.pushKV("end_height", SHADOW_REWARD_END_HEIGHT);
+            schedule.pushKV("total_amount", ValueFromAmount(scheduled_total));
+            schedule.pushKV("through_height_amount", ValueFromAmount(scheduled_through_height));
+            schedule.pushKV("accrued_amount", ValueFromAmount(accrued_amount));
+            schedule.pushKV("unaccrued_amount", ValueFromAmount(scheduled_total - accrued_amount));
+            result.pushKV("schedule", std::move(schedule));
+
+            UniValue pool_bucket(UniValue::VOBJ);
+            pool_bucket.pushKV("amount", ValueFromAmount(pooled_amount));
+            pool_bucket.pushKV("pow_amount", ValueFromAmount(pool.pow_amount));
+            pool_bucket.pushKV("pos_amount", ValueFromAmount(pool.pos_amount));
+            pool_bucket.pushKV("claimable_next_block", pool_claimable_next_block);
+            pool_bucket.pushKV("claimable_amount", ValueFromAmount(claimable_pool_amount));
+            pool_bucket.pushKV("expired_unissued_amount", ValueFromAmount(expired_pool_amount));
+            result.pushKV("pool", std::move(pool_bucket));
+
+            UniValue lifecycle_bucket(UniValue::VOBJ);
+            lifecycle_bucket.pushKV("classification_exact", lifecycle_exact);
+            lifecycle_bucket.pushKV("records_scanned", static_cast<uint64_t>(scanned_records));
+            lifecycle_bucket.pushKV("locked_count", lifecycle_exact
+                ? UniValue(lifecycle.locked_count) : UniValue{});
+            lifecycle_bucket.pushKV("locked_nominal_amount", lifecycle_exact
+                ? UniValue(ValueFromAmount(lifecycle.locked_nominal)) : UniValue{});
+            lifecycle_bucket.pushKV("locked_effective_amount", lifecycle_exact
+                ? UniValue(ValueFromAmount(lifecycle.locked_effective)) : UniValue{});
+            lifecycle_bucket.pushKV("spendable_count", lifecycle_exact
+                ? UniValue(lifecycle.spendable_count) : UniValue{});
+            lifecycle_bucket.pushKV("spendable_nominal_amount", lifecycle_exact
+                ? UniValue(ValueFromAmount(lifecycle.spendable_nominal)) : UniValue{});
+            lifecycle_bucket.pushKV("spendable_effective_amount", lifecycle_exact
+                ? UniValue(ValueFromAmount(lifecycle.spendable_effective)) : UniValue{});
+            lifecycle_bucket.pushKV("expired_payout_count", 0);
+            lifecycle_bucket.pushKV("expired_payout_nominal_amount", ValueFromAmount(0));
+            lifecycle_bucket.pushKV("payout_expiration_policy", "gold_rush_payouts_do_not_expire");
+            result.pushKV("lifecycle", std::move(lifecycle_bucket));
+
+            UniValue burn_bucket(UniValue::VOBJ);
+            burn_bucket.pushKV("realized_amount", ValueFromAmount(supply.spent_decayed));
+            burn_bucket.pushKV("projected_unspent_amount", effective_exact
+                ? UniValue(ValueFromAmount(decayed_unspent)) : UniValue{});
+            burn_bucket.pushKV("projected_total_amount", effective_exact
+                ? UniValue(ValueFromAmount(projected_total_burn)) : UniValue{});
+            burn_bucket.pushKV("disposition", "burned_by_consensus");
+            result.pushKV("burn", std::move(burn_bucket));
+
+            UniValue legacy_bucket(UniValue::VOBJ);
+            legacy_bucket.pushKV("included", false);
+            legacy_bucket.pushKV("spendable_amount", UniValue{});
+            legacy_bucket.pushKV("locked_amount", UniValue{});
+            legacy_bucket.pushKV("source_rpc", "getcirculatingsupply");
+            legacy_bucket.pushKV("reason", "legacy UTXOs are outside the synthetic shadow-ledger accounting scope");
+            result.pushKV("legacy", std::move(legacy_bucket));
             result.pushKV("decay_disposition", "burned_by_consensus");
             result.pushKV("decay_paid_as_fee", false);
             result.pushKV("decay_redistributed", false);
@@ -1078,6 +1431,8 @@ void RegisterShadowRPCCommands(CRPCTable& table)
         {"blockchain", &getquantumwitnessinventory},
         {"blockchain", &getshadowaddress},
         {"blockchain", &getshadowblock},
+        {"blockchain", &getshadowoutpoint},
+        {"blockchain", &getshadowscript},
         {"blockchain", &getshadowtransaction},
         {"blockchain", &getshadowsupply},
     };
