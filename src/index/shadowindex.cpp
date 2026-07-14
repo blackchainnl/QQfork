@@ -529,6 +529,11 @@ bool ShadowIndex::CustomInit(const std::optional<interfaces::BlockKey>& block)
         if (m_db->Exists(DB_CUSTOM_TIP)) {
             return error("%s: unreadable shadowindex custom tip", __func__);
         }
+        if (block && block->height >= SHADOW_REWARD_START_HEIGHT) {
+            return error(
+                "%s: shadowindex custom tip is missing at persisted locator %s; use -reindex",
+                __func__, block->hash.ToString());
+        }
         return true;
     }
     if (custom_tip.height < SHADOW_REWARD_START_HEIGHT || custom_tip.hash.IsNull()) {

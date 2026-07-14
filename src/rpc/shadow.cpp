@@ -182,16 +182,22 @@ void EnsureShadowRPCSnapshotUnchanged(ChainstateManager& chainman,
     }
 }
 
-void MaybeDelayShadowRPCSnapshot(const char* rpc_name,
-                                 const ShadowRPCSnapshot& snapshot)
+void MaybeDelayShadowRPCSnapshot(const char* rpc_name, int height,
+                                 const uint256& hash)
 {
     if (Params().GetChainType() != ChainType::REGTEST) return;
     const int64_t delay_ms = std::clamp<int64_t>(
         gArgs.GetIntArg("-shadowrpcsnapshotdelaymillis", 0), 0, 10000);
     if (delay_ms == 0) return;
     LogPrintf("Shadow RPC snapshot race barrier reached: rpc=%s height=%d hash=%s\n",
-              rpc_name, snapshot.height, snapshot.hash.GetHex());
+              rpc_name, height, hash.GetHex());
     UninterruptibleSleep(std::chrono::milliseconds{delay_ms});
+}
+
+void MaybeDelayShadowRPCSnapshot(const char* rpc_name,
+                                 const ShadowRPCSnapshot& snapshot)
+{
+    MaybeDelayShadowRPCSnapshot(rpc_name, snapshot.height, snapshot.hash);
 }
 
 const CBlockIndex* ParseActiveBlock(const UniValue& value, ChainstateManager& chainman)
@@ -1108,16 +1114,24 @@ RPCHelpMan getquantumwitnessinventory()
             const bool history_index_synced = history_index_enabled &&
                 g_shadow_index->BlockUntilSyncedToCurrentChain();
             IndexSummary history_index_summary;
+            std::optional<uint64_t> history_index_revision;
             bool history_snapshot_covered{false};
             if (history_index_synced) {
+                const uint64_t revision_before = g_shadow_index->GetRevision();
                 history_index_summary = g_shadow_index->GetSummary();
-                LOCK(cs_main);
-                const CBlockIndex* index_tip = chainman.m_blockman.LookupBlockIndex(
-                    history_index_summary.best_block_hash);
-                history_snapshot_covered = index_tip &&
-                    index_tip->nHeight == history_index_summary.best_block_height &&
-                    index_tip->nHeight >= snapshot_tip->nHeight &&
-                    index_tip->GetAncestor(snapshot_tip->nHeight) == snapshot_tip;
+                const uint64_t revision_after = g_shadow_index->GetRevision();
+                if (revision_before == revision_after && history_index_summary.synced) {
+                    LOCK(cs_main);
+                    const CBlockIndex* index_tip = chainman.m_blockman.LookupBlockIndex(
+                        history_index_summary.best_block_hash);
+                    history_snapshot_covered = index_tip &&
+                        index_tip->nHeight == history_index_summary.best_block_height &&
+                        index_tip->nHeight >= snapshot_tip->nHeight &&
+                        index_tip->GetAncestor(snapshot_tip->nHeight) == snapshot_tip;
+                    if (history_snapshot_covered) {
+                        history_index_revision = revision_after;
+                    }
+                }
             }
             if (view == "history" && !history_snapshot_covered) {
                 throw JSONRPCError(RPC_MISC_ERROR,
@@ -1126,6 +1140,12 @@ RPCHelpMan getquantumwitnessinventory()
                         : !history_index_synced
                             ? "shadowindex is still synchronizing; historical witness records are unavailable"
                             : "shadowindex does not cover the immutable UTXO snapshot tip; retry the request");
+            }
+            if (history_snapshot_covered) {
+                MaybeDelayShadowRPCSnapshot(
+                    "getquantumwitnessinventory",
+                    history_index_summary.best_block_height,
+                    history_index_summary.best_block_hash);
             }
 
             WitnessInventoryBucket history_created;
@@ -1208,6 +1228,24 @@ RPCHelpMan getquantumwitnessinventory()
                     history_db_records, history_complete);
                 if (!history_ok) {
                     throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to reconcile historical witness records");
+                }
+            }
+
+            if (history_snapshot_covered) {
+                const uint64_t revision_before = g_shadow_index->GetRevision();
+                const IndexSummary current_summary = g_shadow_index->GetSummary();
+                const uint64_t revision_after = g_shadow_index->GetRevision();
+                if (!history_index_revision ||
+                    revision_before != *history_index_revision ||
+                    revision_after != *history_index_revision ||
+                    !current_summary.synced ||
+                    current_summary.best_block_height !=
+                        history_index_summary.best_block_height ||
+                    current_summary.best_block_hash !=
+                        history_index_summary.best_block_hash) {
+                    throw JSONRPCError(
+                        RPC_MISC_ERROR,
+                        "Shadow index changed during the witness-history snapshot; retry the request");
                 }
             }
 

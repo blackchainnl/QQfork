@@ -1744,11 +1744,13 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (args.GetBoolArg("-shadowindex", DEFAULT_SHADOWINDEX)) {
         ShadowIndexEventCallback event_callback;
 #if ENABLE_ZMQ
-        event_callback = [](bool connected, const ShadowIndexBlockEvent& event) {
-            if (g_zmq_notification_interface) {
-                g_zmq_notification_interface->NotifyShadowBlock(connected, event);
-            }
-        };
+        if (args.IsArgSet("-zmqpubshadow")) {
+            event_callback = [](bool connected, const ShadowIndexBlockEvent& event) {
+                if (g_zmq_notification_interface) {
+                    g_zmq_notification_interface->NotifyShadowBlock(connected, event);
+                }
+            };
+        }
 #endif
         g_shadow_index = std::make_unique<ShadowIndex>(
             interfaces::MakeChain(node), /*cache_size=*/0, false, fReindex,

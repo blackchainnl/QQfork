@@ -207,8 +207,10 @@ The default `utxos` view works without `-shadowindex`. With a synchronized
 index, the response also reconciles current UTXOs against all base-block
 witness-version >1 creations since genesis, including creations that were
 later spent. Use `view="history"` to page those retained records and their exact
-spend provenance. The index tip must contain the immutable UTXO snapshot tip;
-otherwise the RPC asks the caller to retry instead of mixing branches.
+spend provenance. The index tip must contain the immutable UTXO snapshot tip,
+and its live revision must remain unchanged for the entire history scan;
+otherwise the RPC asks the caller to retry instead of mixing branches or
+labeling a partial branch view as exact.
 
 `max_history_records` is a hard scan cap (maximum 10,000,000). When the cap is
 reached, `history_scan_complete` and `history_aggregates_exact` are false,
@@ -297,6 +299,10 @@ in the base block.
   begins at genesis.
 - Corrupt or missing index entries produce RPC/index errors. They are never
   converted into base-chain consensus invalidity.
+- A persisted BaseIndex locator inside the reward window is never accepted
+  without the matching custom shadow tip. This rare interrupted-rewind seam
+  fails closed and requires `-reindex` instead of advertising incomplete data
+  as synchronized.
 - Claim classification is all-or-nothing. Allocation, Argon2, or authenticated
   undo/provenance failure returns an index error with no partial page. The
   shared evaluator runs before an atomic index batch is built or written, and

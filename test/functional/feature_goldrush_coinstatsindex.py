@@ -440,7 +440,7 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         assert_equal(payout_inventory["current_utxos"]["excluded_synthetic_shadow"]["count"], 1)
         assert_equal(payout_inventory["history"]["created"]["count"], 0)
 
-        self.log.info("Rejecting equal-tip ABA reorgs across shadow supply, script, and outpoint snapshots")
+        self.log.info("Rejecting equal-tip ABA reorgs across shadow supply, script, outpoint, and witness-history snapshots")
         race_args = self.extra_args[1] + [
             "-shadowrpcsnapshotdelaymillis=1500",
             f"-mocktime={self.mock_time}",
@@ -453,6 +453,7 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
             ("getshadowsupply", []),
             ("getshadowscript", [payout_script]),
             ("getshadowoutpoint", [payout_utxo["txid"], payout_utxo["vout"]]),
+            ("getquantumwitnessinventory", ["history", 0, 100, 100_000]),
         ):
             self._assert_shadow_snapshot_aba_retry(
                 rpc_name, rpc_args, claim_block_hash, parent_hash
