@@ -183,8 +183,10 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
             "script": output["scriptPubKey"]["hex"],
         }
 
-    def signed_coin_spend(self, coin, outputs):
+    def signed_coin_spend(self, coin, outputs, *, version=2, tx_time=0):
         tx = CTransaction()
+        tx.nVersion = version
+        tx.nTime = tx_time
         tx.vin = [CTxIn(COutPoint(int(coin["txid"], 16), coin["vout"]))]
         tx.vout = list(outputs)
         signed = self.nodes[CANDIDATE].signrawtransactionwithkey(
@@ -294,15 +296,23 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
     def exercise_v2_clock_determinism(self, coin, change_script):
         """Prove candidate/v30.1.0 block validity never depends on node time.
 
-        v26/v28 substitute local adjusted time for the omitted v2 transaction
-        timestamp. That historical rule is intrinsically nondeterministic. The
-        candidate must instead preserve the already-deployed v30.1.0 contract:
-        ConnectBlock supplies the candidate block time to CheckTxInputs.
+        A version-1 funding transaction preserves a nonzero serialized output
+        time. v26/v28 substitute local adjusted time for the omitted timestamp
+        of the version-2 spend, making their result depend on the verifier's
+        clock. The candidate must instead preserve the already-deployed v30.1.0
+        contract: ConnectBlock supplies the candidate block time to
+        CheckTxInputs.
         """
+        tip_time = self.nodes[CANDIDATE].getblockheader(
+            self.nodes[CANDIDATE].getbestblockhash()
+        )["time"]
+        funding_time = tip_time + 1
+        for node in self.nodes:
+            node.setmocktime(funding_time + 1)
         funding_hex = self.signed_coin_spend(coin, [
             CTxOut(COIN, CScript([OP_TRUE])),
             CTxOut(coin["value"] - COIN - FEE, change_script),
-        ])
+        ], version=1, tx_time=funding_time)
         funding_result = self.generateblock(
             self.nodes[CANDIDATE],
             self.nodes[CANDIDATE].get_deterministic_priv_key().address,
@@ -315,6 +325,7 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         funding.rehash()
         parent_hash = funding_result["hash"]
         parent_time = self.nodes[CANDIDATE].getblockheader(parent_hash)["time"]
+        assert parent_time >= funding_time
         spend = self.tx_from_outputs(
             funding.hash,
             0,
@@ -336,7 +347,7 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         for index in (1, 2, CANDIDATE):
             self.disconnect_nodes(index, REFERENCE)
 
-        early_time = parent_time - 1_000
+        early_time = funding_time - 1
         late_time = parent_time + 1_000
         self.nodes[REFERENCE].setmocktime(early_time)
         self.nodes[1].setmocktime(early_time)
