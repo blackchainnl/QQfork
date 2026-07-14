@@ -297,6 +297,10 @@ in the base block.
   begins at genesis.
 - Corrupt or missing index entries produce RPC/index errors. They are never
   converted into base-chain consensus invalidity.
+- Claim classification is all-or-nothing. Allocation, Argon2, or authenticated
+  undo/provenance failure returns an index error with no partial page. The
+  shared evaluator runs before an atomic index batch is built or written, and
+  the index locator is not advanced; restart retries the identical block.
 - The index contains active-chain history only. Orphan-branch records are
   removed during rewind and can be reconstructed if that branch later becomes
   active again.
