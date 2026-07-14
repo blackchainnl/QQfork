@@ -844,10 +844,11 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     TxValidationState& state = ws.m_state;
     std::unique_ptr<CTxMemPoolEntry>& entry = ws.m_entry;
 
-    // Blackcoin: in v2 transactions use GetAdjustedTime() as nTimeTx
-    int64_t nTimeTx = (int64_t)tx.nTime;
-    if (!nTimeTx && tx.nVersion >= 2)
-        nTimeTx = GetAdjustedTimeSeconds();
+    // Version-2 transactions do not serialize nTime. Ignore any hidden value
+    // retained by a locally constructed object so local submissions and their
+    // wire-deserialized peers receive identical mempool policy.
+    const int64_t adjusted_time{GetAdjustedTimeSeconds()};
+    const int64_t nTimeTx{tx.nVersion >= 2 ? adjusted_time : static_cast<int64_t>(tx.nTime)};
 
     if (!CheckTransaction(tx, state)) {
         return false; // state filled in by CheckTransaction
@@ -876,6 +877,9 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
     const int next_height = tip ? tip->nHeight + 1 : 0;
     const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : nTimeTx;
+    const int64_t next_block_spend_time = tip
+        ? std::max<int64_t>(adjusted_time, next_block_mtp + 1)
+        : adjusted_time;
     // Quantum witness spends become consensus-active at Migration even when
     // the independent BIP9 SegWit deployment is not active on this chain.
     const bool witnessEnabled =
@@ -1067,7 +1071,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     }
 
     // The mempool holds txs for the next block, so pass height+1 to CheckTxInputs
-    if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1, nTimeTx, next_block_mtp, ws.m_base_fees)) {
+    if (!Consensus::CheckTxInputs(tx, state, m_view, m_active_chainstate.m_chain.Height() + 1,
+                                  next_block_spend_time, next_block_mtp, ws.m_base_fees)) {
         return false; // state filled in by CheckTxInputs
     }
 
@@ -3699,8 +3704,10 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
     // is also applied by -reindex-chainstate, which skips ContextualCheckBlock.
     if (IsQuantumWitnessSpendActive(params.GetConsensus(), signature_mtp, pindex->nHeight)) {
         for (const CTransactionRef& tx : block.vtx) {
-            if (block.GetBlockTime() < (tx->nTime ? static_cast<int64_t>(tx->nTime)
-                                                  : block.GetBlockTime())) {
+            // Version-2 transactions have no serialized nTime. Their
+            // authoritative consensus time is the containing block header.
+            if (tx->nVersion < 2 && tx->nTime &&
+                block.GetBlockTime() < static_cast<int64_t>(tx->nTime)) {
                 return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS,
                                      "bad-tx-time",
                                      strprintf("%s : block timestamp earlier than transaction timestamp", __func__));
@@ -3737,7 +3744,11 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
                 _("Blackcoin stopped before evaluating proof of stake against inconsistent local demurrage state. Rebuild with -reindex-chainstate."));
         }
     }
-    if (block.IsProofOfStake() && params.GetConsensus().IsProtocolV3(block.GetBlockTime()) && !CheckProofOfStake(pindex->pprev, *block.vtx[1], block.nBits, state, view, block.vtx[1]->nTime ? block.vtx[1]->nTime : block.nTime, m_chainman)) {
+    const uint32_t stake_time = block.IsProofOfStake() &&
+            block.vtx[1]->nVersion < 2 && block.vtx[1]->nTime
+        ? block.vtx[1]->nTime
+        : block.nTime;
+    if (block.IsProofOfStake() && params.GetConsensus().IsProtocolV3(block.GetBlockTime()) && !CheckProofOfStake(pindex->pprev, *block.vtx[1], block.nBits, state, view, stake_time, m_chainman)) {
         LogPrintf("WARNING: %s: check proof-of-stake failed for block %s\n", __func__, block.GetHash().ToString());
         return false; // do not error here as we expect this during initial block download
     }
@@ -5470,11 +5481,18 @@ bool CheckBlock(const CBlock& block, BlockValidationState& state, const Consensu
             return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-multiple", "more than one coinbase");
 
     // Check coinbase timestamp
-    if (block.GetBlockTime() > FutureDrift(chainstate, block.vtx[0]->nTime ? (int64_t)block.vtx[0]->nTime : block.GetBlockTime()))
+    const int64_t coinbase_time = block.vtx[0]->nVersion < 2 && block.vtx[0]->nTime
+        ? static_cast<int64_t>(block.vtx[0]->nTime)
+        : block.GetBlockTime();
+    if (block.GetBlockTime() > FutureDrift(chainstate, coinbase_time))
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cb-time", "coinbase timestamp is too early");
 
     // Check coinstake timestamp
-    if (block.IsProofOfStake() && !CheckCoinStakeTimestamp(block.GetBlockTime(), block.vtx[1]->nTime ? (int64_t)block.vtx[1]->nTime : block.GetBlockTime()))
+    const int64_t coinstake_time = block.IsProofOfStake() &&
+            block.vtx[1]->nVersion < 2 && block.vtx[1]->nTime
+        ? static_cast<int64_t>(block.vtx[1]->nTime)
+        : block.GetBlockTime();
+    if (block.IsProofOfStake() && !CheckCoinStakeTimestamp(block.GetBlockTime(), coinstake_time))
         return state.Invalid(BlockValidationResult::BLOCK_CONSENSUS, "bad-cs-time", "coinstake timestamp violation");
 
     if (block.IsProofOfStake()) {

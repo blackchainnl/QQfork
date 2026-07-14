@@ -807,7 +807,8 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
         assert(Consensus::CheckTxInputs(tx, dummy_state, mempoolDuplicate, spendheight,
                                         check_spend_time, check_demurrage_time, txfee));
         for (const auto& input: tx.vin) mempoolDuplicate.SpendCoin(input.prevout);
-        AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max());
+        AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max(),
+                 /*check=*/false, check_spend_time);
     }
     for (auto it = mapNextTx.cbegin(); it != mapNextTx.cend(); it++) {
         uint256 hash = it->second->GetHash();
@@ -1072,7 +1073,8 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
     CTransactionRef ptx = mempool.get(outpoint.hash);
     if (ptx) {
         if (outpoint.n < ptx->vout.size()) {
-            coin = Coin(ptx->vout[outpoint.n], MEMPOOL_HEIGHT, false, false, ptx->nTime);
+            const uint32_t coin_time{ptx->nVersion < 2 ? ptx->nTime : 0};
+            coin = Coin(ptx->vout[outpoint.n], MEMPOOL_HEIGHT, false, false, coin_time);
             m_non_base_coins.emplace(outpoint);
             return true;
         } else {
@@ -1085,7 +1087,8 @@ bool CCoinsViewMemPool::GetCoin(const COutPoint &outpoint, Coin &coin) const {
 void CCoinsViewMemPool::PackageAddTransaction(const CTransactionRef& tx)
 {
     for (unsigned int n = 0; n < tx->vout.size(); ++n) {
-        m_temp_added.emplace(COutPoint(tx->GetHash(), n), Coin(tx->vout[n], MEMPOOL_HEIGHT, false, false, tx->nTime));
+        const uint32_t coin_time{tx->nVersion < 2 ? tx->nTime : 0};
+        m_temp_added.emplace(COutPoint(tx->GetHash(), n), Coin(tx->vout[n], MEMPOOL_HEIGHT, false, false, coin_time));
         m_non_base_coins.emplace(tx->GetHash(), n);
     }
 }

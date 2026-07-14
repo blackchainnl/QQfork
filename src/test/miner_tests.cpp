@@ -13,6 +13,7 @@
 #include <node/miner.h>
 #include <policy/policy.h>
 #include <pow.h>
+#include <streams.h>
 #include <test/util/random.h>
 #include <test/util/txmempool.h>
 #include <timedata.h>
@@ -37,7 +38,7 @@ struct MinerTestingSetup : public RegTestingSetup {
     void TestPackageSelection(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void TestBasicMining(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst, int baseheight) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     void TestPrioritisedMining(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
-    void TestV2ParentChildTimeCanonicalization(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void TestV2ParentChildTimeCanonicalization(const CScript& scriptPubKey) EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool TestSequenceLocks(const CTransaction& tx, CTxMemPool& tx_mempool) EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
     {
         CCoinsViewMemPool view_mempool{&m_node.chainman->ActiveChainstate().CoinsTip(), tx_mempool};
@@ -76,7 +77,7 @@ BlockAssembler MinerTestingSetup::AssemblerForTest(CTxMemPool& tx_mempool)
     return BlockAssembler{m_node.chainman->ActiveChainstate(), &tx_mempool, options};
 }
 
-void MinerTestingSetup::TestV2ParentChildTimeCanonicalization(const CScript& scriptPubKey, const std::vector<CTransactionRef>& txFirst)
+void MinerTestingSetup::TestV2ParentChildTimeCanonicalization(const CScript& scriptPubKey)
 {
     CTxMemPool& tx_mempool{MakeMempool()};
     LOCK(tx_mempool.cs);
@@ -87,11 +88,23 @@ void MinerTestingSetup::TestV2ParentChildTimeCanonicalization(const CScript& scr
     constexpr CAmount fee{10'000};
     TestMemPoolEntryHelper entry;
 
+    // Give the confirmed input the exact legal PoW candidate time. Package
+    // selection must use MTP+1 before the final header is assembled; using the
+    // earlier adjusted time would incorrectly omit this otherwise-valid chain.
+    const COutPoint timed_prevout{InsecureRand256(), 0};
+    constexpr CAmount input_value{10 * COIN};
+    m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
+        timed_prevout,
+        Coin{CTxOut{input_value, CScript() << OP_TRUE},
+             m_node.chainman->ActiveChain().Height(), /*coinbase=*/false,
+             /*coinstake=*/false, static_cast<int>(candidate_time + 1)},
+        /*possible_overwrite=*/false);
+
     CMutableTransaction parent;
     parent.nVersion = 2;
     parent.nTime = 0;
-    parent.vin.emplace_back(COutPoint{txFirst[0]->GetHash(), 0}, CScript() << OP_1);
-    parent.vout.emplace_back(txFirst[0]->vout[0].nValue - fee, CScript() << OP_TRUE);
+    parent.vin.emplace_back(timed_prevout);
+    parent.vout.emplace_back(input_value - fee, CScript() << OP_TRUE);
     const uint256 parent_hash{parent.GetHash()};
     tx_mempool.addUnchecked(entry.Fee(fee).Time(Now<NodeSeconds>()).SpendsCoinbase(true).FromTx(parent));
 
@@ -108,12 +121,62 @@ void MinerTestingSetup::TestV2ParentChildTimeCanonicalization(const CScript& scr
     const uint256 child_hash{child.GetHash()};
     tx_mempool.addUnchecked(entry.Fee(fee).Time(Now<NodeSeconds>()).SpendsCoinbase(false).FromTx(child));
 
+    // A future hidden value must neither exclude the package nor pull the
+    // header forward. Peers deserialize this exact transaction with nTime=0.
+    CMutableTransaction grandchild;
+    grandchild.nVersion = 2;
+    grandchild.nTime = candidate_time + 100;
+    grandchild.vin.emplace_back(COutPoint{child_hash, 0});
+    grandchild.vout.emplace_back(child.vout[0].nValue - fee, CScript() << OP_TRUE);
+    const uint256 grandchild_hash{grandchild.GetHash()};
+    tx_mempool.addUnchecked(entry.Fee(fee).Time(Now<NodeSeconds>()).SpendsCoinbase(false).FromTx(grandchild));
+
     std::unique_ptr<CBlockTemplate> block_template{AssemblerForTest(tx_mempool).CreateNewBlock(scriptPubKey)};
     BOOST_REQUIRE(block_template);
-    BOOST_REQUIRE_EQUAL(block_template->block.vtx.size(), 3U);
+    BOOST_REQUIRE_EQUAL(block_template->block.vtx.size(), 4U);
     BOOST_CHECK_EQUAL(block_template->block.vtx[1]->GetHash(), parent_hash);
     BOOST_CHECK_EQUAL(block_template->block.vtx[2]->GetHash(), child_hash);
+    BOOST_CHECK_EQUAL(block_template->block.vtx[3]->GetHash(), grandchild_hash);
+    BOOST_CHECK_EQUAL(block_template->block.nTime, candidate_time + 1);
     BOOST_CHECK_GT(block_template->block.nTime, child.nTime);
+    BOOST_CHECK_LT(block_template->block.nTime, grandchild.nTime);
+
+    // Make the local v2 coinbase retain an old construction-only nTime. That
+    // field is absent from both its txid and the block wire encoding, so both
+    // object forms must pass precisely the same block validation path.
+    CBlock local_block{block_template->block};
+    CMutableTransaction local_coinbase{*local_block.vtx[0]};
+    BOOST_REQUIRE_GE(local_coinbase.nVersion, 2);
+    local_coinbase.nTime = local_block.nTime - 24 * 60 * 60 - 1;
+    const uint256 original_coinbase_hash{local_block.vtx[0]->GetHash()};
+    local_block.vtx[0] = MakeTransactionRef(std::move(local_coinbase));
+    BOOST_CHECK_EQUAL(local_block.vtx[0]->GetHash(), original_coinbase_hash);
+    local_block.fChecked = false;
+
+    CDataStream wire{SER_NETWORK};
+    wire << TX_WITH_WITNESS(local_block);
+    CBlock wire_block;
+    wire >> TX_WITH_WITNESS(wire_block);
+    BOOST_REQUIRE_EQUAL(wire_block.vtx.size(), local_block.vtx.size());
+    for (const CTransactionRef& tx : wire_block.vtx) {
+        BOOST_REQUIRE_GE(tx->nVersion, 2);
+        BOOST_CHECK_EQUAL(tx->nTime, 0U);
+    }
+    BOOST_CHECK_EQUAL(wire_block.GetHash(), local_block.GetHash());
+    BOOST_CHECK_EQUAL(wire_block.hashMerkleRoot, local_block.hashMerkleRoot);
+
+    BlockValidationState local_state;
+    BOOST_CHECK_MESSAGE(TestBlockValidity(local_state, Params(),
+        m_node.chainman->ActiveChainstate(), local_block,
+        m_node.chainman->ActiveChain().Tip(), GetAdjustedTime,
+        /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/true, /*fCheckBlockSig=*/true),
+        local_state.ToString());
+    BlockValidationState wire_state;
+    BOOST_CHECK_MESSAGE(TestBlockValidity(wire_state, Params(),
+        m_node.chainman->ActiveChainstate(), wire_block,
+        m_node.chainman->ActiveChain().Tip(), GetAdjustedTime,
+        /*fCheckPOW=*/false, /*fCheckMerkleRoot=*/true, /*fCheckBlockSig=*/true),
+        wire_state.ToString());
 }
 
 constexpr static struct {
@@ -723,7 +786,7 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
 
     LOCK(cs_main);
 
-    TestV2ParentChildTimeCanonicalization(scriptPubKey, txFirst);
+    TestV2ParentChildTimeCanonicalization(scriptPubKey);
     SetMockTime(MinerTestMockTime());
 
     TestBasicMining(scriptPubKey, txFirst, baseheight);

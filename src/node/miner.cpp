@@ -136,8 +136,13 @@ int64_t UpdateTime(CBlock* pblock, const Consensus::Params& consensusParams, con
 int64_t GetMaxTransactionTime(CBlock* pblock)
 {
     int64_t maxTransactionTime = 0;
-    for (std::vector<CTransactionRef>::const_iterator it(pblock->vtx.begin()); it != pblock->vtx.end(); ++it)
-        maxTransactionTime = std::max(maxTransactionTime, (int64_t)it->get()->nTime);
+    for (std::vector<CTransactionRef>::const_iterator it(pblock->vtx.begin()); it != pblock->vtx.end(); ++it) {
+        // Version-2 transactions omit nTime from their wire encoding. A
+        // locally retained value must not change the header peers validate.
+        if (it->get()->nVersion < 2) {
+            maxTransactionTime = std::max(maxTransactionTime, (int64_t)it->get()->nTime);
+        }
+    }
     return maxTransactionTime;
 }
 
@@ -256,6 +261,11 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     pblock->nTime = GetAdjustedTimeSeconds();
     if (pwallet) {
         pblock->nTime &= ~chainparams.GetConsensus().nStakeTimestampMask;
+    } else {
+        // Package checks must use the same mineable PoW timestamp retained by
+        // the final header. In particular, an accelerated chain can have MTP
+        // ahead of adjusted time while version-2 transactions carry no nTime.
+        pblock->nTime = std::max<int64_t>(pblock->nTime, pindexPrev->GetMedianTimePast() + 1);
     }
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
 
@@ -372,9 +382,14 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
     if (pblock->IsProofOfStake()) {
-        pblock->nTime = pblock->vtx[1]->nTime ? pblock->vtx[1]->nTime : pblock->nTime;
+        // Only v1 carries an authoritative transaction timestamp. A v2
+        // coinstake's hidden local nTime disappears on the wire.
+        if (pblock->vtx[1]->nVersion < 2 && pblock->vtx[1]->nTime) {
+            pblock->nTime = pblock->vtx[1]->nTime;
+        }
     } else {
-        pblock->nTime = std::max(pindexPrev->GetMedianTimePast()+1, GetMaxTransactionTime(pblock));
+        pblock->nTime = std::max<int64_t>(pblock->nTime,
+            std::max<int64_t>(pindexPrev->GetMedianTimePast() + 1, GetMaxTransactionTime(pblock)));
         UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
     }
     pblock->nNonce         = 0;
@@ -536,8 +551,10 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
             return false;
         }
         package_fees.emplace(tx.GetHash(), next_block_fee);
-        // peercoin: timestamp limit
-        if (tx.nTime > GetAdjustedTimeSeconds() || (nTime && tx.nTime > nTime)) {
+        // peercoin: only v1 serializes a transaction timestamp. Applying this
+        // policy to a hidden v2 field makes local and relayed objects differ.
+        if (tx.nVersion < 2 &&
+            (tx.nTime > GetAdjustedTimeSeconds() || (nTime && tx.nTime > nTime))) {
             return false;
         }
     }
@@ -818,7 +835,10 @@ static bool ProcessBlockFound(const CBlock* pblock, ChainstateManager& chainman)
     {
         LOCK(cs_main);
         BlockValidationState state;
-        if (!CheckProofOfStake(&chainman.BlockIndex()[pblock->hashPrevBlock], *pblock->vtx[1], pblock->nBits, state, chainman.ActiveChainstate().CoinsTip(), pblock->vtx[1]->nTime ? pblock->vtx[1]->nTime : pblock->nTime, chainman))
+        const uint32_t stake_time = pblock->vtx[1]->nVersion < 2 && pblock->vtx[1]->nTime
+            ? pblock->vtx[1]->nTime
+            : pblock->nTime;
+        if (!CheckProofOfStake(&chainman.BlockIndex()[pblock->hashPrevBlock], *pblock->vtx[1], pblock->nBits, state, chainman.ActiveChainstate().CoinsTip(), stake_time, chainman))
             return error("ProcessBlockFound(): proof-of-stake checking failed");
         
         if (pblock->hashPrevBlock != chainman.ActiveChain().Tip()->GetBlockHash())

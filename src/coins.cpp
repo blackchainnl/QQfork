@@ -205,7 +205,12 @@ void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, bool 
     bool fCoinbase = tx.IsCoinBase();
     bool fCoinstake = tx.IsCoinStake();
     const uint256& txid = tx.GetHash();
-    const unsigned int coin_time = (tx.nVersion < 2 || nBlockTime <= 0) ? tx.nTime : static_cast<unsigned int>(nBlockTime);
+    // Version-2 transactions do not serialize nTime. Never persist a hidden
+    // local-object value as coin provenance. A containing block supplies the
+    // authoritative time; context-free/mempool views use zero until then.
+    const unsigned int coin_time = tx.nVersion < 2
+        ? tx.nTime
+        : (nBlockTime > 0 ? static_cast<unsigned int>(nBlockTime) : 0);
     for (size_t i = 0; i < tx.vout.size(); ++i) {
         if (tx.vout[i].scriptPubKey.IsUnspendable()) continue;
         bool overwrite = check_for_overwrite ? cache.HaveCoin(COutPoint(txid, i)) : fCoinbase;
