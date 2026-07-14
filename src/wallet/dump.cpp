@@ -15,6 +15,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -285,16 +286,36 @@ bool CreateFromDump(const ArgsManager& args, const std::string& name, const fs::
 
         dump_file.close();
     }
-    // On failure, gather the paths to remove
-    std::vector<fs::path> paths_to_remove = wallet->GetDatabase().Files();
-    if (!name.empty()) paths_to_remove.push_back(wallet_path);
+    // On failure, gather the database files before closing the backend. An
+    // unnamed wallet lives directly in the configured wallet directory, which
+    // must never be removed recursively.
+    const std::vector<fs::path> database_files = wallet->GetDatabase().Files();
 
     wallet.reset(); // The pointer deleter will close the wallet for us.
 
-    // Remove the wallet dir if we have a failure
+    // Remove the newly-created database if import failed. Berkeley DB leaves
+    // an environment subdirectory behind, so removing the named wallet path
+    // one entry at a time can throw on the non-empty directory and abort the
+    // wallet tool instead of returning the original validation error.
     if (!ret) {
-        for (const auto& p : paths_to_remove) {
-            fs::remove(p);
+        if (!name.empty()) {
+            std::error_code cleanup_error;
+            fs::remove_all(wallet_path, cleanup_error);
+            if (cleanup_error) {
+                warnings.push_back(strprintf(
+                    _("Warning: Failed to remove incomplete wallet path %s: %s"),
+                    fs::PathToString(wallet_path), cleanup_error.message()));
+            }
+        } else {
+            for (const auto& path : database_files) {
+                std::error_code cleanup_error;
+                fs::remove(path, cleanup_error);
+                if (cleanup_error) {
+                    warnings.push_back(strprintf(
+                        _("Warning: Failed to remove incomplete wallet file %s: %s"),
+                        fs::PathToString(path), cleanup_error.message()));
+                }
+            }
         }
     }
 
