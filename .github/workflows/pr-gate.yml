@@ -803,7 +803,7 @@ jobs:
         run: |
           python3 test/functional/test_runner.py \
             --ci --jobs=1 --failfast --combinedlogslen=999999 \
-            feature_goldrush_mixed_version.py --previous-releases
+            feature_goldrush_mixed_version.py --previous-releases --legacy-wallet
 
       - name: Upload historical binary provenance
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
