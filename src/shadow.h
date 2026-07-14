@@ -321,13 +321,14 @@ bool ValidateShadowPowProofForWork(const ShadowPowWork& work, const std::vector<
  *  No configuration, RPC, or network path can arm this hook. */
 void SetShadowArgon2FailuresForTesting(uint64_t count = 1);
 void ClearShadowArgon2FailuresForTesting();
-/** Test-only allocation-failure injection. APPLY fails the transactional
- *  shadow-state evaluator before it mutates the staging cache. ACCOUNTING
- *  throws from the canonical explorer/credit accounting engine and exercises
- *  its typed bad_alloc boundary. */
+/** Test-only allocation-failure injection. APPLY fails before constructing
+ *  shadow state; APPLY_AFTER_STAGED_MUTATION fails after the child cache has
+ *  received a pool mutation but before it is published; ACCOUNTING throws
+ *  from the canonical explorer/credit accounting engine. */
 enum class ShadowAllocationFailurePoint : uint8_t {
     NONE,
     APPLY,
+    APPLY_AFTER_STAGED_MUTATION,
     ACCOUNTING,
 };
 void SetShadowAllocationFailureForTesting(ShadowAllocationFailurePoint point);
@@ -482,7 +483,10 @@ enum class ShadowApplyResult {
 
 /** Apply/remove deterministic shadow claim state for one shadow-epoch block.
  *  ApplyShadowBlockResult stages every shadow mutation in a child cache and
- *  publishes that cache only after the complete evaluation succeeds. */
+ *  publishes that cache only after the complete evaluation succeeds. A host
+ *  allocation failure while publishing the child can partially mutate the
+ *  supplied cache; every production caller must therefore supply a disposable
+ *  outer cache and discard it on LOCAL_INTERNAL_ERROR. */
 ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
 bool ApplyShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);
 bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo = nullptr, bool gold_rush_active = true);

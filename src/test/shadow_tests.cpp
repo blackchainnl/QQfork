@@ -1803,8 +1803,16 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_winner_is_order_independent_and_replay
     const ShadowGoldRushInfo before_local_failures =
         GetShadowGoldRushInfo(view, &activation_parent);
     const uint256 best_block_before_local_failures = view.GetBestBlock();
+    const std::vector<ShadowSyntheticPayoutCoin> payouts_before_local_failures =
+        GetAppliedShadowClaimPayoutCoins(
+            view, claim_index_a.nHeight, claim_index_a.GetBlockHash(),
+            claim_index_a.GetBlockTime());
 
     SetShadowAllocationFailureForTesting(ShadowAllocationFailurePoint::APPLY);
+    BOOST_CHECK(ApplyShadowBlockResult(view, block_a, &claim_index_a, &undo_a) ==
+                ShadowApplyResult::LOCAL_INTERNAL_ERROR);
+    SetShadowAllocationFailureForTesting(
+        ShadowAllocationFailurePoint::APPLY_AFTER_STAGED_MUTATION);
     BOOST_CHECK(ApplyShadowBlockResult(view, block_a, &claim_index_a, &undo_a) ==
                 ShadowApplyResult::LOCAL_INTERNAL_ERROR);
     SetShadowAllocationFailureForTesting(
@@ -1828,6 +1836,12 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_winner_is_order_independent_and_replay
     BOOST_CHECK_EQUAL(after_local_failures.pos_count,
                       before_local_failures.pos_count);
     BOOST_CHECK(view.GetBestBlock() == best_block_before_local_failures);
+    const std::vector<ShadowSyntheticPayoutCoin> payouts_after_local_failures =
+        GetAppliedShadowClaimPayoutCoins(
+            view, claim_index_a.nHeight, claim_index_a.GetBlockHash(),
+            claim_index_a.GetBlockTime());
+    BOOST_CHECK_EQUAL(payouts_after_local_failures.size(),
+                      payouts_before_local_failures.size());
 
     BOOST_REQUIRE(ApplyShadowBlock(view, block_a, &claim_index_a, &undo_a));
     ShadowPowAccountingContext historical_context_a;

@@ -81,6 +81,18 @@ static_assert(static_cast<CAmount>(MAX_SHADOW_POW_EVALS_PER_BLOCK - 1) * CENT <
 std::atomic<uint64_t> g_shadow_argon2_test_failures{0};
 std::atomic<ShadowAllocationFailurePoint> g_shadow_allocation_test_failure{
     ShadowAllocationFailurePoint::NONE};
+
+void MaybeThrowShadowAllocationFailureForTesting(
+    ShadowAllocationFailurePoint point)
+{
+    ShadowAllocationFailurePoint expected{point};
+    if (g_shadow_allocation_test_failure.compare_exchange_strong(
+            expected, ShadowAllocationFailurePoint::NONE,
+            std::memory_order_relaxed)) {
+        throw std::bad_alloc{};
+    }
+}
+
 // Increment whenever an auxiliary namespace or its authentication semantics
 // changes. This prevents a checkpoint produced by a prerelease schema from
 // authenticating merely because the affected inventory is currently empty.
@@ -2738,13 +2750,8 @@ ShadowPowClaimResult FindCanonicalPowShadowClaims(
     const ShadowPowAccountingContext& context)
 {
     try {
-        ShadowAllocationFailurePoint expected{
-            ShadowAllocationFailurePoint::ACCOUNTING};
-        if (g_shadow_allocation_test_failure.compare_exchange_strong(
-                expected, ShadowAllocationFailurePoint::NONE,
-                std::memory_order_relaxed)) {
-            throw std::bad_alloc{};
-        }
+        MaybeThrowShadowAllocationFailureForTesting(
+            ShadowAllocationFailurePoint::ACCOUNTING);
         return FindCanonicalPowShadowClaimsImpl(block, blockundo, context);
     } catch (const std::bad_alloc&) {
         LogPrintf("ERROR: Quantum Quasar canonical claim accounting allocation failed at height %d\n",
@@ -5521,6 +5528,11 @@ static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CB
         if (!AddClaimMarker(view, pindex, claim_marker_index++, claim)) return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
     }
     WritePool(view, pindex, pool);
+    // The public wrapper evaluates against a child cache. This hook proves
+    // that an allocation failure after a concrete staged mutation cannot
+    // publish that partial state to the caller.
+    MaybeThrowShadowAllocationFailureForTesting(
+        ShadowAllocationFailurePoint::APPLY_AFTER_STAGED_MUTATION);
     if (!AddPoolUndoMarker(view, pindex, undo_pool_present, undo_pool_coin,
                            undo_pool, pool, claims_to_apply)) {
         return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
@@ -5536,12 +5548,8 @@ ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& bl
         return ShadowApplyResult::OK;
     }
     try {
-        ShadowAllocationFailurePoint expected{ShadowAllocationFailurePoint::APPLY};
-        if (g_shadow_allocation_test_failure.compare_exchange_strong(
-                expected, ShadowAllocationFailurePoint::NONE,
-                std::memory_order_relaxed)) {
-            throw std::bad_alloc{};
-        }
+        MaybeThrowShadowAllocationFailureForTesting(
+            ShadowAllocationFailurePoint::APPLY);
 
         // A shadow-layer failure may occur after several authenticated marker
         // writes have been prepared. Keep them isolated until every check and

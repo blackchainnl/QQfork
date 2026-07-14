@@ -742,6 +742,8 @@ public:
     DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view,
                                      bool disconnect_auxiliary_state = true)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** The supplied view is a transaction-local overlay. On any false return
+     *  the caller must discard it rather than inspect, reuse, or flush it. */
     bool ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
                       CCoinsViewCache& view, bool fJustCheck = false, bool fCheckBlockSig = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
@@ -818,6 +820,8 @@ private:
     void InvalidBlockFound(CBlockIndex* pindex, const BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     CBlockIndex* FindMostWorkChain() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
+    /** If auxiliary state is requested, inputs must be a disposable overlay
+     *  and must be discarded after a false return. */
     bool RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& inputs,
                           bool apply_auxiliary_state = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 

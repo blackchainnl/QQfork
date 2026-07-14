@@ -757,7 +757,7 @@ BOOST_FIXTURE_TEST_CASE(shadow_proof_internal_failure_preserves_base_validity_an
         }
         if (allocation_failure) {
             SetShadowAllocationFailureForTesting(
-                ShadowAllocationFailurePoint::APPLY);
+                ShadowAllocationFailurePoint::APPLY_AFTER_STAGED_MUTATION);
         } else {
             SetShadowArgon2FailuresForTesting();
         }
