@@ -492,8 +492,12 @@ jobs:
           make -C src -j "$MAKEJOBS" \
             test/test_blackcoin.exe bench/bench_blackcoin.exe
           mkdir -p ci/scratch
-          cxx=$(sed -n 's/^CXX = //p' src/Makefile)
-          "$cxx" --version | sed -n '1p' > ci/scratch/windows-cross-compiler.txt
+          cxx_line=$(sed -n 's/^CXX = //p' src/Makefile)
+          test -n "$cxx_line"
+          test "$(printf '%s\n' "$cxx_line" | wc -l)" -eq 1
+          read -r -a cxx_argv <<< "$cxx_line"
+          test "${#cxx_argv[@]}" -ge 1
+          "${cxx_argv[@]}" --version | sed -n '1p' > ci/scratch/windows-cross-compiler.txt
           python3 ci/release/verify_windows_native_binary.py \
             --binary src/test/test_blackcoin.exe \
             --binary src/bench/bench_blackcoin.exe \
