@@ -204,15 +204,22 @@ def parse(md_lines):
             txt = inline(s[3:])
             block = [Paragraph(txt, H1),
                      HRFlowable(width="100%", thickness=1.1, color=GOLD, spaceBefore=0, spaceAfter=8)]
-            flow.append(CondPageBreak(1.25*inch))
+            flow.append(CondPageBreak(2.5*inch))
             if first_h1_done:
                 flow.append(Spacer(1, 6))
-            flow.append(KeepTogether(block))
+            heading = KeepTogether(block)
+            heading.keepWithNext = 1
+            flow.append(heading)
             first_h1_done = True
             i += 1
             continue
         if s.startswith("### "):
-            flow.append(Paragraph(inline(s[4:]), H2))
+            # Do not strand a subsection heading at the foot of a page. Leave
+            # enough room for the heading and the opening lines that follow.
+            flow.append(CondPageBreak(1.25*inch))
+            heading = Paragraph(inline(s[4:]), H2)
+            heading.keepWithNext = 1
+            flow.append(heading)
             i += 1
             continue
         if s.startswith("#### "):

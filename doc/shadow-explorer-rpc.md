@@ -6,6 +6,7 @@ Quantum Quasar ledger. Enable it with:
 ```text
 shadowindex=1
 prune=0
+rpcserialversion=1
 ```
 
 `-shadowindex` is optional and disabled by default. The legacy
@@ -15,6 +16,15 @@ retains base-chain witness-version inventory history for
 `getquantumwitnessinventory`. If the index is disabled or still synchronizing,
 the new RPCs return an explicit error rather than silently returning partial
 history.
+
+Explorer processes that fetch raw blocks or transactions must set
+`rpcserialversion=1`. Blackcoin's legacy-compatible default is `0`, which
+omits witness data from raw RPC serialization even though the witness
+commitment remains in the block. Copying a witness-bearing block returned by
+`getblock(hash, 0)` under the default and then submitting those stripped bytes
+will therefore fail with `bad-witness-merkle-match`. This RPC setting does not
+change P2P block relay or consensus; it ensures raw RPC responses contain the
+complete witness data an explorer needs.
 
 Initial index construction reads historical block files. A fully synchronized
 index can continue following new blocks on a pruned node, but a later rebuild
