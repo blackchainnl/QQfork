@@ -141,6 +141,10 @@ class WalletHDTest(BitcoinTestFramework):
             self.nodes[1].wallets_path / self.default_wallet_name / self.wallet_data_filename
         )
         self.start_node(1, extra_args=self.extra_args[1])
+        # The backup predates the addresses under test and this node starts
+        # with -keypool=0. Restore the deterministic lookahead before syncing
+        # so startup scanning can discover those derived destinations.
+        self.nodes[1].keypoolrefill(NUM_HD_ADDS)
         self.connect_nodes(0, 1)
         self.sync_all()
         # Wallet automatically scans blocks older than key on startup

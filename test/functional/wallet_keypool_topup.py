@@ -28,7 +28,9 @@ class KeypoolRestoreTest(BitcoinTestFramework):
     def set_test_params(self):
         self.setup_clean_chain = True
         self.num_nodes = 4
-        self.extra_args = [[], ['-keypool=100'], ['-keypool=100'], ['-keypool=100']]
+        # Background staking reserves wallet keys and makes this keypool-index
+        # test timing-dependent. It is unrelated to restore/top-up behavior.
+        self.extra_args = [['-staking=0'], ['-keypool=100', '-staking=0'], ['-keypool=100', '-staking=0'], ['-keypool=100', '-staking=0']]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -92,7 +94,7 @@ class KeypoolRestoreTest(BitcoinTestFramework):
             # Check that we have marked all keys up to the used keypool key as used
             if self.options.descriptors:
                 if output_type == 'legacy':
-                    assert_equal(self.nodes[idx].getaddressinfo(self.nodes[idx].getnewaddress(address_type=output_type))['hdkeypath'], "m/44h/1h/0h/0/112")
+                    assert_equal(self.nodes[idx].getaddressinfo(self.nodes[idx].getnewaddress(address_type=output_type))['hdkeypath'], "m/44h/1h/0h/0/110")
                 elif output_type == 'p2sh-segwit':
                     assert_equal(self.nodes[idx].getaddressinfo(self.nodes[idx].getnewaddress(address_type=output_type))['hdkeypath'], "m/49h/1h/0h/0/110")
                 elif output_type == 'bech32':
