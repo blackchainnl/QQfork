@@ -126,6 +126,11 @@ Notable changes
   window, during the migration/final-lockout phases.
 - Legacy data-directory migration remains in place so existing Blackcoin users
   can move to Blackcoin without manually relocating wallet or chain data.
+- Version-2 transactions omit their legacy transaction-time field from the
+  wire format. Mempool admission, block assembly, UTXO provenance, and block
+  validation now use the serialized block context consistently so a locally
+  constructed transaction cannot be treated differently from the identical
+  transaction received from a peer.
 
 ### Wallet and RPC
 
@@ -133,6 +138,11 @@ Notable changes
   surfaces are present for testnet validation.
 - Wallet code includes migration and safety checks for the quantum transition
   path.
+- Successful wallet broadcasts refresh mempool state before returning, which
+  prevents rapid consecutive sends from observing stale spendability state.
+- Wallet backups reject destinations that resolve to the wallet root itself,
+  and failed wallet-dump imports clean up incomplete databases without
+  terminating the wallet tool.
 
 ### Packaging
 
