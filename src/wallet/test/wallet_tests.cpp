@@ -149,6 +149,63 @@ static void AddKey(CWallet& wallet, const CKey& key)
     if (!wallet.AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
 }
 
+BOOST_FIXTURE_TEST_CASE(commit_refreshes_mempool_state_before_async_callbacks, TestChain100Setup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CMutableTransaction funding = TestSimpleSpend(
+        *m_coinbase_txns[0],
+        /*index=*/0,
+        coinbaseKey,
+        GetScriptForRawPubKey(wallet_key.GetPubKey()));
+    CreateAndProcessBlock({funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()),
+        wallet_key);
+    SyncWithValidationInterfaceQueue();
+
+    // Keep transactionAddedToMempool queued so the synchronous post-broadcast
+    // refresh is the only way an immediate second send can trust and spend the
+    // first transaction's change.
+    std::promise<void> unblock_callbacks;
+    CallFunctionInValidationInterfaceQueue([&unblock_callbacks] {
+        unblock_callbacks.get_future().wait();
+    });
+
+    try {
+        CKey recipient_key;
+        recipient_key.MakeNewKey(/*fCompressed=*/true);
+        const CRecipient recipient{PKHash{recipient_key.GetPubKey()}, COIN, /*subtract_fee=*/false};
+        CCoinControl coin_control;
+        constexpr int RANDOM_CHANGE_POSITION{-1};
+
+        const auto first = CreateTransaction(*wallet, {recipient}, RANDOM_CHANGE_POSITION, coin_control);
+        BOOST_REQUIRE_MESSAGE(first, util::ErrorString(first).original);
+        BOOST_REQUIRE(wallet->CommitTransaction(first->tx, {}, {}));
+        {
+            LOCK(wallet->cs_wallet);
+            BOOST_REQUIRE(wallet->mapWallet.at(first->tx->GetHash()).InMempool());
+        }
+
+        const auto second = CreateTransaction(*wallet, {recipient}, RANDOM_CHANGE_POSITION, coin_control);
+        BOOST_REQUIRE_MESSAGE(second, util::ErrorString(second).original);
+        BOOST_REQUIRE(wallet->CommitTransaction(second->tx, {}, {}));
+        {
+            LOCK(wallet->cs_wallet);
+            BOOST_REQUIRE(wallet->mapWallet.at(second->tx->GetHash()).InMempool());
+        }
+    } catch (...) {
+        unblock_callbacks.set_value();
+        SyncWithValidationInterfaceQueue();
+        throw;
+    }
+
+    unblock_callbacks.set_value();
+    SyncWithValidationInterfaceQueue();
+}
+
 static void CheckLiveUnspentStakeIndex(CWallet& wallet)
 {
     std::set<COutPoint> expected;

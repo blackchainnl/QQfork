@@ -2855,6 +2855,16 @@ bool CWallet::SubmitTxMemoryPoolAndRelay(const uint256& txid, std::string& err_s
     {
         LOCK(cs_wallet);
         m_inflight_wallet_broadcasts.erase(txid);
+        if (ret) {
+            // broadcastTransaction() does not wait for validation-interface
+            // callbacks. Refresh from the mempool before returning so an
+            // immediately chained wallet send can use its trusted change.
+            // Querying the mempool, rather than assigning TxStateInMempool
+            // unconditionally, preserves removal callbacks as the authority
+            // if the transaction was evicted while broadcast returned.
+            const auto it = mapWallet.find(txid);
+            if (it != mapWallet.end()) RefreshMempoolStatus(it->second);
+        }
     }
     return ret;
 }
