@@ -132,6 +132,10 @@ Notable changes
 
 - Quantum address, Gold Rush, PoW miner, cold-staking, RGB, and EUTXO RPC
   surfaces are present for testnet validation.
+- The optional shadow index exposes versioned block, transaction, original
+  outpoint, address, and exact-script history. `getshadowsupply` adds an
+  explicitly synthetic lifecycle contract for scheduled, pooled, issued,
+  locked, spendable, expired-unissued, nominal, effective, and burned value.
 - Wallet code includes migration and safety checks for the quantum transition
   path.
 

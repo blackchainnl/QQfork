@@ -119,22 +119,69 @@ exclusive cursor and must be supplied together. Continue with the
 `null`. Spent payouts remain in address history with exact base-chain spend
 provenance.
 
+### `getshadowscript scriptPubKey ( after_height after_txid count )`
+
+Returns schema `blackcoin.shadow.script.v1` for one exact hexadecimal output
+script. It uses the same stable ordering, exclusive cursor, and retained spend
+provenance as `getshadowaddress`, but performs no address or descriptor
+normalization. This is the authoritative history query for scripts that do not
+have a standard address encoding. The page and every nested payout state
+explicitly that the record is synthetic and is not included in a base-block
+Merkle tree.
+
+### `getshadowoutpoint synthetic_txid vout`
+
+Returns schema `blackcoin.shadow.outpoint.v1`. An unspent payout is resolved by
+the synthetic-transaction index. Once spent, the same original outpoint is
+resolved by the persisted spent-outpoint index and retains the exact spending
+block, transaction, transaction position, and input position. The
+`lookup_index` field reports which index served the result. Disconnecting the
+spend atomically changes the lookup back to `synthetic_transaction`; a restart
+or index rebuild restores the same result for the active chain.
+
 ### `getshadowsupply ( include_effective max_records )`
 
 Returns schema `blackcoin.shadow.supply.v1`. Issued, spent, and unspent nominal
-totals are constant-time cumulative index values. Before demurrage activates,
-the unspent effective total is identical to the unspent nominal total. After
+totals are constant-time cumulative index values. The additive lifecycle
+contract is versioned separately as
+`blackcoin.shadow.supply.lifecycle.v1`, so existing v1 fields retain their
+names and meanings.
+
+The `schedule` bucket distinguishes the configured height schedule, the amount
+scheduled through the indexed height, value actually accrued into upgraded
+state, and the remaining unaccrued schedule. The `pool` bucket reports exact
+PoW and PoS amounts that accrued but were not issued. It separately identifies
+the amount claimable in the next block and any pool value left unissued after
+the reward-height window. That expired pool value is not a synthetic payout.
+
+The `lifecycle` bucket divides every current unspent synthetic payout into
+locked or spendable count, nominal amount, and current effective amount. During
+Gold Rush the phase lock makes this classification constant-time. After every
+payout is mature and before demurrage, the spendable classification is also
+constant-time. Maturity boundaries and demurrage require a per-payout scan.
+That scan is optional and hard capped by `max_records` (maximum 10,000,000).
+When the cap is reached, `classification_exact` is false and lifecycle values
+are `null`; a scanned prefix is never labeled as a total.
+
+Before demurrage activates, the unspent effective total remains identical to
+the unspent nominal total even if a caller declines a lifecycle scan. After
 activation, an exact current effective total requires evaluating live
-attestation state for each unspent payout. That scan is optional and hard
-capped by `max_records` (maximum 10,000,000). If the cap is reached, the RPC
-sets `effective_amount_exact` to false and returns `null` for effective and
-decayed unspent totals; it never labels a partial sum as total supply.
+attestation state for each unspent payout. If that scan is disabled or capped,
+`effective_amount_exact` is false and effective and decayed unspent totals are
+`null`.
 
 Demurrage decay is destroyed by consensus. It is not paid as a transaction fee
 and is not redistributed. `spent_burned_amount` is the cumulative realized
 burn. For unspent outputs, `unspent_projected_burn_amount` is the exact amount
 that would be burned at the reported next-block valuation point when
-`effective_amount_exact` is true.
+`effective_amount_exact` is true. The `burn` bucket presents the same realized
+amount with the projected unspent and combined totals.
+
+Gold Rush payout outputs do not expire, so the lifecycle payout-expiry count
+and amount are always zero. `getshadowsupply` is intentionally scoped to
+synthetic Gold Rush payouts. Its `legacy` bucket therefore returns null legacy
+spendable/locked amounts and names `getcirculatingsupply` as the authoritative
+whole-UTXO-set source instead of silently mixing two accounting scopes.
 
 ### `getquantumwitnessinventory ( view offset count max_history_records )`
 
@@ -184,6 +231,14 @@ followed by connected events for the replacement branch. Event consumers must
 key idempotency by block hash plus synthetic transaction ID. A future ZMQ topic
 may transport the same schema, but v30.1.1 does not advertise a notification it
 cannot yet deliver reliably.
+
+Base-block BIP158 compact filters and ordinary Electrum transaction histories
+cannot discover synthetic payout transaction IDs because those virtual
+transactions are not members of the base block or its transaction Merkle tree.
+A negative compact-filter match is therefore not evidence that a quantum
+address received no Gold Rush credit. Light-client and explorer integrations
+must ingest `getshadowblock` and use `getshadowaddress` or `getshadowscript`
+until a separately versioned synthetic event/filter transport is implemented.
 
 ## Resource and failure boundaries
 
