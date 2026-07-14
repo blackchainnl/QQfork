@@ -184,15 +184,23 @@ std::optional<COutPoint> outpointFromSelectorData(const QVariant& data)
     return COutPoint(uint256S(parts[0].toStdString()), vout);
 }
 
-bool stakingAddressTier(const QString& address, QuantumStakeTierProgram& tier)
+bool quantumAddressTier(const QString& address, QuantumStakeTierProgram& tier)
 {
     const CTxDestination dest = DecodeDestination(address.toStdString());
     const auto* witness = std::get_if<WitnessUnknown>(&dest);
     if (!witness) return false;
-    if (!DecodeQuantumStakeTierProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram(), tier) || !tier.tiered || tier.cold_stake) {
-        return false;
-    }
-    return true;
+    return DecodeQuantumStakeTierProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram(), tier);
+}
+
+bool stakingAddressTier(const QString& address, QuantumStakeTierProgram& tier)
+{
+    return quantumAddressTier(address, tier) && tier.tiered && !tier.cold_stake;
+}
+
+bool isTieredQuantumAddress(const QString& address)
+{
+    QuantumStakeTierProgram tier;
+    return quantumAddressTier(address, tier) && tier.tiered;
 }
 
 uint16_t stakingAddressLockBlocks(const QString& address)
@@ -3144,13 +3152,16 @@ void StakingMiningPage::refreshControlsEnabled()
     m_quantum_new->setEnabled(can_create_quantum);
     m_quantum_copy->setEnabled(m_quantum_address && !m_quantum_address->text().isEmpty());
     m_quantum_pubkey_copy->setEnabled(m_quantum_pubkey && !m_quantum_pubkey->text().isEmpty());
-    // Re-evaluate from the active tip on every lightweight refresh. A reorg
-    // across the Gold Rush boundary therefore clears these actions without
-    // waiting for the expensive wallet-detail scan. The backend remains the
-    // final authority if the tip changes after this nonblocking check.
-    const bool can_fund_quantum = can_create_quantum &&
-                                  m_wallet_model->wallet().isQuantumFundingActive();
-    m_migration_legacy_sweep->setEnabled(can_fund_quantum);
+    // Re-evaluate all lifecycle-dependent actions from one active-tip snapshot
+    // on every lightweight refresh. The backend remains the final authority if
+    // the tip changes after this nonblocking check.
+    const interfaces::WalletQuantumFundingStatus funding_status = has_wallet
+        ? m_wallet_model->wallet().getQuantumFundingStatus()
+        : interfaces::WalletQuantumFundingStatus{};
+    const bool can_fund_quantum = can_create_quantum && funding_status.quantum_outputs_active;
+    const bool can_migrate_legacy = can_create_quantum && funding_status.legacy_migration_active;
+    const bool can_fund_stake_tiers = can_create_quantum && funding_status.stake_tiers_active;
+    m_migration_legacy_sweep->setEnabled(can_migrate_legacy);
     m_migration_goldrush_sweep->setEnabled(can_fund_quantum);
     m_demurrage_attest->setEnabled(can_create_quantum && m_quantum_address && !m_quantum_address->text().isEmpty());
     m_demurrage_sweep->setEnabled(can_create_quantum && m_demurrage_sweep_available);
@@ -3161,16 +3172,16 @@ void StakingMiningPage::refreshControlsEnabled()
     m_selfstake_copy->setEnabled(m_selfstake_address && !m_selfstake_address->text().isEmpty());
     m_selfstake_output_selector->setEnabled(has_wallet && m_selfstake_output_selector->count() > 1);
     const bool has_selfstake_address = m_selfstake_address && !m_selfstake_address->text().isEmpty();
-    m_selfstake_fund_amount->setEnabled(can_fund_quantum && has_selfstake_address);
-    m_selfstake_fund->setEnabled(can_fund_quantum && has_selfstake_address);
+    m_selfstake_fund_amount->setEnabled(can_fund_stake_tiers && has_selfstake_address);
+    m_selfstake_fund->setEnabled(can_fund_stake_tiers && has_selfstake_address);
     m_selfstake_withdraw->setEnabled(can_create_quantum && has_selfstake_address && m_selfstake_withdraw_available);
     m_operator_new->setEnabled(can_create_quantum);
     m_operator_selector->setEnabled(has_wallet && m_operator_selector->count() > 1);
     m_operator_copy->setEnabled(m_operator_pubkey && !m_operator_pubkey->text().isEmpty());
     m_operator_use_for_delegation->setEnabled(m_operator_pubkey && !m_operator_pubkey->text().isEmpty());
     const bool has_operator_address = m_operator_address && !m_operator_address->text().isEmpty();
-    m_operator_bond_amount->setEnabled(can_fund_quantum && has_operator_address);
-    m_operator_fund->setEnabled(can_fund_quantum && has_operator_address);
+    m_operator_bond_amount->setEnabled(can_fund_stake_tiers && has_operator_address);
+    m_operator_fund->setEnabled(can_fund_stake_tiers && has_operator_address);
     m_operator_withdraw->setEnabled(can_create_quantum && has_operator_address && m_operator_withdraw_available);
     m_operator_registry_refresh->setEnabled(has_wallet);
     bool registry_selection_has_pubkey{false};
@@ -3197,8 +3208,11 @@ void StakingMiningPage::refreshControlsEnabled()
     m_coldstake_new->setEnabled(can_create_quantum && !selectedColdStakeOperatorPubKey().isEmpty());
     m_coldstake_copy->setEnabled(m_coldstake_address && !m_coldstake_address->text().isEmpty());
     const bool has_coldstake_address = m_coldstake_address && !m_coldstake_address->text().isEmpty();
-    m_coldstake_fund_amount->setEnabled(can_fund_quantum && has_coldstake_address);
-    m_coldstake_fund->setEnabled(can_fund_quantum && has_coldstake_address && !selectedColdStakeOperatorPubKey().isEmpty() && m_coldstake_fund_available);
+    const bool coldstake_funding_active = has_coldstake_address && isTieredQuantumAddress(m_coldstake_address->text())
+        ? can_fund_stake_tiers
+        : can_fund_quantum;
+    m_coldstake_fund_amount->setEnabled(coldstake_funding_active && has_coldstake_address);
+    m_coldstake_fund->setEnabled(coldstake_funding_active && has_coldstake_address && !selectedColdStakeOperatorPubKey().isEmpty() && m_coldstake_fund_available);
     m_coldstake_withdraw->setEnabled(can_create_quantum && has_coldstake_address && m_coldstake_withdraw_available);
     m_donation_enable->setEnabled(has_wallet);
     m_donation_percent->setEnabled(has_wallet);

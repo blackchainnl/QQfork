@@ -65,6 +65,7 @@ struct WalletUTXOOptimizationTx;
 struct WalletQuantumStakeOutputInfo;
 struct WalletQuantumPoolInfo;
 struct WalletQuantumPoolOperatorInfo;
+struct WalletQuantumFundingStatus;
 struct WalletMigrationStatus;
 struct WalletRGBAssignmentInfo;
 struct WalletRGBAssetInfo;
@@ -389,10 +390,9 @@ public:
     //! Read wallet migration progress and deadline state.
     virtual WalletMigrationStatus getMigrationStatus() = 0;
 
-    //! Return whether the active tip permits funding quantum outputs in the
-    //! next block. This lightweight GUI guard fails closed if chain state is
-    //! temporarily unavailable.
-    virtual bool isQuantumFundingActive() = 0;
+    //! Return phase-specific next-block quantum funding permissions. This
+    //! lightweight GUI guard fails closed if chain state is unavailable.
+    virtual WalletQuantumFundingStatus getQuantumFundingStatus() = 0;
 
     //! Sweep spendable legacy coins into a wallet-backed quantum address.
     virtual util::Result<WalletQuantumActionTx> migrateLegacyToQuantum() = 0;
@@ -771,6 +771,15 @@ struct WalletUTXOOptimizationTx
     int outputs{0};
     CAmount output_amount{0};
     CAmount fee{0};
+};
+
+//! Nonblocking next-block quantum funding permissions for user interfaces.
+struct WalletQuantumFundingStatus
+{
+    bool available{false};
+    bool quantum_outputs_active{false};
+    bool legacy_migration_active{false};
+    bool stake_tiers_active{false};
 };
 
 //! Wallet migration progress and deadline state.

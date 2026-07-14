@@ -1058,9 +1058,10 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
         "-regtest",
         "-shadowwhitelistheight=20",
         "-shadowgoldrushstartheight=30",
-        "-shadowgoldrushendheight=101",
-        "-qqgoldrushendheight=101",
-        "-qqmigrationendheight=140",
+        "-shadowgoldrushendheight=106",
+        "-qqgoldrushendheight=106",
+        "-qqmigrationendheight=109",
+        "-qqstaketierheight=108",
     };
     TestChain100Setup test{ChainType::REGTEST, phase_args};
     for (int i = 0; i < 5; ++i) {
@@ -1076,53 +1077,139 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     MiniGUI mini_gui(node, platform_style.get());
     mini_gui.initModelForWallet(node, wallet, platform_style.get());
 
+    interfaces::Wallet& wallet_interface = mini_gui.walletModel->wallet();
+    auto selfstake_result = wallet_interface.createQuantumStakeAddress("reorg-selfstake", 9450);
+    QVERIFY(selfstake_result);
+    auto operator_result = wallet_interface.createQuantumStakeAddress("coldstake-operator", 40500);
+    QVERIFY(operator_result);
+    auto staker_result = wallet_interface.createQuantumAddress("reorg-coldstake-staker");
+    QVERIFY(staker_result);
+    auto liquid_coldstake_result = wallet_interface.createQuantumColdStakeAddress(
+        staker_result->public_key, "reorg-liquid-coldstake", 0);
+    QVERIFY(liquid_coldstake_result);
+    auto tiered_coldstake_result = wallet_interface.createQuantumColdStakeAddress(
+        staker_result->public_key, "reorg-tiered-coldstake", 9450);
+    QVERIFY(tiered_coldstake_result);
+
     StakingMiningPage page(platform_style.get());
     page.setClientModel(mini_gui.clientModel.get());
     page.setWalletModel(mini_gui.walletModel.get());
     page.show();
     qApp->processEvents();
 
-    QPushButton* refresh_details = page.findChild<QPushButton*>("stakingMiningRefresh");
     QPushButton* migration_legacy_sweep = page.findChild<QPushButton*>("migrationLegacySweep");
     QPushButton* migration_goldrush_sweep = page.findChild<QPushButton*>("migrationGoldrushSweep");
-    QVERIFY(refresh_details);
+    QLineEdit* selfstake_address = page.findChild<QLineEdit*>("selfStakeAddress");
+    BitcoinAmountField* selfstake_fund_amount = page.findChild<BitcoinAmountField*>("selfStakeFundAmount");
+    QPushButton* selfstake_fund = page.findChild<QPushButton*>("selfStakeFund");
+    QLineEdit* operator_address = page.findChild<QLineEdit*>("coldstakeOperatorAddress");
+    BitcoinAmountField* operator_bond_amount = page.findChild<BitcoinAmountField*>("coldstakeOperatorBondAmount");
+    QPushButton* operator_fund = page.findChild<QPushButton*>("coldstakeOperatorFund");
+    QLineEdit* coldstake_address = page.findChild<QLineEdit*>("coldstakeAddress");
+    BitcoinAmountField* coldstake_fund_amount = page.findChild<BitcoinAmountField*>("coldstakeFundAmount");
     QVERIFY(migration_legacy_sweep);
     QVERIFY(migration_goldrush_sweep);
+    QVERIFY(selfstake_address);
+    QVERIFY(selfstake_fund_amount);
+    QVERIFY(selfstake_fund);
+    QVERIFY(operator_address);
+    QVERIFY(operator_bond_amount);
+    QVERIFY(operator_fund);
+    QVERIFY(coldstake_address);
+    QVERIFY(coldstake_fund_amount);
 
-    refresh_details->click();
-    qApp->processEvents();
-    QVERIFY(mini_gui.walletModel->wallet().isQuantumFundingActive());
-    QVERIFY(migration_legacy_sweep->isEnabled());
-    QVERIFY(migration_goldrush_sweep->isEnabled());
+    selfstake_address->setText(QString::fromStdString(selfstake_result->address));
+    operator_address->setText(QString::fromStdString(operator_result->address));
+    coldstake_address->setText(QString::fromStdString(tiered_coldstake_result->address));
 
-    // Roll back every Migration block. The inexpensive status path must read
-    // the active tip again and disable funding without a full detail refresh.
-    for (int i = 0; i < 5; ++i) {
+    const auto height = [&] {
+        return WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Height());
+    };
+    const auto update_controls = [&] {
+        QVERIFY(QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection));
+        qApp->processEvents();
+    };
+    const auto expect_controls = [&](int expected_height, bool quantum_active, bool legacy_active, bool tiers_active) {
+        QCOMPARE(height(), expected_height);
+        const interfaces::WalletQuantumFundingStatus status = wallet_interface.getQuantumFundingStatus();
+        QVERIFY(status.available);
+        QCOMPARE(status.quantum_outputs_active, quantum_active);
+        QCOMPARE(status.legacy_migration_active, legacy_active);
+        QCOMPARE(status.stake_tiers_active, tiers_active);
+
+        coldstake_address->setText(QString::fromStdString(tiered_coldstake_result->address));
+        update_controls();
+        QCOMPARE(migration_legacy_sweep->isEnabled(), legacy_active);
+        QCOMPARE(migration_goldrush_sweep->isEnabled(), quantum_active);
+        QCOMPARE(selfstake_fund_amount->isEnabled(), tiers_active);
+        QCOMPARE(selfstake_fund->isEnabled(), tiers_active);
+        QCOMPARE(operator_bond_amount->isEnabled(), tiers_active);
+        QCOMPARE(operator_fund->isEnabled(), tiers_active);
+        QCOMPARE(coldstake_fund_amount->isEnabled(), tiers_active);
+
+        // Liquid cold-stake funding follows ordinary quantum-output support;
+        // only tiered cold-stake addresses require stake-tier activation.
+        coldstake_address->setText(QString::fromStdString(liquid_coldstake_result->address));
+        update_controls();
+        QCOMPARE(coldstake_fund_amount->isEnabled(), quantum_active);
+        coldstake_address->setText(QString::fromStdString(tiered_coldstake_result->address));
+    };
+    const auto mine_block = [&] {
+        test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+        SyncWithValidationInterfaceQueue();
+    };
+    const auto invalidate_tip = [&] {
         CBlockIndex* tip = WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Tip());
+        QVERIFY(tip);
         BlockValidationState state;
         QVERIFY(test.m_node.chainman->ActiveChainstate().InvalidateBlock(state, tip));
-    }
-    SyncWithValidationInterfaceQueue();
-    QCOMPARE(WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Height()), 100);
-    QVERIFY(QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection));
-    qApp->processEvents();
-    QVERIFY(!mini_gui.walletModel->wallet().isQuantumFundingActive());
-    QVERIFY(!migration_legacy_sweep->isEnabled());
-    QVERIFY(!migration_goldrush_sweep->isEnabled());
+        SyncWithValidationInterfaceQueue();
+    };
 
-    // Mine an alternate branch back into Migration. The same lightweight path
-    // must enable the controls again from the new active tip.
+    // Tip 105 creates candidate 106, the final Gold Rush block. Both the UI
+    // and the backend reject migration without allocating an unused address.
+    expect_controls(105, /*quantum_active=*/false, /*legacy_active=*/false, /*tiers_active=*/false);
+    const size_t goldrush_address_count = wallet_interface.listQuantumAddresses().size();
+    QVERIFY(!wallet_interface.migrateLegacyToQuantum());
+    QCOMPARE(wallet_interface.listQuantumAddresses().size(), goldrush_address_count);
+
+    // Candidate 107 is Migration but precedes the tier activation at 108.
+    mine_block();
+    expect_controls(106, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/false);
+
+    // Candidate 108 is the first block that permits tiered funding.
+    mine_block();
+    expect_controls(107, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/true);
+
+    mine_block();
+    mine_block();
+    // Candidate 110 is Final: ordinary quantum and tiered funding remain
+    // available, but legacy migration closes. Failure must not reserve a key.
+    expect_controls(109, /*quantum_active=*/true, /*legacy_active=*/false, /*tiers_active=*/true);
+    const size_t final_address_count = wallet_interface.listQuantumAddresses().size();
+    QVERIFY(!wallet_interface.migrateLegacyToQuantum());
+    QCOMPARE(wallet_interface.listQuantumAddresses().size(), final_address_count);
+
+    // Reorg backward across Final, tier activation, and Gold Rush. Every
+    // lightweight refresh must derive permissions from the new active tip.
+    invalidate_tip();
+    expect_controls(108, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/true);
+    invalidate_tip();
+    expect_controls(107, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/true);
+    invalidate_tip();
+    expect_controls(106, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/false);
+    invalidate_tip();
+    expect_controls(105, /*quantum_active=*/false, /*legacy_active=*/false, /*tiers_active=*/false);
+
+    // Mine an alternate branch forward through the same exact boundaries.
     test.coinbaseKey.MakeNewKey(true);
-    for (int i = 0; i < 5; ++i) {
-        test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
-    }
-    SyncWithValidationInterfaceQueue();
-    QCOMPARE(WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Height()), 105);
-    QVERIFY(QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection));
-    qApp->processEvents();
-    QVERIFY(mini_gui.walletModel->wallet().isQuantumFundingActive());
-    QVERIFY(migration_legacy_sweep->isEnabled());
-    QVERIFY(migration_goldrush_sweep->isEnabled());
+    mine_block();
+    expect_controls(106, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/false);
+    mine_block();
+    expect_controls(107, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/true);
+    mine_block();
+    mine_block();
+    expect_controls(109, /*quantum_active=*/true, /*legacy_active=*/false, /*tiers_active=*/true);
 }
 
 } // namespace

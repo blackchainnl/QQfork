@@ -74,6 +74,7 @@ using interfaces::WalletQuantumAddressInfo;
 using interfaces::WalletQuantumColdStakeBalanceInfo;
 using interfaces::WalletQuantumActionTx;
 using interfaces::WalletQuantumColdStakeInfo;
+using interfaces::WalletQuantumFundingStatus;
 using interfaces::WalletQuantumOperatorBondInfo;
 using interfaces::WalletQuantumOperatorBondTx;
 using interfaces::WalletQuantumPoolInfo;
@@ -106,6 +107,40 @@ bool IsDirectQuantumMigrationScript(const CScript& script_pub_key)
 {
     const auto tier = GetQuantumStakeTierProgram(script_pub_key);
     return tier && !tier->tiered && !tier->cold_stake;
+}
+
+std::optional<bilingual_str> QuantumMigrationSweepPhaseError(
+    const CWallet& wallet,
+    bool goldrush_rewards_only)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main)
+{
+    if (!wallet.HaveChain()) {
+        return _("Chain state is unavailable; migration cannot be evaluated.");
+    }
+
+    const CBlockIndex* tip = wallet.chain().getTip();
+    if (!tip) {
+        return _("Chain tip is unavailable; migration cannot be evaluated.");
+    }
+
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int64_t mtp = tip->GetMedianTimePast();
+    const int next_height = tip->nHeight + 1;
+    const bool quantum_outputs_active = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
+    if (goldrush_rewards_only) {
+        if (!quantum_outputs_active) {
+            return _("Gold Rush reward outputs remain locked until quantum witness spends activate after the Gold Rush.");
+        }
+        return std::nullopt;
+    }
+
+    if (consensus.IsQuantumFinalLockout(mtp, next_height)) {
+        return _("The migration deadline has passed; legacy coins are no longer spendable and cannot be migrated.");
+    }
+    if (!quantum_outputs_active || !consensus.IsQuantumMigrationWindow(mtp, next_height)) {
+        return _("Legacy migration is available only during the active Migration phase.");
+    }
+    return std::nullopt;
 }
 
 util::Result<void> CommitWalletTransactionOrError(CWallet& wallet, const CTransactionRef& tx, mapValue_t map_value, const std::string& action)
@@ -1398,6 +1433,16 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     const std::string& destination_label,
     const std::string& comment_override)
 {
+    // Check the current lifecycle before reserving a new destination. Repeat
+    // the check under the transaction-creation locks below to close the race
+    // if the active tip changes while the key is being generated.
+    {
+        LOCK(::cs_main);
+        if (const auto error = QuantumMigrationSweepPhaseError(wallet, goldrush_rewards_only)) {
+            return util::Error{*error};
+        }
+    }
+
     const std::string label = !destination_label.empty()
         ? destination_label
         : (goldrush_rewards_only ? "goldrush-consolidation-gui" : "migration-gui");
@@ -1422,18 +1467,14 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
             return util::Error{_("Error: Private keys are disabled for this wallet")};
         }
 
+        if (const auto error = QuantumMigrationSweepPhaseError(wallet, goldrush_rewards_only)) {
+            return util::Error{*error};
+        }
         const Consensus::Params& consensus = Params().GetConsensus();
         const CBlockIndex* tip = wallet.chain().getTip();
-        const int64_t mtp = tip ? tip->GetMedianTimePast() : 0;
-        const int next_height = tip ? tip->nHeight + 1 : 0;
-        if (goldrush_rewards_only) {
-            const bool can_move_reward_outputs = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
-            if (!can_move_reward_outputs) {
-                return util::Error{_("Gold Rush reward outputs remain locked until quantum witness spends activate after the Gold Rush.")};
-            }
-        } else if (consensus.IsQuantumFinalLockout(mtp, next_height)) {
-                return util::Error{_("The migration deadline has passed; legacy coins are no longer spendable and cannot be migrated.")};
-        }
+        Assume(tip != nullptr);
+        const int64_t mtp = tip->GetMedianTimePast();
+        const int next_height = tip->nHeight + 1;
 
         if (!wallet.GetQuantumKeyInfo(destination).has_value()) {
             return util::Error{_("Refusing to migrate: destination ML-DSA key is not confirmed stored in the wallet.")};
@@ -2735,16 +2776,24 @@ public:
         }
         return status;
     }
-    bool isQuantumFundingActive() override
+    WalletQuantumFundingStatus getQuantumFundingStatus() override
     {
+        WalletQuantumFundingStatus status;
         TRY_LOCK(::cs_main, main_lock);
-        if (!main_lock || !m_wallet->HaveChain()) return false;
+        if (!main_lock || !m_wallet->HaveChain()) return status;
 
         const CBlockIndex* tip = m_wallet->chain().chainman().ActiveChain().Tip();
-        if (!tip) return false;
+        if (!tip) return status;
 
-        return IsQuantumWitnessSpendActive(
-            Params().GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1);
+        const Consensus::Params& consensus = Params().GetConsensus();
+        const int64_t mtp = tip->GetMedianTimePast();
+        const int next_height = tip->nHeight + 1;
+        status.available = true;
+        status.quantum_outputs_active = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
+        status.legacy_migration_active = status.quantum_outputs_active &&
+                                         consensus.IsQuantumMigrationWindow(mtp, next_height);
+        status.stake_tiers_active = IsQuantumStakeTiersActive(consensus, mtp, next_height);
+        return status;
     }
     util::Result<WalletQuantumActionTx> migrateLegacyToQuantum() override
     {
