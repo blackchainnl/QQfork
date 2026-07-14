@@ -62,6 +62,10 @@ ASSUMEVALID_WINDOW = 14 * 24 * 60 * 60
 # script verification may be skipped for an assumed-valid ancestor.
 ASSUMEVALID_BURY_DEPTH = ASSUMEVALID_WINDOW // TARGET_SPACING + 1
 MAX_HEADERS_PER_MESSAGE = 2000
+# Unlike headers, each block is fully connected while the P2P message handler
+# drains its receive queue. Keep that queue small enough that the ping barrier
+# remains responsive in debug, lock-order, and sanitizer builds.
+BLOCK_PROCESSING_BATCH_SIZE = 256
 SHALLOW_CHAIN_HEIGHT = 200
 
 
@@ -109,7 +113,7 @@ class AssumeValidTest(BitcoinTestFramework):
         """Send a long block chain in bounded batches."""
         for index, block in enumerate(blocks, start=1):
             p2p_conn.send_message(msg_block(block))
-            if index % MAX_HEADERS_PER_MESSAGE == 0:
+            if index % BLOCK_PROCESSING_BATCH_SIZE == 0:
                 p2p_conn.sync_with_ping(timeout=self.rpc_timeout)
         p2p_conn.sync_with_ping(timeout=self.rpc_timeout)
 
