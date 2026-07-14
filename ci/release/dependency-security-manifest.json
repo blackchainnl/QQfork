@@ -175,7 +175,7 @@
     {
       "package": "miniupnpc",
       "recipe": "depends/packages/miniupnpc.mk",
-      "recipe_sha256": "315bd3b5a7144ad770345b3e164466c0bbc6c2f08c589192f9e883272b701c8f",
+      "recipe_sha256": "5dd467f46a2fcfc4466917d0988618e47c33d5977197fc44860ded4833707c3c",
       "version": "2.3.3",
       "sources": [
         {"url": "https://miniupnp.tuxfamily.org/files/miniupnpc-2.3.3.tar.gz", "sha256": "d52a0afa614ad6c088cc9ddff1ae7d29c8c595ac5fdd321170a05f41e634bd1a"}
