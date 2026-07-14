@@ -510,7 +510,9 @@ static RPCHelpMan staking()
     return RPCHelpMan{"staking",
             "Gets or sets the current staking configuration.\n"
             "When called without an argument, returns the current status of staking.\n"
-            "When called with an argument, enables or disables staking.\n",
+            "When called with an argument, enables or disables staking.\n"
+            "For fleet mode with -qqallowautokeycreation=0, configure -qqpospayoutaddress with an existing wallet-owned quantum address before an automatic Gold Rush PoS signal becomes eligible.\n"
+            "The independent -qqautodemurrageattest=0 switch disables background demurrage-attestation scans without disabling staking or manual attestation RPCs.\n",
             {
                 {"generate", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED, "To enable or disable staking."},
 
@@ -1934,7 +1936,8 @@ static RPCHelpMan setpowmining()
     return RPCHelpMan{"setpowmining",
         "\nStart, stop, or reconfigure the built-in (in-process) Gold Rush Proof-of-Work miner.\n"
         "No external miner is required. Mining only produces claims during the Gold Rush reward window,\n"
-        "requires an unlocked wallet with private keys, and credits valid claims to an auto-created quantum address in the upgraded shadow ledger.\n"
+        "requires an unlocked wallet with private keys, and credits valid claims to a wallet-owned quantum address in the upgraded shadow ledger.\n"
+        "Set -qqpowpayoutaddress to bind an existing address. With -qqallowautokeycreation=0, that explicit binding is required and no payout key is generated.\n"
         "Claim submission is not whitelist-gated, but it does require a spendable non-dust legacy UTXO to authenticate the QQSPROOF transaction and pay the minimal network fee.\n",
         {
             {"enabled", RPCArg::Type::BOOL, RPCArg::Optional::NO, "true to start mining, false to stop."},
@@ -1945,7 +1948,7 @@ static RPCHelpMan setpowmining()
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is now enabled."},
             {RPCResult::Type::NUM, "threads", "Configured worker threads."},
             {RPCResult::Type::NUM, "cpu_percent", "Configured per-core CPU duty cycle."},
-            {RPCResult::Type::STR, "payout_address", "The quantum payout address (created if needed)."},
+            {RPCResult::Type::STR, "payout_address", "The configured, restored, or newly created wallet-owned quantum payout address."},
             {RPCResult::Type::STR, "warning", /*optional=*/true, "Backup reminder when a wallet-backed quantum payout key was created."},
         }},
         RPCExamples{

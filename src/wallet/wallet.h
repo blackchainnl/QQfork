@@ -390,6 +390,13 @@ struct QuantumKeyInfo
     bool backup_verified{false};
 };
 
+/** Result of resolving an explicit wallet-backed quantum address option. */
+enum class QuantumAddressBindingResult {
+    UNSET,
+    RESOLVED,
+    INVALID,
+};
+
 struct QuantumColdStakeDelegationRecord
 {
     uint256 staker_pubkey_hash;
@@ -1543,7 +1550,18 @@ public:
     void StopPowMining();
     bool IsPowMiningClosing() const;
     void ThreadShadowPoWMiner(int worker_id);
+    QuantumAddressBindingResult ResolveConfiguredQuantumAddress(
+        const std::string& option,
+        const std::string& purpose,
+        CTxDestination& destination,
+        bilingual_str& error) const;
     bool EnsurePowPayoutAddress(bilingual_str& error, bool* created = nullptr);
+    bool EnsureShadowSignalPayoutAddress(
+        CScript& payout_script,
+        std::string& payout_address,
+        bilingual_str& error,
+        bool* created = nullptr);
+    bool PrepareAutomaticDemurrageChangeAddress(CCoinControl& coin_control, bilingual_str& error) const;
     bool TryBeginShadowPowClaimSubmission()
     {
         bool expected{false};

@@ -19,6 +19,8 @@
 
 #include <addresstype.h>
 #include <chain.h>
+#include <common/args.h>
+#include <common/settings.h>
 #include <consensus/demurrage.h>
 #include <coins.h>
 #include <crypto/mldsa.h>
@@ -59,6 +61,51 @@ namespace wallet {
 RPCHelpMan importmulti();
 RPCHelpMan dumpwallet();
 RPCHelpMan importwallet();
+
+class ScopedArgsSettings
+{
+public:
+    ScopedArgsSettings()
+    {
+        gArgs.LockSettings([&](common::Settings& settings) { m_saved = settings; });
+    }
+
+    ~ScopedArgsSettings()
+    {
+        gArgs.LockSettings([&](common::Settings& settings) { settings = m_saved; });
+    }
+
+    void Force(const std::string& option, const std::string& value)
+    {
+        gArgs.ForceSetArg(option, value);
+    }
+
+    void Unset(const std::string& option)
+    {
+        const std::string name = option.front() == '-' ? option.substr(1) : option;
+        gArgs.LockSettings([&](common::Settings& settings) {
+            settings.forced_settings.erase(name);
+            settings.command_line_options.erase(name);
+            for (auto& [_, section] : settings.ro_config) section.erase(name);
+            settings.rw_settings.erase(name);
+        });
+    }
+
+    void SetRepeated(const std::string& option, const std::vector<std::string>& values)
+    {
+        const std::string name = option.front() == '-' ? option.substr(1) : option;
+        gArgs.LockSettings([&](common::Settings& settings) {
+            settings.forced_settings.erase(name);
+            settings.command_line_options[name].clear();
+            for (const std::string& value : values) {
+                settings.command_line_options[name].emplace_back(value);
+            }
+        });
+    }
+
+private:
+    common::Settings m_saved;
+};
 
 // Blackcoin
 /*
@@ -1594,6 +1641,182 @@ BOOST_FIXTURE_TEST_CASE(QuantumWalletKeysPersistAndSign, QuantumWalletSigningTes
             CheckQuantumWalletSigning(*wallet, dest);
         }
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsPersistWithoutKeyCreation, QuantumWalletSigningTestingSetup)
+{
+    ScopedArgsSettings args_guard;
+    args_guard.Force("-qqallowautokeycreation", "0");
+    args_guard.Force("-qqautoredelegate", "0");
+
+    auto quantum_inventory = [](CWallet& wallet) {
+        LOCK(wallet.cs_wallet);
+        std::set<std::string> addresses;
+        for (const QuantumKeyInfo& info : wallet.ListQuantumKeyInfos()) {
+            addresses.insert(EncodeDestination(info.destination));
+        }
+        return addresses;
+    };
+
+    for (DatabaseFormat format : DATABASE_FORMATS) {
+        const std::string name{strprintf("explicit-quantum-bindings-%i", format)};
+        CTxDestination bound_dest;
+        std::set<std::string> expected_inventory;
+        {
+            auto wallet{TestLoadQuantumWallet(name, format, m_node.chain.get())};
+            {
+                LOCK(wallet->cs_wallet);
+                auto created = wallet->GetNewQuantumDestination("unrelated operator key");
+                BOOST_REQUIRE(created);
+                bound_dest = *created;
+                const auto* entry = wallet->FindAddressBookEntry(bound_dest);
+                BOOST_REQUIRE(entry);
+                BOOST_CHECK_EQUAL(entry->GetLabel(), "unrelated operator key");
+            }
+            expected_inventory = quantum_inventory(*wallet);
+            BOOST_REQUIRE_EQUAL(expected_inventory.size(), 1U);
+
+            const std::string address = EncodeDestination(bound_dest);
+            args_guard.Force("-qqpowpayoutaddress", address);
+            args_guard.Force("-qqpospayoutaddress", address);
+            args_guard.Force("-qqdemurragechangeaddress", address);
+
+            bilingual_str error;
+            bool created{true};
+            BOOST_REQUIRE_MESSAGE(wallet->EnsurePowPayoutAddress(error, &created), error.original);
+            BOOST_CHECK(!created);
+            {
+                LOCK(wallet->cs_wallet);
+                BOOST_CHECK_EQUAL(wallet->m_pow_payout_quantum, address);
+            }
+
+            CScript payout_script;
+            std::string payout_address;
+            created = true;
+            BOOST_REQUIRE_MESSAGE(
+                wallet->EnsureShadowSignalPayoutAddress(payout_script, payout_address, error, &created),
+                error.original);
+            BOOST_CHECK(!created);
+            BOOST_CHECK_EQUAL(payout_address, address);
+            BOOST_CHECK(payout_script == GetScriptForDestination(bound_dest));
+
+            CCoinControl coin_control;
+            BOOST_REQUIRE_MESSAGE(wallet->PrepareAutomaticDemurrageChangeAddress(coin_control, error), error.original);
+            BOOST_CHECK(coin_control.destChange == bound_dest);
+            BOOST_CHECK(quantum_inventory(*wallet) == expected_inventory);
+        }
+
+        // The binding is configuration-backed and the key is wallet-backed.
+        // Reopen the database, invoke all three paths again, and prove that no
+        // extra non-HD key appears and no payout label is required.
+        {
+            auto wallet{TestLoadQuantumWallet(name, format, m_node.chain.get())};
+            BOOST_CHECK(quantum_inventory(*wallet) == expected_inventory);
+
+            bilingual_str error;
+            bool created{true};
+            BOOST_REQUIRE_MESSAGE(wallet->EnsurePowPayoutAddress(error, &created), error.original);
+            BOOST_CHECK(!created);
+
+            CScript payout_script;
+            std::string payout_address;
+            created = true;
+            BOOST_REQUIRE_MESSAGE(
+                wallet->EnsureShadowSignalPayoutAddress(payout_script, payout_address, error, &created),
+                error.original);
+            BOOST_CHECK(!created);
+            BOOST_CHECK_EQUAL(payout_address, EncodeDestination(bound_dest));
+
+            CCoinControl coin_control;
+            BOOST_REQUIRE_MESSAGE(wallet->PrepareAutomaticDemurrageChangeAddress(coin_control, error), error.original);
+            BOOST_CHECK(coin_control.destChange == bound_dest);
+            BOOST_CHECK(quantum_inventory(*wallet) == expected_inventory);
+        }
+    }
+}
+
+BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsFailClosed, WalletTestingSetup)
+{
+    ScopedArgsSettings args_guard;
+    args_guard.Force("-qqallowautokeycreation", "0");
+    args_guard.Force("-qqautoredelegate", "0");
+
+    CTxDestination owned_dest;
+    {
+        LOCK(m_wallet.cs_wallet);
+        auto created = m_wallet.GetNewQuantumDestination("ordinary quantum key");
+        BOOST_REQUIRE(created);
+        owned_dest = *created;
+    }
+    const size_t original_key_count = WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size());
+    BOOST_REQUIRE_EQUAL(original_key_count, 1U);
+
+    bilingual_str error;
+    args_guard.Unset("-qqpowpayoutaddress");
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error));
+    BOOST_CHECK(error.original.find("-qqpowpayoutaddress") != std::string::npos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
+
+    const std::string owned_address = EncodeDestination(owned_dest);
+    args_guard.SetRepeated("-qqpowpayoutaddress", {owned_address, owned_address});
+    error.clear();
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error));
+    BOOST_CHECK(error.original.find("ambiguous") != std::string::npos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
+
+    args_guard.Force("-qqpowpayoutaddress", "not-a-quantum-address");
+    error.clear();
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error));
+    BOOST_CHECK(error.original.find("valid Quantum Quasar") != std::string::npos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
+
+    CWallet foreign_wallet(/*chain=*/nullptr, "foreign", CreateMockableWalletDatabase());
+    BOOST_REQUIRE_EQUAL(foreign_wallet.LoadWallet(), DBErrors::LOAD_OK);
+    CTxDestination foreign_dest;
+    {
+        LOCK(foreign_wallet.cs_wallet);
+        auto created = foreign_wallet.GetNewQuantumDestination("foreign quantum key");
+        BOOST_REQUIRE(created);
+        foreign_dest = *created;
+    }
+    args_guard.Force("-qqpowpayoutaddress", EncodeDestination(foreign_dest));
+    error.clear();
+    BOOST_CHECK(!m_wallet.EnsurePowPayoutAddress(error));
+    BOOST_CHECK(error.original.find("not backed") != std::string::npos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
+
+    args_guard.Unset("-qqpospayoutaddress");
+    CScript payout_script;
+    std::string payout_address;
+    error.clear();
+    BOOST_CHECK(!m_wallet.EnsureShadowSignalPayoutAddress(payout_script, payout_address, error));
+    BOOST_CHECK(error.original.find("-qqpospayoutaddress") != std::string::npos);
+
+    args_guard.Unset("-qqdemurragechangeaddress");
+    CCoinControl coin_control;
+    error.clear();
+    BOOST_CHECK(!m_wallet.PrepareAutomaticDemurrageChangeAddress(coin_control, error));
+    BOOST_CHECK(error.original.find("-qqdemurragechangeaddress") != std::string::npos);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
+
+    args_guard.Force("-qqautodemurrageattest", "0");
+    {
+        LOCK(m_wallet.cs_wallet);
+        m_wallet.m_demurrage_last_auto_attest_scan_height = 77;
+    }
+    m_wallet.m_enabled_staking = true;
+    BOOST_CHECK_EQUAL(MaybeAutoDemurrageAttest(m_wallet), 0);
+    m_wallet.m_enabled_staking = false;
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(m_wallet.cs_wallet, return m_wallet.m_demurrage_last_auto_attest_scan_height),
+        77);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
+
+    // The source-level guard remains fail-closed even if a caller bypasses
+    // startup parameter interaction and leaves auto-redelegation enabled.
+    args_guard.Force("-qqautoredelegate", "1");
+    BOOST_CHECK_EQUAL(MaybeAutoRedelegateQuantumColdStake(m_wallet), 0);
+    BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), original_key_count);
 }
 
 BOOST_AUTO_TEST_CASE(QuantumWalletKeyCreationIsAtomicAndDurable)

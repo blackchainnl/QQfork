@@ -153,9 +153,6 @@ struct AutoShadowSignalCandidate
 
 static constexpr const char* SHADOW_SIGNAL_COMMENT{"PoS Claim"};
 static constexpr const char* OLD_SHADOW_SIGNAL_COMMENT{"Quantum PoS Claim"};
-static constexpr const char* SHADOW_SIGNAL_PAYOUT_LABEL{"PoS - Quantum Stake Address"};
-static constexpr const char* OLD_SHADOW_SIGNAL_PAYOUT_LABEL{"Quantum PoS Reward Address"};
-static constexpr const char* LEGACY_SHADOW_SIGNAL_PAYOUT_LABEL{"goldrush-pos"};
 static constexpr unsigned int DEFAULT_SHADOW_SIGNAL_MAX_RETRY_FAILURES{6};
 static constexpr int64_t DEFAULT_SHADOW_SIGNAL_RETRY_BASE_MILLIS{1000};
 
@@ -388,44 +385,6 @@ bool HasPendingShadowSignal(CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_
         if (wtx.isUnconfirmed()) return true;
     }
     return false;
-}
-
-bool EnsureShadowSignalPayout(CWallet& wallet, CScript& payout_script, std::string& payout_address, bilingual_str& error)
-{
-    std::optional<CTxDestination> reused_dest;
-    bool relabel_reused_dest{false};
-    {
-        LOCK(wallet.cs_wallet);
-        for (const auto& [dest, entry] : wallet.m_address_book) {
-            const std::string label = entry.GetLabel();
-            if (entry.IsChange() || (label != SHADOW_SIGNAL_PAYOUT_LABEL && label != OLD_SHADOW_SIGNAL_PAYOUT_LABEL && label != LEGACY_SHADOW_SIGNAL_PAYOUT_LABEL)) continue;
-            if (!IsValidDestination(dest) || !IsQuantumMigrationDestination(dest)) continue;
-            const auto key_info = wallet.GetQuantumKeyInfo(dest);
-            if (!key_info || !key_info->durably_stored) continue;
-            payout_address = EncodeDestination(dest);
-            payout_script = GetScriptForDestination(dest);
-            reused_dest = dest;
-            relabel_reused_dest = label != SHADOW_SIGNAL_PAYOUT_LABEL;
-            break;
-        }
-    }
-    if (reused_dest) {
-        if (relabel_reused_dest && !wallet.SetAddressBook(*reused_dest, SHADOW_SIGNAL_PAYOUT_LABEL, AddressPurpose::RECEIVE)) {
-            error = _("Failed to update Gold Rush PoS payout address label.");
-            return false;
-        }
-        return true;
-    }
-
-    auto dest = wallet.GetNewQuantumDestination(SHADOW_SIGNAL_PAYOUT_LABEL);
-    if (!dest) {
-        error = util::ErrorString(dest);
-        return false;
-    }
-    payout_address = EncodeDestination(*dest);
-    payout_script = GetScriptForDestination(*dest);
-    wallet.WalletLogPrintf("Gold Rush PoS signaler created payout address %s. Back up the wallet.\n", payout_address);
-    return true;
 }
 
 bool FindAutoShadowSignalCandidate(CWallet& wallet, AutoShadowSignalCandidate& candidate)
@@ -1373,6 +1332,8 @@ bool CreateQuantumColdStakeRedelegationTransaction(
 
 int MaybeAutoDemurrageAttest(CWallet& wallet)
 {
+    if (!gArgs.GetBoolArg("-qqautodemurrageattest", true)) return 0;
+
     {
         LOCK(wallet.cs_wallet);
         if (!wallet.m_enabled_staking.load() ||
@@ -1481,6 +1442,15 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         }
     }
 
+    CCoinControl automatic_change_control;
+    if (!candidates.empty()) {
+        bilingual_str change_error;
+        if (!wallet.PrepareAutomaticDemurrageChangeAddress(automatic_change_control, change_error)) {
+            wallet.WalletLogPrintf("Demurrage auto-attest skipped: %s\n", change_error.original);
+            return 0;
+        }
+    }
+
     int submitted{0};
     bool logged_no_fee{false};
     std::set<COutPoint> used_fee_outpoints;
@@ -1500,7 +1470,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
         for (const COutPoint& fee_outpoint : fee_outpoints) {
             if (used_fee_outpoints.count(fee_outpoint)) continue;
 
-            CCoinControl coin_control;
+            CCoinControl coin_control = automatic_change_control;
             coin_control.m_allow_other_inputs = false;
             coin_control.m_avoid_address_reuse = false;
             coin_control.Select(fee_outpoint);
@@ -1604,7 +1574,7 @@ int MaybeAutoShadowSignal(CWallet& wallet)
     CScript payout_script;
     std::string payout_address;
     bilingual_str error;
-    if (!EnsureShadowSignalPayout(wallet, payout_script, payout_address, error)) {
+    if (!wallet.EnsureShadowSignalPayoutAddress(payout_script, payout_address, error)) {
         wallet.WalletLogPrintf("Gold Rush PoS signal skipped: %s\n", error.original);
         ScheduleAutoShadowSignalRetry(wallet, candidate.scan_height, error.original);
         return 0;
@@ -1697,6 +1667,10 @@ int MaybeAutoShadowSignal(CWallet& wallet)
 int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
 {
     if (!gArgs.GetBoolArg("-qqautoredelegate", true)) return 0;
+    if (!gArgs.GetBoolArg("-qqallowautokeycreation", true)) {
+        wallet.WalletLogPrintf("Automatic Quantum cold-stake redelegation is disabled because -qqallowautokeycreation=0 forbids its new owner-key generation path. Keep -qqautoredelegate=0 in fleet configuration.\n");
+        return 0;
+    }
     if (wallet.IsLocked() || wallet.m_wallet_unlock_staking_only || wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         return 0;
     }

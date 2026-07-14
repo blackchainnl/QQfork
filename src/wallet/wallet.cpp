@@ -8470,12 +8470,87 @@ bool CWallet::IsPowMiningClosing() const
     return (HaveChain() && chain().shutdownRequested()) || m_stop_pow_mining_thread.load();
 }
 
+QuantumAddressBindingResult CWallet::ResolveConfiguredQuantumAddress(
+    const std::string& option,
+    const std::string& purpose,
+    CTxDestination& destination,
+    bilingual_str& error) const
+{
+    destination = CNoDestination{};
+    const std::vector<std::string> configured = gArgs.GetArgs(option);
+    if (configured.empty()) return QuantumAddressBindingResult::UNSET;
+    if (configured.size() != 1) {
+        error = Untranslated(strprintf(
+            "%s is ambiguous for %s: specify exactly one wallet-owned quantum address.",
+            option, purpose));
+        return QuantumAddressBindingResult::INVALID;
+    }
+    if (configured.front().empty()) {
+        error = Untranslated(strprintf(
+            "%s is empty for %s: specify one wallet-owned quantum address.",
+            option, purpose));
+        return QuantumAddressBindingResult::INVALID;
+    }
+
+    const CTxDestination candidate = DecodeDestination(configured.front());
+    if (!IsValidDestination(candidate) || !IsQuantumMigrationDestination(candidate)) {
+        error = Untranslated(strprintf(
+            "%s for %s must be a valid Quantum Quasar ML-DSA address for the active network.",
+            option, purpose));
+        return QuantumAddressBindingResult::INVALID;
+    }
+
+    {
+        LOCK(cs_wallet);
+        const auto key_info = GetQuantumKeyInfo(candidate);
+        if (!key_info) {
+            error = Untranslated(strprintf(
+                "%s for %s is not backed by an ML-DSA private key owned by this wallet.",
+                option, purpose));
+            return QuantumAddressBindingResult::INVALID;
+        }
+        if (!key_info->durably_stored) {
+            error = Untranslated(strprintf(
+                "%s for %s is not backed by a durably stored wallet ML-DSA key.",
+                option, purpose));
+            return QuantumAddressBindingResult::INVALID;
+        }
+    }
+
+    destination = candidate;
+    return QuantumAddressBindingResult::RESOLVED;
+}
+
 bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created)
 {
     if (created) *created = false;
     static constexpr const char* POW_PAYOUT_LABEL{"PoW - Quantum Claim Address"};
     static constexpr const char* OLD_POW_PAYOUT_LABEL{"Quantum PoW Reward Address"};
     static constexpr const char* LEGACY_POW_PAYOUT_LABEL{"goldrush-pow"};
+
+    CTxDestination configured_dest;
+    switch (ResolveConfiguredQuantumAddress(
+        "-qqpowpayoutaddress", "Gold Rush PoW payouts", configured_dest, error)) {
+    case QuantumAddressBindingResult::RESOLVED: {
+        const std::string encoded = EncodeDestination(configured_dest);
+        {
+            LOCK(cs_wallet);
+            m_pow_payout_quantum = encoded;
+        }
+        WalletLogPrintf("Gold Rush PoW miner bound to configured payout address %s.\n", encoded);
+        return true;
+    }
+    case QuantumAddressBindingResult::INVALID:
+        return false;
+    case QuantumAddressBindingResult::UNSET:
+        break;
+    }
+
+    if (!gArgs.GetBoolArg("-qqallowautokeycreation", true)) {
+        error = _("Gold Rush PoW payout is not configured. Set -qqpowpayoutaddress=<existing wallet-owned quantum address>, or explicitly allow automatic key creation with -qqallowautokeycreation=1.");
+        return false;
+    }
+
     std::string restored_payout;
     std::optional<CTxDestination> relabel_dest;
     {
@@ -8526,6 +8601,99 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created)
     }
     WalletLogPrintf("Gold Rush PoW miner created payout address %s. Back up the wallet.\n", encoded);
     if (created) *created = true;
+    return true;
+}
+
+bool CWallet::EnsureShadowSignalPayoutAddress(
+    CScript& payout_script,
+    std::string& payout_address,
+    bilingual_str& error,
+    bool* created)
+{
+    if (created) *created = false;
+    static constexpr const char* SHADOW_SIGNAL_PAYOUT_LABEL{"PoS - Quantum Stake Address"};
+    static constexpr const char* OLD_SHADOW_SIGNAL_PAYOUT_LABEL{"Quantum PoS Reward Address"};
+    static constexpr const char* LEGACY_SHADOW_SIGNAL_PAYOUT_LABEL{"goldrush-pos"};
+
+    CTxDestination configured_dest;
+    switch (ResolveConfiguredQuantumAddress(
+        "-qqpospayoutaddress", "Gold Rush PoS signal payouts", configured_dest, error)) {
+    case QuantumAddressBindingResult::RESOLVED:
+        payout_address = EncodeDestination(configured_dest);
+        payout_script = GetScriptForDestination(configured_dest);
+        WalletLogPrintf("Gold Rush PoS signaler bound to configured payout address %s.\n", payout_address);
+        return true;
+    case QuantumAddressBindingResult::INVALID:
+        return false;
+    case QuantumAddressBindingResult::UNSET:
+        break;
+    }
+
+    if (!gArgs.GetBoolArg("-qqallowautokeycreation", true)) {
+        error = _("Gold Rush PoS payout is not configured. Set -qqpospayoutaddress=<existing wallet-owned quantum address>, or explicitly allow automatic key creation with -qqallowautokeycreation=1.");
+        return false;
+    }
+
+    std::optional<CTxDestination> reused_dest;
+    bool relabel_reused_dest{false};
+    {
+        LOCK(cs_wallet);
+        for (const auto& [dest, entry] : m_address_book) {
+            const std::string label = entry.GetLabel();
+            if (entry.IsChange() ||
+                (label != SHADOW_SIGNAL_PAYOUT_LABEL &&
+                 label != OLD_SHADOW_SIGNAL_PAYOUT_LABEL &&
+                 label != LEGACY_SHADOW_SIGNAL_PAYOUT_LABEL)) {
+                continue;
+            }
+            if (!IsValidDestination(dest) || !IsQuantumMigrationDestination(dest)) continue;
+            const auto key_info = GetQuantumKeyInfo(dest);
+            if (!key_info || !key_info->durably_stored) continue;
+            payout_address = EncodeDestination(dest);
+            payout_script = GetScriptForDestination(dest);
+            reused_dest = dest;
+            relabel_reused_dest = label != SHADOW_SIGNAL_PAYOUT_LABEL;
+            break;
+        }
+    }
+    if (reused_dest) {
+        if (relabel_reused_dest && !SetAddressBook(*reused_dest, SHADOW_SIGNAL_PAYOUT_LABEL, AddressPurpose::RECEIVE)) {
+            error = _("Failed to update Gold Rush PoS payout address label.");
+            return false;
+        }
+        return true;
+    }
+
+    auto dest = GetNewQuantumDestination(SHADOW_SIGNAL_PAYOUT_LABEL);
+    if (!dest) {
+        error = util::ErrorString(dest);
+        return false;
+    }
+    payout_address = EncodeDestination(*dest);
+    payout_script = GetScriptForDestination(*dest);
+    WalletLogPrintf("Gold Rush PoS signaler created payout address %s. Back up the wallet.\n", payout_address);
+    if (created) *created = true;
+    return true;
+}
+
+bool CWallet::PrepareAutomaticDemurrageChangeAddress(CCoinControl& coin_control, bilingual_str& error) const
+{
+    CTxDestination configured_dest;
+    switch (ResolveConfiguredQuantumAddress(
+        "-qqdemurragechangeaddress", "automatic demurrage-attestation change", configured_dest, error)) {
+    case QuantumAddressBindingResult::RESOLVED:
+        coin_control.destChange = configured_dest;
+        return true;
+    case QuantumAddressBindingResult::INVALID:
+        return false;
+    case QuantumAddressBindingResult::UNSET:
+        break;
+    }
+
+    if (!gArgs.GetBoolArg("-qqallowautokeycreation", true)) {
+        error = _("Automatic demurrage-attestation change is not configured. Set -qqdemurragechangeaddress=<existing wallet-owned quantum address>, or explicitly allow automatic key creation with -qqallowautokeycreation=1.");
+        return false;
+    }
     return true;
 }
 

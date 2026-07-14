@@ -85,6 +85,48 @@ The wallet exposes helper RPCs for both paths, including `getgoldrushstate`,
 `getgoldrushinfo`, `sendshadowsignal`, `getshadowpowwork`,
 `sendshadowpowclaim`, `setpowmining`, and `getpowmininginfo`.
 
+### Fleet-safe quantum payout bindings
+
+The default interactive-wallet behavior may create a new ML-DSA key when an
+automatic Gold Rush payout or later automatic demurrage-attestation change
+first needs one. Every such non-HD key requires a new wallet backup. Fleet
+operators can prohibit all background key creation and bind the automatic
+paths to an existing key instead:
+
+```ini
+qqallowautokeycreation=0
+qqpowpayoutaddress=blk1...
+qqpospayoutaddress=blk1...
+qqdemurragechangeaddress=blk1...
+qqautoredelegate=0
+qqautodemurrageattest=0
+```
+
+The three address options may use the same address. Each value must decode as
+a quantum address for the active network and must be backed by a durably stored
+ML-DSA private key in the wallet performing the operation. Address-book labels
+are not used to resolve an explicit binding. Missing, repeated, invalid, or
+foreign-wallet values fail closed before key generation and return an
+actionable wallet error. Keep one independently configured wallet per fleet
+process; a loaded wallet that does not own the process-level binding cannot use
+that automatic path.
+
+`qqallowautokeycreation=0` also requires an explicit
+`qqautoredelegate=0`. Autonomous cold-stake redelegation currently creates a
+new owner key, so startup rejects the hard fleet mode unless that automation is
+disabled. The hard mode does not disable a user's explicit
+`getnewquantumaddress` request. Keep the bindings in the node configuration so
+they survive restart, and verify that the referenced key is present in every
+wallet backup before enabling staking or mining.
+
+During Gold Rush and Migration, fleet operators may keep
+`qqautodemurrageattest=0`. This emergency switch returns before the automatic
+attestation scheduler scans the wallet or constructs a transaction. Before
+enabling it at Final activation, keep `qqdemurragechangeaddress` bound to an
+existing backed-up key, restart with `qqautodemurrageattest=1`, and verify that
+the wallet's quantum-key inventory has not changed. Manual attestation RPCs are
+not disabled by this background-automation switch.
+
 ## Quantum Addresses And Migration
 
 Quantum migration addresses use ML-DSA keys and are distinct from legacy

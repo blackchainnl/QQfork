@@ -95,12 +95,17 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
     argsman.AddArg("-staking=<true/false>", strprintf("Enables or disables staking (default: %u)", node::DEFAULT_STAKE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-autostartstaking=<true/false>", "Automatically start wallet staking when a wallet is loaded (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqautoshadowsignal=<true/false>", "Automatically submit eligible Gold Rush PoS signals to the shadow ledger (default: true)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqautodemurrageattest=<true/false>", "Automatically submit eligible demurrage liveness attestations after Final activation (default: true). Fleet operators may keep this false until an explicit -qqdemurragechangeaddress is deployed.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-stakecache=<true/false>", strprintf("Enables or disables the staking cache; significantly improves staking performance, but can use a lot of memory (default: %u)", node::DEFAULT_STAKE_CACHE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-staketimio=<n>", strprintf("Proof of stake timeout. (default: %u)", node::DEFAULT_STAKETIMIO), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-solostaking=<true/false>", strprintf("Stake on an isolated private chain without peers or a public-chain sync estimate (testnet/regtest only on this branch) (default: %u)", node::DEFAULT_SOLO_STAKING), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);
     argsman.AddArg("-powmining=<true/false>", "Auto-start the built-in (in-process) Gold Rush Proof-of-Work miner at startup. Requires an unlocked wallet with private keys (default: false)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingthreads=<n>", "Worker threads (CPU cores) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingcpu=<n>", "Per-core CPU utilization target (1-100) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqallowautokeycreation=<true/false>", "Allow background wallet automation to generate new ML-DSA keys (default: true). Set false for fleet operation with explicit -qqpowpayoutaddress, -qqpospayoutaddress, and -qqdemurragechangeaddress bindings and explicit -qqautoredelegate=0. This does not disable user-requested address creation.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqpowpayoutaddress=<address>", "Bind automatic Gold Rush PoW rewards to one existing, durably stored quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqpospayoutaddress=<address>", "Bind automatic Gold Rush PoS signal rewards to one existing, durably stored quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqdemurragechangeaddress=<address>", "Bind automatic demurrage-attestation change to one existing, durably stored quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqshadowsignalmaxretryfailures=<n>", "Regtest/testnet-only Gold Rush PoS signal retry ceiling (default: 6)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
     argsman.AddArg("-qqshadowsignalretrybasemillis=<n>", "Regtest/testnet-only Gold Rush PoS signal retry base delay in milliseconds (default: 1000)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
     argsman.AddArg("-qqshadowsignalcleanupdelaymillis=<n>", "Regtest/testnet-only cleanup race-test barrier delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
@@ -161,6 +166,27 @@ bool WalletInit::ParameterInteraction() const
         if (pow_cpu < 1 || pow_cpu > 100) {
             return InitError(Untranslated("-powminingcpu must be between 1 and 100."));
         }
+    }
+
+    for (const std::string& option : {
+             "-qqpowpayoutaddress",
+             "-qqpospayoutaddress",
+             "-qqdemurragechangeaddress"}) {
+        const std::vector<std::string> bindings = gArgs.GetArgs(option);
+        if (bindings.size() > 1) {
+            return InitError(Untranslated(strprintf(
+                "%s is ambiguous: specify exactly one wallet-owned quantum address.", option)));
+        }
+        if (!bindings.empty() && bindings.front().empty()) {
+            return InitError(Untranslated(strprintf(
+                "%s requires a non-empty wallet-owned quantum address.", option)));
+        }
+    }
+
+    if (!gArgs.GetBoolArg("-qqallowautokeycreation", true) &&
+        (!gArgs.IsArgSet("-qqautoredelegate") || gArgs.GetBoolArg("-qqautoredelegate", true))) {
+        return InitError(Untranslated(
+            "-qqallowautokeycreation=0 requires explicit -qqautoredelegate=0 because automatic redelegation otherwise generates a new quantum owner key."));
     }
 
     if (gArgs.IsArgSet("-zapwallettxes")) {
