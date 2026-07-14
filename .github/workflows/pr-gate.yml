@@ -115,7 +115,9 @@ jobs:
         run: python3 ci/release/test_release_tools.py
 
       - name: Test script corpus precondition tooling
-        run: python3 ci/test/test_verify_script_assets.py
+        run: |
+          python3 ci/test/test_verify_script_assets.py
+          python3 test/fuzz/test_runner_tests.py
 
       - name: Run repository linters
         shell: bash

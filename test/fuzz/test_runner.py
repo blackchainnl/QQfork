@@ -10,11 +10,26 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import argparse
+import base64
 import configparser
+import hashlib
 import logging
 import os
 import subprocess
 import sys
+import tempfile
+
+
+PINNED_REGRESSION_INPUTS = {
+    'block': ({
+        'name': 'initialized-chainstate',
+        'base64': (
+            'AYAAACQsrFdmSTEYT1POKzB0HI5Shnh4YWJpdiswdAx7yF3/ARMgAQABAP8A/'
+            'wF//wAAAAAyGE9TziswdAx7yF3/ARMAAAAAAP//DMhd/wEAAAAAAAAAAAA='
+        ),
+        'sha256': '4cc1cc0892fd66dbde05b5b75332caab5f158f31068d368c82bca03b8802b936',
+    },),
+}
 
 
 def get_fuzz_env(*, target, source_dir):
@@ -24,6 +39,65 @@ def get_fuzz_env(*, target, source_dir):
         f'suppressions={source_dir}/test/sanitizer_suppressions/ubsan:print_stacktrace=1:halt_on_error=1:report_error_type=1',
         "ASAN_OPTIONS": "detect_stack_use_after_return=1:check_initialization_order=1:strict_init_order=1",
     }
+
+
+def decode_pinned_regression(regression):
+    try:
+        data = base64.b64decode(regression['base64'], validate=True)
+    except (KeyError, ValueError) as error:
+        raise ValueError('invalid pinned fuzz regression encoding') from error
+    digest = hashlib.sha256(data).hexdigest()
+    if digest != regression.get('sha256'):
+        raise ValueError(
+            f"pinned fuzz regression {regression.get('name', '<unnamed>')} "
+            f"hash mismatch: {digest}"
+        )
+    return data
+
+
+def run_pinned_regressions(*, targets, src_dir, build_dir, using_libfuzzer, use_valgrind):
+    selected = sorted(set(targets).intersection(PINNED_REGRESSION_INPUTS))
+    if not selected:
+        return
+
+    fuzz_bin = os.path.join(build_dir, 'src', 'test', 'fuzz', 'fuzz')
+    with tempfile.TemporaryDirectory(prefix='blackcoin-fuzz-regressions-') as temporary:
+        for target in selected:
+            for regression in PINNED_REGRESSION_INPUTS[target]:
+                data = decode_pinned_regression(regression)
+                input_path = Path(temporary) / f"{target}-{regression['name']}"
+                input_path.write_bytes(data)
+                args = [fuzz_bin]
+                if using_libfuzzer:
+                    args.append('-runs=1')
+                args.append(input_path)
+                if use_valgrind:
+                    args = ['valgrind', '--quiet', '--error-exitcode=1'] + args
+                result = subprocess.run(
+                    args,
+                    env=get_fuzz_env(target=target, source_dir=src_dir),
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                logging.debug(
+                    "Run pinned regression %s/%s with args %s%s",
+                    target,
+                    regression['name'],
+                    args,
+                    result.stderr,
+                )
+                try:
+                    result.check_returncode()
+                except subprocess.CalledProcessError as error:
+                    if error.stderr:
+                        logging.info(error.stderr)
+                    logging.info(
+                        "Pinned regression %s/%s failed with exit code %s",
+                        target,
+                        regression['name'],
+                        error.returncode,
+                    )
+                    sys.exit(1)
 
 
 def main():
@@ -161,6 +235,14 @@ def main():
     except subprocess.TimeoutExpired:
         logging.error("subprocess timed out: Currently only libFuzzer is supported")
         sys.exit(1)
+
+    run_pinned_regressions(
+        targets=test_list_selection,
+        src_dir=config['environment']['SRCDIR'],
+        build_dir=config["environment"]["BUILDDIR"],
+        using_libfuzzer=using_libfuzzer,
+        use_valgrind=args.valgrind,
+    )
 
     with ThreadPoolExecutor(max_workers=args.par) as fuzz_pool:
         if args.generate:

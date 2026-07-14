@@ -14,6 +14,7 @@
 #include <pubkey.h>
 #include <streams.h>
 #include <test/fuzz/fuzz.h>
+#include <util/check.h>
 #include <util/chaintype.h>
 #include <validation.h>
 #include <version.h>
@@ -23,12 +24,13 @@
 #include <string>
 
 namespace {
-const BasicTestingSetup* g_setup;
+const TestingSetup* g_setup;
 } // namespace
 
 void initialize_block()
 {
-    SelectParams(ChainType::REGTEST);
+    static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>(ChainType::REGTEST);
+    g_setup = testing_setup.get();
 }
 
 FUZZ_TARGET(block, .init = initialize_block)
@@ -45,7 +47,7 @@ FUZZ_TARGET(block, .init = initialize_block)
     }
     const Consensus::Params& consensus_params = Params().GetConsensus();
     BlockValidationState validation_state_pow_and_merkle;
-    auto& chainstate = g_setup->m_node.chainman->ActiveChainstate();
+    auto& chainstate = Assert(Assert(g_setup)->m_node.chainman)->ActiveChainstate();
     const bool valid_incl_pow_and_merkle = CheckBlock(block, validation_state_pow_and_merkle, consensus_params, chainstate, /* fCheckPOW= */ true, /* fCheckMerkleRoot= */ true);
     assert(validation_state_pow_and_merkle.IsValid() || validation_state_pow_and_merkle.IsInvalid() || validation_state_pow_and_merkle.IsError());
     (void)validation_state_pow_and_merkle.Error("");
