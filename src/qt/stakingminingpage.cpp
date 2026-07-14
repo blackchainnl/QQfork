@@ -2541,6 +2541,7 @@ void StakingMiningPage::updateStatus()
     CAmount staked_quantum_amount{0};
     unsigned int goldrush_reward_outputs_needing_move{0};
     const interfaces::WalletMigrationStatus migration = w.getMigrationStatus();
+    m_quantum_funding_active = migration.available && migration.quantum_spends_active;
     if (migration.available) {
         m_migration_phase->setText(QString::fromStdString(migration.phase));
         if (!migration.deadline_scheduled) {
@@ -3043,6 +3044,7 @@ void StakingMiningPage::resetStatusForNoWallet()
     m_pow_enable->setChecked(false);
     m_pow_unlock_wallet->setChecked(false);
     m_pow_settings_dirty = false;
+    m_quantum_funding_active = false;
     m_pow_payout->clear();
     m_pow_status->setText(tr("Load a wallet to use Gold Rush PoW mining."));
 
@@ -3144,8 +3146,9 @@ void StakingMiningPage::refreshControlsEnabled()
     m_quantum_new->setEnabled(can_create_quantum);
     m_quantum_copy->setEnabled(m_quantum_address && !m_quantum_address->text().isEmpty());
     m_quantum_pubkey_copy->setEnabled(m_quantum_pubkey && !m_quantum_pubkey->text().isEmpty());
-    m_migration_legacy_sweep->setEnabled(can_create_quantum);
-    m_migration_goldrush_sweep->setEnabled(can_create_quantum);
+    const bool can_fund_quantum = can_create_quantum && m_quantum_funding_active;
+    m_migration_legacy_sweep->setEnabled(can_fund_quantum);
+    m_migration_goldrush_sweep->setEnabled(can_fund_quantum);
     m_demurrage_attest->setEnabled(can_create_quantum && m_quantum_address && !m_quantum_address->text().isEmpty());
     m_demurrage_sweep->setEnabled(can_create_quantum && m_demurrage_sweep_available);
     m_rgb_copy_contract->setEnabled(has_wallet && m_rgb_assets && !m_rgb_assets->selectedItems().empty());
@@ -3155,16 +3158,16 @@ void StakingMiningPage::refreshControlsEnabled()
     m_selfstake_copy->setEnabled(m_selfstake_address && !m_selfstake_address->text().isEmpty());
     m_selfstake_output_selector->setEnabled(has_wallet && m_selfstake_output_selector->count() > 1);
     const bool has_selfstake_address = m_selfstake_address && !m_selfstake_address->text().isEmpty();
-    m_selfstake_fund_amount->setEnabled(can_create_quantum && has_selfstake_address);
-    m_selfstake_fund->setEnabled(can_create_quantum && has_selfstake_address);
+    m_selfstake_fund_amount->setEnabled(can_fund_quantum && has_selfstake_address);
+    m_selfstake_fund->setEnabled(can_fund_quantum && has_selfstake_address);
     m_selfstake_withdraw->setEnabled(can_create_quantum && has_selfstake_address && m_selfstake_withdraw_available);
     m_operator_new->setEnabled(can_create_quantum);
     m_operator_selector->setEnabled(has_wallet && m_operator_selector->count() > 1);
     m_operator_copy->setEnabled(m_operator_pubkey && !m_operator_pubkey->text().isEmpty());
     m_operator_use_for_delegation->setEnabled(m_operator_pubkey && !m_operator_pubkey->text().isEmpty());
     const bool has_operator_address = m_operator_address && !m_operator_address->text().isEmpty();
-    m_operator_bond_amount->setEnabled(can_create_quantum && has_operator_address);
-    m_operator_fund->setEnabled(can_create_quantum && has_operator_address);
+    m_operator_bond_amount->setEnabled(can_fund_quantum && has_operator_address);
+    m_operator_fund->setEnabled(can_fund_quantum && has_operator_address);
     m_operator_withdraw->setEnabled(can_create_quantum && has_operator_address && m_operator_withdraw_available);
     m_operator_registry_refresh->setEnabled(has_wallet);
     bool registry_selection_has_pubkey{false};
@@ -3191,8 +3194,8 @@ void StakingMiningPage::refreshControlsEnabled()
     m_coldstake_new->setEnabled(can_create_quantum && !selectedColdStakeOperatorPubKey().isEmpty());
     m_coldstake_copy->setEnabled(m_coldstake_address && !m_coldstake_address->text().isEmpty());
     const bool has_coldstake_address = m_coldstake_address && !m_coldstake_address->text().isEmpty();
-    m_coldstake_fund_amount->setEnabled(can_create_quantum && has_coldstake_address);
-    m_coldstake_fund->setEnabled(can_create_quantum && has_coldstake_address && !selectedColdStakeOperatorPubKey().isEmpty() && m_coldstake_fund_available);
+    m_coldstake_fund_amount->setEnabled(can_fund_quantum && has_coldstake_address);
+    m_coldstake_fund->setEnabled(can_fund_quantum && has_coldstake_address && !selectedColdStakeOperatorPubKey().isEmpty() && m_coldstake_fund_available);
     m_coldstake_withdraw->setEnabled(can_create_quantum && has_coldstake_address && m_coldstake_withdraw_available);
     m_donation_enable->setEnabled(has_wallet);
     m_donation_percent->setEnabled(has_wallet);

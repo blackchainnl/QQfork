@@ -346,6 +346,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QPushButton* quantum_new = page.findChild<QPushButton*>("newQuantumAddress");
     QPushButton* quantum_copy = page.findChild<QPushButton*>("quantumCopy");
     QPushButton* quantum_pubkey_copy = page.findChild<QPushButton*>("quantumPubkeyCopy");
+    QPushButton* migration_legacy_sweep = page.findChild<QPushButton*>("migrationLegacySweep");
+    QPushButton* migration_goldrush_sweep = page.findChild<QPushButton*>("migrationGoldrushSweep");
     QComboBox* selfstake_lock_period = page.findChild<QComboBox*>("selfStakeLockPeriod");
     QComboBox* selfstake_selector = page.findChild<QComboBox*>("selfStakeAddressSelector");
     QLineEdit* selfstake_address = page.findChild<QLineEdit*>("selfStakeAddress");
@@ -410,6 +412,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(quantum_new);
     QVERIFY(quantum_copy);
     QVERIFY(quantum_pubkey_copy);
+    QVERIFY(migration_legacy_sweep);
+    QVERIFY(migration_goldrush_sweep);
     QVERIFY(selfstake_lock_period);
     QVERIFY(selfstake_selector);
     QVERIFY(selfstake_address);
@@ -469,6 +473,11 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(coldstake_quantum_available->text().contains(QString("BLK")));
     QVERIFY(!quantum_copy->isEnabled());
     QVERIFY(!quantum_pubkey_copy->isEnabled());
+    // The default regtest schedule remains in Gold Rush. Key/address creation
+    // is available, but every action that would fund a quantum output must
+    // stay disabled until Migration opens.
+    QVERIFY(!migration_legacy_sweep->isEnabled());
+    QVERIFY(!migration_goldrush_sweep->isEnabled());
     QVERIFY(selfstake_new->isEnabled());
     QVERIFY(!selfstake_selector->isEnabled());
     QVERIFY(!selfstake_copy->isEnabled());
@@ -520,8 +529,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(selfstake_selector->isEnabled());
     QVERIFY(selfstake_selector->findData(selfstake_address->text()) >= 0);
     QVERIFY(!selfstake_output_selector->isEnabled());
-    QVERIFY(selfstake_fund_amount->isEnabled());
-    QVERIFY(selfstake_fund->isEnabled());
+    QVERIFY(!selfstake_fund_amount->isEnabled());
+    QVERIFY(!selfstake_fund->isEnabled());
     QVERIFY(!selfstake_withdraw->isEnabled());
     QVERIFY(selfstake_status->text().contains(QString("9450")));
 
@@ -540,6 +549,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(!coldstake_operator_address_selector->currentText().contains(QString("40500")));
     QVERIFY(coldstake_operator_copy->isEnabled());
     QVERIFY(coldstake_operator_use->isEnabled());
+    QVERIFY(!coldstake_operator_bond_amount->isEnabled());
+    QVERIFY(!coldstake_operator_fund->isEnabled());
     QVERIFY(coldstake_operator_status->text().contains(QString("30-day")));
 
     coldstake_operator_copy->click();
@@ -561,7 +572,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(coldstake_delegation_selector->isEnabled());
     QVERIFY(coldstake_delegation_selector->findData(coldstake_address->text()) >= 0);
     QVERIFY(coldstake_copy->isEnabled());
-    QVERIFY(coldstake_fund_amount->isEnabled());
+    QVERIFY(!coldstake_fund_amount->isEnabled());
     QVERIFY(!coldstake_fund->isEnabled());
     QVERIFY(!coldstake_withdraw->isEnabled());
     QVERIFY(coldstake_status->text().contains(QString("Cold-stake address created")));
