@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Generate fail-closed metadata for an initially unpublished exact-SHA alpha bundle."""
+"""Generate fail-closed metadata for an unpublished exact-SHA prerelease bundle."""
 
 import argparse
 import hashlib
@@ -15,8 +15,9 @@ import sys
 EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 SEMANTIC_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
-ALPHA_LABEL_RE = re.compile(
-    r"^(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-alpha(?P<rc>[1-9][0-9]*)$"
+PRERELEASE_LABEL_RE = re.compile(
+    r"^(?P<version>[0-9]+\.[0-9]+\.[0-9]+)-"
+    r"(?P<channel>alpha|beta)(?P<rc>[1-9][0-9]*)$"
 )
 
 
@@ -39,9 +40,11 @@ def generate_manifest(
     workflow_run_id,
     output,
 ):
-    label_match = ALPHA_LABEL_RE.fullmatch(package_label)
+    label_match = PRERELEASE_LABEL_RE.fullmatch(package_label)
     if label_match is None:
-        raise RuntimeError("package-label must have major.minor.patch-alphaN form")
+        raise RuntimeError(
+            "package-label must have major.minor.patch-alphaN or major.minor.patch-betaN form"
+        )
     if not SEMANTIC_VERSION_RE.fullmatch(source_version):
         raise RuntimeError("source-version must have major.minor.patch form")
     if label_match.group("version") != source_version:
@@ -49,7 +52,7 @@ def generate_manifest(
     if not re.fullmatch(r"[1-9][0-9]*", release_candidate):
         raise RuntimeError("release-candidate must be a positive integer")
     if label_match.group("rc") != release_candidate:
-        raise RuntimeError("package-label alpha number and release-candidate do not match")
+        raise RuntimeError("package-label prerelease number and release-candidate do not match")
     if configured_version != f"{source_version}rc{release_candidate}":
         raise RuntimeError("configured-version does not match source-version and release-candidate")
     if not FULL_SHA_RE.fullmatch(source_sha):
@@ -107,6 +110,7 @@ def generate_manifest(
     required_marker_text = (
         "UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE",
         f"package_label={package_label}",
+        f"prerelease_channel={label_match.group('channel')}",
         f"configured_version={configured_version}",
         f"source_commit={source_sha}",
         f"workflow_run_id={workflow_run_id}",
@@ -119,6 +123,7 @@ def generate_manifest(
             raise RuntimeError(f"unsigned canary marker is missing required text: {required}")
     required_reproducibility_text = (
         f"package_label={package_label}",
+        f"prerelease_channel={label_match.group('channel')}",
         f"configured_version={configured_version}",
         f"source_commit={source_sha}",
     )
@@ -132,6 +137,7 @@ def generate_manifest(
         "schema": 1,
         "classification": "UNSIGNED_CANARY_NOT_FOR_PRODUCTION",
         "package_label": package_label,
+        "prerelease_channel": label_match.group("channel"),
         "source_version": source_version,
         "configured_version": configured_version,
         "release_candidate": int(release_candidate),

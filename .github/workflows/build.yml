@@ -47,6 +47,7 @@ jobs:
       package_label: ${{ steps.resolve.outputs.package_label }}
       configured_version: ${{ steps.resolve.outputs.configured_version }}
       release_candidate: ${{ steps.resolve.outputs.release_candidate }}
+      prerelease_channel: ${{ steps.resolve.outputs.prerelease_channel }}
       asset_prefix: ${{ steps.resolve.outputs.asset_prefix }}
       target: ${{ steps.resolve.outputs.target }}
       publish: ${{ steps.resolve.outputs.publish }}
@@ -109,17 +110,20 @@ jobs:
               exit 1
             }
             test "$TARGET_SHA" = "$REQUESTED_SHA"
-            [[ "$REQUESTED_PACKAGE_LABEL" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha[1-9][0-9]*$ ]] || {
-              echo "::error::Manual builds require an explicit major.minor.patch-alphaN package label"
+            [[ "$REQUESTED_PACKAGE_LABEL" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)([1-9][0-9]*)$ ]] || {
+              echo "::error::Manual builds require an explicit major.minor.patch-alphaN or major.minor.patch-betaN package label"
               exit 1
             }
+            PRERELEASE_CHANNEL="${BASH_REMATCH[1]}"
+            PRERELEASE_NUMBER="${BASH_REMATCH[2]}"
             [[ "$RC" =~ ^[1-9][0-9]*$ ]]
             test "$IS_RELEASE" = "false" || {
-              echo "::error::Manual alpha builds require CLIENT_VERSION_IS_RELEASE=false"
+              echo "::error::Manual prerelease builds require CLIENT_VERSION_IS_RELEASE=false"
               exit 1
             }
-            test "$REQUESTED_PACKAGE_LABEL" = "$BASE_VERSION-alpha$RC" || {
-              echo "::error::Package label must match the source version and RC: $BASE_VERSION-alpha$RC"
+            test "$PRERELEASE_NUMBER" = "$RC"
+            test "$REQUESTED_PACKAGE_LABEL" = "$BASE_VERSION-$PRERELEASE_CHANNEL$RC" || {
+              echo "::error::Package label must match the source version and RC: $BASE_VERSION-$PRERELEASE_CHANNEL$RC"
               exit 1
             }
             VERSION="$BASE_VERSION"
@@ -137,6 +141,7 @@ jobs:
             TAG="$GITHUB_REF_NAME"
             VERSION="${TAG#v}"
             PACKAGE_LABEL="$VERSION"
+            PRERELEASE_CHANNEL=production
             ASSET_PREFIX="Blackcoin-$VERSION"
             TARGET=all
             PUBLISH=true
@@ -175,6 +180,7 @@ jobs:
             echo "package_label=$PACKAGE_LABEL"
             echo "configured_version=$CONFIGURED_VERSION"
             echo "release_candidate=$RC"
+            echo "prerelease_channel=$PRERELEASE_CHANNEL"
             echo "asset_prefix=$ASSET_PREFIX"
             echo "target=$TARGET"
             echo "publish=$PUBLISH"
@@ -182,17 +188,18 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
   safety-gate:
-    name: Exact-SHA alpha or production safety gate
+    name: Exact-SHA prerelease or production safety gate
     needs: resolve-target
     permissions:
       contents: read
     uses: ./.github/workflows/pr-gate.yml
     with:
       target_sha: ${{ needs.resolve-target.outputs.target_sha }}
-      # Manual, unpublished alpha artifacts wait for the core gate. Only the
-      # authenticated tag-push publication path may request the production-only
-      # exhaustive, native-macOS, sanitizer, and fuzz jobs.
-      release_mode: ${{ needs.resolve-target.outputs.publish == 'true' }}
+      # Alpha artifacts wait for the core gate. A beta must first pass the same
+      # exhaustive, native-macOS, sanitizer, and fuzz evidence as production;
+      # it remains unsigned and unpublished because only the authenticated
+      # final tag path can set publish=true.
+      release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
 
   select-targets:
     name: Select build target
@@ -459,6 +466,7 @@ jobs:
       PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
       CONFIGURED_VERSION: ${{ needs.resolve-target.outputs.configured_version }}
       RELEASE_CANDIDATE: ${{ needs.resolve-target.outputs.release_candidate }}
+      PRERELEASE_CHANNEL: ${{ needs.resolve-target.outputs.prerelease_channel }}
       ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
     steps:
       - name: Checkout immutable verification code
@@ -486,6 +494,7 @@ jobs:
           report="release-assets/$ASSET_PREFIX-REPRODUCIBILITY.txt"
           {
             printf 'package_label=%s\n' "$PACKAGE_LABEL"
+            printf 'prerelease_channel=%s\n' "$PRERELEASE_CHANNEL"
             printf 'configured_version=%s\n' "$CONFIGURED_VERSION"
           } > "$report"
           for primary in "${primaries[@]}"; do
@@ -546,6 +555,7 @@ jobs:
             echo 'UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE'
             echo
             echo "package_label=$PACKAGE_LABEL"
+            echo "prerelease_channel=$PRERELEASE_CHANNEL"
             echo "source_version=$VERSION"
             echo "configured_version=$CONFIGURED_VERSION"
             echo "source_commit=$TARGET_SHA"
@@ -554,7 +564,7 @@ jobs:
             echo 'notarized=false'
             echo 'published=false'
             echo
-            echo 'These exact-SHA alpha artifacts are for controlled canary testing only.'
+            echo "These exact-SHA $PRERELEASE_CHANNEL artifacts are for controlled canary testing only."
             echo 'They are not signed, notarized, tagged, or published as a production release.'
             echo 'Verify the unsigned SHA256 manifest before testing.'
           } > "$marker"

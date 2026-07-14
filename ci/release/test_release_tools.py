@@ -655,6 +655,7 @@ class ReleaseToolTests(unittest.TestCase):
             )
             (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(
                 f"package_label={package_label}\n"
+                "prerelease_channel=alpha\n"
                 "configured_version=30.1.1rc1\n"
                 f"source_commit={SOURCE_SHA}\n",
                 encoding="utf-8",
@@ -662,6 +663,7 @@ class ReleaseToolTests(unittest.TestCase):
             (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
                 "UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE\n"
                 f"package_label={package_label}\n"
+                "prerelease_channel=alpha\n"
                 "configured_version=30.1.1rc1\n"
                 f"source_commit={SOURCE_SHA}\n"
                 "workflow_run_id=12345\n"
@@ -683,6 +685,7 @@ class ReleaseToolTests(unittest.TestCase):
 
             self.assertEqual(manifest["classification"], "UNSIGNED_CANARY_NOT_FOR_PRODUCTION")
             self.assertEqual(manifest["package_label"], package_label)
+            self.assertEqual(manifest["prerelease_channel"], "alpha")
             self.assertEqual(manifest["source"]["commit"], SOURCE_SHA)
             self.assertFalse(manifest["release"]["signed"])
             self.assertFalse(manifest["release"]["published"])
@@ -701,6 +704,7 @@ class ReleaseToolTests(unittest.TestCase):
             (artifacts / "Blackcoin-30.1.1-Linux-x86_64.tar.gz").write_bytes(b"ambiguous")
             (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(
                 f"package_label={package_label}\n"
+                "prerelease_channel=alpha\n"
                 "configured_version=30.1.1rc1\n"
                 f"source_commit={SOURCE_SHA}\n",
                 encoding="utf-8",
@@ -708,6 +712,7 @@ class ReleaseToolTests(unittest.TestCase):
             (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
                 "UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE\n"
                 f"package_label={package_label}\n"
+                "prerelease_channel=alpha\n"
                 "configured_version=30.1.1rc1\n"
                 f"source_commit={SOURCE_SHA}\n"
                 "workflow_run_id=12345\n"
@@ -727,12 +732,62 @@ class ReleaseToolTests(unittest.TestCase):
                     output=output,
                 )
 
-    def test_alpha_workflow_keeps_the_signed_production_gate_separate(self):
+    def test_unsigned_beta_manifest_is_bound_to_channel_and_exact_source(self):
+        generator = load_module("generate_canary_manifest")
+        package_label = "30.1.1-beta1"
+        prefix = f"Blackcoin-{package_label}-{SOURCE_SHA}-"
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            (artifacts / f"{prefix}Linux-x86_64.tar.gz").write_bytes(b"beta")
+            (artifacts / f"{prefix}linux-64-bit-SOURCE_COMMIT.txt").write_text(
+                SOURCE_SHA + "\n", encoding="utf-8"
+            )
+            (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(
+                f"package_label={package_label}\n"
+                "prerelease_channel=beta\n"
+                "configured_version=30.1.1rc1\n"
+                f"source_commit={SOURCE_SHA}\n",
+                encoding="utf-8",
+            )
+            (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
+                "UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE\n"
+                f"package_label={package_label}\n"
+                "prerelease_channel=beta\n"
+                "configured_version=30.1.1rc1\n"
+                f"source_commit={SOURCE_SHA}\n"
+                "workflow_run_id=12345\n"
+                "signed=false\nnotarized=false\npublished=false\n",
+                encoding="utf-8",
+            )
+            output = artifacts / f"{prefix}MANIFEST-UNSIGNED.json"
+
+            manifest = generator.generate_manifest(
+                artifacts=artifacts,
+                package_label=package_label,
+                source_version="30.1.1",
+                configured_version="30.1.1rc1",
+                source_sha=SOURCE_SHA,
+                release_candidate="1",
+                workflow_run_id="12345",
+                output=output,
+            )
+
+            self.assertEqual(manifest["package_label"], package_label)
+            self.assertEqual(manifest["prerelease_channel"], "beta")
+            self.assertEqual(manifest["source"]["commit"], SOURCE_SHA)
+            self.assertFalse(manifest["release"]["published"])
+
+    def test_prerelease_workflow_keeps_the_signed_production_gate_separate(self):
         workflow = (TOOLS.parent.parent / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
         self.assertIn("default: 30.1.1-alpha1", workflow)
-        self.assertIn('test "$REQUESTED_PACKAGE_LABEL" = "$BASE_VERSION-alpha$RC"', workflow)
+        self.assertIn("-(alpha|beta)", workflow)
+        self.assertIn(
+            'test "$REQUESTED_PACKAGE_LABEL" = "$BASE_VERSION-$PRERELEASE_CHANNEL$RC"',
+            workflow,
+        )
+        self.assertIn("prerelease_channel == 'beta'", workflow)
         self.assertIn('test "$IS_RELEASE" = "false"', workflow)
         self.assertIn('test "$RC" = "0"', workflow)
         self.assertIn('test "$IS_RELEASE" = "true"', workflow)

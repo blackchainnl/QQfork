@@ -19,6 +19,23 @@ tagged, signed, notarized, or production release.
 The alpha path is for controlled operator testing. Do not attach an alpha to
 the final `v30.1.1` tag, call it v30.1.1 final, or remove the canary notice.
 
+### Unsigned beta candidate
+
+A beta is also an initially unpublished, exact-commit test artifact produced
+by the manual workflow. Its package label is `30.1.1-betaN`, the beta number
+must equal the source release-candidate number, and every filename remains
+bound to the full source commit. Unlike an alpha, the workflow does not start
+the beta platform matrix until the exact commit passes the exhaustive
+functional/soak suite, native macOS vectors, address/undefined/thread
+sanitizers, pinned fuzz corpus, and the core unit, lint, critical, and real
+mixed-version gates.
+
+A beta remains unsigned, unnotarized, unpublished, and unsuitable for a fleet
+rollout until an isolated canary succeeds. It may be prepared only after every
+P0/P1 implementation assigned to the beta is present on the candidate branch;
+passing the beta workflow is evidence for review, not permission to call the
+candidate production-ready.
+
 ### Optional public alpha prerelease
 
 After the exact-SHA canary gate and operator verification pass, the project may
@@ -51,6 +68,12 @@ The public alpha release must satisfy all of these controls:
 The public prerelease must never be marked latest, promoted to a production
 release, or reused as the final `v30.1.1` release. A later alpha or production
 build uses a new tag and new filenames.
+
+An authorized public beta uses an immutable `v30.1.1-betaN` tag and the
+unchanged `30.1.1-betaN` canary bundle. It must satisfy every public
+prerelease control above, remain `prerelease=true` and `latest=false`, and
+state that its full P0/P1 and operator validation is still in progress. A beta
+tag or asset is never moved, replaced, or reused for the final release.
 
 ### Production v30.1.1
 
@@ -127,8 +150,8 @@ independently documents the real keys and certificates.
    release; an alpha does not waive that production requirement.
 2. Set `configure.ac` to version 30.1.1 with release candidate `0` and
    `_CLIENT_VERSION_IS_RELEASE` set to `true` only for the final production
-   commit. Alpha sources retain a nonzero release-candidate number and
-   `_CLIENT_VERSION_IS_RELEASE=false`.
+   commit. Alpha and beta sources retain a nonzero release-candidate number
+   and `_CLIENT_VERSION_IS_RELEASE=false`.
 3. Finalize `doc/release-notes/release-notes-30.1.1.md`. Remove every
    `RELEASE_NOTES_NOT_FINAL` marker.
 4. Run `python3 ci/release/test_release_tools.py`, repository lint, unit tests,
@@ -167,6 +190,25 @@ independently documents the real keys and certificates.
    passed.
 9. Freeze the public prerelease tag and assets. Corrections require a new alpha
    tag; they do not permit replacing the published bytes.
+
+## Beta artifact procedure
+
+1. Select the exact candidate SHA, matching `30.1.1-betaN` label, and required
+   platform. Confirm the source release-candidate number is `N`.
+2. Require the workflow's complete exact-SHA gate, including exhaustive
+   functional/soak, native vectors, sanitizers, fuzz, mixed-version, critical,
+   unit, and lint jobs. A skipped, canceled, neutral, stale, or failed job is
+   not a pass.
+3. Download the `unsigned-canary-*` bundle only after both isolated builders
+   reproduce every selected artifact byte for byte. Verify the unsigned
+   checksum manifest and its `prerelease_channel=beta` binding.
+4. Install one isolated canary with verified wallet and datadir backups. Run
+   the two-start upgrade, replay/reindex, restart, staking, wallet, GUI, and
+   rollback checks required by the beta plan before any broader testing.
+5. If public beta testing is authorized, create the immutable
+   `v30.1.1-betaN` prerelease at that exact SHA, upload only the unchanged
+   verified bundle, keep `latest=false`, then redownload and compare every
+   public byte. Corrections require a new release-candidate number and tag.
 
 ## Production publication procedure
 
