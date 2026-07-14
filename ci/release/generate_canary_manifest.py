@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Generate fail-closed metadata for an unpublished exact-SHA alpha bundle."""
+"""Generate fail-closed metadata for an initially unpublished exact-SHA alpha bundle."""
 
 import argparse
 import hashlib

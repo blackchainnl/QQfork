@@ -9,14 +9,43 @@ below.
 
 ### Unsigned alpha canary
 
-An alpha is an unpublished, exact-commit test artifact produced by a manual
-`workflow_dispatch` run of `.github/workflows/build.yml`. Its package label is
-`30.1.1-alphaN`, its filenames include the full source commit, and its bundle
-contains an unsigned checksum file and an `UNSIGNED-CANARY` notice. It is not a
+An alpha build begins as an initially unpublished, exact-commit test artifact
+produced by a manual `workflow_dispatch` run of
+`.github/workflows/build.yml`. Its package label is `30.1.1-alphaN`, its
+filenames include the full source commit, and its bundle contains an unsigned
+checksum file and an `UNSIGNED-CANARY` notice. The initial bundle is not a
 tagged, signed, notarized, or production release.
 
-The alpha path is for controlled operator testing. Do not upload an alpha to a
-production release page, call it v30.1.1 final, or remove the canary notice.
+The alpha path is for controlled operator testing. Do not attach an alpha to
+the final `v30.1.1` tag, call it v30.1.1 final, or remove the canary notice.
+
+### Optional public alpha prerelease
+
+After the exact-SHA canary gate and operator verification pass, the project may
+promote those unchanged bytes to a public GitHub prerelease. The first public
+alpha uses the `v30.1.1-alpha1` tag and remains visibly classified as an
+unsigned canary. Public prerelease promotion does not rerun or transform the
+artifacts.
+
+The public alpha release must satisfy all of these controls:
+
+- the tag points to the exact source SHA recorded in every asset filename and
+  canary manifest;
+- GitHub `prerelease` is true and `latest` remains false;
+- `signed=false`, `notarized=false` in the canary manifest remain unchanged.
+  Its `published=false` value records that the build workflow did not publish
+  the bundle when it generated that provenance record; the later GitHub
+  prerelease page does not rewrite the original manifest;
+- the `UNSIGNED-CANARY` warning, unsigned checksum manifest, full-SHA
+  filenames, and operator-testing warning remain in the public bundle;
+- the prerelease title and notes state that the artifacts are alpha test
+  binaries, not v30.1.1 production binaries; and
+- the tag and uploaded assets become immutable when published. Never move or
+  recreate the tag and never replace an asset under an existing filename.
+
+The public prerelease must never be marked latest, promoted to a production
+release, or reused as the final `v30.1.1` release. A later alpha or production
+build uses a new tag and new filenames.
 
 ### Production v30.1.1
 
@@ -123,6 +152,16 @@ independently documents the real keys and certificates.
    installation target, wallet backup identifier, start/end heights, and any
    failure. Never install canary artifacts without a separately verified wallet
    backup and rollback plan.
+6. If public testing is authorized, create `v30.1.1-alpha1` at that exact SHA
+   only after steps 1 through 5 pass. Upload the unchanged complete canary
+   bundle to a GitHub release marked `prerelease`, with `latest` false.
+7. Re-download the public assets and verify the unsigned checksum manifest.
+   Compare every public byte with the locally verified canary bundle.
+8. Confirm the public release page retains the unsigned/notarized warning and
+   does not claim that the production gate, production signing, or notarization
+   passed.
+9. Freeze the public prerelease tag and assets. Corrections require a new alpha
+   tag; they do not permit replacing the published bytes.
 
 ## Production publication procedure
 

@@ -326,6 +326,12 @@ class ReleaseToolTests(unittest.TestCase):
                 self.assertNotIn(stale_reference, runbook.lower())
 
         required = (
+            "initially unpublished",
+            "optional public alpha prerelease",
+            "`v30.1.1-alpha1`",
+            "github `prerelease` is true and `latest` remains false",
+            "`signed=false`, `notarized=false`",
+            "never be marked latest",
             "signed annotated `v30.1.1` tag",
             "production-release",
             "independent rebuilder",
@@ -341,6 +347,8 @@ class ReleaseToolTests(unittest.TestCase):
         for release_control in required:
             with self.subTest(release_control=release_control):
                 self.assertIn(release_control, lowered)
+        self.assertNotIn("an alpha is an unpublished", lowered)
+        self.assertNotIn("do not upload an alpha to a production release page", lowered)
 
     def test_every_third_party_workflow_action_is_commit_pinned(self):
         workflows = TOOLS.parent.parent / ".github" / "workflows"
