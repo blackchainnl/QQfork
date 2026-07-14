@@ -50,6 +50,13 @@ def load_path(name, path):
 class ReleaseToolTests(unittest.TestCase):
     def test_resource_benchmark_evidence_is_source_bound_and_fail_closed(self):
         generator = load_module("generate_resource_benchmark_evidence")
+        repository = TOOLS.parent.parent
+        source_sha = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
 
         def result(name, unit, median, batch=1):
             return {
@@ -85,7 +92,9 @@ class ReleaseToolTests(unittest.TestCase):
             evidence = generator.generate_evidence(
                 nanobench_json=raw,
                 binary=binary,
-                source_sha=SOURCE_SHA,
+                source_sha=source_sha,
+                repo_root=repository,
+                repository="Blackcoin-Dev/Blackcoin",
                 platform="linux",
                 architecture="x86_64",
                 toolchain="GCC 11.4.0",
@@ -125,7 +134,9 @@ class ReleaseToolTests(unittest.TestCase):
                 generator.generate_evidence(
                     nanobench_json=raw,
                     binary=binary,
-                    source_sha=SOURCE_SHA,
+                    source_sha=source_sha,
+                    repo_root=repository,
+                    repository="Blackcoin-Dev/Blackcoin",
                     platform="linux",
                     architecture="x86_64",
                     toolchain="GCC 11.4.0",
@@ -168,6 +179,13 @@ class ReleaseToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "benchmark set mismatch"):
                 generator.parse_measurements(raw, {"crypto"}, 250)
 
+            with self.assertRaisesRegex(RuntimeError, "repository must be exactly"):
+                generator.verify_source_checkout(repository, "fork/Blackcoin", source_sha)
+            with self.assertRaisesRegex(RuntimeError, "source commit mismatch"):
+                generator.verify_source_checkout(
+                    repository, "Blackcoin-Dev/Blackcoin", "f" * 40
+                )
+
     def test_resource_benchmark_workflow_measures_and_does_not_overclaim(self):
         root = TOOLS.parent.parent
         gate = (root / ".github" / "workflows" / "pr-gate.yml").read_text(
@@ -202,6 +220,8 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("--require-domain synthetic-state", gate)
         self.assertIn("quantum-resource-benchmarks-macos-", gate)
         self.assertIn('--compiler-flags="$cxxflags"', gate)
+        self.assertIn('--repository "$GITHUB_REPOSITORY"', gate)
+        self.assertIn("--repo-root .", gate)
         self.assertIn("--build-profile native-debug-lockorder", gate)
         self.assertIn("--build-profile native-walletless-default", gate)
         self.assertIn("--minimum-runtime-ms 250", gate)

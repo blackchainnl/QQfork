@@ -255,6 +255,8 @@ jobs:
             --nanobench-json "$raw" \
             --binary "$binary" \
             --source-sha "$TARGET_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repo-root . \
             --platform linux \
             --architecture x86_64 \
             --toolchain "$cxx; $(c++ --version | sed -n '1p')" \
@@ -344,6 +346,8 @@ jobs:
             --nanobench-json "$raw" \
             --binary src/bench/bench_blackcoin \
             --source-sha "$TARGET_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --repo-root . \
             --platform macos \
             --architecture "${{ matrix.expected_arch }}" \
             --toolchain "$cxx; $(clang++ --version | sed -n '1p')" \

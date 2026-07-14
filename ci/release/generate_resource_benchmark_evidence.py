@@ -11,11 +11,13 @@ import math
 from pathlib import Path
 import re
 import statistics
+import subprocess
 import sys
 
 
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 LABEL_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
 MAX_SHADOW_POW_EVALS_PER_BLOCK = 64
 MIN_QUANTUM_INPUT_WEIGHT = 3903
 MAX_WEIGHT_BOUND_QUANTUM_INPUTS = 8198
@@ -64,6 +66,27 @@ def checked_line(value: str, label: str) -> str:
     if not value or any(ord(character) < 32 for character in value):
         raise RuntimeError(f"{label} must be non-empty printable single-line text")
     return value
+
+
+def verify_source_checkout(repo_root: Path, repository: str,
+                           source_sha: str) -> None:
+    if repository != EXPECTED_REPOSITORY:
+        raise RuntimeError(
+            f"source repository must be exactly {EXPECTED_REPOSITORY}, got {repository}"
+        )
+    try:
+        actual = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(f"cannot verify benchmark source checkout: {error}") from error
+    if actual != source_sha:
+        raise RuntimeError(
+            f"benchmark source commit mismatch: checkout is {actual}, expected {source_sha}"
+        )
 
 
 def expected_benchmarks(required_domains: set[str]) -> dict:
@@ -187,12 +210,14 @@ def parse_measurements(path: Path, required_domains: set[str],
 
 
 def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
+                      repo_root: Path, repository: str,
                       platform: str, architecture: str, toolchain: str,
                       compiler_flags: str, build_profile: str,
                       minimum_runtime_ms: int, provenance_manifest: Path,
                       required_domains: set[str]) -> dict:
     if not SHA1_RE.fullmatch(source_sha):
         raise RuntimeError("source SHA must be a full lowercase commit identifier")
+    verify_source_checkout(repo_root, repository, source_sha)
     if not LABEL_RE.fullmatch(platform) or not LABEL_RE.fullmatch(architecture):
         raise RuntimeError("platform and architecture must be simple stable labels")
     toolchain = checked_line(toolchain, "toolchain")
@@ -246,7 +271,7 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
 
     return {
         "schema": 1,
-        "source": {"commit": source_sha},
+        "source": {"repository": repository, "commit": source_sha},
         "runner": {
             "platform": platform,
             "architecture": architecture,
@@ -287,6 +312,9 @@ def main() -> None:
     parser.add_argument("--nanobench-json", required=True, type=Path)
     parser.add_argument("--binary", required=True, type=Path)
     parser.add_argument("--source-sha", required=True)
+    parser.add_argument("--repository", required=True)
+    parser.add_argument("--repo-root", type=Path,
+                        default=Path(__file__).resolve().parents[2])
     parser.add_argument("--platform", required=True)
     parser.add_argument("--architecture", required=True)
     parser.add_argument("--toolchain", required=True)
@@ -309,6 +337,8 @@ def main() -> None:
         nanobench_json=args.nanobench_json,
         binary=args.binary,
         source_sha=args.source_sha,
+        repo_root=args.repo_root,
+        repository=args.repository,
         platform=args.platform,
         architecture=args.architecture,
         toolchain=args.toolchain,
