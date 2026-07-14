@@ -191,7 +191,10 @@ struct ShadowClaim {
     bool direct{false};
 };
 
-uint256 HashBlockClaims(const CBlockIndex* pindex, const std::vector<ShadowClaim>& claims);
+uint256 HashBlockClaims(int height, const uint256& block_hash,
+                        const std::vector<ShadowClaim>& claims);
+uint256 HashBlockClaims(const CBlockIndex* pindex,
+                        const std::vector<ShadowClaim>& claims);
 
 /** A fee-paying QQSPROOF can produce only this PoW-specific value. The generic
  * ShadowClaim mode is assigned later at the single marker-construction seam. */
@@ -353,12 +356,17 @@ COutPoint PoolOutpoint()
     return COutPoint{TaggedHash("Quantum Quasar Shadow Pool", {}), 0};
 }
 
-COutPoint PoolUndoOutpoint(const CBlockIndex* pindex)
+COutPoint PoolUndoOutpoint(int height, const uint256& block_hash)
 {
     CHashWriter ss;
     ss << std::string("Quantum Quasar Shadow Pool Undo")
-       << pindex->nHeight << pindex->GetBlockHash();
+       << height << block_hash;
     return COutPoint{ss.GetHash(), 0};
+}
+
+COutPoint PoolUndoOutpoint(const CBlockIndex* pindex)
+{
+    return PoolUndoOutpoint(pindex->nHeight, pindex->GetBlockHash());
 }
 
 COutPoint ReplayStateOutpoint()
@@ -370,6 +378,20 @@ valtype ReplayStateFingerprint(const Consensus::Params& consensus, const CBlockI
                                const CCoinsViewCache& view);
 
 } // namespace
+
+uint32_t GetShadowSyntheticClaimLimit(const Consensus::Params& consensus,
+                                      int height,
+                                      uint32_t authenticated_whitelist_count)
+{
+    if (!consensus.IsShadowCompetingClaimsActive(height)) {
+        return MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK;
+    }
+    const uint64_t derived_limit =
+        static_cast<uint64_t>(authenticated_whitelist_count) +
+        MAX_SHADOW_POW_EVALS_PER_BLOCK;
+    return static_cast<uint32_t>(std::min<uint64_t>(
+        MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK, derived_limit));
+}
 
 CScript CanonicalizeLegacyStakeScript(const CScript& scriptPubKey)
 {
@@ -1777,15 +1799,23 @@ bool DecodeClaimMarkerEnvelope(const valtype& marker_payload, uint32_t& origin_h
            marker_index < MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK && !origin_hash.IsNull();
 }
 
-uint256 HashBlockClaims(const CBlockIndex* pindex, const std::vector<ShadowClaim>& claims)
+uint256 HashBlockClaims(int height, const uint256& block_hash,
+                        const std::vector<ShadowClaim>& claims)
 {
     CHashWriter ss;
     ss << std::string("Quantum Quasar Block Claim Set v1")
-       << (pindex ? pindex->nHeight : 0)
-       << (pindex ? pindex->GetBlockHash() : uint256{})
+       << height << block_hash
        << static_cast<uint32_t>(claims.size());
     for (const ShadowClaim& claim : claims) ss << EncodeClaim(claim);
     return ss.GetHash();
+}
+
+uint256 HashBlockClaims(const CBlockIndex* pindex,
+                        const std::vector<ShadowClaim>& claims)
+{
+    return HashBlockClaims(pindex ? pindex->nHeight : 0,
+                           pindex ? pindex->GetBlockHash() : uint256{},
+                           claims);
 }
 
 uint256 HashGoldRushClaim(const ShadowClaim& claim)
@@ -2336,6 +2366,64 @@ std::optional<uint32_t> ReadAuthenticatedWhitelistCount(const CCoinsViewCache& v
     return manifest.entry_count;
 }
 
+bool PoolUndoClaimCountWithinBound(const CCoinsViewCache& view,
+                                   const CBlockIndex* pindex,
+                                   const Consensus::Params& consensus,
+                                   const ShadowPoolUndoState& undo)
+{
+    if (!pindex || undo.claim_count > MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK) {
+        return false;
+    }
+    if (!consensus.IsShadowCompetingClaimsActive(pindex->nHeight)) {
+        return true;
+    }
+    const std::optional<uint32_t> whitelist_count =
+        ReadAuthenticatedWhitelistCount(view, pindex);
+    return whitelist_count &&
+           undo.claim_count <= GetShadowSyntheticClaimLimit(
+               consensus, pindex->nHeight, *whitelist_count);
+}
+
+std::optional<ShadowPoolUndoState> ReadAuthenticatedPoolUndo(
+    const CCoinsViewCache& view, int height, const uint256& block_hash,
+    int64_t block_time)
+{
+    if (height < SHADOW_REWARD_START_HEIGHT ||
+        height > SHADOW_REWARD_END_HEIGHT || block_hash.IsNull() ||
+        block_time < 0 ||
+        static_cast<uint64_t>(block_time) >
+            std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;
+    }
+    Coin coin;
+    ShadowPoolUndoState undo;
+    if (!view.GetCoin(PoolUndoOutpoint(height, block_hash), coin) ||
+        coin.IsSpent() || coin.out.nValue != 0 || !coin.fCoinBase ||
+        coin.fCoinStake || coin.nHeight != static_cast<uint32_t>(height) ||
+        coin.nTime != static_cast<uint32_t>(block_time) ||
+        !DecodePoolUndo(coin.out.scriptPubKey, undo) ||
+        undo.block_hash != block_hash) {
+        return std::nullopt;
+    }
+    return undo;
+}
+
+std::optional<ShadowPoolUndoState> ReadAuthenticatedPoolUndo(
+    const CCoinsViewCache& view, const CBlockIndex* pindex,
+    const Consensus::Params& consensus)
+{
+    if (!pindex) return std::nullopt;
+    std::optional<ShadowPoolUndoState> undo = ReadAuthenticatedPoolUndo(
+        view, pindex->nHeight, pindex->GetBlockHash(), pindex->GetBlockTime());
+    if (!undo ||
+        undo->previous_block_hash !=
+            (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{}) ||
+        !PoolUndoClaimCountWithinBound(view, pindex, consensus, *undo)) {
+        return std::nullopt;
+    }
+    return undo;
+}
+
 ActiveSignalStateReadResult ReadActiveSignalStateMarker(const CCoinsViewCache& view,
                                                          const CBlockIndex* pindex,
                                                          std::map<CScript, ShadowActiveSignal>& active,
@@ -2874,14 +2962,95 @@ bool AddClaimMarker(CCoinsViewCache& view, const CBlockIndex* pindex, uint32_t m
     return WriteGoldRushInventory(view, pindex, std::move(inventory), /*finalize=*/false);
 }
 
+std::optional<std::vector<ShadowClaim>> ReadAuthenticatedBlockClaims(
+    const CCoinsViewCache& view, int height, const uint256& block_hash,
+    int64_t block_time, const ShadowPoolUndoState& undo)
+{
+    std::vector<ShadowClaim> claims;
+    claims.reserve(undo.claim_count);
+    for (uint32_t marker_index = 0; marker_index < undo.claim_count;
+         ++marker_index) {
+        Coin claim_coin;
+        if (!view.GetCoin(ClaimOutpoint(height, block_hash, marker_index),
+                          claim_coin) ||
+            claim_coin.IsSpent() || claim_coin.out.nValue != 0 ||
+            !claim_coin.fCoinBase || claim_coin.fCoinStake ||
+            claim_coin.nHeight != static_cast<uint32_t>(height) ||
+            claim_coin.nTime != static_cast<uint32_t>(block_time)) {
+            return std::nullopt;
+        }
+        valtype marker_payload;
+        if (!ParseMarkerScript(claim_coin.out.scriptPubKey,
+                               MARKER_DIRECT_CLAIM, &marker_payload)) {
+            return std::nullopt;
+        }
+        if (marker_payload.size() >= CLAIM_MARKER_MAGIC_V3.size() &&
+            std::equal(CLAIM_MARKER_MAGIC_V3.begin(),
+                       CLAIM_MARKER_MAGIC_V3.end(), marker_payload.begin())) {
+            uint32_t envelope_height{0};
+            uint256 envelope_hash;
+            uint32_t envelope_index{0};
+            valtype enclosed_claim;
+            if (!DecodeClaimMarkerEnvelope(marker_payload, envelope_height,
+                                           envelope_hash, envelope_index,
+                                           enclosed_claim) ||
+                envelope_height != static_cast<uint32_t>(height) ||
+                envelope_hash != block_hash || envelope_index != marker_index) {
+                return std::nullopt;
+            }
+        }
+        const std::optional<ShadowClaim> claim =
+            DecodeClaimScript(claim_coin.out.scriptPubKey);
+        if (!claim || !claim->direct || claim->amount <= 0 ||
+            !MoneyRange(claim->amount) ||
+            !IsDirectQuantumMigrationScript(claim->target) ||
+            EncodePool(claim->undo_pool) != EncodePool(undo.previous)) {
+            return std::nullopt;
+        }
+        claims.push_back(*claim);
+    }
+    if (HashBlockClaims(height, block_hash, claims) != undo.claims_hash) {
+        return std::nullopt;
+    }
+    return claims;
+}
+
+std::optional<std::vector<ShadowClaim>> ReadAuthenticatedBlockClaims(
+    const CCoinsViewCache& view, int height, const uint256& block_hash,
+    int64_t block_time)
+{
+    const std::optional<ShadowPoolUndoState> undo = ReadAuthenticatedPoolUndo(
+        view, height, block_hash, block_time);
+    if (!undo) return std::nullopt;
+    return ReadAuthenticatedBlockClaims(view, height, block_hash, block_time,
+                                        *undo);
+}
+
+std::optional<std::vector<ShadowClaim>> ReadAuthenticatedBlockClaims(
+    const CCoinsViewCache& view, const CBlockIndex* pindex,
+    const Consensus::Params& consensus)
+{
+    if (!pindex) return std::nullopt;
+    const std::optional<ShadowPoolUndoState> undo = ReadAuthenticatedPoolUndo(
+        view, pindex, consensus);
+    if (!undo) return std::nullopt;
+    return ReadAuthenticatedBlockClaims(
+        view, pindex->nHeight, pindex->GetBlockHash(), pindex->GetBlockTime(),
+        *undo);
+}
+
 std::vector<COutPoint> FindDeterministicClaimMarkers(const CCoinsViewCache& view, const CBlockIndex* pindex)
 {
     std::vector<COutPoint> outpoints;
     if (!pindex) return outpoints;
-    for (uint32_t marker_index = 0; marker_index < MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK; ++marker_index) {
-        const COutPoint outpoint = ClaimOutpoint(pindex, marker_index);
-        if (!view.HaveCoin(outpoint)) break;
-        outpoints.push_back(outpoint);
+    const std::optional<std::vector<ShadowClaim>> claims =
+        ReadAuthenticatedBlockClaims(
+        view, pindex, Params().GetConsensus());
+    if (!claims) return outpoints;
+    outpoints.reserve(claims->size());
+    for (uint32_t marker_index = 0; marker_index < claims->size();
+         ++marker_index) {
+        outpoints.push_back(ClaimOutpoint(pindex, marker_index));
     }
     return outpoints;
 }
@@ -2954,7 +3123,8 @@ bool DeepAuditGoldRushClaimInventory(const CCoinsViewCache& view,
             undo_coin.nTime != static_cast<uint32_t>(pindex->GetBlockTime()) ||
             !DecodePoolUndo(undo_coin.out.scriptPubKey, undo) ||
             undo.block_hash != pindex->GetBlockHash() ||
-            undo.previous_block_hash != (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{})) {
+            undo.previous_block_hash != (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{}) ||
+            !PoolUndoClaimCountWithinBound(view, pindex, consensus, undo)) {
             return false;
         }
 
@@ -3399,9 +3569,13 @@ bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex,
                              bool expected_previous_present)
 {
     if (!pindex) return false;
+    const std::optional<uint32_t> whitelist_count =
+        ReadAuthenticatedWhitelistCount(view, pindex);
+    if (!whitelist_count) return false;
     // Remove obsolete append-only compatibility markers if an old prerelease
     // chainstate is being inspected. They are never used to authorize state.
-    for (uint32_t marker_index = 0; marker_index < MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK; ++marker_index) {
+    for (uint32_t marker_index = 0; marker_index < *whitelist_count;
+         ++marker_index) {
         const COutPoint outpoint = ActiveSignalOutpoint(pindex, marker_index);
         if (!view.HaveCoin(outpoint)) break;
         view.SpendCoin(outpoint);
@@ -3421,7 +3595,6 @@ bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex,
     }
     if (undo_coin.nHeight != static_cast<uint32_t>(pindex->nHeight) ||
         undo_coin.nTime != static_cast<uint32_t>(pindex->GetBlockTime())) return false;
-    const std::optional<uint32_t> whitelist_count = ReadAuthenticatedWhitelistCount(view, pindex);
     valtype undo_blob;
     ShadowActiveSignalUndo undo;
     if (!whitelist_count || !ReadActiveSignalUndoBlob(view, pindex, undo_coin, undo_blob) ||
@@ -3815,7 +3988,8 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
             !DecodePoolUndo(pool_undo_coin.out.scriptPubKey, pool_undo) ||
             pool_undo.block_hash != pindex->GetBlockHash() ||
             pool_undo.previous_block_hash !=
-                (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{})) {
+                (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{}) ||
+            !PoolUndoClaimCountWithinBound(view, pindex, consensus, pool_undo)) {
             return ShadowPowAccountingResult::LOCAL_INTERNAL_ERROR;
         }
         pool = pool_undo.previous;
@@ -4122,20 +4296,19 @@ std::vector<ShadowSyntheticPayoutTransaction> GetAppliedShadowClaimPayoutTransac
 {
     std::vector<ShadowSyntheticPayoutTransaction> payouts;
     if (height < SHADOW_REWARD_START_HEIGHT || height > SHADOW_REWARD_END_HEIGHT) return payouts;
-
-    for (uint32_t marker_index = 0; marker_index < MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK; ++marker_index) {
-        Coin claim_coin;
-        if (!view.GetCoin(ClaimOutpoint(height, block_hash, marker_index), claim_coin)) break;
-        const auto claim = DecodeClaimScript(claim_coin.out.scriptPubKey);
-        if (!claim || !claim->direct || claim->amount <= 0 || !MoneyRange(claim->amount) ||
-            !IsDirectQuantumMigrationScript(claim->target)) {
-            break;
-        }
+    const std::optional<std::vector<ShadowClaim>> claims =
+        ReadAuthenticatedBlockClaims(view, height, block_hash, block_time);
+    if (!claims) return payouts;
+    payouts.reserve(claims->size());
+    for (uint32_t marker_index = 0; marker_index < claims->size();
+         ++marker_index) {
+        const ShadowClaim& claim = claims->at(marker_index);
         payouts.push_back(ShadowSyntheticPayoutTransaction{
-            BuildClaimPayoutTransaction(height, block_hash, block_time, marker_index, *claim),
-            claim->target,
-            claim->amount,
-            claim->mode == ShadowProofMode::POW,
+            BuildClaimPayoutTransaction(height, block_hash, block_time,
+                                        marker_index, claim),
+            claim.target,
+            claim.amount,
+            claim.mode == ShadowProofMode::POW,
         });
     }
     return payouts;
@@ -4154,19 +4327,18 @@ std::vector<ShadowSyntheticPayoutCoin> GetAppliedShadowClaimPayoutCoins(const CC
 {
     std::vector<ShadowSyntheticPayoutCoin> payouts;
     if (height < SHADOW_REWARD_START_HEIGHT || height > SHADOW_REWARD_END_HEIGHT) return payouts;
-
-    for (uint32_t marker_index = 0; marker_index < MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK; ++marker_index) {
-        Coin claim_coin;
-        if (!view.GetCoin(ClaimOutpoint(height, block_hash, marker_index), claim_coin)) break;
-        const auto claim = DecodeClaimScript(claim_coin.out.scriptPubKey);
-        if (!claim || !claim->direct || claim->amount <= 0 || !MoneyRange(claim->amount) ||
-            !IsDirectQuantumMigrationScript(claim->target)) {
-            break;
-        }
-        const CTransactionRef payout_tx = BuildClaimPayoutTransaction(height, block_hash, block_time, marker_index, *claim);
+    const std::optional<std::vector<ShadowClaim>> claims =
+        ReadAuthenticatedBlockClaims(view, height, block_hash, block_time);
+    if (!claims) return payouts;
+    payouts.reserve(claims->size());
+    for (uint32_t marker_index = 0; marker_index < claims->size();
+         ++marker_index) {
+        const ShadowClaim& claim = claims->at(marker_index);
+        const CTransactionRef payout_tx = BuildClaimPayoutTransaction(
+            height, block_hash, block_time, marker_index, claim);
         payouts.push_back(ShadowSyntheticPayoutCoin{
             COutPoint{payout_tx->GetHash(), 0},
-            CTxOut{claim->amount, claim->target},
+            CTxOut{claim.amount, claim.target},
             static_cast<uint32_t>(height),
             block_time,
         });
@@ -4257,14 +4429,16 @@ bool AuthenticateGoldRushPayoutRecord(const CCoinsViewCache& view, const COutPoi
                                     marker.nTime, record.claim_index, *claim)->GetHash(), 0};
     if (deterministic_payout != outpoint) return false;
 
-    Coin undo_coin;
-    ShadowPoolUndoState undo;
-    CHashWriter undo_key;
-    undo_key << std::string("Quantum Quasar Shadow Pool Undo")
-             << static_cast<int>(record.origin_height) << record.origin_block_hash;
-    if (!view.GetCoin(COutPoint{undo_key.GetHash(), 0}, undo_coin) || undo_coin.IsSpent() ||
-        !DecodePoolUndo(undo_coin.out.scriptPubKey, undo) ||
-        undo.block_hash != record.origin_block_hash || record.claim_index >= undo.claim_count) {
+    const std::optional<ShadowPoolUndoState> undo = ReadAuthenticatedPoolUndo(
+        view, static_cast<int>(record.origin_height), record.origin_block_hash,
+        marker.nTime);
+    if (!undo || record.claim_index >= undo->claim_count ||
+        (origin_block &&
+         (undo->previous_block_hash !=
+              (origin_block->pprev ? origin_block->pprev->GetBlockHash()
+                                   : uint256{}) ||
+          !PoolUndoClaimCountWithinBound(view, origin_block,
+                                         Params().GetConsensus(), *undo)))) {
         return false;
     }
 
@@ -5030,22 +5204,29 @@ bool CollectAuthenticatedShadowStateOutpoints(const CCoinsViewCache& view, const
     for (const auto& [height, candidates] : claim_marker_candidates) {
         const CBlockIndex* marker_block = SafeGetAncestor(pindexTip, height);
         if (!marker_block) continue;
+        const std::optional<ShadowPoolUndoState> undo = ReadAuthenticatedPoolUndo(
+            view, marker_block, Params().GetConsensus());
+        const uint32_t candidate_bound = static_cast<uint32_t>(
+            std::min<size_t>(candidates.size(),
+                             std::numeric_limits<uint32_t>::max()));
+        const uint32_t search_count = undo ? undo->claim_count : candidate_bound;
+        std::map<COutPoint, uint32_t> expected_claim_indices;
+        for (uint32_t marker_index = 0; marker_index < search_count;
+             ++marker_index) {
+            expected_claim_indices.emplace(
+                ClaimOutpoint(marker_block, marker_index), marker_index);
+        }
         for (const COutPoint& claim_outpoint : candidates) {
-            std::optional<uint32_t> matched_index;
-            for (uint32_t marker_index = 0; marker_index < MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK; ++marker_index) {
-                if (ClaimOutpoint(marker_block, marker_index) == claim_outpoint) {
-                    matched_index = marker_index;
-                    break;
-                }
-            }
-            if (!matched_index) continue;
+            const auto matched = expected_claim_indices.find(claim_outpoint);
+            if (matched == expected_claim_indices.end()) continue;
+            const uint32_t matched_index = matched->second;
             Coin claim_coin;
             if (!view.GetCoin(claim_outpoint, claim_coin) || claim_coin.nHeight != static_cast<uint32_t>(height)) continue;
             const auto claim = DecodeClaimScript(claim_coin.out.scriptPubKey);
             if (!claim || !claim->direct || !IsValidDirectClaimMarker(marker_block, *claim)) continue;
             authenticated.insert(claim_outpoint);
 
-            const COutPoint payout_outpoint = ClaimPayoutOutpoint(marker_block, *matched_index, *claim);
+            const COutPoint payout_outpoint = ClaimPayoutOutpoint(marker_block, matched_index, *claim);
             Coin payout_coin;
             if (view.GetCoin(payout_outpoint, payout_coin) &&
                 payout_coin.nHeight == static_cast<uint32_t>(height) &&
@@ -5076,15 +5257,17 @@ bool CollectAuthenticatedShadowStateOutpoints(const CCoinsViewCache& view, const
     for (const auto& [height, candidates] : active_signal_candidates) {
         const CBlockIndex* marker_block = SafeGetAncestor(pindexTip, height);
         if (!marker_block) continue;
+        const uint32_t candidate_bound = static_cast<uint32_t>(
+            std::min<size_t>(candidates.size(),
+                             std::numeric_limits<uint32_t>::max()));
+        std::set<COutPoint> expected_signal_outpoints;
+        for (uint32_t marker_index = 0; marker_index < candidate_bound;
+             ++marker_index) {
+            expected_signal_outpoints.insert(
+                ActiveSignalOutpoint(marker_block, marker_index));
+        }
         for (const COutPoint& outpoint : candidates) {
-            bool deterministic_outpoint{false};
-            for (uint32_t marker_index = 0; marker_index < MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK; ++marker_index) {
-                if (ActiveSignalOutpoint(marker_block, marker_index) == outpoint) {
-                    deterministic_outpoint = true;
-                    break;
-                }
-            }
-            if (!deterministic_outpoint) continue;
+            if (expected_signal_outpoints.count(outpoint) == 0) continue;
             Coin coin;
             ShadowActiveSignal signal;
             if (view.GetCoin(outpoint, coin) && coin.nHeight == static_cast<uint32_t>(height) &&
@@ -5837,7 +6020,10 @@ static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CB
         LogPrintf("ERROR: Quantum Quasar shadow obligation cap exceeded at height %d\n", pindex->nHeight);
         return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
     }
-    if (claims_to_apply.size() > MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK) {
+    const uint32_t synthetic_claim_limit = GetShadowSyntheticClaimLimit(
+        Params().GetConsensus(), pindex->nHeight, *whitelist_count);
+    if (pos_payouts.size() > *whitelist_count ||
+        claims_to_apply.size() > synthetic_claim_limit) {
         LogPrintf("ERROR: Quantum Quasar synthetic claim count exceeds the authenticated marker bound at height %d\n",
                   pindex->nHeight);
         return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
@@ -5952,7 +6138,8 @@ bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockInd
         pool_undo_coin.nTime != static_cast<uint32_t>(pindex->GetBlockTime()) ||
         !DecodePoolUndo(pool_undo_coin.out.scriptPubKey, pool_undo) ||
         pool_undo.block_hash != pindex->GetBlockHash() ||
-        pool_undo.previous_block_hash != (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{})) return false;
+        pool_undo.previous_block_hash != (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{}) ||
+        !PoolUndoClaimCountWithinBound(view, pindex, Params().GetConsensus(), pool_undo)) return false;
     uint256 post_pool_hash;
     if (!HashShadowPoolState(true, current_pool_coin.nHeight, current_pool_coin.nTime,
                              pindex->GetBlockHash(), pool, post_pool_hash) ||

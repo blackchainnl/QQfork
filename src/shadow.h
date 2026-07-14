@@ -269,6 +269,16 @@ static constexpr CAmount SHADOW_MAX_EMISSION = 51437700 * COIN;
 /** Checked deterministic scheduled emission through last_height, inclusive. */
 std::optional<CAmount> GetScheduledShadowEmissionThrough(int last_height);
 
+/** Deterministic upper bound for synthetic claim records written by one
+ * Gold Rush block. Historical v30.1.0 blocks retain their legacy block-size
+ * bound. From the competing-claims activation height onward, the bound is
+ * derived from authenticated whitelist state plus the fixed PoW evaluation
+ * cap; this is an assertion of existing allocation rules, not a participant
+ * cap or reward-allocation change. */
+uint32_t GetShadowSyntheticClaimLimit(const Consensus::Params& consensus,
+                                      int height,
+                                      uint32_t authenticated_whitelist_count);
+
 /** Get the magic OP_RETURN prefix used for Quantum Quasar shadow proofs. */
 const std::vector<unsigned char>& GetShadowPrefix();
 
