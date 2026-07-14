@@ -829,7 +829,9 @@ bool CopyDirectoryTreeVerified(const fs::path& source, const fs::path& destinati
         if (PathExistsNoThrow(destination)) {
             throw std::runtime_error("migration destination appeared before atomic promotion");
         }
-        fs::rename(temp_path, destination);
+        if (!RenameNoReplace(temp_path, destination)) {
+            throw std::runtime_error("failed to atomically promote verified migration copy without replacing an existing destination");
+        }
         if (!PathIsRealDirectoryNoThrow(destination)) {
             throw std::runtime_error("migrated datadir root was not a real directory");
         }
@@ -880,7 +882,9 @@ bool MoveActiveDestinationAside(const fs::path& destination, const fs::path& mov
 
     try {
         fs::create_directories(moved_path.parent_path());
-        fs::rename(destination, moved_path);
+        if (!RenameNoReplace(destination, moved_path)) {
+            throw std::runtime_error("failed to atomically preserve active datadir without replacing an existing backup");
+        }
         std::error_code ec;
         fs::remove(moved_path / MIGRATION_LOCK_FILENAME, ec);
         locks.ReleaseDirectory(destination_lock_identity);
@@ -935,7 +939,9 @@ bool ClearNonPayloadDestination(const fs::path& destination, MigrationLockSet& l
     const fs::path moved = UniqueBackupPath(destination, "preexisting-blackcoin");
     try {
         fs::create_directories(moved.parent_path());
-        fs::rename(destination, moved);
+        if (!RenameNoReplace(destination, moved)) {
+            throw std::runtime_error("failed to atomically preserve pre-existing datadir without replacing an existing backup");
+        }
         std::error_code remove_ec;
         fs::remove(moved / MIGRATION_LOCK_FILENAME, remove_ec);
         locks.ReleaseDirectory(destination_lock_identity);
@@ -1032,7 +1038,9 @@ bool PreserveInterruptedDestination(const fs::path& destination, MigrationLockSe
     const fs::path preserved = UniqueBackupPath(destination, "interrupted-destination");
     try {
         fs::create_directories(preserved.parent_path());
-        fs::rename(destination, preserved);
+        if (!RenameNoReplace(destination, preserved)) {
+            throw std::runtime_error("failed to atomically preserve interrupted datadir without replacing an existing backup");
+        }
         std::error_code remove_ec;
         fs::remove(preserved / MIGRATION_LOCK_FILENAME, remove_ec);
         locks.ReleaseDirectory(destination_lock_identity);
@@ -1369,7 +1377,9 @@ MigrationOutcome MaybeMigrateLegacyDataDir(ArgsManager& args, const common::Lega
             if (PathExistsNoThrow(base_path)) {
                 throw std::runtime_error("active .blackcoin datadir still exists before staged import promotion");
             }
-            fs::rename(staged_import_path, base_path);
+            if (!RenameNoReplace(staged_import_path, base_path)) {
+                throw std::runtime_error("failed to atomically promote staged import without replacing an active datadir");
+            }
             if (!PathIsRealDirectoryNoThrow(base_path)) {
                 throw std::runtime_error("promoted .blackmore import was not a real directory");
             }
@@ -1388,7 +1398,9 @@ MigrationOutcome MaybeMigrateLegacyDataDir(ArgsManager& args, const common::Lega
 
         if (moved_active_path && !PathExistsNoThrow(base_path)) {
             try {
-                fs::rename(*moved_active_path, base_path);
+                if (!RenameNoReplace(*moved_active_path, base_path)) {
+                    throw std::runtime_error("failed to atomically restore original datadir without replacing an active destination");
+                }
                 ClearRecoveryRecord(base_path);
                 DirectoryCommit(base_path.parent_path());
                 LogPrintf("Blackcoin: restored original .blackcoin datadir after .blackmore migration failed\n");
