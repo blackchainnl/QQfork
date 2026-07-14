@@ -21,6 +21,7 @@
 #include <util/strencodings.h>
 #include <util/translation.h>
 #include <validation.h>
+#include <validationinterface.h>
 #include <warnings.h>
 
 #include <boost/test/unit_test.hpp>
@@ -30,6 +31,7 @@
 #include <cstdlib>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -115,6 +117,25 @@ private:
     node::NodeContext& m_node;
     const bool m_previous_shutdown_on_fatal;
     const int m_previous_exit_status;
+};
+
+class BlockCheckedCatcher final : public CValidationInterface
+{
+public:
+    explicit BlockCheckedCatcher(const uint256& expected_hash)
+        : m_expected_hash{expected_hash}
+    {
+    }
+
+    void BlockChecked(const CBlock& block, const BlockValidationState& state) override
+    {
+        if (block.GetHash() == m_expected_hash) m_state = state;
+    }
+
+    std::optional<BlockValidationState> m_state;
+
+private:
+    const uint256 m_expected_hash;
 };
 
 std::vector<unsigned char> ProgramForPubkey(const std::vector<uint8_t>& pubkey)
@@ -1049,6 +1070,39 @@ BOOST_FIXTURE_TEST_CASE(block_signature_internal_failure_is_fail_stop_retryable_
                                GetShadowReplayStateInfo(chainstate.CoinsTip(), Params().GetConsensus(),
                                                         chainstate.m_chain.Tip()));
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(noncanonical_block_signature_is_reported_as_invalid_header, RegTestingSetup)
+{
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    const uint256 tip_hash = WITH_LOCK(cs_main, return chainman.ActiveChain().Tip()->GetBlockHash());
+
+    std::vector<uint8_t> pubkey;
+    std::vector<uint8_t> privkey;
+    BOOST_REQUIRE(ML_DSA::KeyGen(pubkey, privkey));
+    CBlock malformed = BuildQuantumSignedBlock(pubkey, privkey, tip_hash);
+    BOOST_REQUIRE_EQUAL(malformed.vchBlockSig.size(), ML_DSA::SIGNATURE_BYTES);
+    malformed.vchBlockSig.pop_back();
+
+    auto block = std::make_shared<const CBlock>(ReplayBlockBytes(malformed));
+    BlockCheckedCatcher catcher{block->GetHash()};
+    RegisterValidationInterface(&catcher);
+    bool new_block{true};
+    const bool processed = chainman.ProcessNewBlock(
+        block, /*force_processing=*/true, /*min_pow_checked=*/true, &new_block);
+    UnregisterValidationInterface(&catcher);
+    SyncWithValidationInterfaceQueue();
+
+    BOOST_CHECK(!processed);
+    BOOST_CHECK(!new_block);
+    BOOST_REQUIRE(catcher.m_state.has_value());
+    BOOST_CHECK(catcher.m_state->IsInvalid());
+    BOOST_CHECK_EQUAL(catcher.m_state->GetResult(), BlockValidationResult::BLOCK_INVALID_HEADER);
+    BOOST_CHECK_EQUAL(catcher.m_state->GetRejectReason(), "bad-signature-encoding");
+    BOOST_CHECK_EQUAL(m_node.exit_status.load(), EXIT_SUCCESS);
+    LOCK(cs_main);
+    BOOST_CHECK(chainman.m_blockman.LookupBlockIndex(block->GetHash()) == nullptr);
+    BOOST_CHECK(chainman.ActiveChain().Tip()->GetBlockHash() == tip_hash);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -6120,9 +6120,16 @@ bool ChainstateManager::ProcessNewBlock(const std::shared_ptr<const CBlock>& blo
         // malleability that cause CheckBlock() to fail; see e.g. CVE-2012-2459 and
         // https://lists.linuxfoundation.org/pipermail/bitcoin-dev/2019-February/016697.html.  Because CheckBlock() is
         // not very expensive, the anti-DoS benefits of caching failure (of a definitely-invalid block) are not substantial.
-        // Blackcoin: also check for the signature encoding
+        // Blackcoin: also check for the signature encoding. Report this
+        // deterministic header failure through BlockChecked so local submitters
+        // receive the same explicit invalid result as network peers instead of
+        // an inconclusive failure.
         if (!CheckCanonicalBlockSignature(block)) {
-            return error("%s: AcceptBlock FAILED (%s)", __func__, "bad block signature encoding");
+            state.Invalid(BlockValidationResult::BLOCK_INVALID_HEADER,
+                          "bad-signature-encoding",
+                          "AcceptBlock(): bad block signature encoding");
+            GetMainSignals().BlockChecked(*block, state);
+            return error("%s: AcceptBlock FAILED (%s)", __func__, state.ToString());
         }
         bool ret = CheckBlock(*block, state, GetConsensus(), ActiveChainstate());
         if (!ret && state.IsError()) {
