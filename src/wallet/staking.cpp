@@ -279,15 +279,17 @@ bool TryAbandonInactiveShadowSignal(CWallet& wallet, const uint256& txid)
         }
     }
 
-    // Keep validation's authoritative mempool membership and wallet state in
-    // one snapshot. TRY_LOCK avoids waiting on cs_wallet while holding the
-    // canonical cs_main -> mempool.cs order. Holding mempool.cs until
-    // AbandonTransaction completes prevents a peer from inserting the exact
-    // transaction between the membership test and the state transition.
+    // Keep mempool membership and wallet state in one snapshot using the
+    // established wallet -> mempool order used by wallet notifications.
+    // Nonblocking acquisition keeps the staking worker from delaying either
+    // validation or foreground wallet work. Holding both locks through
+    // AbandonTransaction prevents a peer from inserting the exact transaction
+    // between the membership test and the state transition.
     const CTxMemPool& mempool = wallet.chain().mempool();
-    LOCK2(::cs_main, mempool.cs);
     TRY_LOCK(wallet.cs_wallet, wallet_lock);
-    if (!wallet_lock || mempool.exists(GenTxid::Txid(txid))) return false;
+    if (!wallet_lock) return false;
+    TRY_LOCK(mempool.cs, mempool_lock);
+    if (!mempool_lock || mempool.exists(GenTxid::Txid(txid))) return false;
     const CWalletTx* wtx = wallet.GetWalletTx(txid);
     if (!wtx || !wtx->isUnconfirmed() || wtx->InMempool()) return false;
     return wallet.AbandonTransaction(txid);
