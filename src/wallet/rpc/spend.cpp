@@ -1506,110 +1506,115 @@ RPCHelpMan sendall()
             }
 
             CMutableTransaction rawTx{ConstructTransaction(options["inputs"], recipient_key_value_pairs, options["locktime"])};
-            LOCK2(::cs_main, pwallet->cs_wallet);
-            if (!options.exists("inputs")) {
-                ApplyOutputInputFamily(coin_control, rawTx.vout);
-            }
-
-            CAmount total_input_value(0);
-            bool send_max{options.exists("send_max") ? options["send_max"].get_bool() : false};
-            if (options.exists("inputs") && options.exists("send_max")) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot combine send_max with specific inputs.");
-            } else if (options.exists("inputs") && (options.exists("minconf") || options.exists("maxconf"))) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot combine minconf or maxconf with specific inputs.");
-            } else if (options.exists("inputs")) {
-                for (const CTxIn& input : rawTx.vin) {
-                    if (pwallet->IsSpent(input.prevout)) {
-                        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Input not available. UTXO (%s:%d) was already spent.", input.prevout.hash.ToString(), input.prevout.n));
-                    }
-                    const CWalletTx* tx{pwallet->GetWalletTx(input.prevout.hash)};
-                    if (!tx || input.prevout.n >= tx->tx->vout.size() || !(pwallet->IsMine(tx->tx->vout[input.prevout.n]) & (coin_control.fAllowWatchOnly ? ISMINE_ALL : ISMINE_SPENDABLE))) {
-                        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Input not found. UTXO (%s:%d) is not part of wallet.", input.prevout.hash.ToString(), input.prevout.n));
-                    }
-                    total_input_value += tx->tx->vout[input.prevout.n].nValue;
+            // FinishTransaction snapshots active-chain policy before FillPSBT
+            // acquires cs_wallet. Keep input selection atomic here, then release
+            // both locks before crossing that public wallet boundary.
+            {
+                LOCK2(::cs_main, pwallet->cs_wallet);
+                if (!options.exists("inputs")) {
+                    ApplyOutputInputFamily(coin_control, rawTx.vout);
                 }
-            } else {
-                CoinFilterParams coins_params;
-                coins_params.min_amount = 0;
-                for (const COutput& output : AvailableCoins(*pwallet, &coin_control, fee_rate, coins_params).All()) {
-                    CHECK_NONFATAL(output.input_bytes > 0);
-                    if (send_max && fee_rate.GetFee(output.input_bytes) > output.txout.nValue) {
-                        continue;
-                    }
-                    CTxIn input(output.outpoint.hash, output.outpoint.n, CScript(), CTxIn::SEQUENCE_FINAL);
-                    rawTx.vin.push_back(input);
-                    total_input_value += output.txout.nValue;
-                }
-            }
 
-            // estimate final size of tx
-            const TxSize tx_size{CalculateMaximumSignedTxSize(CTransaction(rawTx), pwallet.get())};
-            if (tx_size.vsize == -1 || tx_size.weight == -1) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Missing solving data for estimating transaction size");
-            }
-            const CAmount fee_from_size{std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), GetAdjustedTimeSeconds()), fee_rate.GetFee(tx_size.vsize))};
-            const CAmount effective_value{total_input_value - fee_from_size};
-
-            if (fee_from_size > pwallet->m_default_max_tx_fee) {
-                throw JSONRPCError(RPC_WALLET_ERROR, TransactionErrorString(TransactionError::MAX_FEE_EXCEEDED).original);
-            }
-
-            if (effective_value <= 0) {
-                if (send_max) {
-                    throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Total value of UTXO pool too low to pay for transaction, try using lower feerate.");
-                } else {
-                    throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Total value of UTXO pool too low to pay for transaction. Try using lower feerate or excluding uneconomic UTXOs with 'send_max' option.");
-                }
-            }
-
-            // If this transaction is too large, e.g. because the wallet has many UTXOs, it will be rejected by the node's mempool.
-            if (tx_size.weight > MAX_STANDARD_TX_WEIGHT) {
-                throw JSONRPCError(RPC_WALLET_ERROR, "Transaction too large.");
-            }
-
-            CAmount output_amounts_claimed{0};
-            for (const CTxOut& out : rawTx.vout) {
-                output_amounts_claimed += out.nValue;
-            }
-
-            if (output_amounts_claimed > total_input_value) {
-                throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Assigned more value to outputs than available funds.");
-            }
-
-            const CAmount remainder{effective_value - output_amounts_claimed};
-            if (remainder < 0) {
-                throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds for fees after creating specified outputs.");
-            }
-
-            const CAmount per_output_without_amount{remainder / (long)addresses_without_amount.size()};
-
-            bool gave_remaining_to_first{false};
-            for (CTxOut& out : rawTx.vout) {
-                CTxDestination dest;
-                ExtractDestination(out.scriptPubKey, dest);
-                std::string addr{EncodeDestination(dest)};
-                if (addresses_without_amount.count(addr) > 0) {
-                    out.nValue = per_output_without_amount;
-                    if (!gave_remaining_to_first) {
-                        out.nValue += remainder % addresses_without_amount.size();
-                        gave_remaining_to_first = true;
-                    }
-                    if (IsDust(out, pwallet->chain().relayDustFee())) {
-                        // Dynamically generated output amount is dust
-                        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Dynamically assigned remainder results in dust output.");
+                CAmount total_input_value(0);
+                bool send_max{options.exists("send_max") ? options["send_max"].get_bool() : false};
+                if (options.exists("inputs") && options.exists("send_max")) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot combine send_max with specific inputs.");
+                } else if (options.exists("inputs") && (options.exists("minconf") || options.exists("maxconf"))) {
+                    throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot combine minconf or maxconf with specific inputs.");
+                } else if (options.exists("inputs")) {
+                    for (const CTxIn& input : rawTx.vin) {
+                        if (pwallet->IsSpent(input.prevout)) {
+                            throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Input not available. UTXO (%s:%d) was already spent.", input.prevout.hash.ToString(), input.prevout.n));
+                        }
+                        const CWalletTx* tx{pwallet->GetWalletTx(input.prevout.hash)};
+                        if (!tx || input.prevout.n >= tx->tx->vout.size() || !(pwallet->IsMine(tx->tx->vout[input.prevout.n]) & (coin_control.fAllowWatchOnly ? ISMINE_ALL : ISMINE_SPENDABLE))) {
+                            throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Input not found. UTXO (%s:%d) is not part of wallet.", input.prevout.hash.ToString(), input.prevout.n));
+                        }
+                        total_input_value += tx->tx->vout[input.prevout.n].nValue;
                     }
                 } else {
-                    if (IsDust(out, pwallet->chain().relayDustFee())) {
-                        // Specified output amount is dust
-                        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Specified output amount to %s is below dust threshold.", addr));
+                    CoinFilterParams coins_params;
+                    coins_params.min_amount = 0;
+                    for (const COutput& output : AvailableCoins(*pwallet, &coin_control, fee_rate, coins_params).All()) {
+                        CHECK_NONFATAL(output.input_bytes > 0);
+                        if (send_max && fee_rate.GetFee(output.input_bytes) > output.txout.nValue) {
+                            continue;
+                        }
+                        CTxIn input(output.outpoint.hash, output.outpoint.n, CScript(), CTxIn::SEQUENCE_FINAL);
+                        rawTx.vin.push_back(input);
+                        total_input_value += output.txout.nValue;
                     }
                 }
-            }
 
-            const bool lock_unspents{options.exists("lock_unspents") ? options["lock_unspents"].get_bool() : false};
-            if (lock_unspents) {
-                for (const CTxIn& txin : rawTx.vin) {
-                    pwallet->LockCoin(txin.prevout);
+                // estimate final size of tx
+                const TxSize tx_size{CalculateMaximumSignedTxSize(CTransaction(rawTx), pwallet.get())};
+                if (tx_size.vsize == -1 || tx_size.weight == -1) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Missing solving data for estimating transaction size");
+                }
+                const CAmount fee_from_size{std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), GetAdjustedTimeSeconds()), fee_rate.GetFee(tx_size.vsize))};
+                const CAmount effective_value{total_input_value - fee_from_size};
+
+                if (fee_from_size > pwallet->m_default_max_tx_fee) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, TransactionErrorString(TransactionError::MAX_FEE_EXCEEDED).original);
+                }
+
+                if (effective_value <= 0) {
+                    if (send_max) {
+                        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Total value of UTXO pool too low to pay for transaction, try using lower feerate.");
+                    } else {
+                        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Total value of UTXO pool too low to pay for transaction. Try using lower feerate or excluding uneconomic UTXOs with 'send_max' option.");
+                    }
+                }
+
+                // If this transaction is too large, e.g. because the wallet has many UTXOs, it will be rejected by the node's mempool.
+                if (tx_size.weight > MAX_STANDARD_TX_WEIGHT) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Transaction too large.");
+                }
+
+                CAmount output_amounts_claimed{0};
+                for (const CTxOut& out : rawTx.vout) {
+                    output_amounts_claimed += out.nValue;
+                }
+
+                if (output_amounts_claimed > total_input_value) {
+                    throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Assigned more value to outputs than available funds.");
+                }
+
+                const CAmount remainder{effective_value - output_amounts_claimed};
+                if (remainder < 0) {
+                    throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Insufficient funds for fees after creating specified outputs.");
+                }
+
+                const CAmount per_output_without_amount{remainder / (long)addresses_without_amount.size()};
+
+                bool gave_remaining_to_first{false};
+                for (CTxOut& out : rawTx.vout) {
+                    CTxDestination dest;
+                    ExtractDestination(out.scriptPubKey, dest);
+                    std::string addr{EncodeDestination(dest)};
+                    if (addresses_without_amount.count(addr) > 0) {
+                        out.nValue = per_output_without_amount;
+                        if (!gave_remaining_to_first) {
+                            out.nValue += remainder % addresses_without_amount.size();
+                            gave_remaining_to_first = true;
+                        }
+                        if (IsDust(out, pwallet->chain().relayDustFee())) {
+                            // Dynamically generated output amount is dust
+                            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Dynamically assigned remainder results in dust output.");
+                        }
+                    } else {
+                        if (IsDust(out, pwallet->chain().relayDustFee())) {
+                            // Specified output amount is dust
+                            throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Specified output amount to %s is below dust threshold.", addr));
+                        }
+                    }
+                }
+
+                const bool lock_unspents{options.exists("lock_unspents") ? options["lock_unspents"].get_bool() : false};
+                if (lock_unspents) {
+                    for (const CTxIn& txin : rawTx.vin) {
+                        pwallet->LockCoin(txin.prevout);
+                    }
                 }
             }
 
