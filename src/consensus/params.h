@@ -275,7 +275,20 @@ struct Params {
     bool IsStakeTiersActive(int nHeight) const { return nHeight >= nStakeTierActivationHeight; }
     bool IsStakeRewardSplitActive(int nHeight) const { return nHeight >= nStakeRewardSplitActivationHeight; }
     bool IsShadowCompetingClaimsActive(int nHeight) const { return nHeight >= nShadowCompetingClaimsActivationHeight; }
-    int EffectiveDemurrageActivationHeight() const { return std::max(nDemurrageActivationHeight, nDemurrageMinActivationHeight); }
+    int EffectiveDemurrageActivationHeight() const
+    {
+        // A complete height-authoritative lifecycle has one atomic transition:
+        // the block after the last Migration block is both the first Final
+        // block and the first demurrage-active block. Do not permit the legacy
+        // demurrage-height fields to become an independent activation gate.
+        if (UsesHeightLifecycle() && IsQuantumLifecycleScheduleOrdered()) {
+            if (nQuantumMigrationEndHeight == std::numeric_limits<int>::max()) {
+                return std::numeric_limits<int>::max();
+            }
+            return nQuantumMigrationEndHeight + 1;
+        }
+        return std::max(nDemurrageActivationHeight, nDemurrageMinActivationHeight);
+    }
     int DemurrageBlocksPerMonth() const { return std::max(1, nDemurrageBlocksPerMonth); }
     int DemurrageGraceBlocks() const { return 6 * DemurrageBlocksPerMonth(); }
     int DemurrageZeroBlocks() const { return 24 * DemurrageBlocksPerMonth(); }

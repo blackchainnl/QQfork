@@ -177,6 +177,16 @@ BOOST_AUTO_TEST_CASE(mainnet_lifecycle_is_height_coherent_and_demurrage_is_autom
     BOOST_CHECK(IsQuantumWitnessSpendActive(consensus, active_mtp, migration_end + 1));
     BOOST_CHECK(consensus.IsDemurrageActive(migration_end + 1, active_mtp));
 
+    // A complete height lifecycle must not retain a second, independently
+    // configurable demurrage gate. Poison both legacy fields and verify that
+    // the Migration -> Final transition remains the sole activation decision.
+    Consensus::Params poisoned_demurrage_gate{consensus};
+    poisoned_demurrage_gate.nDemurrageActivationHeight = std::numeric_limits<int>::max();
+    poisoned_demurrage_gate.nDemurrageMinActivationHeight = std::numeric_limits<int>::max();
+    BOOST_CHECK_EQUAL(poisoned_demurrage_gate.EffectiveDemurrageActivationHeight(), migration_end + 1);
+    BOOST_CHECK(!poisoned_demurrage_gate.IsDemurrageActive(migration_end, active_mtp));
+    BOOST_CHECK(poisoned_demurrage_gate.IsDemurrageActive(migration_end + 1, active_mtp));
+
     Coin pre_final_coin{CTxOut{10 * COIN, GetScriptForDestination(WitnessUnknown{
         QUANTUM_MIGRATION_WITNESS_VERSION, std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0x42)})},
         migration_end - 100, false, false, 0};
