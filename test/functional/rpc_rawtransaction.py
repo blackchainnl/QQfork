@@ -509,6 +509,9 @@ class RawTransactionsTest(BitcoinTestFramework):
 
         # send 1.2 BTC to msig adr
         txId = self.nodes[0].sendtoaddress(mSigObj, 1.2)
+        tx_hex = self.nodes[0].gettransaction(txId)["hex"]
+        for node in self.nodes[1:]:
+            assert_equal(node.sendrawtransaction(tx_hex), txId)
         self.sync_all()
         self.generate(self.nodes[0], 1)
         # node2 has both keys of the 2of2 ms addr, tx should affect the balance
@@ -530,6 +533,8 @@ class RawTransactionsTest(BitcoinTestFramework):
         txId = self.nodes[0].sendtoaddress(mSigObj, 2.2)
         decTx = self.nodes[0].gettransaction(txId)
         rawTx = self.nodes[0].decoderawtransaction(decTx['hex'])
+        for node in self.nodes[1:]:
+            assert_equal(node.sendrawtransaction(decTx["hex"]), txId)
         self.sync_all()
         self.generate(self.nodes[0], 1)
 

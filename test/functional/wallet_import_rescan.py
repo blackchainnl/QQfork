@@ -280,6 +280,10 @@ class ImportRescanTest(BitcoinTestFramework):
 
         # Mine a block so these parents are confirmed
         assert_equal(len(self.nodes[0].getrawmempool()), len(mempool_variants))
+        for variant in mempool_variants:
+            raw = self.nodes[0].getrawtransaction(variant.initial_txid)
+            for node in self.nodes[1:]:
+                assert_equal(node.sendrawtransaction(raw), variant.initial_txid)
         self.sync_mempools()
         block_to_disconnect = self.generate(self.nodes[0], 1)[0]
         assert_equal(len(self.nodes[0].getrawmempool()), 0)
@@ -300,7 +304,8 @@ class ImportRescanTest(BitcoinTestFramework):
             )
             variant.child_txid = child["txid"]
             variant.amount_received = 0
-            self.nodes[0].sendrawtransaction(child["hex"])
+            for node in self.nodes:
+                assert_equal(node.sendrawtransaction(child["hex"]), variant.child_txid)
 
         # Mempools should contain the child transactions for each variant.
         assert_equal(len(self.nodes[0].getrawmempool()), len(mempool_variants))
