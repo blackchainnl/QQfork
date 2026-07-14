@@ -6,7 +6,11 @@
 
 import unittest
 
-from test_runner import decode_pinned_regression, PINNED_REGRESSION_INPUTS
+from test_runner import (
+    decode_pinned_regression,
+    missing_pinned_regression_targets,
+    PINNED_REGRESSION_INPUTS,
+)
 
 
 class PinnedFuzzRegressionTests(unittest.TestCase):
@@ -32,6 +36,11 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
                 'base64': '*',
                 'sha256': '0' * 64,
             })
+
+    def test_required_block_regression_cannot_be_omitted(self):
+        self.assertEqual(missing_pinned_regression_targets([]), ['block'])
+        self.assertEqual(missing_pinned_regression_targets(['transaction']), ['block'])
+        self.assertEqual(missing_pinned_regression_targets(['block']), [])
 
 
 if __name__ == '__main__':

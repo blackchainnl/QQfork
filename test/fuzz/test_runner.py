@@ -55,6 +55,11 @@ def decode_pinned_regression(regression):
     return data
 
 
+def missing_pinned_regression_targets(targets):
+    """Return pinned regression targets omitted by the selected target set."""
+    return sorted(set(PINNED_REGRESSION_INPUTS).difference(targets))
+
+
 def run_pinned_regressions(*, targets, src_dir, build_dir, using_libfuzzer, use_valgrind):
     selected = sorted(set(targets).intersection(PINNED_REGRESSION_INPUTS))
     if not selected:
@@ -116,6 +121,11 @@ def main():
         '--valgrind',
         action='store_true',
         help='If true, run fuzzing binaries under the valgrind memory error detector',
+    )
+    parser.add_argument(
+        '--require-pinned-regressions',
+        action='store_true',
+        help='Fail unless every source-pinned regression target is selected and executed',
     )
     parser.add_argument(
         "--empty_min_time",
@@ -198,6 +208,16 @@ def main():
                 continue
             test_list_selection.remove(excluded_target)
     test_list_selection.sort()
+
+    if args.require_pinned_regressions:
+        missing_pinned = missing_pinned_regression_targets(test_list_selection)
+        if missing_pinned:
+            logging.error(
+                "Required pinned regression targets are not selected: {}".format(
+                    " ".join(missing_pinned)
+                )
+            )
+            sys.exit(1)
 
     logging.info("{} of {} detected fuzz target(s) selected: {}".format(len(test_list_selection), len(test_list_all), " ".join(test_list_selection)))
 
