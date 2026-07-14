@@ -132,11 +132,15 @@ Notable changes
   post-boundary v30.1.1 wallet/datadir in v30.1.0; restore the cold pre-upgrade
   copy for rollback. Base-chain compatibility does not imply identical shadow
   state.
-- Optional shadowindex schema 7 and coinstatsindex schema 3 automatically
+- Optional shadowindex schema 8 and coinstatsindex schema 3 automatically
   invalidate and rebuild incompatible prerelease records derived with the
   superseded height-5,950,000 competing-claim boundary or incomplete
-  proof-mode and spend-anchor classification. Shadowindex schema 7 persists
-  ordered spend anchors for bounded event construction.
+  proof-mode, spend-anchor, or claim-accounting classification. Shadowindex
+  schema 8 persists at most 64 evaluated claim rows per block plus fixed
+  disposition totals and a deterministic commitment to the complete ordered
+  note stream. The corresponding explorer response is versioned as
+  `blackcoin.shadow.block.v3`; v2's unbounded per-note detail contract is not
+  reused with different semantics.
 - Ordinary v14/v16 quantum funding, ML-DSA spends, and larger post-quantum
   script elements remain disabled throughout Gold Rush and activate at
   Migration height 6,193,000. Gold Rush credits remain phase-locked until that

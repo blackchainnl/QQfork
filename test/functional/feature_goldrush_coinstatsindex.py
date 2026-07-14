@@ -191,7 +191,7 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
             offset = 0
             while True:
                 page = node.getshadowblock(height, offset, 2)
-                assert_equal(page["schema"], "blackcoin.shadow.block.v2")
+                assert_equal(page["schema"], "blackcoin.shadow.block.v3")
                 assert_equal(page["synthetic"], True)
                 assert_equal(page["merkle_included"], False)
                 observed.extend(page["payouts"])
@@ -368,6 +368,8 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         claim_accounting = claim_shadow["pow_claim_accounting"]
         assert_equal(claim_accounting["active"], True)
         assert_equal(claim_accounting["total_records"], 1)
+        assert_equal(claim_accounting["observed_count"], 1)
+        assert_equal(claim_accounting["evaluated_count"], 1)
         assert_equal(claim_accounting["winner_count"], 1)
         assert_equal(claim_accounting["reimbursed_loser_count"], 0)
         assert_equal(claim_accounting["rejected_count"], 0)
@@ -638,7 +640,7 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
             (self.extra_args[1] + ["-reindex-chainstate"], None),
             (
                 self.extra_args[1] + ["-shadowindexmockobsoleteschema=1"],
-                "ShadowIndex: rebuilding incompatible schema version 6 as version 7",
+                "ShadowIndex: rebuilding incompatible schema version 7 as version 8",
             ),
         ):
             if expected_shadow_log:

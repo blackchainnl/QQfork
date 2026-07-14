@@ -31,7 +31,7 @@ from test_framework.messages import (
 )
 from test_framework.p2p import P2PDataStore
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 MAX_REIMBURSEMENT = Decimal("0.01")
@@ -232,17 +232,30 @@ class GoldRushPowContentionTest(BitcoinTestFramework):
     def _assert_competing_accounting(
         self, node, block_hash, expected_pool, claims, payout_by_txid
     ):
+        assert_raises_rpc_error(
+            -8,
+            "claim_count must be between 1 and 64",
+            node.getshadowblock,
+            block_hash,
+            0,
+            10,
+            0,
+            65,
+        )
         page = node.getshadowblock(block_hash, 0, 10, 0, 10)
-        assert_equal(page["schema"], "blackcoin.shadow.block.v2")
+        assert_equal(page["schema"], "blackcoin.shadow.block.v3")
         assert_equal(page["total_payouts"], 2)
         assert_equal(page["count"], 2)
         assert_equal(self._amount(page["pow_payout_total"]), expected_pool)
         summary = page["pow_claim_accounting"]
         assert_equal(summary["active"], True)
         assert_equal(summary["total_records"], 2)
+        assert_equal(summary["observed_count"], 2)
+        assert_equal(summary["evaluated_count"], 2)
         assert_equal(summary["winner_count"], 1)
         assert_equal(summary["reimbursed_loser_count"], 1)
         assert_equal(summary["rejected_count"], 0)
+        assert len(summary["accounting_commitment"]) == 64
         assert_equal(self._amount(summary["credited_total"]), expected_pool)
         assert_equal(summary["next_offset"], None)
 
@@ -375,11 +388,13 @@ class GoldRushPowContentionTest(BitcoinTestFramework):
         assert_equal(pow_page["observed_pow_claim_txids"], [claim_a["txid"]])
         assert_equal(pow_page["total_payouts"], 0)
         assert_equal(self._amount(pow_page["pow_payout_total"]), Decimal(0))
-        assert_equal(pow_page["pow_claim_accounting"]["total_records"], 1)
-        assert_equal(
-            pow_page["pow_claim_accounting"]["records"][0]["disposition"],
-            "invalid_location",
-        )
+        pow_summary = pow_page["pow_claim_accounting"]
+        assert_equal(pow_summary["total_records"], 0)
+        assert_equal(pow_summary["observed_count"], 1)
+        assert_equal(pow_summary["evaluated_count"], 0)
+        assert_equal(pow_summary["invalid_location_count"], 1)
+        assert_equal(pow_summary["rejected_count"], 1)
+        assert_equal(pow_summary["records"], [])
         assert_equal(self._quantum_utxos(claimant_a, payout_a), [])
         self.nodes[0].invalidateblock(pow_hash)
         self.wait_until(lambda: self.nodes[0].getbestblockhash() == parent_hash, timeout=30)
@@ -454,6 +469,10 @@ class GoldRushPowContentionTest(BitcoinTestFramework):
             self._normalized_accounting(page_ab["pow_claim_accounting"]),
             self._normalized_accounting(page_ba["pow_claim_accounting"]),
         )
+        assert (
+            page_ab["pow_claim_accounting"]["accounting_commitment"]
+            != page_ba["pow_claim_accounting"]["accounting_commitment"]
+        ), "ordered-note commitment must distinguish transaction permutations"
 
         utxo_ab_a = self._assert_wallet_claim(
             self.nodes[0],

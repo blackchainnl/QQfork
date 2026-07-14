@@ -67,18 +67,38 @@ struct ShadowIndexPowClaimRecord {
 
 struct ShadowIndexPowClaimSummary {
     bool active{false};
+    /** Number of persisted detailed rows; always <= 64. */
     uint32_t record_count{0};
+    /** Number of all QQSPROOF-shaped outputs committed by this block. */
+    uint32_t observed_count{0};
+    uint32_t evaluated_count{0};
     uint32_t winner_count{0};
     uint32_t reimbursed_loser_count{0};
     uint32_t rejected_count{0};
+    uint32_t invalid_location_count{0};
+    uint32_t malformed_transaction_count{0};
+    uint32_t invalid_proof_count{0};
+    uint32_t wrong_mode_count{0};
+    uint32_t unknown_mode_count{0};
+    uint32_t input_mismatch_count{0};
+    uint32_t invalid_base_fee_count{0};
+    uint32_t evaluation_limit_count{0};
+    uint256 accounting_commitment;
     CAmount credited_total{0};
     CAmount winner_credited_total{0};
     CAmount reimbursed_credited_total{0};
 
     SERIALIZE_METHODS(ShadowIndexPowClaimSummary, obj)
     {
-        READWRITE(obj.active, obj.record_count, obj.winner_count,
+        READWRITE(obj.active, obj.record_count, obj.observed_count,
+                  obj.evaluated_count, obj.winner_count,
                   obj.reimbursed_loser_count, obj.rejected_count,
+                  obj.invalid_location_count,
+                  obj.malformed_transaction_count,
+                  obj.invalid_proof_count, obj.wrong_mode_count,
+                  obj.unknown_mode_count, obj.input_mismatch_count,
+                  obj.invalid_base_fee_count, obj.evaluation_limit_count,
+                  obj.accounting_commitment,
                   obj.credited_total, obj.winner_credited_total,
                   obj.reimbursed_credited_total);
     }

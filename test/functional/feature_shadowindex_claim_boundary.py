@@ -136,10 +136,13 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
         accounting = page["pow_claim_accounting"]
         assert_equal(accounting["active"], False)
         assert_equal(accounting["total_records"], 0)
+        assert_equal(accounting["observed_count"], 0)
+        assert_equal(accounting["evaluated_count"], 0)
         assert_equal(accounting["winner_count"], 0)
         assert_equal(accounting["reimbursed_loser_count"], 0)
         assert_equal(accounting["rejected_count"], 0)
         assert_equal(accounting["credited_total"], Decimal("0.00000000"))
+        assert_equal(accounting["accounting_commitment"], None)
         assert_equal(accounting["records"], [])
         assert_equal(accounting["next_offset"], None)
 
@@ -154,9 +157,12 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
         accounting = page["pow_claim_accounting"]
         assert_equal(accounting["active"], True)
         assert_equal(accounting["total_records"], 1)
+        assert_equal(accounting["observed_count"], 1)
+        assert_equal(accounting["evaluated_count"], 1)
         assert_equal(accounting["winner_count"], 1)
         assert_equal(accounting["reimbursed_loser_count"], 0)
         assert_equal(accounting["rejected_count"], 0)
+        assert len(accounting["accounting_commitment"]) == 64
         assert_equal(accounting["records"][0]["txid"], claim_txid)
         assert_equal(accounting["records"][0]["disposition"], "winner")
         assert_equal(accounting["records"][0]["synthetic_txid"], payout_txid)

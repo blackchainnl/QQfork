@@ -6,11 +6,14 @@
 
 #include <chainparams.h>
 #include <common/args.h>
+#include <consensus/consensus.h>
+#include <consensus/merkle.h>
 #include <dbwrapper.h>
 #include <index/coinstatsindex.h>
 #include <index/shadowindex.h>
 #include <interfaces/chain.h>
 #include <kernel/coinstats.h>
+#include <pow.h>
 #include <shadow.h>
 #include <test/util/index.h>
 #include <test/util/setup_common.h>
@@ -18,6 +21,27 @@
 #include <validation.h>
 
 #include <boost/test/unit_test.hpp>
+
+#include <chrono>
+
+namespace {
+
+class BoundedShadowIndexTestingSetup : public TestChain100Setup
+{
+public:
+    BoundedShadowIndexTestingSetup()
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-regtest",
+              "-shadowwhitelistheight=100",
+              "-shadowgoldrushstartheight=101",
+              "-shadowgoldrushblocks=4",
+              "-shadowcompetingclaimsheight=101",
+          }}
+    {
+    }
+};
+
+} // namespace
 
 BOOST_AUTO_TEST_SUITE(coinstatsindex_tests)
 
@@ -27,7 +51,7 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
     static constexpr uint32_t PRERELEASE_COINSTATS_SCHEMA{2};
     static constexpr uint32_t CURRENT_COINSTATS_SCHEMA{3};
     static constexpr uint32_t PRERELEASE_SHADOW_SCHEMA{4};
-    static constexpr uint32_t CURRENT_SHADOW_SCHEMA{7};
+    static constexpr uint32_t CURRENT_SHADOW_SCHEMA{8};
     const std::string sentinel{"prerelease-claim-allocation"};
 
     const auto build_index = [](BaseIndex& index) {
@@ -132,6 +156,191 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
         BOOST_REQUIRE(db.Write(SCHEMA_KEY, CURRENT_SHADOW_SCHEMA + 1));
     }
     BOOST_CHECK_THROW((ShadowIndex{interfaces::MakeChain(m_node), 1 << 20}), std::runtime_error);
+}
+
+BOOST_FIXTURE_TEST_CASE(shadowindex_bounded_claim_state_survives_max_weight_reorg_and_rebuild,
+                        BoundedShadowIndexTestingSetup)
+{
+    static constexpr int64_t MAX_OPERATION_MILLISECONDS{120000};
+    static constexpr size_t MAX_PERSISTED_BLOCK_RECORD_BYTES{4096};
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+    const CScript script_pub_key{
+        CScript{} << ToByteVector(coinbaseKey.GetPubKey()) << OP_CHECKSIG};
+
+    ShadowIndex index{interfaces::MakeChain(m_node), 1 << 20, true};
+    BOOST_REQUIRE(index.Init());
+    BOOST_REQUIRE(index.StartBackgroundSync());
+    IndexWaitSynced(index);
+
+    CBlock stress_block = CreateBlock({}, script_pub_key, chainstate);
+    CMutableTransaction coinbase{*stress_block.vtx.at(0)};
+    const size_t base_output_count = coinbase.vout.size();
+    const valtype malformed_payload{'Q', 'Q', 'S', 'P', 'R', 'O', 'O', 'F', 0};
+    const CTxOut malformed_output{
+        0, CScript{} << OP_RETURN << malformed_payload};
+    const size_t output_weight =
+        GetSerializeSize(TX_NO_WITNESS(malformed_output)) *
+        WITNESS_SCALE_FACTOR;
+    BOOST_REQUIRE_GT(output_weight, 0U);
+    const size_t available_weight =
+        MAX_BLOCK_WEIGHT - GetBlockWeight(stress_block);
+    const size_t initial_output_count = available_weight / output_weight;
+    coinbase.vout.reserve(coinbase.vout.size() + initial_output_count);
+    for (size_t i = 0; i < initial_output_count; ++i) {
+        coinbase.vout.push_back(malformed_output);
+    }
+    stress_block.vtx[0] = MakeTransactionRef(coinbase);
+    stress_block.hashMerkleRoot = BlockMerkleRoot(stress_block);
+    while (GetBlockWeight(stress_block) > MAX_BLOCK_WEIGHT) {
+        coinbase.vout.pop_back();
+        stress_block.vtx[0] = MakeTransactionRef(coinbase);
+        stress_block.hashMerkleRoot = BlockMerkleRoot(stress_block);
+    }
+    while (GetBlockWeight(stress_block) + output_weight <= MAX_BLOCK_WEIGHT) {
+        coinbase.vout.push_back(malformed_output);
+        stress_block.vtx[0] = MakeTransactionRef(coinbase);
+        stress_block.hashMerkleRoot = BlockMerkleRoot(stress_block);
+    }
+    const uint32_t expected_notes =
+        static_cast<uint32_t>(coinbase.vout.size() - base_output_count);
+    BOOST_REQUIRE_GT(expected_notes, MAX_SHADOW_POW_EVALS_PER_BLOCK);
+    BOOST_CHECK_LE(MAX_BLOCK_WEIGHT - GetBlockWeight(stress_block),
+                   output_weight);
+    stress_block.nNonce = 0;
+    while (!CheckProofOfWork(stress_block.GetPoWHash(), stress_block.nBits,
+                             chainman.GetConsensus())) {
+        ++stress_block.nNonce;
+    }
+    const uint256 stress_hash = stress_block.GetHash();
+
+    const auto require_within_limit = [&](const char* operation,
+                                          const auto& callable) {
+        const auto start = std::chrono::steady_clock::now();
+        callable();
+        const int64_t elapsed_milliseconds =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - start)
+                .count();
+        BOOST_TEST_CONTEXT(operation) {
+            BOOST_CHECK_LT(elapsed_milliseconds,
+                           MAX_OPERATION_MILLISECONDS);
+        }
+    };
+    const auto wait_for_index = [&] {
+        SyncWithValidationInterfaceQueue();
+        IndexWaitSynced(index);
+    };
+
+    require_within_limit("maximum-weight connect and live index append", [&] {
+        bool new_block{false};
+        BOOST_REQUIRE(chainman.ProcessNewBlock(
+            std::make_shared<const CBlock>(stress_block), true, true,
+            &new_block));
+        BOOST_REQUIRE(new_block);
+        wait_for_index();
+    });
+
+    ShadowIndexBlockRecord first_record;
+    BOOST_REQUIRE(index.LookupBlock(stress_hash, first_record));
+    BOOST_CHECK(first_record.pow_claims.active);
+    BOOST_CHECK_EQUAL(first_record.pow_claims.observed_count, expected_notes);
+    BOOST_CHECK_EQUAL(first_record.pow_claims.evaluated_count, 0U);
+    BOOST_CHECK_EQUAL(first_record.pow_claims.record_count, 0U);
+    BOOST_CHECK_EQUAL(first_record.pow_claims.invalid_location_count,
+                      expected_notes);
+    BOOST_CHECK_EQUAL(first_record.pow_claims.rejected_count, expected_notes);
+    BOOST_CHECK(!first_record.pow_claims.accounting_commitment.IsNull());
+    BOOST_CHECK_EQUAL(first_record.observed_pow_claim_txids.size(), 1U);
+    BOOST_CHECK_LE(GetSerializeSize(first_record),
+                   MAX_PERSISTED_BLOCK_RECORD_BYTES);
+    std::vector<ShadowIndexPowClaimRecord> claims;
+    std::optional<size_t> next;
+    BOOST_REQUIRE(index.LookupPowClaims(stress_hash, 0,
+                                       MAX_SHADOW_POW_EVALS_PER_BLOCK,
+                                       claims, next));
+    BOOST_CHECK(claims.empty());
+    BOOST_CHECK(!next.has_value());
+    BOOST_CHECK(!index.LookupPowClaims(stress_hash, 0,
+                                      MAX_SHADOW_POW_EVALS_PER_BLOCK + 1,
+                                      claims, next));
+
+    CBlockIndex* stress_index{nullptr};
+    {
+        LOCK(cs_main);
+        stress_index = chainman.m_blockman.LookupBlockIndex(stress_hash);
+    }
+    BOOST_REQUIRE(stress_index != nullptr);
+    require_within_limit("maximum-weight disconnect and index undo", [&] {
+        BlockValidationState state;
+        BOOST_REQUIRE(chainstate.InvalidateBlock(state, stress_index));
+        BOOST_REQUIRE_MESSAGE(state.IsValid(), state.ToString());
+        wait_for_index();
+    });
+    ShadowIndexBlockRecord disconnected_record;
+    BOOST_CHECK(!index.LookupBlock(stress_hash, disconnected_record));
+
+    CBlock alternate_block;
+    require_within_limit("alternate-chain connect", [&] {
+        alternate_block = CreateAndProcessBlock({}, script_pub_key);
+        wait_for_index();
+    });
+    const uint256 alternate_hash = alternate_block.GetHash();
+    ShadowIndexBlockRecord alternate_record;
+    BOOST_REQUIRE(index.LookupBlock(alternate_hash, alternate_record));
+    BOOST_CHECK_EQUAL(alternate_record.pow_claims.observed_count, 0U);
+    BOOST_CHECK(!alternate_record.pow_claims.accounting_commitment.IsNull());
+
+    require_within_limit("reorg back to maximum-weight block", [&] {
+        CBlockIndex* alternate_index{nullptr};
+        {
+            LOCK(cs_main);
+            alternate_index =
+                chainman.m_blockman.LookupBlockIndex(alternate_hash);
+        }
+        BOOST_REQUIRE(alternate_index != nullptr);
+        BlockValidationState state;
+        BOOST_REQUIRE(chainstate.InvalidateBlock(state, alternate_index));
+        BOOST_REQUIRE_MESSAGE(state.IsValid(), state.ToString());
+        {
+            LOCK(cs_main);
+            chainstate.ResetBlockFailureFlags(stress_index);
+        }
+        BlockValidationState activate_state;
+        BOOST_REQUIRE(chainstate.ActivateBestChain(activate_state));
+        BOOST_REQUIRE_MESSAGE(activate_state.IsValid(),
+                              activate_state.ToString());
+        wait_for_index();
+    });
+    BOOST_CHECK_EQUAL(
+        WITH_LOCK(cs_main, return chainstate.m_chain.Tip()->GetBlockHash()),
+        stress_hash);
+    ShadowIndexBlockRecord reconnected_record;
+    BOOST_REQUIRE(index.LookupBlock(stress_hash, reconnected_record));
+    BOOST_CHECK_EQUAL(reconnected_record.pow_claims.accounting_commitment,
+                      first_record.pow_claims.accounting_commitment);
+    BOOST_CHECK_EQUAL(reconnected_record.pow_claims.observed_count,
+                      expected_notes);
+
+    SyncWithValidationInterfaceQueue();
+    index.Stop();
+    require_within_limit("clean shadowindex rebuild over maximum-weight block", [&] {
+        ShadowIndex rebuilt{interfaces::MakeChain(m_node), 1 << 20,
+                            /*memory=*/true, /*wipe=*/true};
+        BOOST_REQUIRE(rebuilt.Init());
+        BOOST_REQUIRE(rebuilt.StartBackgroundSync());
+        IndexWaitSynced(rebuilt);
+        ShadowIndexBlockRecord rebuilt_record;
+        BOOST_REQUIRE(rebuilt.LookupBlock(stress_hash, rebuilt_record));
+        BOOST_CHECK_EQUAL(rebuilt_record.pow_claims.accounting_commitment,
+                          first_record.pow_claims.accounting_commitment);
+        BOOST_CHECK_EQUAL(rebuilt_record.pow_claims.observed_count,
+                          expected_notes);
+        BOOST_CHECK_EQUAL(rebuilt_record.pow_claims.record_count, 0U);
+        BOOST_CHECK_LE(GetSerializeSize(rebuilt_record),
+                       MAX_PERSISTED_BLOCK_RECORD_BYTES);
+        rebuilt.Stop();
+    });
 }
 
 BOOST_FIXTURE_TEST_CASE(shadow_replay_preserves_pre_whitelist_snapshot_stats, TestChain100Setup)

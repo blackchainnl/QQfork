@@ -40,10 +40,12 @@ static constexpr uint8_t DB_POW_CLAIM{'c'};
 static constexpr uint8_t DB_CUSTOM_TIP{'T'};
 // Schema 5 invalidated prerelease records built with the superseded claim
 // activation boundary. Schema 6 is reserved for the additive proof-mode
-// accounting update. Schema 7 persists ordered shadow-spend anchors for bounded
-// event construction. The index is auxiliary and fully reconstructible, so a
-// recognized older schema is wiped and rebuilt instead of being interpreted.
-static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{7};
+// accounting update. Schema 7 persists ordered shadow-spend anchors. Schema 8
+// replaces unbounded per-note/per-transaction claim data with a strict
+// top-64 detail set, fixed aggregates, and an authenticated commitment. The
+// index is auxiliary and fully reconstructible, so a recognized older schema
+// is wiped and rebuilt instead of being interpreted.
+static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{8};
 static constexpr size_t MAX_SCRIPT_QUERY_RESULTS{1000};
 static constexpr size_t DIRECT_QUANTUM_SCRIPT_SIZE{2 + QUANTUM_MIGRATION_PROGRAM_SIZE};
 
@@ -312,6 +314,18 @@ bool IsValidShadowPowClaimRecord(const ShadowIndexPowClaimRecord& record)
         record.credited_amount < 0 || !MoneyRange(record.credited_amount)) {
         return false;
     }
+    switch (record.source.disposition) {
+    case ShadowPowClaimDisposition::INVALID_PROOF:
+    case ShadowPowClaimDisposition::INPUT_MISMATCH:
+    case ShadowPowClaimDisposition::INVALID_BASE_FEE:
+    case ShadowPowClaimDisposition::WINNER:
+    case ShadowPowClaimDisposition::REIMBURSED_LOSER:
+        break;
+    default:
+        // Schema 8 represents structural and over-budget outcomes only in
+        // the fixed block aggregate; they can never have detail rows.
+        return false;
+    }
     const bool credited_disposition =
         IsCreditedPowDisposition(record.source.disposition);
     if ((credited_disposition &&
@@ -352,10 +366,25 @@ bool IsValidShadowIndexBlockRecord(const ShadowIndexBlockRecord& record)
     }
 
     const ShadowIndexPowClaimSummary& summary = record.pow_claims;
-    if (summary.winner_count > 1 ||
+    const uint64_t rejected_breakdown =
+        static_cast<uint64_t>(summary.invalid_location_count) +
+        summary.malformed_transaction_count + summary.invalid_proof_count +
+        summary.wrong_mode_count + summary.unknown_mode_count +
+        summary.input_mismatch_count + summary.invalid_base_fee_count +
+        summary.evaluation_limit_count;
+    const uint64_t evaluated_breakdown =
+        static_cast<uint64_t>(summary.invalid_proof_count) +
+        summary.input_mismatch_count + summary.invalid_base_fee_count +
+        summary.winner_count + summary.reimbursed_loser_count;
+    if (summary.record_count > MAX_SHADOW_POW_EVALS_PER_BLOCK ||
+        summary.evaluated_count != summary.record_count ||
+        summary.observed_count > MAX_SHADOW_POW_NOTES_PER_BLOCK ||
+        summary.winner_count > 1 ||
         static_cast<uint64_t>(summary.winner_count) +
                 summary.reimbursed_loser_count + summary.rejected_count !=
-            summary.record_count ||
+            summary.observed_count ||
+        rejected_breakdown != summary.rejected_count ||
+        evaluated_breakdown != summary.evaluated_count ||
         summary.credited_total < 0 || !MoneyRange(summary.credited_total) ||
         summary.winner_credited_total < 0 ||
         !MoneyRange(summary.winner_credited_total) ||
@@ -369,7 +398,17 @@ bool IsValidShadowIndexBlockRecord(const ShadowIndexBlockRecord& record)
         Params().GetConsensus().IsShadowCompetingClaimsActive(record.height);
     if (summary.active != accounting_expected ||
         (!summary.active &&
-         (summary.record_count != 0 || summary.credited_total != 0))) {
+         (summary.record_count != 0 || summary.observed_count != 0 ||
+          summary.credited_total != 0 ||
+          !summary.accounting_commitment.IsNull())) ||
+        (summary.active && summary.accounting_commitment.IsNull())) {
+        return false;
+    }
+
+    if (record.observed_pow_claim_txids.size() >
+            MAX_SHADOW_POW_EVALS_PER_BLOCK ||
+        (summary.active && record.observed_pow_claim_txids.size() >
+                               summary.observed_count)) {
         return false;
     }
 
@@ -850,19 +889,28 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
     // cs_main, so explorer indexing cannot hold the validation lock while
     // evaluating memory-hard proofs.
     std::vector<ShadowPowClaimAccounting> pow_accounting;
-    const bool has_pow_notes = std::any_of(
-        block.data->vtx.begin(), block.data->vtx.end(),
-        [](const CTransactionRef& tx) { return TransactionHasShadowProof(*tx); });
+    ShadowPowClaimAggregate pow_accounting_aggregate;
     if (pow_accounting_context.valid && pow_accounting_context.canonical_rule_active &&
-        has_pow_notes) {
+        block.height >= SHADOW_REWARD_START_HEIGHT) {
         CBlockUndo block_undo;
-        if (block.height <= 0 ||
-            !m_chainstate->m_blockman.UndoReadFromDisk(block_undo, *pindex)) {
-            return error("%s: unable to read undo for POW claim accounting at %s",
-                         __func__, block.hash.ToString());
+        const bool has_pow_notes = std::any_of(
+            block.data->vtx.begin(), block.data->vtx.end(),
+            [](const CTransactionRef& tx) {
+                return TransactionHasShadowProof(*tx);
+            });
+        const CBlockUndo* block_undo_ptr{nullptr};
+        if (has_pow_notes) {
+            if (block.height <= 0 ||
+                !m_chainstate->m_blockman.UndoReadFromDisk(block_undo,
+                                                           *pindex)) {
+                return error("%s: unable to read undo for POW claim accounting at %s",
+                             __func__, block.hash.ToString());
+            }
+            block_undo_ptr = &block_undo;
         }
         if (EvaluateShadowPowClaimAccounting(pow_accounting_context, *block.data,
-                                             &block_undo, pow_accounting) !=
+                                             block_undo_ptr, pow_accounting,
+                                             &pow_accounting_aggregate) !=
             ShadowPowAccountingResult::OK) {
             return error("%s: POW claim accounting failed locally for %s",
                          __func__, block.hash.ToString());
@@ -1078,8 +1126,47 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         }
     }
 
-    if (pow_accounting.size() > std::numeric_limits<uint32_t>::max()) {
-        return error("%s: too many POW claim accounting records", __func__);
+    if (pow_accounting.size() > MAX_SHADOW_POW_EVALS_PER_BLOCK) {
+        return error("%s: POW claim detail exceeds bounded evaluation limit", __func__);
+    }
+    if (block_record.pow_claims.active) {
+        block_record.pow_claims.record_count =
+            static_cast<uint32_t>(pow_accounting.size());
+        block_record.pow_claims.observed_count =
+            pow_accounting_aggregate.observed_count;
+        block_record.pow_claims.evaluated_count =
+            pow_accounting_aggregate.evaluated_count;
+        block_record.pow_claims.winner_count =
+            pow_accounting_aggregate.winner_count;
+        block_record.pow_claims.reimbursed_loser_count =
+            pow_accounting_aggregate.reimbursed_loser_count;
+        block_record.pow_claims.invalid_location_count =
+            pow_accounting_aggregate.invalid_location_count;
+        block_record.pow_claims.malformed_transaction_count =
+            pow_accounting_aggregate.malformed_transaction_count;
+        block_record.pow_claims.invalid_proof_count =
+            pow_accounting_aggregate.invalid_proof_count;
+        block_record.pow_claims.wrong_mode_count =
+            pow_accounting_aggregate.wrong_mode_count;
+        block_record.pow_claims.unknown_mode_count =
+            pow_accounting_aggregate.unknown_mode_count;
+        block_record.pow_claims.input_mismatch_count =
+            pow_accounting_aggregate.input_mismatch_count;
+        block_record.pow_claims.invalid_base_fee_count =
+            pow_accounting_aggregate.invalid_base_fee_count;
+        block_record.pow_claims.evaluation_limit_count =
+            pow_accounting_aggregate.evaluation_limit_count;
+        block_record.pow_claims.accounting_commitment =
+            pow_accounting_aggregate.accounting_commitment;
+        const uint64_t credited_claims =
+            static_cast<uint64_t>(block_record.pow_claims.winner_count) +
+            block_record.pow_claims.reimbursed_loser_count;
+        if (credited_claims > block_record.pow_claims.observed_count) {
+            return error("%s: invalid bounded POW claim aggregates", __func__);
+        }
+        block_record.pow_claims.rejected_count =
+            block_record.pow_claims.observed_count -
+            static_cast<uint32_t>(credited_claims);
     }
     std::vector<const ShadowSyntheticPayoutTransaction*> pow_payouts;
     CAmount pow_payout_total{0};
@@ -1111,26 +1198,21 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         claim_record.payout_script = accounting.payout_script;
         claim_record.credited_amount = accounting.credited_amount;
 
-        if (!Increment(block_record.pow_claims.record_count) ||
-            !AddMoney(block_record.pow_claims.credited_total,
+        if (!AddMoney(block_record.pow_claims.credited_total,
                       accounting.credited_amount)) {
             return error("%s: POW claim accounting aggregate overflow", __func__);
         }
         if (accounting.disposition == ShadowPowClaimDisposition::WINNER) {
-            if (!Increment(block_record.pow_claims.winner_count) ||
-                !AddMoney(block_record.pow_claims.winner_credited_total,
+            if (!AddMoney(block_record.pow_claims.winner_credited_total,
                           accounting.credited_amount)) {
                 return error("%s: POW winner accounting overflow", __func__);
             }
         } else if (accounting.disposition ==
                    ShadowPowClaimDisposition::REIMBURSED_LOSER) {
-            if (!Increment(block_record.pow_claims.reimbursed_loser_count) ||
-                !AddMoney(block_record.pow_claims.reimbursed_credited_total,
+            if (!AddMoney(block_record.pow_claims.reimbursed_credited_total,
                           accounting.credited_amount)) {
                 return error("%s: POW loser accounting overflow", __func__);
             }
-        } else if (!Increment(block_record.pow_claims.rejected_count)) {
-            return error("%s: POW rejection accounting overflow", __func__);
         }
 
         if (IsCreditedPowDisposition(accounting.disposition) &&
@@ -1152,11 +1234,14 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         batch.Write(DBPowClaimKey{block.hash, accounting_index}, claim_record);
     }
     if (block_record.pow_claims.record_count != pow_accounting.size() ||
+        block_record.pow_claims.record_count > MAX_SHADOW_POW_EVALS_PER_BLOCK ||
+        block_record.pow_claims.evaluated_count !=
+            block_record.pow_claims.record_count ||
         block_record.pow_claims.winner_count > 1 ||
         block_record.pow_claims.winner_count +
                 block_record.pow_claims.reimbursed_loser_count +
                 block_record.pow_claims.rejected_count !=
-            block_record.pow_claims.record_count ||
+            block_record.pow_claims.observed_count ||
         block_record.pow_claims.winner_credited_total +
                 block_record.pow_claims.reimbursed_credited_total !=
             block_record.pow_claims.credited_total ||
@@ -1165,7 +1250,9 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
           block_record.pow_claims.credited_total != pow_payout_total)) ||
         (!block_record.pow_claims.active &&
          (next_pow_payout != 0 || block_record.pow_claims.record_count != 0 ||
-          block_record.pow_claims.credited_total != 0))) {
+          block_record.pow_claims.observed_count != 0 ||
+          block_record.pow_claims.credited_total != 0 ||
+          !block_record.pow_claims.accounting_commitment.IsNull()))) {
         return error("%s: inconsistent POW claim accounting summary", __func__);
     }
 
@@ -1211,7 +1298,11 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
     }
 
     for (const CTransactionRef& tx : block.data->vtx) {
-        if (TransactionHasShadowProof(*tx)) block_record.observed_pow_claim_txids.push_back(tx->GetHash());
+        if (TransactionHasShadowProof(*tx) &&
+            block_record.observed_pow_claim_txids.size() <
+                MAX_SHADOW_POW_EVALS_PER_BLOCK) {
+            block_record.observed_pow_claim_txids.push_back(tx->GetHash());
+        }
         if (TransactionHasShadowSignal(*tx)) block_record.observed_signal_txids.push_back(tx->GetHash());
     }
 
@@ -1428,7 +1519,7 @@ bool ShadowIndex::LookupPowClaims(
 {
     records.clear();
     next.reset();
-    if (limit == 0 || limit > MAX_SCRIPT_QUERY_RESULTS) return false;
+    if (limit == 0 || limit > MAX_SHADOW_POW_EVALS_PER_BLOCK) return false;
     ShadowIndexBlockRecord block;
     if (!LookupBlock(block_hash, block)) return false;
     const size_t total = block.pow_claims.record_count;

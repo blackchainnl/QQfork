@@ -39,6 +39,8 @@ namespace {
 
 static constexpr int DEFAULT_SHADOW_PAGE_SIZE{100};
 static constexpr int MAX_SHADOW_PAGE_SIZE{1000};
+static constexpr int MAX_SHADOW_CLAIM_PAGE_SIZE{
+    static_cast<int>(MAX_SHADOW_POW_EVALS_PER_BLOCK)};
 static constexpr int64_t DEFAULT_EFFECTIVE_SCAN_LIMIT{1000000};
 static constexpr int64_t MAX_EFFECTIVE_SCAN_LIMIT{10000000};
 
@@ -504,7 +506,7 @@ RPCHelpMan getshadowblock()
             {"offset", RPCArg::Type::NUM, RPCArg::Default{0}, "Zero-based payout offset"},
             {"count", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_SHADOW_PAGE_SIZE}, "Maximum payouts to return (1-1000)"},
             {"claim_offset", RPCArg::Type::NUM, RPCArg::Default{0}, "Zero-based canonical POW-claim accounting offset"},
-            {"claim_count", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_SHADOW_PAGE_SIZE}, "Maximum POW-claim records to return (1-1000)"},
+            {"claim_count", RPCArg::Type::NUM, RPCArg::Default{MAX_SHADOW_CLAIM_PAGE_SIZE}, "Maximum POW-claim records to return (1-64)"},
         },
         RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing shadow block record",
             {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
@@ -516,14 +518,14 @@ RPCHelpMan getshadowblock()
             const int offset = request.params[1].isNull() ? 0 : request.params[1].getInt<int>();
             const int count = request.params[2].isNull() ? DEFAULT_SHADOW_PAGE_SIZE : request.params[2].getInt<int>();
             const int claim_offset = request.params[3].isNull() ? 0 : request.params[3].getInt<int>();
-            const int claim_count = request.params[4].isNull() ? DEFAULT_SHADOW_PAGE_SIZE : request.params[4].getInt<int>();
+            const int claim_count = request.params[4].isNull() ? MAX_SHADOW_CLAIM_PAGE_SIZE : request.params[4].getInt<int>();
             if (offset < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "offset must be non-negative");
             if (claim_offset < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "claim_offset must be non-negative");
             if (count < 1 || count > MAX_SHADOW_PAGE_SIZE) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "count must be between 1 and 1000");
             }
-            if (claim_count < 1 || claim_count > MAX_SHADOW_PAGE_SIZE) {
-                throw JSONRPCError(RPC_INVALID_PARAMETER, "claim_count must be between 1 and 1000");
+            if (claim_count < 1 || claim_count > MAX_SHADOW_CLAIM_PAGE_SIZE) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "claim_count must be between 1 and 64");
             }
 
             EnsureShadowIndexReady();
@@ -625,7 +627,7 @@ RPCHelpMan getshadowblock()
             const bool reward_active = IsShadowGoldRushRewardActive(
                 consensus, indexed.median_time_past, pindex->nHeight);
             UniValue result(UniValue::VOBJ);
-            result.pushKV("schema", "blackcoin.shadow.block.v2");
+            result.pushKV("schema", "blackcoin.shadow.block.v3");
             result.pushKV("height", pindex->nHeight);
             result.pushKV("blockhash", pindex->GetBlockHash().GetHex());
             result.pushKV("time", indexed.block_time);
@@ -645,9 +647,22 @@ RPCHelpMan getshadowblock()
             UniValue claim_summary(UniValue::VOBJ);
             claim_summary.pushKV("active", indexed.pow_claims.active);
             claim_summary.pushKV("total_records", indexed.pow_claims.record_count);
+            claim_summary.pushKV("observed_count", indexed.pow_claims.observed_count);
+            claim_summary.pushKV("evaluated_count", indexed.pow_claims.evaluated_count);
             claim_summary.pushKV("winner_count", indexed.pow_claims.winner_count);
             claim_summary.pushKV("reimbursed_loser_count", indexed.pow_claims.reimbursed_loser_count);
             claim_summary.pushKV("rejected_count", indexed.pow_claims.rejected_count);
+            claim_summary.pushKV("invalid_location_count", indexed.pow_claims.invalid_location_count);
+            claim_summary.pushKV("malformed_transaction_count", indexed.pow_claims.malformed_transaction_count);
+            claim_summary.pushKV("invalid_proof_count", indexed.pow_claims.invalid_proof_count);
+            claim_summary.pushKV("wrong_mode_count", indexed.pow_claims.wrong_mode_count);
+            claim_summary.pushKV("unknown_mode_count", indexed.pow_claims.unknown_mode_count);
+            claim_summary.pushKV("input_mismatch_count", indexed.pow_claims.input_mismatch_count);
+            claim_summary.pushKV("invalid_base_fee_count", indexed.pow_claims.invalid_base_fee_count);
+            claim_summary.pushKV("evaluation_limit_count", indexed.pow_claims.evaluation_limit_count);
+            claim_summary.pushKV("accounting_commitment", indexed.pow_claims.active
+                ? UniValue(indexed.pow_claims.accounting_commitment.GetHex())
+                : UniValue{});
             claim_summary.pushKV("credited_total", ValueFromAmount(indexed.pow_claims.credited_total));
             claim_summary.pushKV("winner_credited_total", ValueFromAmount(indexed.pow_claims.winner_credited_total));
             claim_summary.pushKV("reimbursed_credited_total", ValueFromAmount(indexed.pow_claims.reimbursed_credited_total));

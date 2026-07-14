@@ -2,6 +2,7 @@
 #define BITCOIN_SHADOW_H
 
 #include <consensus/amount.h>
+#include <consensus/consensus.h>
 #include <primitives/block.h>
 #include <script/script.h>
 #include <util/fs.h>
@@ -144,6 +145,14 @@ struct ShadowProofObservation {
     bool duplicate_in_transaction{false};
 };
 
+/** Bounded structural scan metadata for compatibility RPCs. */
+struct ShadowProofObservationSummary {
+    uint32_t observed_count{0};
+    uint32_t returned_count{0};
+    uint32_t omitted_count{0};
+    uint256 commitment;
+};
+
 enum class ShadowPowClaimDisposition : uint8_t {
     // Values 0-7 were persisted by the first canonical-accounting release.
     // Keep them explicit so old shadow indexes retain their exact meaning.
@@ -168,6 +177,29 @@ struct ShadowPowClaimAccounting {
     CAmount credited_amount{0};
     bool base_fee_known{false};
     ShadowPowClaimDisposition disposition{ShadowPowClaimDisposition::INVALID_PROOF};
+};
+
+/**
+ * Fixed-size block aggregate for post-boundary QQSPROOF accounting.
+ *
+ * Only Argon2-evaluated candidates have detailed rows. All other notes are
+ * represented by these counters and by accounting_commitment, which commits
+ * to every exact note plus the complete deterministic classification.
+ */
+struct ShadowPowClaimAggregate {
+    uint32_t observed_count{0};
+    uint32_t evaluated_count{0};
+    uint32_t invalid_location_count{0};
+    uint32_t malformed_transaction_count{0};
+    uint32_t invalid_proof_count{0};
+    uint32_t wrong_mode_count{0};
+    uint32_t unknown_mode_count{0};
+    uint32_t input_mismatch_count{0};
+    uint32_t invalid_base_fee_count{0};
+    uint32_t evaluation_limit_count{0};
+    uint32_t winner_count{0};
+    uint32_t reimbursed_loser_count{0};
+    uint256 accounting_commitment;
 };
 
 /** Immutable, lock-free input to the bounded claim-accounting engine. */
@@ -257,6 +289,11 @@ static constexpr CAmount SHADOW_WHITELIST_MIN_BALANCE = 10000 * COIN;
 static constexpr int SHADOW_SOLVER_ACTIVITY_SECONDS = 14 * 24 * 60 * 60;
 static constexpr int SHADOW_SOLVER_ACTIVITY_WINDOW = SHADOW_SOLVER_ACTIVITY_SECONDS / 64;
 static constexpr unsigned int MAX_SHADOW_POW_EVALS_PER_BLOCK = 64;
+/** A serialized CTxOut consumes at least 9 non-witness bytes (36 weight).
+ *  This is therefore a conservative consensus-derived ceiling on the number
+ *  of QQSPROOF-shaped outputs in any V4-valid block. */
+static constexpr uint32_t MAX_SHADOW_POW_NOTES_PER_BLOCK =
+    V4_MAX_BLOCK_WEIGHT / (WITNESS_SCALE_FACTOR * 9);
 static constexpr uint32_t SHADOW_ARGON2_TIME_COST = 1;
 static constexpr uint32_t SHADOW_ARGON2_MEMORY_KIB = 1024;
 static constexpr uint32_t SHADOW_ARGON2_LANES = 1;
@@ -430,11 +467,13 @@ bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block,
  *  duplicating monetary logic or persisting extra chainstate. */
 ShadowPowAccountingResult GetShadowPowClaimAccounting(
     const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
-    const CBlockUndo* blockundo, std::vector<ShadowPowClaimAccounting>& accounting_out);
+    const CBlockUndo* blockundo, std::vector<ShadowPowClaimAccounting>& accounting_out,
+    ShadowPowClaimAggregate* aggregate_out = nullptr);
 ShadowPowAccountingResult GetShadowPowClaimAccounting(
     const CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex,
     const CBlockUndo* blockundo, const Consensus::Params& consensus,
-    std::vector<ShadowPowClaimAccounting>& accounting_out);
+    std::vector<ShadowPowClaimAccounting>& accounting_out,
+    ShadowPowClaimAggregate* aggregate_out = nullptr);
 /** Copy and authenticate the small historical pool context while the caller
  *  holds its chain/view lock. This performs no Argon2 work. */
 ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
@@ -449,11 +488,14 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
 ShadowPowAccountingResult EvaluateShadowPowClaimAccounting(
     const ShadowPowAccountingContext& context, const CBlock& block,
     const CBlockUndo* blockundo,
-    std::vector<ShadowPowClaimAccounting>& accounting_out);
+    std::vector<ShadowPowClaimAccounting>& accounting_out,
+    ShadowPowClaimAggregate* aggregate_out = nullptr);
 
 /** Mempool policy helpers for next-block-only QQSPROOF claims. */
 ShadowProofPayloadMode ClassifyShadowProofPayload(const std::vector<unsigned char>& prefixed_proof);
 std::vector<ShadowProofObservation> GetShadowProofObservations(const CBlock& block);
+std::vector<ShadowProofObservation> GetShadowProofObservations(
+    const CBlock& block, ShadowProofObservationSummary& summary);
 bool TransactionHasShadowProof(const CTransaction& tx);
 bool TransactionHasShadowSignal(const CTransaction& tx);
 ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);

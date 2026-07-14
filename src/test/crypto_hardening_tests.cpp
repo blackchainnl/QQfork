@@ -28,6 +28,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -130,6 +131,21 @@ public:
               "-shadowgoldrushendheight=100",
               "-qqgoldrushendheight=100",
               "-qqmigrationendheight=200",
+          }}
+    {
+    }
+};
+
+class BoundedShadowClaimTestingSetup : public TestChain100Setup
+{
+public:
+    BoundedShadowClaimTestingSetup()
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-regtest",
+              "-shadowwhitelistheight=100",
+              "-shadowgoldrushstartheight=101",
+              "-shadowgoldrushblocks=4",
+              "-shadowcompetingclaimsheight=101",
           }}
     {
     }
@@ -351,6 +367,19 @@ void CheckShadowReplayEqual(const ShadowReplayStateInfo& expected, const ShadowR
     BOOST_CHECK_EQUAL(actual.marker_time, expected.marker_time);
     BOOST_CHECK(actual.marker_block_hash == expected.marker_block_hash);
     BOOST_CHECK(actual.commitment == expected.commitment);
+}
+
+void RefreshShadowCandidateBlock(LegacyShadowClaimCandidate& candidate,
+                                 const CBlockIndex* parent)
+{
+    candidate.block.hashMerkleRoot = BlockMerkleRoot(candidate.block);
+    candidate.block_hash = candidate.block.GetHash();
+    candidate.index =
+        std::make_unique<CBlockIndex>(candidate.block.GetBlockHeader());
+    candidate.index->phashBlock = &candidate.block_hash;
+    candidate.index->pprev = const_cast<CBlockIndex*>(parent);
+    candidate.index->nHeight = parent->nHeight + 1;
+    candidate.index->SetProofOfStake();
 }
 
 } // namespace
@@ -1031,6 +1060,188 @@ BOOST_FIXTURE_TEST_CASE(shadow_proof_internal_failure_preserves_base_validity_an
     BOOST_CHECK_EQUAL(replay_payouts.front().amount,
                       retry_payouts.front().amount);
     BOOST_CHECK((candidate.index->nStatus & BLOCK_FAILED_MASK) == 0);
+}
+
+BOOST_FIXTURE_TEST_CASE(bounded_claim_accounting_accepts_max_weight_malformed_blocks,
+                        BoundedShadowClaimTestingSetup)
+{
+    ChainstateManager& chainman = *Assert(m_node.chainman);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+    CBlockIndex* parent{nullptr};
+    {
+        LOCK(cs_main);
+        parent = chainstate.m_chain.Tip();
+    }
+    BOOST_REQUIRE(parent != nullptr);
+    BOOST_REQUIRE_EQUAL(parent->nHeight, 100);
+    const valtype malformed_payload{'Q', 'Q', 'S', 'P', 'R', 'O', 'O', 'F', 0};
+    const CTxOut malformed_output{
+        0, CScript{} << OP_RETURN << malformed_payload};
+
+    const auto evaluate_and_connect = [&](LegacyShadowClaimCandidate& candidate,
+                                          uint32_t expected_observed,
+                                          uint32_t expected_evaluated,
+                                          uint32_t expected_malformed,
+                                          uint32_t expected_invalid,
+                                          uint32_t expected_over_limit) {
+        CCoinsViewCache view{&chainstate.CoinsTip()};
+        SeedLegacyShadowClaimView(view, parent, candidate);
+        ShadowPowAccountingContext context;
+        BOOST_REQUIRE(PrepareShadowPowClaimAccounting(
+                          view, candidate.index.get(), context) ==
+                      ShadowPowAccountingResult::OK);
+        BOOST_REQUIRE(context.valid);
+        BOOST_REQUIRE(context.canonical_rule_active);
+
+        std::vector<ShadowPowClaimAccounting> accounting;
+        ShadowPowClaimAggregate aggregate;
+        const auto evaluation_start = std::chrono::steady_clock::now();
+        BOOST_REQUIRE(EvaluateShadowPowClaimAccounting(
+                          context, candidate.block, nullptr, accounting,
+                          &aggregate) == ShadowPowAccountingResult::OK);
+        const auto evaluation_seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - evaluation_start)
+                .count();
+        BOOST_CHECK_LT(evaluation_seconds, 120);
+        BOOST_CHECK_LE(accounting.size(), MAX_SHADOW_POW_EVALS_PER_BLOCK);
+        BOOST_CHECK_LE(accounting.capacity(), MAX_SHADOW_POW_EVALS_PER_BLOCK);
+        BOOST_CHECK_LE(accounting.capacity() * sizeof(ShadowPowClaimAccounting),
+                       MAX_SHADOW_POW_EVALS_PER_BLOCK *
+                           sizeof(ShadowPowClaimAccounting));
+        BOOST_CHECK_EQUAL(aggregate.observed_count, expected_observed);
+        BOOST_CHECK_EQUAL(aggregate.evaluated_count, expected_evaluated);
+        BOOST_CHECK_EQUAL(aggregate.malformed_transaction_count,
+                          expected_malformed);
+        BOOST_CHECK_EQUAL(aggregate.invalid_proof_count, expected_invalid);
+        BOOST_CHECK_EQUAL(aggregate.evaluation_limit_count,
+                          expected_over_limit);
+        BOOST_CHECK(!aggregate.accounting_commitment.IsNull());
+
+        ShadowProofObservationSummary observation_summary;
+        const std::vector<ShadowProofObservation> observations =
+            GetShadowProofObservations(candidate.block, observation_summary);
+        BOOST_CHECK_EQUAL(observation_summary.observed_count,
+                          expected_observed);
+        BOOST_CHECK_EQUAL(observation_summary.returned_count,
+                          std::min<uint32_t>(expected_observed,
+                                             MAX_SHADOW_POW_EVALS_PER_BLOCK));
+        BOOST_CHECK_EQUAL(observation_summary.omitted_count,
+                          expected_observed -
+                              observation_summary.returned_count);
+        BOOST_CHECK_EQUAL(observations.size(),
+                          observation_summary.returned_count);
+        BOOST_CHECK_LE(observations.capacity(),
+                       MAX_SHADOW_POW_EVALS_PER_BLOCK);
+        BOOST_CHECK(!observation_summary.commitment.IsNull());
+
+        BlockValidationState state;
+        const auto connect_start = std::chrono::steady_clock::now();
+        {
+            LOCK(cs_main);
+            BOOST_REQUIRE_MESSAGE(
+                chainstate.ConnectBlock(candidate.block, state,
+                                        candidate.index.get(), view,
+                                        /*fJustCheck=*/true,
+                                        /*fCheckBlockSig=*/false),
+                state.ToString());
+        }
+        const auto connect_seconds =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - connect_start)
+                .count();
+        BOOST_CHECK_LT(connect_seconds, 120);
+        BOOST_CHECK(state.IsValid());
+        const ShadowGoldRushInfo info =
+            GetShadowGoldRushInfo(view, candidate.index.get());
+        BOOST_CHECK_EQUAL(info.pow_count, 0U);
+        BOOST_CHECK_GT(info.pow_amount, 0);
+    };
+
+    LegacyShadowClaimCandidate single;
+    {
+        CCoinsViewCache construction_view{&chainstate.CoinsTip()};
+        SeedLegacyShadowClaimView(construction_view, parent, single);
+        single = BuildLegacyShadowClaimCandidate(
+            parent, construction_view, chainman.GetConsensus());
+    }
+    CMutableTransaction single_tx{*single.block.vtx[2]};
+    single_tx.vout.resize(1);
+    CBlock sizing_block = single.block;
+    sizing_block.vtx[2] = MakeTransactionRef(single_tx);
+    const size_t output_weight =
+        GetSerializeSize(TX_NO_WITNESS(malformed_output)) *
+        WITNESS_SCALE_FACTOR;
+    const size_t available_weight =
+        MAX_BLOCK_WEIGHT - GetBlockWeight(sizing_block);
+    const size_t initial_output_count =
+        available_weight / output_weight > 8
+            ? available_weight / output_weight - 8
+            : 2;
+    single_tx.vout.reserve(1 + initial_output_count + 8);
+    for (size_t i = 0; i < initial_output_count; ++i) {
+        single_tx.vout.push_back(malformed_output);
+    }
+    single.block.vtx[2] = MakeTransactionRef(single_tx);
+    RefreshShadowCandidateBlock(single, parent);
+    while (GetBlockWeight(single.block) + output_weight <=
+           MAX_BLOCK_WEIGHT) {
+        single_tx.vout.push_back(malformed_output);
+        single.block.vtx[2] = MakeTransactionRef(single_tx);
+        RefreshShadowCandidateBlock(single, parent);
+    }
+    while (GetBlockWeight(single.block) > MAX_BLOCK_WEIGHT) {
+        single_tx.vout.pop_back();
+        single.block.vtx[2] = MakeTransactionRef(single_tx);
+        RefreshShadowCandidateBlock(single, parent);
+    }
+    const uint32_t single_notes =
+        static_cast<uint32_t>(single_tx.vout.size() - 1);
+    BOOST_REQUIRE_GT(single_notes, MAX_SHADOW_POW_EVALS_PER_BLOCK);
+    BOOST_CHECK_LE(MAX_BLOCK_WEIGHT - GetBlockWeight(single.block),
+                   output_weight);
+    evaluate_and_connect(single, single_notes, 0, single_notes, 0, 0);
+
+    LegacyShadowClaimCandidate many;
+    {
+        CCoinsViewCache construction_view{&chainstate.CoinsTip()};
+        SeedLegacyShadowClaimView(construction_view, parent, many);
+        many = BuildLegacyShadowClaimCandidate(
+            parent, construction_view, chainman.GetConsensus());
+    }
+    many.block.vtx.resize(2);
+    COutPoint previous = many.claim_outpoint;
+    size_t estimated_weight = GetBlockWeight(many.block);
+    size_t one_tx_weight{0};
+    while (true) {
+        CMutableTransaction tx;
+        tx.nVersion = 1;
+        tx.nTime = many.block.nTime;
+        tx.vin.emplace_back(previous);
+        tx.vout.emplace_back(many.claim_amount, many.legacy_script);
+        tx.vout.push_back(malformed_output);
+        CTransactionRef tx_ref = MakeTransactionRef(std::move(tx));
+        const size_t tx_weight = GetTransactionWeight(*tx_ref);
+        if (one_tx_weight == 0) one_tx_weight = tx_weight;
+        if (estimated_weight + tx_weight + 16 > MAX_BLOCK_WEIGHT) break;
+        previous = COutPoint{tx_ref->GetHash(), 0};
+        many.block.vtx.push_back(std::move(tx_ref));
+        estimated_weight += tx_weight;
+    }
+    RefreshShadowCandidateBlock(many, parent);
+    while (GetBlockWeight(many.block) > MAX_BLOCK_WEIGHT) {
+        many.block.vtx.pop_back();
+        RefreshShadowCandidateBlock(many, parent);
+    }
+    const uint32_t many_notes =
+        static_cast<uint32_t>(many.block.vtx.size() - 2);
+    BOOST_REQUIRE_GT(many_notes, MAX_SHADOW_POW_EVALS_PER_BLOCK);
+    BOOST_CHECK_LE(MAX_BLOCK_WEIGHT - GetBlockWeight(many.block),
+                   one_tx_weight + 16);
+    evaluate_and_connect(
+        many, many_notes, MAX_SHADOW_POW_EVALS_PER_BLOCK, 0,
+        MAX_SHADOW_POW_EVALS_PER_BLOCK,
+        many_notes - MAX_SHADOW_POW_EVALS_PER_BLOCK);
 }
 
 BOOST_FIXTURE_TEST_CASE(block_signature_internal_failure_is_fail_stop_retryable_and_not_cached, RegTestingSetup)

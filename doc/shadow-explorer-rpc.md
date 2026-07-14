@@ -40,11 +40,13 @@ index can continue following new blocks on a pruned node, but a later rebuild
 cannot cross deleted block data. Explorer operators should therefore use
 `-prune=0`. `-reindex` wipes and deterministically rebuilds the index.
 
-v30.1.1 uses shadowindex schema 7. Schema 5 invalidated prerelease data built
+v30.1.1 uses shadowindex schema 8. Schema 5 invalidated prerelease data built
 with the superseded height-5,950,000 claim boundary, schema 6 added proof-mode
-classification, and schema 7 adds ordered spend anchors used by the bounded
-event transport. Any recognized older shadowindex schema is discarded and
-rebuilt automatically. Coinstatsindex schema 3 likewise invalidates its
+classification, schema 7 added ordered spend anchors used by the bounded event
+transport, and schema 8 replaces unbounded per-note claim rows with top-64
+detail, fixed aggregates, and a deterministic commitment. Any recognized older
+shadowindex schema is discarded and rebuilt automatically. Coinstatsindex
+schema 3 likewise invalidates its
 prerelease schema-2 synthetic-payout statistics. These auxiliary-index rebuilds
 do not require a full block or chainstate reindex when all active-chain block
 files remain available. A pruned operator without the required history must
@@ -69,11 +71,15 @@ spend record includes its base block, transaction ID, transaction position, and
 input position. Disconnecting a block atomically restores the prior spend and
 attestation state; disconnecting the origin block removes the synthetic record.
 
-Every observed `QQSPROOF` note is also indexed from the same canonical,
-bounded accounting engine used by chainstate. The record identifies its source
-transaction/output, canonical rank, decoded payout destination, actual base fee
-when known, credited amount, exact disposition, and linked synthetic payout (if
-one exists). The index does not reimplement winner selection or fee arithmetic.
+The index stores detailed rows only for the at most 64 canonically selected
+`QQSPROOF` candidates evaluated by the same engine used by chainstate. Each row
+identifies its source transaction/output, canonical rank, decoded payout
+destination, actual base fee when known, credited amount, exact disposition,
+and linked synthetic payout (if one exists). Every other note is represented
+by fixed disposition counts and `accounting_commitment`, which binds the exact
+ordered note stream, accounting context, aggregates, and retained rows to the
+indexed base-block anchor. The index does not reimplement winner selection or
+fee arithmetic and never writes more than 64 claim-detail records for a block.
 Fee-paying `QQSPROOF` is a PoW-only channel. A payload carrying mode byte `1`
 (`pos`) or an unknown mode remains ordinary base-block data but cannot consume,
 clear, count, or retarget either shadow pool. `QQSIGNAL` plus a qualified
@@ -95,22 +101,34 @@ cannot create a silent false negative.
 
 ### `getshadowblock hash_or_height ( offset count claim_offset claim_count )`
 
-Returns schema `blackcoin.shadow.block.v2`. `count` and `claim_count` are each
-limited to 1,000. `offset`/`next_offset` page synthetic payouts;
+Returns schema `blackcoin.shadow.block.v3`. Version 3 replaces v2's unbounded
+per-note detail semantics with the fixed aggregate and top-64 detail contract
+below. `count` is limited to 1,000 and
+`claim_count` is limited to 64, the same bound as the persisted detail set.
+`offset`/`next_offset` page synthetic payouts;
 `claim_offset`/`pow_claim_accounting.next_offset` independently page claim
 records.
 Continue with `next_offset` until it is `null`. Only active-chain blocks are
 accepted, so an explorer detects a reorganization when a previously stored
 anchor hash is rejected or no longer matches `getblockhash(height)`.
 
-`pow_claim_accounting` reports winner, reimbursed-loser, and rejection counts,
-plus exact winner, reimbursement, and combined credited totals. Stable claim
-dispositions are `invalid_location`, `malformed_transaction`, `invalid_proof`,
-`wrong_mode_pos`, `unknown_mode`, `input_mismatch`, `invalid_base_fee`,
-`evaluation_limit`, `winner`, and `reimbursed_loser`. A positive winner or
-reimbursed-loser credit carries the exact synthetic transaction ID. Zero-fee
-valid losers remain visible as `reimbursed_loser` records with zero credit and
-no synthetic output.
+`pow_claim_accounting` reports `observed_count`, `evaluated_count`, winner,
+reimbursed-loser, total rejection counts, and a fixed breakdown for invalid
+location, malformed transaction, invalid proof, wrong/unknown mode, input
+mismatch, invalid base fee, and evaluation-limit outcomes. It also reports
+exact winner, reimbursement, and combined credited totals plus the non-null
+`accounting_commitment`. `total_records` is the pageable detail count and is
+always equal to `evaluated_count` and at most 64; aggregate-only structural and
+over-budget outcomes do not have invented detail rows. Stable detailed
+dispositions are `invalid_proof`, `input_mismatch`, `invalid_base_fee`,
+`winner`, and `reimbursed_loser`. A positive winner or reimbursed-loser credit
+carries the exact synthetic transaction ID. Zero-fee valid losers remain
+visible as `reimbursed_loser` rows with zero credit and no synthetic output.
+
+`observed_pow_claim_txids` is retained as a compatibility sample in base-block
+order and is capped at 64 entries. It is not a complete inventory when
+`observed_count` exceeds the array length. Consumers must use the aggregate
+counts and commitment rather than treating the sample as exhaustive.
 
 On mainnet this canonical per-claim classification begins at height 5,993,200.
 Earlier Gold Rush blocks intentionally reproduce the v30.1.0 first-valid-claim
