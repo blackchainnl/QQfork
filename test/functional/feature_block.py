@@ -226,7 +226,11 @@ class FullBlockTest(BitcoinTestFramework):
         #                      \-> b3 (1) -> b4 (2)
         self.log.info("Reject a block where the miner creates too much coinbase reward")
         self.move_tip(6)
-        b9 = self.next_block(9, spend=out[4], additional_coinbase_value=1)
+        # Before quantum-spend activation, Blackcoin consensus preserves the
+        # legacy client's second fee allowance. next_block() already claims
+        # the first fee, so add the fee plus one satoshi to exceed the actual
+        # consensus limit by exactly one satoshi.
+        b9 = self.next_block(9, spend=out[4], additional_coinbase_value=out[4].vout[0].nValue)
         self.send_blocks([b9], success=False, reject_reason='bad-cb-amount', reconnect=True)
 
         # Create a fork that ends in a block with too much fee (the one that causes the reorg)
@@ -238,7 +242,7 @@ class FullBlockTest(BitcoinTestFramework):
         b10 = self.next_block(10, spend=out[3])
         self.send_blocks([b10], False)
 
-        b11 = self.next_block(11, spend=out[4], additional_coinbase_value=1)
+        b11 = self.next_block(11, spend=out[4], additional_coinbase_value=out[4].vout[0].nValue)
         self.send_blocks([b11], success=False, reject_reason='bad-cb-amount', reconnect=True)
 
         # Try again, but with a valid fork first
@@ -251,7 +255,7 @@ class FullBlockTest(BitcoinTestFramework):
         self.save_spendable_output()
         b13 = self.next_block(13, spend=out[4])
         self.save_spendable_output()
-        b14 = self.next_block(14, spend=out[5], additional_coinbase_value=1)
+        b14 = self.next_block(14, spend=out[5], additional_coinbase_value=out[5].vout[0].nValue)
         self.send_blocks([b12, b13, b14], success=False, reject_reason='bad-cb-amount', reconnect=True)
 
         # New tip should be b13.
@@ -970,22 +974,23 @@ class FullBlockTest(BitcoinTestFramework):
         # -> b64 (18) -> b65 (19) -> b69 (20)
         #                        \-> b68 (20)
         #
-        # b68 - coinbase claims one satoshi more than the transaction fee.
-        #       this fails because the coinbase is trying to claim 1 satoshi too much in fees
+        # b68 - coinbase claims one satoshi more than the legacy double-fee
+        #       allowance. This fails because the coinbase is trying to claim
+        #       1 satoshi too much in fees.
         #
-        # b69 - coinbase claims exactly the transaction fee.
-        #       this succeeds
+        # b69 - coinbase claims exactly the legacy double-fee allowance.
+        #       This succeeds.
         #
         self.log.info("Reject a block trying to claim too much subsidy in the coinbase transaction")
         self.move_tip(65)
-        self.next_block(68, additional_coinbase_value=MIN_BLOCK_TX_FEE + 1)
+        self.next_block(68, additional_coinbase_value=2 * MIN_BLOCK_TX_FEE + 1)
         tx = self.create_and_sign_transaction(out[20], out[20].vout[0].nValue - MIN_BLOCK_TX_FEE)
         b68 = self.update_block(68, [tx])
         self.send_blocks([b68], success=False, reject_reason='bad-cb-amount', reconnect=True)
 
         self.log.info("Accept a block claiming the correct subsidy in the coinbase transaction")
         self.move_tip(65)
-        b69 = self.next_block(69, additional_coinbase_value=MIN_BLOCK_TX_FEE)
+        b69 = self.next_block(69, additional_coinbase_value=2 * MIN_BLOCK_TX_FEE)
         tx = self.create_and_sign_transaction(out[20], out[20].vout[0].nValue - MIN_BLOCK_TX_FEE)
         self.update_block(69, [tx])
         self.send_blocks([b69], True)
