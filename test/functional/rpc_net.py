@@ -243,6 +243,22 @@ class NetTest(BitcoinTestFramework):
         assert_equal(['UNKNOWN[2^4]', 'UNKNOWN[2^63]'], self.nodes[0].getpeerinfo()[-1]['servicesnames'])
         self.nodes[0].disconnect_p2ps()
 
+        self.log.info("Distinguish shadow-aware peers without rejecting legacy peers")
+        legacy_services = test_framework.messages.NODE_NETWORK
+        quantum_services = legacy_services | test_framework.messages.NODE_QUANTUM_QUASAR
+        self.nodes[0].add_p2p_connection(P2PInterface(), services=legacy_services)
+        self.nodes[0].add_p2p_connection(P2PInterface(), services=quantum_services)
+
+        offered_services = {
+            int(peer["services"], 16): peer["servicesnames"]
+            for peer in self.nodes[0].getpeerinfo()
+            if int(peer["services"], 16) in (legacy_services, quantum_services)
+        }
+        assert_equal(offered_services[legacy_services], ["NETWORK"])
+        assert_equal(offered_services[quantum_services], ["NETWORK", "QUANTUM_QUASAR"])
+        assert_equal(len(self.nodes[0].p2ps), 2)
+        self.nodes[0].disconnect_p2ps()
+
     def test_getnodeaddresses(self):
         self.log.info("Test getnodeaddresses")
         self.nodes[0].add_p2p_connection(P2PInterface())
