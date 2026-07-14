@@ -6,6 +6,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <chain.h>
+#include <chainparams.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
 #include <test/fuzz/util.h>
@@ -14,7 +15,17 @@
 #include <optional>
 #include <vector>
 
-FUZZ_TARGET(chain)
+namespace {
+void initialize_chain_fuzz_target()
+{
+    // CBlockIndex::GetMedianTimePast() applies Blackcoin's ProtocolV2 rule
+    // through Params(). Select a deterministic network before the corpus can
+    // reach that accessor.
+    SelectParams(ChainType::REGTEST);
+}
+} // namespace
+
+FUZZ_TARGET(chain, .init = initialize_chain_fuzz_target)
 {
     FuzzedDataProvider fuzzed_data_provider(buffer.data(), buffer.size());
     std::optional<CDiskBlockIndex> disk_block_index = ConsumeDeserializable<CDiskBlockIndex>(fuzzed_data_provider);
