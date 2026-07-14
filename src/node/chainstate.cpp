@@ -10,6 +10,7 @@
 #include <arith_uint256.h>
 #include <chain.h>
 #include <coins.h>
+#include <common/args.h>
 #include <consensus/params.h>
 #include <hash.h>
 #include <logging.h>
@@ -28,6 +29,7 @@
 #include <util/time.h>
 #include <util/translation.h>
 #include <validation.h>
+#include <univalue.h>
 
 #include <algorithm>
 #include <array>
@@ -38,7 +40,9 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -52,6 +56,11 @@ constexpr const char* REBUILD_BASE_BACKUP{"chainstate.rebuild-backup"};
 constexpr const char* REBUILD_SNAPSHOT_BACKUP{"chainstate_snapshot.rebuild-backup"};
 constexpr const char* REBUILD_BASE_PARTIAL{"chainstate.rebuild-partial"};
 constexpr const char* REBUILD_SNAPSHOT_PARTIAL{"chainstate_snapshot.rebuild-partial"};
+
+Mutex g_rebuild_safety_mutex;
+bool g_rebuild_safety_applied GUARDED_BY(g_rebuild_safety_mutex){false};
+std::map<std::string, std::optional<common::SettingsValue>> g_rebuild_previous_settings
+    GUARDED_BY(g_rebuild_safety_mutex);
 
 enum class RebuildPhase {
     PREPARED,
@@ -657,6 +666,67 @@ ChainstateLoadResult RecoverInterruptedRebuild(ChainstateManager& chainman)
 }
 
 } // namespace
+
+ChainstateRebuildJournalStatus GetChainstateRebuildJournalStatus(const fs::path& datadir)
+{
+    std::string error;
+    const bool journal_exists = PathExists(JournalPath(datadir));
+    const std::optional<RebuildJournal> journal = ReadJournal(datadir, error);
+    if (!journal) {
+        return journal_exists ? ChainstateRebuildJournalStatus::INVALID
+                              : ChainstateRebuildJournalStatus::NONE;
+    }
+    if (journal->phase == RebuildPhase::COMMIT_READY ||
+        journal->phase == RebuildPhase::CLEANUP_READY) {
+        return ChainstateRebuildJournalStatus::VERIFICATION_PENDING;
+    }
+    return ChainstateRebuildJournalStatus::RECOVERY_PENDING;
+}
+
+void SetChainstateRebuildSafetyOverrides(ArgsManager& args, bool enabled)
+{
+    static constexpr std::array<const char*, 7> SAFETY_SETTINGS{
+        "staking",
+        "autostartstaking",
+        "powmining",
+        "qqautoshadowsignal",
+        "qqautodemurrageattest",
+        "qqautoredelegate",
+        "qqallowautokeycreation",
+    };
+    LOCK(g_rebuild_safety_mutex);
+    if (enabled) {
+        if (g_rebuild_safety_applied) return;
+        args.LockSettings([](const common::Settings& settings) {
+            for (const char* setting : SAFETY_SETTINGS) {
+                const common::SettingsValue* previous =
+                    common::FindKey(settings.forced_settings, setting);
+                g_rebuild_previous_settings[setting] = previous
+                    ? std::optional<common::SettingsValue>{*previous}
+                    : std::nullopt;
+            }
+        });
+        for (const char* setting : SAFETY_SETTINGS) {
+            args.ForceSetArg(std::string{"-"} + setting, "0");
+        }
+        g_rebuild_safety_applied = true;
+        return;
+    }
+    if (!g_rebuild_safety_applied) return;
+    args.LockSettings([](common::Settings& settings) {
+        for (const char* setting : SAFETY_SETTINGS) {
+            const std::optional<common::SettingsValue>& previous =
+                g_rebuild_previous_settings.at(setting);
+            if (!previous) {
+                settings.forced_settings.erase(setting);
+            } else {
+                settings.forced_settings[setting] = *previous;
+            }
+        }
+    });
+    g_rebuild_previous_settings.clear();
+    g_rebuild_safety_applied = false;
+}
 
 static bilingual_str ChainstateRebuildRequiredMessage()
 {
@@ -1303,6 +1373,12 @@ bool FinalizeChainstateRebuild(ChainstateManager& chainman, bilingual_str& error
             NotifyDurableRebuildTransition(chainman, RebuildPhase::COMMIT_READY);
             chainman.m_chainstate_rebuild_committed_this_process = true;
             LogPrintf("Committed staged chainstate rebuild; preserved database will be retired only after a verified restart\n");
+            // Make shutdown visible before releasing cs_main. Continuing to
+            // accept blocks would make the durable full-Coin commitment stale
+            // before the required separate-process verification restart.
+            if (chainman.m_options.chainstate_rebuild_commit_callback) {
+                chainman.m_options.chainstate_rebuild_commit_callback();
+            }
             return true;
         }
 

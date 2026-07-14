@@ -6,6 +6,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <common/args.h>
+#include <init.h>
 #include <sync.h>
 #include <test/util/logging.h>
 #include <test/util/setup_common.h>
@@ -82,6 +83,27 @@ struct TestArgsManager : public ArgsManager
     using ArgsManager::m_network;
     using ArgsManager::m_settings;
 };
+
+BOOST_AUTO_TEST_CASE(persistent_reindex_modes_are_rejected)
+{
+    for (const std::string& option : {"reindex", "reindex-chainstate"}) {
+        TestArgsManager persistent;
+        persistent.SetupArgs({{"-" + option, ArgsManager::ALLOW_ANY}});
+        persistent.ReadConfigString(option + "=1\n");
+        BOOST_CHECK(!AppInitParameterInteraction(persistent));
+
+        // A one-shot forced/command-line value is intentionally excluded from
+        // the persistent setting check.
+        TestArgsManager one_shot;
+        one_shot.ForceSetArg("-" + option, "1");
+        BOOST_CHECK(one_shot.GetPersistentSetting(option).isNull());
+
+        TestArgsManager disabled;
+        disabled.SetupArgs({{"-" + option, ArgsManager::ALLOW_ANY}});
+        disabled.ReadConfigString(option + "=0\n");
+        BOOST_CHECK(!SettingToBool(disabled.GetPersistentSetting(option), true));
+    }
+}
 
 //! Test GetSetting and GetArg type coercion, negation, and default value handling.
 class CheckValueTest : public TestChain100Setup

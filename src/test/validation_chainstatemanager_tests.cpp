@@ -45,6 +45,29 @@ using node::SnapshotMetadata;
 
 BOOST_FIXTURE_TEST_SUITE(validation_chainstatemanager_tests, TestingSetup)
 
+BOOST_AUTO_TEST_CASE(chainstate_rebuild_safety_overrides_restore_forced_settings)
+{
+    ArgsManager args;
+    args.ForceSetArg("-staking", "operator-staking-value");
+    args.ForceSetArg("-qqautoredelegate", "1");
+
+    node::SetChainstateRebuildSafetyOverrides(args, true);
+    for (const std::string& option : {
+             "-staking", "-autostartstaking", "-powmining",
+             "-qqautoshadowsignal", "-qqautodemurrageattest",
+             "-qqautoredelegate", "-qqallowautokeycreation"}) {
+        BOOST_CHECK_EQUAL(args.GetArg(option, "missing"), "0");
+    }
+
+    // Reapplying from both the Qt and AppInitMain guards is idempotent.
+    node::SetChainstateRebuildSafetyOverrides(args, true);
+    node::SetChainstateRebuildSafetyOverrides(args, false);
+    BOOST_CHECK_EQUAL(args.GetArg("-staking", "missing"),
+                      "operator-staking-value");
+    BOOST_CHECK_EQUAL(args.GetArg("-qqautoredelegate", "missing"), "1");
+    BOOST_CHECK_EQUAL(args.GetArg("-powmining", "missing"), "missing");
+}
+
 //! Basic tests for ChainstateManager.
 //!
 //! First create a legacy (IBD) chainstate, then create a snapshot chainstate.
@@ -695,6 +718,8 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_staged_rebuild_crash_rolls_back, Snaps
         ::cs_main, return chainman.GetAll().front()->CoinsDB().GetBestBlock());
     const uint256 snapshot_tip = WITH_LOCK(
         ::cs_main, return chainman.ActiveChainstate().CoinsDB().GetBestBlock());
+    BOOST_CHECK(node::GetChainstateRebuildJournalStatus(datadir) ==
+                node::ChainstateRebuildJournalStatus::NONE);
 
     ChainstateManager& restarted = this->SimulateNodeRestart();
     node::ChainstateLoadOptions rebuild;
@@ -706,6 +731,8 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_staged_rebuild_crash_rolls_back, Snaps
     BOOST_CHECK(fs::exists(datadir / "chainstate-rebuild.journal"));
     BOOST_CHECK(fs::exists(datadir / "chainstate.rebuild-backup"));
     BOOST_CHECK(fs::exists(datadir / "chainstate_snapshot.rebuild-backup"));
+    BOOST_CHECK(node::GetChainstateRebuildJournalStatus(datadir) ==
+                node::ChainstateRebuildJournalStatus::RECOVERY_PENDING);
 
     // ActivateBestChain returns success after making limited progress when a
     // shutdown interrupt is raised. That partial reconstruction must never be
@@ -739,6 +766,8 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_staged_rebuild_crash_rolls_back, Snaps
     BOOST_CHECK(!fs::exists(datadir / "chainstate-rebuild.journal"));
     BOOST_CHECK(!fs::exists(datadir / "chainstate.rebuild-backup"));
     BOOST_CHECK(!fs::exists(datadir / "chainstate_snapshot.rebuild-backup"));
+    BOOST_CHECK(node::GetChainstateRebuildJournalStatus(datadir) ==
+                node::ChainstateRebuildJournalStatus::NONE);
     WITH_LOCK(::cs_main, {
         BOOST_CHECK_EQUAL(
             recovered.ActiveChainstate().CoinsDB().GetBestBlock(), snapshot_tip);
@@ -825,6 +854,8 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_commit_ready_requires_current_verifica
     const fs::path backup = datadir / "chainstate.rebuild-backup";
     BOOST_REQUIRE(fs::exists(journal));
     BOOST_REQUIRE(fs::exists(backup));
+    BOOST_CHECK(node::GetChainstateRebuildJournalStatus(datadir) ==
+                node::ChainstateRebuildJournalStatus::VERIFICATION_PENDING);
 
     // A repeated finalizer call from the building manager remains valid but
     // cannot interpret its own COMMIT_READY write as a verification restart.
@@ -884,8 +915,58 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_commit_ready_requires_current_verifica
     BOOST_REQUIRE(node::FinalizeChainstateRebuild(reopened, finalize_error));
     BOOST_CHECK(!fs::exists(journal));
     BOOST_CHECK(!fs::exists(backup));
+    BOOST_CHECK(node::GetChainstateRebuildJournalStatus(datadir) ==
+                node::ChainstateRebuildJournalStatus::NONE);
     BOOST_CHECK_EQUAL(WITH_LOCK(
         ::cs_main, return reopened.ActiveTip()->GetBlockHash()), source_tip);
+}
+
+//! Once COMMIT_READY is durable, queued validation and RPC work must not stale
+//! the recorded tip or full Coin set while orderly shutdown drains threads.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_commit_ready_quiesces_chain_mutation, SnapshotTestSetup)
+{
+    ChainstateManager& rebuilding = BuildAndCommitProtectedChainstate();
+    const fs::path datadir = rebuilding.m_options.datadir;
+    const uint256 committed_tip = WITH_LOCK(
+        ::cs_main, return rebuilding.ActiveTip()->GetBlockHash());
+    const uint256 committed_coins = WITH_LOCK(
+        ::cs_main, return LegacyMuHash(rebuilding.ActiveChainstate().CoinsDB()));
+
+    BlockValidationState disconnect_state;
+    {
+        LOCK2(::cs_main, rebuilding.ActiveChainstate().MempoolMutex());
+        DisconnectedBlockTransactions disconnectpool{
+            MAX_DISCONNECTED_TX_POOL_SIZE * 1000};
+        BOOST_CHECK(!rebuilding.ActiveChainstate().DisconnectTip(
+            disconnect_state, &disconnectpool));
+    }
+
+    // Model a block-validation task queued before COMMIT_READY. The block may
+    // enter the block index, but ActivateBestChain must acknowledge shutdown
+    // quiescence without changing the active chain or Coin database.
+    mineBlocks(1);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        ::cs_main, return rebuilding.ActiveTip()->GetBlockHash()), committed_tip);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        ::cs_main, return LegacyMuHash(rebuilding.ActiveChainstate().CoinsDB())),
+        committed_coins);
+
+    ChainstateManager& reopened = SimulateNodeRestart();
+    node::ChainstateLoadOptions normal;
+    normal.mempool = Assert(m_node.mempool.get());
+    auto [status, error] = node::LoadChainstate(reopened, m_cache_sizes, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    std::tie(status, error) = node::VerifyLoadedChainstate(reopened, normal);
+    BOOST_REQUIRE(status == node::ChainstateLoadStatus::SUCCESS);
+    bilingual_str finalize_error;
+    BOOST_REQUIRE(node::FinalizeChainstateRebuild(reopened, finalize_error));
+    BOOST_CHECK(node::GetChainstateRebuildJournalStatus(datadir) ==
+                node::ChainstateRebuildJournalStatus::NONE);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        ::cs_main, return reopened.ActiveTip()->GetBlockHash()), committed_tip);
+    BOOST_CHECK_EQUAL(WITH_LOCK(
+        ::cs_main, return LegacyMuHash(reopened.ActiveChainstate().CoinsDB())),
+        committed_coins);
 }
 
 //! A CLEANUP_READY restart must reopen and authenticate the complete live Coin

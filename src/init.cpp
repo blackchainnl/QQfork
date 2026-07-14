@@ -48,6 +48,7 @@
 #include <node/blockstorage.h>
 #include <node/caches.h>
 #include <node/chainstate.h>
+#include <node/chainstate_rebuild.h>
 #include <node/chainstatemanager_args.h>
 #include <node/context.h>
 #include <node/interface_ui.h>
@@ -919,6 +920,18 @@ bool AppInitParameterInteraction(const ArgsManager& args)
 
     // also see: InitParameterInteraction()
 
+    // Reindex modes are one-shot recovery operations. Persisting either flag
+    // can create an endless destructive/rebuild loop after a service or GUI
+    // restart, so fail before opening chainstate and require the operator to
+    // remove the persistent entry.
+    for (const std::string& option : {"reindex-chainstate", "reindex"}) {
+        if (SettingToBool(args.GetPersistentSetting(option), false)) {
+            return InitError(strprintf(_(
+                "%s=1 is set persistently. Remove it from blackcoin.conf or settings.json and pass -%s only once on the command line."),
+                option, option));
+        }
+    }
+
     // Error if network-specific options (-addnode, -connect, etc) are
     // specified in default section of config file, but not overridden
     // on the command line or in this chain's section of the config file.
@@ -1215,8 +1228,22 @@ static bool AppInitMainImpl(NodeContext& node,
 {
     node.rebuild_restart_required = false;
     rebuild_restart_required = false;
-    const ArgsManager& args = *Assert(node.args);
+    ArgsManager& args = *Assert(node.args);
     const CChainParams& chainparams = Params();
+    const bool requested_chainstate_rebuild =
+        args.GetBoolArg("-reindex-chainstate", false);
+    const bool chainstate_verification_pending =
+        node::GetChainstateRebuildJournalStatus(args.GetDataDirNet()) ==
+        node::ChainstateRebuildJournalStatus::VERIFICATION_PENDING;
+
+    // A command-line/manual rebuild and a service-managed verification restart
+    // receive the same fail-closed protection as the GUI assistant. These
+    // settings are process-local; command-line, config, and settings.json
+    // values are preserved and restored only after the replacement has been
+    // authenticated and the durable journal has been retired.
+    if (requested_chainstate_rebuild || chainstate_verification_pending) {
+        node::SetChainstateRebuildSafetyOverrides(args, true);
+    }
 
     auto opt_max_upload = ParseByteUnits(args.GetArg("-maxuploadtarget", DEFAULT_MAX_UPLOAD_TARGET), ByteUnit::M);
     if (!opt_max_upload) {
@@ -1590,11 +1617,27 @@ static bool AppInitMainImpl(NodeContext& node,
     node.notifications = std::make_unique<KernelNotifications>(node.exit_status);
     ReadNotificationArgs(args, *node.notifications);
     fReindex = args.GetBoolArg("-reindex", false);
-    bool fReindexChainState = args.GetBoolArg("-reindex-chainstate", false);
+    bool fReindexChainState = requested_chainstate_rebuild;
+    const std::string gui_rebuild_phase =
+        args.GetArg("-gui-chainstate-rebuild", "");
+    if (gui_rebuild_phase == "rebuild") {
+        uiInterface.InitMessage(_(
+            "Protected v30.1.1 chainstate rebuild in progress — wallet automation is disabled…").translated);
+        LogPrintf("GUI chainstate rebuild assistant: protected rebuild process started; wallet automation is disabled\n");
+    } else if (gui_rebuild_phase == "verify") {
+        uiInterface.InitMessage(_(
+            "Verifying the rebuilt v30.1.1 chainstate before loading wallets…").translated);
+        LogPrintf("GUI chainstate rebuild assistant: verification process started; wallet automation remains disabled\n");
+    }
     ChainstateManager::Options chainman_opts{
         .chainparams = chainparams,
         .datadir = args.GetDataDirNet(),
         .adjusted_time_callback = GetAdjustedTime,
+        .chainstate_rebuild_commit_callback = [&node] {
+            node.chainstate_rebuild_status.store(
+                node::ChainstateRebuildStatus::REBUILD_COMMITTED);
+            StartShutdown();
+        },
         .notifications = *node.notifications,
     };
     Assert(ApplyArgsManOptions(args, chainman_opts)); // no error can happen, already checked in AppInitParameterInteraction
@@ -1773,9 +1816,39 @@ static bool AppInitMainImpl(NodeContext& node,
             */
             std::tie(status, error) = catch_exceptions([&]{ return VerifyLoadedChainstate(chainman, options);});
             if (status == node::ChainstateLoadStatus::SUCCESS) {
+                // Every reopened COMMIT_READY replacement, including daemon
+                // and manual restarts, must be authenticated and retired here
+                // before wallets load or any automation can start.
+                if (node::GetChainstateRebuildJournalStatus(args.GetDataDirNet()) ==
+                    node::ChainstateRebuildJournalStatus::VERIFICATION_PENDING) {
+                    bilingual_str finalize_error;
+                    if (!node::FinalizeChainstateRebuild(chainman, finalize_error)) {
+                        return InitError(finalize_error);
+                    }
+                }
+                if (chainstate_verification_pending) {
+                    node::SetChainstateRebuildSafetyOverrides(args, false);
+                }
+                if (node.gui_process && gui_rebuild_phase == "verify") {
+                    node.chainstate_rebuild_status.store(
+                        node::ChainstateRebuildStatus::VERIFICATION_COMPLETE);
+                }
                 fLoaded = true;
                 LogPrintf(" block index %15dms\n", Ticks<std::chrono::milliseconds>(SteadyClock::now() - load_block_index_start_time));
             }
+        }
+
+        if (node.gui_process &&
+            status == node::ChainstateLoadStatus::FAILURE_CHAINSTATE_REBUILD_REQUIRED) {
+            node.chainstate_rebuild_status.store(
+                node::ChainstateRebuildStatus::REQUIRED);
+            return false;
+        }
+        if (node.gui_process && gui_rebuild_phase == "rebuild" &&
+            status == node::ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED) {
+            node.chainstate_rebuild_status.store(
+                node::ChainstateRebuildStatus::FULL_REINDEX_REQUIRED);
+            return false;
         }
 
         if (status == node::ChainstateLoadStatus::FAILURE_FATAL ||
@@ -1982,6 +2055,10 @@ static bool AppInitMainImpl(NodeContext& node,
     chainman.m_thread_load = std::thread(&util::TraceThread, "initload", [=, &chainman, &args, &node] {
         // Import blocks
         ImportBlocks(chainman, vImportFiles);
+        if (ShutdownRequested()) {
+            LogPrintf("Block import reached a requested shutdown; skipping index and mempool startup\n");
+            return;
+        }
         if (args.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
             LogPrintf("Stopping after block import\n");
             StartShutdown();

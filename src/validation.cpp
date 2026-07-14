@@ -4565,6 +4565,10 @@ bool Chainstate::DisconnectTip(BlockValidationState& state, DisconnectedBlockTra
 {
     AssertLockHeld(cs_main);
     if (m_mempool) AssertLockHeld(m_mempool->cs);
+    if (m_chainman.m_chainstate_rebuild_committed_this_process) {
+        LogPrintf("DisconnectTip: refusing active-chain mutation after protected chainstate commit\n");
+        return false;
+    }
 
     CBlockIndex *pindexDelete = m_chain.Tip();
     assert(pindexDelete);
@@ -4679,6 +4683,10 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
 {
     AssertLockHeld(cs_main);
     if (m_mempool) AssertLockHeld(m_mempool->cs);
+    if (m_chainman.m_chainstate_rebuild_committed_this_process) {
+        LogPrintf("ConnectTip: refusing active-chain mutation after protected chainstate commit\n");
+        return false;
+    }
 
     assert(pindexNew->pprev == m_chain.Tip());
     // Read block from disk.
@@ -5034,6 +5042,17 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
     // we use m_chainstate_mutex to enforce mutual exclusion so that only one caller may execute this function at a time
     LOCK(m_chainstate_mutex);
 
+    // COMMIT_READY authenticates a specific tip and full Coin set for the next
+    // process to reopen. A validation task queued before shutdown may reach
+    // this function after that durable write. Treat it as successfully
+    // quiesced instead of connecting, disconnecting, or invalidating anything
+    // against the committed replacement.
+    if (WITH_LOCK(::cs_main, return
+            m_chainman.m_chainstate_rebuild_committed_this_process.load())) {
+        LogPrintf("ActivateBestChain: protected chainstate commit is immutable until restart\n");
+        return true;
+    }
+
     // Belt-and-suspenders check that we aren't attempting to advance the background
     // chainstate past the snapshot base block.
     if (WITH_LOCK(::cs_main, return m_disabled)) {
@@ -5058,6 +5077,10 @@ bool Chainstate::ActivateBestChain(BlockValidationState& state, std::shared_ptr<
             LOCK(cs_main);
             // Lock transaction pool for at least as long as it takes for connectTrace to be consumed
             LOCK(MempoolMutex());
+            if (m_chainman.m_chainstate_rebuild_committed_this_process) {
+                LogPrintf("ActivateBestChain: stopping queued validation at protected chainstate commit\n");
+                return true;
+            }
             const bool was_in_ibd = m_chainman.IsInitialBlockDownload();
             CBlockIndex* starting_tip = m_chain.Tip();
             bool blocks_connected = false;
