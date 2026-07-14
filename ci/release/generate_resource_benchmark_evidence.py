@@ -46,6 +46,22 @@ MAXIMUM_MAINNET_SYNTHETIC_MUHASH_INSERTIONS = (
 # still bounding the complete apply+checkpoint+undo+rewind transition to less
 # than 1/32 of Blackcoin's 64-second target spacing.
 MAXIMUM_SYNTHETIC_STATE_APPLY_UNDO_SECONDS = 2.0
+MAINNET_SHADOW_REWARD_START_HEIGHT = 5_950_000
+MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT = 5_993_200
+MAINNET_SHADOW_REWARD_END_HEIGHT = 6_192_999
+MAINNET_SHADOW_GOLD_RUSH_BLOCKS = 243_000
+LEGACY_POW_CLAIMS_PER_BLOCK = 1
+V4_MAX_BLOCK_WEIGHT = 32_000_000
+MIN_TRANSACTION_WEIGHT = 4 * 60
+MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK = (
+    V4_MAX_BLOCK_WEIGHT // MIN_TRANSACTION_WEIGHT
+) + 2
+MAX_SHADOW_STATE_MARKER_BYTES = 0x02000000 - 1024
+MAX_SHADOW_SHARD_DATA_BYTES = 8000
+DIRECT_QUANTUM_SCRIPT_BYTES = 34
+CANONICAL_P2PKH_SCRIPT_BYTES = 25
+POOL_V2_BYTES = 49
+SHADOW_MAX_EMISSION_SATOSHIS = 51_437_700 * 100_000_000
 
 DOMAIN_BENCHMARKS = {
     "crypto": {
@@ -73,6 +89,359 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def verify_epoch_source_contract(repo_root: Path) -> dict[str, str]:
+    """Bind epoch arithmetic to the exact serializers and mainnet schedule."""
+    required = {
+        "src/shadow.h": (
+            "static constexpr int MAINNET_SHADOW_REWARD_START_HEIGHT = 5950000;",
+            "static constexpr int MAINNET_SHADOW_GOLD_RUSH_BLOCKS = (180 * 24 * 60 * 60) / 64;",
+            "static constexpr int MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS = 43200;",
+            "static_assert(MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT == 5993200);",
+            "static_assert(MAINNET_SHADOW_REWARD_END_HEIGHT == 6192999);",
+            "static constexpr unsigned int MAX_SHADOW_POW_EVALS_PER_BLOCK = 64;",
+            "static constexpr CAmount SHADOW_MAX_EMISSION = 51437700 * COIN;",
+        ),
+        "src/shadow.cpp": (
+            "static constexpr size_t POOL_V2_SIZE = 49;",
+            "static constexpr size_t MAX_SHADOW_STATE_MARKER_BYTES = MAX_SIZE - 1024;",
+            "static constexpr size_t MAX_SHADOW_SHARD_DATA_BYTES = 8000;",
+            "static constexpr uint32_t MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK = (V4_MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT) + 2;",
+            "static constexpr size_t HEADER_SIZE = 1 + uint256::size() + 3 * sizeof(uint32_t);",
+            "static constexpr size_t SIZE = 2 + 3 * sizeof(uint32_t) + 6 * uint256::size() + POOL_V2_SIZE;",
+            "static_assert(2 + QUANTUM_MIGRATION_PROGRAM_SIZE == 34);",
+        ),
+        "src/serialize.h": (
+            "static constexpr uint64_t MAX_SIZE = 0x02000000;",
+        ),
+        "src/consensus/consensus.h": (
+            "static const unsigned int V4_MAX_BLOCK_WEIGHT = 32000000;",
+            "static const int WITNESS_SCALE_FACTOR = 4;",
+            "static const size_t MIN_TRANSACTION_WEIGHT = WITNESS_SCALE_FACTOR * 60;",
+        ),
+        "src/consensus/quantum_witness.h": (
+            "static constexpr unsigned int QUANTUM_MIGRATION_PROGRAM_SIZE = 32;",
+        ),
+        "src/consensus/amount.h": (
+            "static constexpr CAmount COIN = 100000000;",
+        ),
+        "src/coins.h": (
+            "uint32_t code = nHeight * uint32_t{4} + (fCoinBase ? 1 : 0) + (fCoinStake ? 2 : 0);",
+            "::Serialize(s, VARINT(code));",
+            "::Serialize(s, VARINT(nTime));",
+            "::Serialize(s, Using<TxOutCompression>(out));",
+        ),
+        "src/txdb.cpp": (
+            "SERIALIZE_METHODS(CoinEntry, obj) { READWRITE(obj.key, obj.outpoint->hash, VARINT(obj.outpoint->n)); }",
+        ),
+        "src/compressor.h": (
+            "static const unsigned int nSpecialScripts = 6;",
+            "unsigned int nSize = script.size() + nSpecialScripts;",
+            "READWRITE(Using<AmountCompression>(obj.nValue), Using<ScriptCompression>(obj.scriptPubKey))",
+        ),
+        "src/compressor.cpp": (
+            "uint64_t CompressAmount(uint64_t n)",
+            "return 1 + (n*9 + d - 1)*10 + e;",
+            "return 1 + (n - 1)*10 + 9;",
+        ),
+        "src/kernel/chainparams.cpp": (
+            "consensus.nShadowCompetingClaimsActivationHeight =\n            MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;",
+        ),
+        "src/bench/quantum_crypto.cpp": (
+            "constexpr uint32_t MAINNET_AUTHENTICATED_WHITELIST_ENTRIES{687};",
+            "static_assert(MAXIMUM_MAINNET_SYNTHETIC_CLAIMS == 751);",
+        ),
+        "src/dbwrapper.cpp": (
+            "options.compression = leveldb::kNoCompression;",
+        ),
+    }
+    hashes = {}
+    for relative, fragments in required.items():
+        path = repo_root / relative
+        if not path.is_file():
+            raise RuntimeError(f"epoch-bound source file is missing: {relative}")
+        source = path.read_text(encoding="utf-8")
+        missing = [fragment for fragment in fragments if fragment not in source]
+        if missing:
+            raise RuntimeError(
+                f"epoch-bound source contract changed in {relative}: {missing[0]}"
+            )
+        hashes[relative] = sha256_file(path)
+    return hashes
+
+
+def varint_size(value: int) -> int:
+    if value < 0:
+        raise RuntimeError("VARINT input must be nonnegative")
+    size = 1
+    while value > 0x7F:
+        value = (value >> 7) - 1
+        size += 1
+    return size
+
+
+def compress_amount(value: int) -> int:
+    if value < 0:
+        raise RuntimeError("compressed amount must be nonnegative")
+    if value == 0:
+        return 0
+    exponent = 0
+    while value % 10 == 0 and exponent < 9:
+        value //= 10
+        exponent += 1
+    if exponent < 9:
+        digit = value % 10
+        value //= 10
+        return 1 + (value * 9 + digit - 1) * 10 + exponent
+    return 1 + (value - 1) * 10 + 9
+
+
+def script_push_size(payload_bytes: int) -> int:
+    if payload_bytes < 0:
+        raise RuntimeError("script payload size must be nonnegative")
+    if payload_bytes <= 75:
+        return 1
+    if payload_bytes <= 0xFF:
+        return 2
+    if payload_bytes <= 0xFFFF:
+        return 3
+    return 5
+
+
+def marker_script_size(tag_bytes: int, payload_bytes: int) -> int:
+    return (
+        2 + script_push_size(tag_bytes) + tag_bytes +
+        script_push_size(payload_bytes) + payload_bytes
+    )
+
+
+def coin_value_size(script_bytes: int, compressed_amount_varint_bytes: int = 1) -> int:
+    # Every Gold Rush height uses a four-byte height-code VARINT. A uint32
+    # block time needs at most five bytes. Marker scripts are not one of the
+    # six special CTxOutCompressor templates.
+    return (
+        4 + 5 + compressed_amount_varint_bytes +
+        varint_size(script_bytes + 6) + script_bytes
+    )
+
+
+def leveldb_batch_put_size(value_bytes: int) -> int:
+    # CoinEntry is 'C' + uint256 + VARINT(0): 34 bytes. CDBBatch::WriteImpl
+    # adds a type byte and key/value length VARINTs. These are serialized batch
+    # payload bytes, not an SSTable or compaction-amplification bound.
+    key_bytes = 34
+    return 3 + key_bytes + (1 if value_bytes > 127 else 0) + value_bytes
+
+
+def active_undo_batch_payload(blob_bytes: int) -> dict:
+    if blob_bytes <= 0 or blob_bytes > MAX_SHADOW_STATE_MARKER_BYTES:
+        raise RuntimeError("active undo blob is outside the source marker bound")
+    shard_count = (
+        blob_bytes + MAX_SHADOW_SHARD_DATA_BYTES - 1
+    ) // MAX_SHADOW_SHARD_DATA_BYTES
+    manifest_payload = 1 + 2 * 32 + 2 * 4 + 32
+    manifest_script = marker_script_size(6, manifest_payload)
+    total = leveldb_batch_put_size(coin_value_size(manifest_script))
+    remaining = blob_bytes
+    for _ in range(shard_count):
+        data_bytes = min(MAX_SHADOW_SHARD_DATA_BYTES, remaining)
+        remaining -= data_bytes
+        shard_payload = 1 + 32 + 3 * 4 + data_bytes
+        shard_script = marker_script_size(6, shard_payload)
+        total += leveldb_batch_put_size(coin_value_size(shard_script))
+    if remaining != 0:
+        raise RuntimeError("active undo shard accounting did not consume the blob")
+    return {"blob_bytes": blob_bytes, "shards": shard_count,
+            "batch_payload_bytes": total}
+
+
+def calculate_full_epoch_bounds() -> dict:
+    legacy_blocks = (
+        MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT -
+        MAINNET_SHADOW_REWARD_START_HEIGHT
+    )
+    canonical_blocks = MAINNET_SHADOW_GOLD_RUSH_BLOCKS - legacy_blocks
+    if (legacy_blocks != 43_200 or canonical_blocks != 199_800 or
+            MAINNET_SHADOW_REWARD_END_HEIGHT -
+            MAINNET_SHADOW_REWARD_START_HEIGHT + 1 !=
+            MAINNET_SHADOW_GOLD_RUSH_BLOCKS):
+        raise RuntimeError("mainnet Gold Rush phase arithmetic changed")
+
+    legacy_claims_per_block = (
+        MAINNET_AUTHENTICATED_WHITELIST_ENTRIES +
+        LEGACY_POW_CLAIMS_PER_BLOCK
+    )
+    canonical_claims_per_block = MAXIMUM_MAINNET_SYNTHETIC_CLAIMS
+    maximum_claims = (
+        legacy_blocks * legacy_claims_per_block +
+        canonical_blocks * canonical_claims_per_block
+    )
+    protocol_maximum_claims = (
+        MAINNET_SHADOW_GOLD_RUSH_BLOCKS *
+        MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK
+    )
+
+    claim_payload = 4 + 8 + 1 + POOL_V2_BYTES + 2 + DIRECT_QUANTUM_SCRIPT_BYTES
+    claim_envelope = 4 + 4 + 32 + 4 + claim_payload
+    claim_marker_script = marker_script_size(8, claim_envelope)
+    claim_marker_bytes = leveldb_batch_put_size(
+        coin_value_size(claim_marker_script)
+    )
+
+    # A claim cannot exceed the entire scheduled emission. The largest
+    # non-multiple of ten below that cap maximizes CompressAmount over the
+    # interval and therefore bounds every claim's amount VARINT.
+    maximum_claim_amount_varint_bytes = varint_size(
+        compress_amount(SHADOW_MAX_EMISSION_SATOSHIS - 1)
+    )
+    if maximum_claim_amount_varint_bytes != 8:
+        raise RuntimeError("maximum claim amount compression changed")
+    payout_bytes = leveldb_batch_put_size(
+        coin_value_size(DIRECT_QUANTUM_SCRIPT_BYTES,
+                        compressed_amount_varint_bytes=
+                        maximum_claim_amount_varint_bytes)
+    )
+    payout_record_payload = (
+        1 + 4 + 32 + 4 + 36 + 8 + 1 + 32 +
+        1 + DIRECT_QUANTUM_SCRIPT_BYTES
+    )
+    payout_marker_script = marker_script_size(7, payout_record_payload)
+    payout_marker_bytes = leveldb_batch_put_size(
+        coin_value_size(payout_marker_script)
+    )
+    claim_family_bytes = claim_marker_bytes + payout_bytes + payout_marker_bytes
+    if (claim_marker_bytes, payout_bytes, payout_marker_bytes,
+            claim_family_bytes) != (205, 89, 215, 509):
+        raise RuntimeError("claim-family serialization arithmetic changed")
+
+    pool_undo_payload = 2 + 3 * 4 + 6 * 32 + POOL_V2_BYTES
+    pool_undo_script = marker_script_size(6, pool_undo_payload)
+    pool_undo_bytes = leveldb_batch_put_size(coin_value_size(pool_undo_script))
+    solver_script = marker_script_size(7, 1 + 32)
+    solver_bytes = leveldb_batch_put_size(coin_value_size(solver_script))
+    if (pool_undo_bytes, solver_bytes) != (316, 92):
+        raise RuntimeError("fixed marker serialization arithmetic changed")
+
+    p2pkh_whitelist_blob = (
+        1 + 4 + MAINNET_AUTHENTICATED_WHITELIST_ENTRIES *
+        (2 + CANONICAL_P2PKH_SCRIPT_BYTES)
+    )
+    p2pkh_active_state = (
+        p2pkh_whitelist_blob + 32 +
+        40 * MAINNET_AUTHENTICATED_WHITELIST_ENTRIES
+    )
+    p2pkh_active_undo = (
+        p2pkh_whitelist_blob + 169 +
+        41 * MAINNET_AUTHENTICATED_WHITELIST_ENTRIES
+    )
+    p2pkh_undo_storage = active_undo_batch_payload(p2pkh_active_undo)
+    protocol_undo_storage = active_undo_batch_payload(
+        MAX_SHADOW_STATE_MARKER_BYTES
+    )
+    if (p2pkh_whitelist_blob, p2pkh_active_state, p2pkh_active_undo,
+            p2pkh_undo_storage["batch_payload_bytes"],
+            protocol_undo_storage["batch_payload_bytes"]) != (
+                18_554, 46_066, 46_890, 47_696, 34_002_437):
+        raise RuntimeError("active-state serialization arithmetic changed")
+
+    fixed_per_block = pool_undo_bytes + solver_bytes
+    p2pkh_retained_payload_bytes = (
+        maximum_claims * claim_family_bytes +
+        MAINNET_SHADOW_GOLD_RUSH_BLOCKS *
+        (p2pkh_undo_storage["batch_payload_bytes"] + fixed_per_block)
+    )
+    protocol_retained_payload_bytes = (
+        protocol_maximum_claims * claim_family_bytes +
+        MAINNET_SHADOW_GOLD_RUSH_BLOCKS *
+        (protocol_undo_storage["batch_payload_bytes"] + fixed_per_block)
+    )
+
+    return {
+        "schedule": {
+            "start_height": MAINNET_SHADOW_REWARD_START_HEIGHT,
+            "competing_claims_activation_height":
+                MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT,
+            "end_height": MAINNET_SHADOW_REWARD_END_HEIGHT,
+            "blocks": MAINNET_SHADOW_GOLD_RUSH_BLOCKS,
+            "legacy_allocation_blocks": legacy_blocks,
+            "canonical_reimbursement_blocks": canonical_blocks,
+        },
+        "claim_operations": {
+            "canonical_687_entry_fixture": {
+                "authenticated_whitelist_entries":
+                    MAINNET_AUTHENTICATED_WHITELIST_ENTRIES,
+                "legacy_claims_per_block": legacy_claims_per_block,
+                "canonical_claims_per_block": canonical_claims_per_block,
+                "maximum_claims": maximum_claims,
+                "maximum_claim_family_records": maximum_claims * 3,
+                "maximum_muhash_insertions": maximum_claims * 2,
+            },
+            "protocol_source_envelope": {
+                "maximum_claims_per_block":
+                    MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK,
+                "maximum_claims": protocol_maximum_claims,
+                "maximum_claim_family_records": protocol_maximum_claims * 3,
+                "maximum_muhash_insertions": protocol_maximum_claims * 2,
+            },
+        },
+        "serialized_chainstate_batch_payload": {
+            "claim_marker_bytes": claim_marker_bytes,
+            "payout_coin_bytes": payout_bytes,
+            "payout_provenance_bytes": payout_marker_bytes,
+            "claim_family_bytes": claim_family_bytes,
+            "pool_undo_bytes_per_block": pool_undo_bytes,
+            "solver_bytes_per_block": solver_bytes,
+            "canonical_p2pkh_fixture": {
+                "whitelist_blob_bytes": p2pkh_whitelist_blob,
+                "maximum_active_state_bytes": p2pkh_active_state,
+                "maximum_active_undo": p2pkh_undo_storage,
+                "full_epoch_retained_append_only_payload_bytes":
+                    p2pkh_retained_payload_bytes,
+            },
+            "protocol_source_envelope": {
+                "maximum_active_undo": protocol_undo_storage,
+                "full_epoch_retained_append_only_payload_bytes":
+                    protocol_retained_payload_bytes,
+            },
+            "scope": (
+                "serialized retained append-only claim-family, undo and solver "
+                "CoinEntry "
+                "payloads plus CDBBatch framing; excludes pre-existing base "
+                "UTXOs, rolling checkpoint puts/deletes, SSTable/index/filter/"
+                "WAL overhead, obsolete files and compaction amplification"
+            ),
+            "physical_leveldb_disk_bound_established": False,
+        },
+        "startup": {
+            "full_epoch_claim_scan_required_by_application": False,
+            "maximum_active_state_shards_canonical_p2pkh_fixture": 6,
+            "maximum_active_state_shards_protocol_source_envelope": 4_195,
+            "leveldb_open_wall_clock_bound_established": False,
+        },
+        "replay": {
+            "canonical_687_entry_fixture_maximum_claim_applications":
+                maximum_claims,
+            "canonical_687_entry_fixture_maximum_muhash_insertions":
+                maximum_claims * 2,
+            "protocol_source_envelope_maximum_claim_applications":
+                protocol_maximum_claims,
+            "protocol_source_envelope_maximum_muhash_insertions":
+                protocol_maximum_claims * 2,
+            "sum_of_per_block_apply_undo_thresholds_seconds":
+                MAINNET_SHADOW_GOLD_RUSH_BLOCKS *
+                MAXIMUM_SYNTHETIC_STATE_APPLY_UNDO_SECONDS,
+            "full_replay_wall_clock_bound_established": False,
+        },
+        "retention": {
+            "authenticated_compaction_implemented": False,
+            "decision": (
+                "unresolved until exact snapshot dimensions, physical "
+                "LevelDB amplification, and full-epoch replay are qualified"
+            ),
+        },
+        "issue_13_disposition": "partial",
+    }
 
 
 def finite_positive(value, label: str) -> float:
@@ -278,6 +647,7 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
         repo_root, repository, source_sha,
         allowed_untracked=(nanobench_json,),
     )
+    epoch_source_contract = verify_epoch_source_contract(repo_root)
     if not LABEL_RE.fullmatch(platform) or not LABEL_RE.fullmatch(architecture):
         raise RuntimeError("platform and architecture must be simple stable labels")
     toolchain = checked_line(toolchain, "toolchain")
@@ -375,6 +745,7 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
             "maximum_fraction_of_target_spacing":
                 MAXIMUM_SYNTHETIC_STATE_APPLY_UNDO_SECONDS / 64.0,
         }
+        derived["full_gold_rush_epoch"] = calculate_full_epoch_bounds()
 
     return {
         "schema": 1,
@@ -395,6 +766,7 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
             "nanobench_json_sha256": sha256_file(nanobench_json),
             "quantum_crypto_provenance_manifest_sha256":
                 sha256_file(provenance_manifest),
+            "epoch_source_contract_sha256": epoch_source_contract,
         },
         "consensus_limits": {
             "minimum_quantum_input_weight": MIN_QUANTUM_INPUT_WEIGHT,

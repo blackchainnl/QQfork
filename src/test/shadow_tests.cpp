@@ -14,6 +14,7 @@
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
+#include <serialize.h>
 #include <shadow.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
@@ -376,6 +377,46 @@ BOOST_AUTO_TEST_CASE(synthetic_claim_limit_preserves_history_and_tightens_at_act
                           consensus, 100,
                           std::numeric_limits<uint32_t>::max()),
                       legacy_limit);
+}
+
+BOOST_AUTO_TEST_CASE(active_signal_resource_bounds_follow_authenticated_whitelist)
+{
+    // Mainnet's observed 687 canonical P2PKH targets produce a whitelist blob
+    // of 5 + 687 * (2 + 25) bytes. The bound is derived from those manifest
+    // dimensions rather than the generic 32 MiB deserialization ceiling.
+    const auto direct = GetShadowActiveSignalResourceBounds(
+        /*whitelist_entries=*/687,
+        /*whitelist_blob_bytes=*/18'554);
+    BOOST_REQUIRE(direct);
+    BOOST_CHECK_EQUAL(direct->maximum_state_bytes, 46'066U);
+    BOOST_CHECK_EQUAL(direct->maximum_undo_bytes, 46'890U);
+    BOOST_CHECK_EQUAL(direct->maximum_state_shards, 6U);
+    BOOST_CHECK_EQUAL(direct->maximum_undo_shards, 6U);
+
+    const auto empty = GetShadowActiveSignalResourceBounds(
+        /*whitelist_entries=*/0,
+        /*whitelist_blob_bytes=*/5);
+    BOOST_REQUIRE(empty);
+    BOOST_CHECK_EQUAL(empty->maximum_state_bytes, 37U);
+    BOOST_CHECK_EQUAL(empty->maximum_undo_bytes, 174U);
+    BOOST_CHECK_EQUAL(empty->maximum_state_shards, 1U);
+    BOOST_CHECK_EQUAL(empty->maximum_undo_shards, 1U);
+
+    BOOST_CHECK(!GetShadowActiveSignalResourceBounds(
+        /*whitelist_entries=*/1,
+        /*whitelist_blob_bytes=*/7));
+    BOOST_CHECK(!GetShadowActiveSignalResourceBounds(
+        /*whitelist_entries=*/687,
+        /*whitelist_blob_bytes=*/MAX_SIZE));
+
+    const auto envelope = GetShadowActiveSignalResourceBounds(
+        /*whitelist_entries=*/687,
+        /*whitelist_blob_bytes=*/MAX_SIZE - 1024);
+    BOOST_REQUIRE(envelope);
+    BOOST_CHECK_EQUAL(envelope->maximum_state_bytes, MAX_SIZE - 1024);
+    BOOST_CHECK_EQUAL(envelope->maximum_undo_bytes, MAX_SIZE - 1024);
+    BOOST_CHECK_EQUAL(envelope->maximum_state_shards, 4'195U);
+    BOOST_CHECK_EQUAL(envelope->maximum_undo_shards, 4'195U);
 }
 
 BOOST_AUTO_TEST_CASE(shadow_index_record_validation_respects_claim_boundary)

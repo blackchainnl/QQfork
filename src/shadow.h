@@ -37,6 +37,25 @@ struct ShadowGoldRushInfo {
     unsigned int pow_target_bits{0};
 };
 
+/** Maximum serialized active-signal state derived from the authenticated
+ * whitelist manifest. The limits describe logical payload bytes before
+ * deterministic 8,000-byte sharding; they do not include LevelDB overhead. */
+struct ShadowActiveSignalResourceBounds {
+    uint32_t whitelist_entries{0};
+    uint32_t whitelist_blob_bytes{0};
+    uint32_t maximum_state_bytes{0};
+    uint32_t maximum_undo_bytes{0};
+    uint32_t maximum_state_shards{0};
+    uint32_t maximum_undo_shards{0};
+};
+
+/** Derive fail-closed active-state and undo bounds from a decoded whitelist
+ * manifest. Returns null when the manifest dimensions cannot encode the
+ * declared number of non-empty scripts. */
+std::optional<ShadowActiveSignalResourceBounds>
+GetShadowActiveSignalResourceBounds(uint32_t whitelist_entries,
+                                    uint32_t whitelist_blob_bytes);
+
 /** Snapshot-decodable provenance for one synthetic Gold Rush payout marker. */
 struct GoldRushPayoutMarkerInfo {
     COutPoint payout_outpoint;

@@ -172,6 +172,77 @@ class ReleaseToolTests(unittest.TestCase):
                 synthetic_bound["measured_maximum_epoch_seconds"], 0.2
             )
             self.assertEqual(synthetic_bound["maximum_allowed_seconds"], 2.0)
+            epoch = evidence["derived_upper_bounds"]["full_gold_rush_epoch"]
+            self.assertEqual(epoch["schedule"]["blocks"], 243_000)
+            self.assertEqual(
+                epoch["schedule"]["legacy_allocation_blocks"], 43_200
+            )
+            self.assertEqual(
+                epoch["schedule"]["canonical_reimbursement_blocks"], 199_800
+            )
+            self.assertEqual(
+                epoch["claim_operations"]["canonical_687_entry_fixture"]
+                ["maximum_claims"],
+                179_771_400,
+            )
+            self.assertEqual(
+                epoch["claim_operations"]["canonical_687_entry_fixture"]
+                ["maximum_claim_family_records"],
+                539_314_200,
+            )
+            self.assertEqual(
+                epoch["claim_operations"]["canonical_687_entry_fixture"]
+                ["maximum_muhash_insertions"],
+                359_542_800,
+            )
+            protocol_claims = epoch["claim_operations"] \
+                ["protocol_source_envelope"]
+            self.assertEqual(
+                protocol_claims["maximum_claims_per_block"], 133_335
+            )
+            self.assertEqual(
+                protocol_claims["maximum_claims"], 32_400_405_000
+            )
+            footprint = epoch["serialized_chainstate_batch_payload"]
+            self.assertEqual(footprint["claim_family_bytes"], 509)
+            self.assertEqual(
+                footprint["canonical_p2pkh_fixture"]
+                ["full_epoch_retained_append_only_payload_bytes"],
+                103_192_914_600,
+            )
+            self.assertEqual(
+                footprint["protocol_source_envelope"]
+                ["full_epoch_retained_append_only_payload_bytes"],
+                24_754_497_480_000,
+            )
+            self.assertFalse(footprint["physical_leveldb_disk_bound_established"])
+            self.assertFalse(
+                epoch["replay"]["full_replay_wall_clock_bound_established"]
+            )
+            self.assertEqual(
+                epoch["replay"]
+                ["protocol_source_envelope_maximum_claim_applications"],
+                32_400_405_000,
+            )
+            self.assertEqual(epoch["issue_13_disposition"], "partial")
+            self.assertEqual(
+                set(evidence["inputs"]["epoch_source_contract_sha256"]),
+                {
+                    "src/shadow.h",
+                    "src/shadow.cpp",
+                    "src/serialize.h",
+                    "src/consensus/consensus.h",
+                    "src/consensus/quantum_witness.h",
+                    "src/consensus/amount.h",
+                    "src/coins.h",
+                    "src/txdb.cpp",
+                    "src/compressor.h",
+                    "src/compressor.cpp",
+                    "src/kernel/chainparams.cpp",
+                    "src/bench/quantum_crypto.cpp",
+                    "src/dbwrapper.cpp",
+                },
+            )
 
             synthetic_result = document["results"].pop()
             raw.write_text(json.dumps(document), encoding="utf-8")
@@ -371,6 +442,50 @@ class ReleaseToolTests(unittest.TestCase):
                 repository, "Blackcoin-Dev/Blackcoin", source_sha,
                 allowed_untracked=(raw,),
             )
+
+    def test_full_epoch_bound_arithmetic_is_fail_closed(self):
+        generator = load_module("generate_resource_benchmark_evidence")
+        bounds = generator.calculate_full_epoch_bounds()
+        self.assertEqual(
+            bounds["serialized_chainstate_batch_payload"]
+            ["canonical_p2pkh_fixture"]["maximum_active_undo"],
+            {"blob_bytes": 46_890, "shards": 6,
+             "batch_payload_bytes": 47_696},
+        )
+        self.assertEqual(
+            bounds["serialized_chainstate_batch_payload"]
+            ["protocol_source_envelope"]["maximum_active_undo"],
+            {"blob_bytes": 33_553_408, "shards": 4_195,
+             "batch_payload_bytes": 34_002_437},
+        )
+        self.assertEqual(
+            bounds["replay"]
+            ["sum_of_per_block_apply_undo_thresholds_seconds"],
+            486_000.0,
+        )
+        source_hashes = generator.verify_epoch_source_contract(
+            TOOLS.parent.parent
+        )
+        self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", digest)
+                            for digest in source_hashes.values()))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in source_hashes:
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes((TOOLS.parent.parent / relative).read_bytes())
+            shadow = root / "src" / "shadow.h"
+            shadow.write_text(
+                shadow.read_text(encoding="utf-8").replace(
+                    "MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS = 43200",
+                    "MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS = 43201",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(
+                    RuntimeError, "epoch-bound source contract changed"):
+                generator.verify_epoch_source_contract(root)
 
     def test_resource_benchmark_workflow_measures_and_does_not_overclaim(self):
         root = TOOLS.parent.parent

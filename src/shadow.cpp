@@ -394,6 +394,59 @@ uint32_t GetShadowSyntheticClaimLimit(const Consensus::Params& consensus,
         MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK, derived_limit));
 }
 
+std::optional<ShadowActiveSignalResourceBounds>
+GetShadowActiveSignalResourceBounds(uint32_t whitelist_entries,
+                                    uint32_t whitelist_blob_bytes)
+{
+    // The whitelist blob is version(1), count(4), then at least a uint16
+    // length and one script byte per entry. Reject impossible dimensions
+    // before using them to relax any active-state allocation bound.
+    static constexpr uint64_t WHITELIST_HEADER_BYTES{1 + sizeof(uint32_t)};
+    static constexpr uint64_t MINIMUM_WHITELIST_ENTRY_BYTES{
+        sizeof(uint16_t) + 1};
+    const uint64_t minimum_whitelist_bytes = WHITELIST_HEADER_BYTES +
+        static_cast<uint64_t>(whitelist_entries) *
+            MINIMUM_WHITELIST_ENTRY_BYTES;
+    if (whitelist_entries > MAX_SHADOW_CLAIM_MARKERS_PER_BLOCK ||
+        whitelist_blob_bytes < minimum_whitelist_bytes ||
+        whitelist_blob_bytes > MAX_SHADOW_STATE_MARKER_BYTES) {
+        return std::nullopt;
+    }
+
+    // Whitelist encoding contributes (uint16 length + target) per entry.
+    // Active state contributes (height + two uint16 lengths + target + the
+    // fixed 34-byte direct quantum payout), plus a 37-byte header. Relative
+    // to the whitelist blob this is exactly 32 + 40 bytes per entry.
+    //
+    // Undo has a 174-byte header. Its maximum entry restores a previous
+    // signal and contributes (target length + target + presence + height +
+    // payout length + fixed payout), exactly 169 + 41 bytes per whitelist
+    // entry beyond the whitelist blob.
+    static_assert(2 + QUANTUM_MIGRATION_PROGRAM_SIZE == 34);
+    const uint64_t state_bytes = std::min<uint64_t>(
+        MAX_SHADOW_STATE_MARKER_BYTES,
+        static_cast<uint64_t>(whitelist_blob_bytes) + 32 +
+            static_cast<uint64_t>(whitelist_entries) * 40);
+    const uint64_t undo_bytes = std::min<uint64_t>(
+        MAX_SHADOW_STATE_MARKER_BYTES,
+        static_cast<uint64_t>(whitelist_blob_bytes) + 169 +
+            static_cast<uint64_t>(whitelist_entries) * 41);
+    const auto shard_count = [](uint64_t bytes) {
+        return static_cast<uint32_t>(
+            (bytes + MAX_SHADOW_SHARD_DATA_BYTES - 1) /
+            MAX_SHADOW_SHARD_DATA_BYTES);
+    };
+
+    return ShadowActiveSignalResourceBounds{
+        whitelist_entries,
+        whitelist_blob_bytes,
+        static_cast<uint32_t>(state_bytes),
+        static_cast<uint32_t>(undo_bytes),
+        shard_count(state_bytes),
+        shard_count(undo_bytes),
+    };
+}
+
 CScript CanonicalizeLegacyStakeScript(const CScript& scriptPubKey)
 {
     return CanonicalLegacyStakeScript(scriptPubKey);
@@ -2351,8 +2404,9 @@ bool ActiveSignalPoolPairValid(const Consensus::Params& consensus,
            pool_present == *transition_applied;
 }
 
-std::optional<uint32_t> ReadAuthenticatedWhitelistCount(const CCoinsViewCache& view,
-                                                        const CBlockIndex* pindex)
+std::optional<ShadowActiveSignalResourceBounds>
+ReadAuthenticatedWhitelistResourceBounds(const CCoinsViewCache& view,
+                                          const CBlockIndex* pindex)
 {
     Coin coin;
     WhitelistManifest manifest;
@@ -2364,7 +2418,16 @@ std::optional<uint32_t> ReadAuthenticatedWhitelistCount(const CCoinsViewCache& v
     const CBlockIndex* snapshot_block = SafeGetAncestor(pindex, manifest.snapshot_height);
     if (!snapshot_block || snapshot_block->GetBlockHash() != manifest.snapshot_hash ||
         coin.nTime != static_cast<uint32_t>(snapshot_block->GetBlockTime())) return std::nullopt;
-    return manifest.entry_count;
+    return GetShadowActiveSignalResourceBounds(manifest.entry_count,
+                                               manifest.total_size);
+}
+
+std::optional<uint32_t> ReadAuthenticatedWhitelistCount(const CCoinsViewCache& view,
+                                                        const CBlockIndex* pindex)
+{
+    const auto bounds = ReadAuthenticatedWhitelistResourceBounds(view, pindex);
+    if (!bounds) return std::nullopt;
+    return bounds->whitelist_entries;
 }
 
 bool PoolUndoClaimCountWithinBound(const CCoinsViewCache& view,
@@ -2446,14 +2509,17 @@ ActiveSignalStateReadResult ReadActiveSignalStateMarker(const CCoinsViewCache& v
         return ActiveSignalStateReadResult::INVALID;
     }
     const CBlockIndex* marker_block = SafeGetAncestor(pindex, static_cast<int>(coin.nHeight));
-    const std::optional<uint32_t> whitelist_count = ReadAuthenticatedWhitelistCount(view, pindex);
+    const auto resource_bounds =
+        ReadAuthenticatedWhitelistResourceBounds(view, pindex);
     ActiveSignalStateManifest manifest;
     if (!marker_block || coin.nTime != static_cast<uint32_t>(marker_block->GetBlockTime()) ||
-        !whitelist_count ||
+        !resource_bounds ||
         coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
         !DecodeActiveSignalStateManifest(coin.out.scriptPubKey, manifest) ||
         manifest.marker_hash != marker_block->GetBlockHash() ||
-        manifest.entry_count > *whitelist_count) {
+        manifest.entry_count > resource_bounds->whitelist_entries ||
+        manifest.total_size > resource_bounds->maximum_state_bytes ||
+        manifest.shard_count > resource_bounds->maximum_state_shards) {
         active.clear();
         return ActiveSignalStateReadResult::INVALID;
     }
@@ -2476,7 +2542,8 @@ ActiveSignalStateReadResult ReadActiveSignalStateMarker(const CCoinsViewCache& v
     }
     if (blob.size() != manifest.total_size ||
         HashStateBlob("Quantum Quasar Active Signal State Blob v1", blob) != manifest.blob_hash ||
-        !DecodeActiveSignalSetPayload(blob, active, &marker_hash, *whitelist_count) ||
+        !DecodeActiveSignalSetPayload(blob, active, &marker_hash,
+                                      resource_bounds->whitelist_entries) ||
         marker_hash != manifest.marker_hash || active.size() != manifest.entry_count) {
         active.clear();
         return ActiveSignalStateReadResult::INVALID;
@@ -3474,11 +3541,13 @@ bool ActiveSignalMapsEqual(const std::map<CScript, ShadowActiveSignal>& lhs,
 
 bool BuildActiveSignalStateScripts(const std::map<CScript, ShadowActiveSignal>& active,
                                    const uint256& marker_hash,
+                                   size_t maximum_blob_bytes,
                                    CScript& manifest_script,
                                    std::vector<CScript>& shard_scripts)
 {
     valtype blob;
-    if (!EncodeActiveSignalSetPayload(active, marker_hash, blob)) return false;
+    if (!EncodeActiveSignalSetPayload(active, marker_hash, blob) ||
+        blob.size() > maximum_blob_bytes) return false;
     const uint32_t shard_count = BlobShardCount(blob.size());
     if (shard_count == 0) return false;
     ActiveSignalStateManifest manifest;
@@ -3502,11 +3571,13 @@ bool BuildActiveSignalStateScripts(const std::map<CScript, ShadowActiveSignal>& 
 }
 
 bool BuildActiveSignalUndoScripts(const ShadowActiveSignalUndo& undo,
+                                  size_t maximum_blob_bytes,
                                   CScript& manifest_script,
                                   std::vector<CScript>& shard_scripts)
 {
     valtype blob;
-    if (!EncodeActiveSignalUndo(undo, blob)) return false;
+    if (!EncodeActiveSignalUndo(undo, blob) ||
+        blob.size() > maximum_blob_bytes) return false;
     const uint32_t shard_count = BlobShardCount(blob.size());
     if (shard_count == 0) return false;
     ActiveSignalUndoManifest manifest;
@@ -3547,11 +3618,16 @@ bool ReadActiveSignalUndoBlob(const CCoinsViewCache& view, const CBlockIndex* pi
                               const Coin& undo_coin, valtype& blob_out)
 {
     ActiveSignalUndoManifest manifest;
+    const auto resource_bounds =
+        ReadAuthenticatedWhitelistResourceBounds(view, pindex);
     if (!pindex || undo_coin.out.nValue != 0 || !undo_coin.fCoinBase || undo_coin.fCoinStake ||
+        !resource_bounds ||
         undo_coin.out.scriptPubKey.size() > MAX_SCRIPT_SIZE ||
         !DecodeActiveSignalUndoManifest(undo_coin.out.scriptPubKey, manifest) ||
         manifest.block_hash != pindex->GetBlockHash() ||
-        manifest.previous_block_hash != (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{})) return false;
+        manifest.previous_block_hash != (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{}) ||
+        manifest.total_size > resource_bounds->maximum_undo_bytes ||
+        manifest.shard_count > resource_bounds->maximum_undo_shards) return false;
     blob_out.clear();
     blob_out.reserve(manifest.total_size);
     for (uint32_t shard_index = 0; shard_index < manifest.shard_count; ++shard_index) {
@@ -3578,11 +3654,15 @@ bool WriteActiveSignalStateChange(CCoinsViewCache& view, const CBlockIndex* pind
                                   const std::map<CScript, ShadowActiveSignal>& next)
 {
     if (!pindex) return false;
-    const std::optional<uint32_t> whitelist_count = ReadAuthenticatedWhitelistCount(view, pindex);
-    if (!whitelist_count || prior.size() > *whitelist_count || next.size() > *whitelist_count) return false;
+    const auto resource_bounds =
+        ReadAuthenticatedWhitelistResourceBounds(view, pindex);
+    if (!resource_bounds ||
+        prior.size() > resource_bounds->whitelist_entries ||
+        next.size() > resource_bounds->whitelist_entries) return false;
     CScript state_manifest_script;
     std::vector<CScript> state_shard_scripts;
     if (!BuildActiveSignalStateScripts(next, pindex->GetBlockHash(),
+                                       resource_bounds->maximum_state_bytes,
                                        state_manifest_script, state_shard_scripts)) return false;
 
     ShadowActiveSignalUndo undo;
@@ -3618,7 +3698,10 @@ bool WriteActiveSignalStateChange(CCoinsViewCache& view, const CBlockIndex* pind
 
     CScript undo_manifest_script;
     std::vector<CScript> undo_shard_scripts;
-    if (!BuildActiveSignalUndoScripts(undo, undo_manifest_script, undo_shard_scripts)) return false;
+    if (!BuildActiveSignalUndoScripts(undo,
+                                      resource_bounds->maximum_undo_bytes,
+                                      undo_manifest_script,
+                                      undo_shard_scripts)) return false;
     const COutPoint undo_outpoint = ActiveSignalUndoOutpoint(pindex);
     if (view.HaveCoin(undo_outpoint)) return false;
 
@@ -3670,12 +3753,13 @@ bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex,
                              bool expected_previous_present)
 {
     if (!pindex) return false;
-    const std::optional<uint32_t> whitelist_count =
-        ReadAuthenticatedWhitelistCount(view, pindex);
-    if (!whitelist_count) return false;
+    const auto resource_bounds =
+        ReadAuthenticatedWhitelistResourceBounds(view, pindex);
+    if (!resource_bounds) return false;
     // Remove obsolete append-only compatibility markers if an old prerelease
     // chainstate is being inspected. They are never used to authorize state.
-    for (uint32_t marker_index = 0; marker_index < *whitelist_count;
+    for (uint32_t marker_index = 0;
+         marker_index < resource_bounds->whitelist_entries;
          ++marker_index) {
         const COutPoint outpoint = ActiveSignalOutpoint(pindex, marker_index);
         if (!view.HaveCoin(outpoint)) break;
@@ -3698,8 +3782,9 @@ bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex,
         undo_coin.nTime != static_cast<uint32_t>(pindex->GetBlockTime())) return false;
     valtype undo_blob;
     ShadowActiveSignalUndo undo;
-    if (!whitelist_count || !ReadActiveSignalUndoBlob(view, pindex, undo_coin, undo_blob) ||
-        !DecodeActiveSignalUndoPayload(undo_blob, undo, *whitelist_count) ||
+    if (!ReadActiveSignalUndoBlob(view, pindex, undo_coin, undo_blob) ||
+        !DecodeActiveSignalUndoPayload(
+            undo_blob, undo, resource_bounds->whitelist_entries) ||
         undo.state_was_present != expected_previous_present ||
         undo.block_hash != pindex->GetBlockHash() ||
         undo.previous_block_hash != (pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{})) return false;
@@ -3745,6 +3830,7 @@ bool UndoActiveSignalMarkers(CCoinsViewCache& view, const CBlockIndex* pindex,
         CScript restored_manifest_script;
         std::vector<CScript> restored_shard_scripts;
         if (!BuildActiveSignalStateScripts(restored, undo.previous_marker_hash,
+                                           resource_bounds->maximum_state_bytes,
                                            restored_manifest_script, restored_shard_scripts)) return false;
         Coin restored_coin;
         restored_coin.out.nValue = 0;
