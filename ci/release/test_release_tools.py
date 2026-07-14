@@ -254,9 +254,36 @@ class ReleaseToolTests(unittest.TestCase):
 
             self.write_windows_test_pe(
                 bench_binary,
-                import_directory_size=(verifier.MAX_IMPORT_DESCRIPTORS + 1) * 20,
+                import_directory_size=44,
             )
-            with self.assertRaisesRegex(RuntimeError, "descriptor limit"):
+            verifier.build_manifest(paths, source_sha, repository)
+
+            self.write_windows_test_pe(
+                bench_binary,
+                import_directory_size=verifier.MAX_IMPORT_DIRECTORY_BYTES + 1,
+            )
+            with self.assertRaisesRegex(RuntimeError, "byte limit"):
+                verifier.build_manifest(paths, source_sha, repository)
+
+            self.write_windows_test_pe(
+                bench_binary,
+                imports=("KERNEL32.dll", "WS2_32.dll"),
+            )
+            with mock.patch.object(verifier, "MAX_IMPORT_DESCRIPTORS", 1):
+                with self.assertRaisesRegex(RuntimeError, "descriptor limit"):
+                    verifier.build_manifest(paths, source_sha, repository)
+
+            self.write_windows_test_pe(
+                bench_binary,
+                import_directory_size=40,
+            )
+            data = bytearray(bench_binary.read_bytes())
+            struct.pack_into(
+                "<IIIII", data, 0x200 + 20,
+                0, 0, 0, 0x1100, 0x1308,
+            )
+            bench_binary.write_bytes(data)
+            with self.assertRaisesRegex(RuntimeError, "unterminated"):
                 verifier.build_manifest(paths, source_sha, repository)
 
             self.write_windows_test_pe(bench_binary)

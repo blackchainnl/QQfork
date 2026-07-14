@@ -22,6 +22,7 @@ PE32_PLUS_MAGIC = 0x020B
 IMPORT_DIRECTORY_INDEX = 1
 DELAY_IMPORT_DIRECTORY_INDEX = 13
 MAX_IMPORT_DESCRIPTORS = 1024
+MAX_IMPORT_DIRECTORY_BYTES = 16 * 1024 * 1024
 
 # Exact Windows system DLL names accepted by the walletless vector binaries.
 # Third-party runtimes and libraries must be statically linked.
@@ -157,14 +158,20 @@ def inspect_pe(path: Path) -> dict:
             f"{path.name}: delay imports are not permitted")
     require(import_rva != 0 and import_size >= 40,
             f"{path.name}: PE import directory is missing")
-    require(import_size % 20 == 0,
-            f"{path.name}: PE import directory size is not descriptor-aligned")
-    require(import_size <= MAX_IMPORT_DESCRIPTORS * 20,
-            f"{path.name}: PE import directory exceeds the reviewed descriptor limit")
+    # IMAGE_DATA_DIRECTORY.Size covers the complete import-table region, not
+    # only its fixed-width IMAGE_IMPORT_DESCRIPTOR prefix. Real linkers include
+    # lookup tables, address tables, and DLL names, so this byte count need not
+    # be descriptor-aligned. The descriptor array is bounded independently and
+    # must end with its specified all-zero entry.
+    require(import_size <= MAX_IMPORT_DIRECTORY_BYTES,
+            f"{path.name}: PE import directory exceeds the reviewed byte limit")
+    descriptor_slots = import_size // 20
+    require(descriptor_slots >= 2,
+            f"{path.name}: PE import directory cannot contain an import and terminator")
 
     imports = set()
     terminated = False
-    for index in range(import_size // 20):
+    for index in range(min(descriptor_slots, MAX_IMPORT_DESCRIPTORS + 1)):
         descriptor_rva = import_rva + index * 20
         descriptor = rva_to_offset(descriptor_rva, data, sections, size_of_headers)
         fields = unpack_from("<IIIII", data, descriptor,
@@ -172,6 +179,8 @@ def inspect_pe(path: Path) -> dict:
         if not any(fields):
             terminated = True
             break
+        require(index < MAX_IMPORT_DESCRIPTORS,
+                f"{path.name}: PE import directory exceeds the reviewed descriptor limit")
         name_rva = fields[3]
         require(name_rva != 0, f"{path.name}: import descriptor has no DLL name")
         name_offset = rva_to_offset(name_rva, data, sections, size_of_headers)
@@ -179,6 +188,9 @@ def inspect_pe(path: Path) -> dict:
         require(name in ALLOWED_SYSTEM_DLLS,
                 f"{path.name}: non-system or unreviewed DLL import: {name}")
         imports.add(name)
+    if not terminated and descriptor_slots > MAX_IMPORT_DESCRIPTORS:
+        raise RuntimeError(
+            f"{path.name}: PE import directory exceeds the reviewed descriptor limit")
     require(terminated, f"{path.name}: import descriptor table is unterminated")
     require(imports, f"{path.name}: PE import set is empty")
 
