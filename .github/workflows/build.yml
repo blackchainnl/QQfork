@@ -393,7 +393,7 @@ jobs:
             local output="$2"
             shift 2
             tar -C "$root" --sort=name --mtime="@$SOURCE_DATE_EPOCH" \
-              --owner=0 --group=0 --numeric-owner --format=gnu \
+              --owner=0 --group=0 --numeric-owner --format=posix \
               --pax-option=delete=atime,delete=ctime -cf - "$@" | gzip -n -9 > "$output"
           }
           case "${{ matrix.name }}" in
