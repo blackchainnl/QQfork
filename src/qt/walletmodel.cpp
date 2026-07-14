@@ -28,8 +28,11 @@
 #include <wallet/coincontrol.h>
 #include <wallet/wallet.h> // for CRecipient
 
-#include <stdint.h>
+#include <algorithm>
+#include <exception>
 #include <functional>
+#include <stdint.h>
+#include <utility>
 
 #include <QDebug>
 #include <QMessageBox>
@@ -218,6 +221,133 @@ bool WalletModel::checkBalanceChanged(const interfaces::WalletBalances& new_bala
 interfaces::WalletBalances WalletModel::getCachedBalance() const
 {
     return m_cached_balances;
+}
+
+void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotRequest& request)
+{
+    // Only the GUI thread owns request/coalescing state. The cancellation flag
+    // is the sole object shared with WalletWorker and is checked between every
+    // wallet walk so teardown and wallet switches never wait in the view.
+    cancelStakingMiningSnapshot();
+    m_completed_staking_snapshot.reset();
+    m_staking_snapshot_request_id = request.request_id;
+    const auto cancel = std::make_shared<std::atomic<bool>>(false);
+    m_staking_snapshot_cancel = cancel;
+
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, cancel] {
+        assert(QThread::currentThread() == worker->thread());
+        auto snapshot = std::make_shared<StakingMiningSnapshot>();
+        snapshot->request = request;
+
+        const auto publish = [this, snapshot] {
+            QMetaObject::invokeMethod(this, [this, snapshot] {
+                if (m_staking_snapshot_request_id == snapshot->request.request_id) {
+                    m_completed_staking_snapshot = snapshot;
+                    m_staking_snapshot_cancel.reset();
+                }
+                Q_EMIT stakingMiningSnapshotReady(snapshot->request.request_id, snapshot->request.generation);
+            }, Qt::QueuedConnection);
+        };
+        const auto checkpoint = [this, cancel, snapshot] {
+            if (cancel->load(std::memory_order_acquire) || m_node.shutdownRequested()) {
+                snapshot->cancelled = true;
+                return true;
+            }
+            return false;
+        };
+
+        if (checkpoint()) {
+            publish();
+            return;
+        }
+
+        try {
+            snapshot->start_tip = m_node.getBestBlockHash().GetHex();
+            if (!request.expected_tip.empty() && snapshot->start_tip != request.expected_tip) {
+                snapshot->stale_tip = true;
+                publish();
+                return;
+            }
+
+            snapshot->pow = m_wallet->getPowMiningInfo();
+            if (checkpoint()) { publish(); return; }
+            snapshot->migration = m_wallet->getMigrationStatus();
+            if (checkpoint()) { publish(); return; }
+            snapshot->demurrage = m_wallet->getDemurrageInfo();
+            if (checkpoint()) { publish(); return; }
+            snapshot->rgb_assets = m_wallet->listRGBAssets(/*include_spent=*/false);
+            if (checkpoint()) { publish(); return; }
+            snapshot->eutxo_states = m_wallet->listEUTXOStates(/*include_spent=*/true);
+            if (checkpoint()) { publish(); return; }
+            snapshot->quantum_addresses = m_wallet->listQuantumAddresses();
+            if (checkpoint()) { publish(); return; }
+            snapshot->coldstake_delegations = m_wallet->listQuantumColdStakeDelegations();
+            if (checkpoint()) { publish(); return; }
+
+            snapshot->selfstake_query_address = request.selfstake_address;
+            if (snapshot->selfstake_query_address.empty()) {
+                const auto selfstake = std::find_if(snapshot->quantum_addresses.begin(), snapshot->quantum_addresses.end(), [](const interfaces::WalletQuantumAddressInfo& info) {
+                    return info.tiered && info.label == "quantum-stake";
+                });
+                if (selfstake != snapshot->quantum_addresses.end()) snapshot->selfstake_query_address = selfstake->address;
+            }
+            if (!snapshot->selfstake_query_address.empty()) {
+                snapshot->selfstake_queried = true;
+                snapshot->selfstake_outputs = m_wallet->listQuantumStakeOutputs(snapshot->selfstake_query_address);
+                if (checkpoint()) { publish(); return; }
+                snapshot->selfstake_bond = m_wallet->getQuantumStakeAddressBondInfo(snapshot->selfstake_query_address);
+                if (checkpoint()) { publish(); return; }
+            }
+            snapshot->operator_query_address = request.operator_address;
+            if (!snapshot->operator_query_address.empty()) {
+                snapshot->operator_queried = true;
+                snapshot->operator_bond = m_wallet->getQuantumOperatorBondInfo(snapshot->operator_query_address);
+                if (checkpoint()) { publish(); return; }
+            }
+
+            snapshot->coldstake_balances.reserve(snapshot->coldstake_delegations.size());
+            for (const interfaces::WalletQuantumColdStakeInfo& info : snapshot->coldstake_delegations) {
+                snapshot->coldstake_balances.push_back({info.address, m_wallet->getQuantumColdStakeBalanceInfo(info.address)});
+                if (checkpoint()) { publish(); return; }
+            }
+            snapshot->selected_coldstake_query_address = request.coldstake_address;
+            if (!snapshot->selected_coldstake_query_address.empty()) {
+                snapshot->selected_coldstake_queried = true;
+                snapshot->selected_coldstake_balance = m_wallet->getQuantumColdStakeBalanceInfo(snapshot->selected_coldstake_query_address);
+                if (checkpoint()) { publish(); return; }
+            }
+
+            snapshot->pool = m_wallet->getQuantumPoolInfo();
+            if (checkpoint()) { publish(); return; }
+            snapshot->end_tip = m_node.getBestBlockHash().GetHex();
+            snapshot->stale_tip = snapshot->start_tip != snapshot->end_tip ||
+                (!request.expected_tip.empty() && snapshot->end_tip != request.expected_tip);
+        } catch (const std::exception& e) {
+            snapshot->error = e.what();
+        } catch (...) {
+            snapshot->error = "Unknown error while building staking and mining details";
+        }
+
+        publish();
+    }, Qt::QueuedConnection);
+    assert(invoked);
+}
+
+void WalletModel::cancelStakingMiningSnapshot(uint64_t request_id)
+{
+    if (m_staking_snapshot_cancel &&
+        (request_id == 0 || request_id == m_staking_snapshot_request_id)) {
+        m_staking_snapshot_cancel->store(true, std::memory_order_release);
+    }
+}
+
+std::shared_ptr<const WalletModel::StakingMiningSnapshot> WalletModel::takeStakingMiningSnapshot(uint64_t request_id)
+{
+    if (!m_completed_staking_snapshot ||
+        m_completed_staking_snapshot->request.request_id != request_id) {
+        return {};
+    }
+    return std::exchange(m_completed_staking_snapshot, {});
 }
 
 void WalletModel::updateTransaction()
@@ -675,6 +805,8 @@ void WalletModel::join()
     // Stop timer
     if (timer)
         timer->stop();
+
+    cancelStakingMiningSnapshot();
 
     // Quit thread
     if (t.isRunning()) {

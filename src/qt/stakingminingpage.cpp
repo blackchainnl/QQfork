@@ -322,7 +322,12 @@ StakingMiningPage::StakingMiningPage(const PlatformStyle* platformStyle, QWidget
     });
 }
 
-StakingMiningPage::~StakingMiningPage() = default;
+StakingMiningPage::~StakingMiningPage()
+{
+    if (m_wallet_model && m_detail_refresh_in_flight) {
+        m_wallet_model->cancelStakingMiningSnapshot(m_detail_request_in_flight);
+    }
+}
 
 QSize StakingMiningPage::minimumSizeHint() const
 {
@@ -1198,11 +1203,18 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
 {
     if (m_timer) m_timer->stop();
     if (m_wallet_model) {
+        if (m_detail_refresh_in_flight) {
+            m_wallet_model->cancelStakingMiningSnapshot(m_detail_request_in_flight);
+        }
         disconnect(m_wallet_model, nullptr, this, nullptr);
     }
 
+    ++m_wallet_generation;
     m_wallet_model = walletModel;
     m_updating = false;
+    m_detail_refresh_in_flight = false;
+    m_detail_refresh_pending = false;
+    m_detail_request_in_flight = 0;
     m_pow_apply_pending = false;
     m_pow_settings_dirty = false;
     m_operator_registry_loaded = false;
@@ -1210,10 +1222,16 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
     m_operator_last_action_status.clear();
 
     if (m_wallet_model) {
+        connect(m_wallet_model, &WalletModel::stakingMiningSnapshotReady,
+                this, &StakingMiningPage::onStakingMiningSnapshotReady);
         connect(m_wallet_model, &QObject::destroyed, this, [this] {
+            ++m_wallet_generation;
             m_wallet_model = nullptr;
             if (m_timer) m_timer->stop();
             m_updating = false;
+            m_detail_refresh_in_flight = false;
+            m_detail_refresh_pending = false;
+            m_detail_request_in_flight = 0;
             m_pow_apply_pending = false;
             m_pow_settings_dirty = false;
             m_operator_registry_loaded = false;
@@ -1904,7 +1922,8 @@ void StakingMiningPage::onWithdrawOperatorBond()
 
 void StakingMiningPage::onRefreshOperatorRegistry()
 {
-    refreshOperatorRegistry();
+    m_force_full_refresh = true;
+    updateStatus();
 }
 
 void StakingMiningPage::onUseRegistryOperatorForDelegation()
@@ -2208,13 +2227,12 @@ void StakingMiningPage::onOptimizeUTXOSet()
     updateStatus();
 }
 
-void StakingMiningPage::refreshOperatorRegistry()
+void StakingMiningPage::applyOperatorRegistry(const interfaces::WalletQuantumPoolInfo& pool)
 {
     if (!m_wallet_model || !m_operator_registry || !m_coldstake_operator_selector) return;
 
     const QString previous_selection = m_coldstake_operator_user_selected ? selectedColdStakeOperatorPubKey() : QString();
     const QString previous_label = m_coldstake_operator_selector->currentText();
-    interfaces::WalletQuantumPoolInfo pool = m_wallet_model->wallet().getQuantumPoolInfo();
 
     QSignalBlocker selector_blocker(m_coldstake_operator_selector);
     m_operator_registry->setRowCount(0);
@@ -2378,18 +2396,117 @@ void StakingMiningPage::updateStatus()
 
     refreshDonationControls();
 
-    // Everything below walks large parts of the wallet: getPowMiningInfo()
-    // scans the full UTXO set (AvailableCoins + per-output IsMine), as do the
-    // migration/RGB/EUTXO/quantum sections further down. On a large wallet each
-    // pass costs seconds on the GUI thread, so run it only on the slow
-    // full-refresh cadence (and on show), never on every 5-second tick.
-    if (!full_refresh) {
-        refreshControlsEnabled();
+    // A full detail refresh is a single immutable WalletWorker snapshot. This
+    // callback only queues/coalesces work and returns, so even a multi-second
+    // wallet walk cannot stop event delivery, painting, or window teardown.
+    if (full_refresh) queueFullDetailRefresh();
+    refreshControlsEnabled();
+}
+
+void StakingMiningPage::queueFullDetailRefresh()
+{
+    if (!m_wallet_model) return;
+
+    m_detail_refresh_pending = true;
+    if (m_detail_refresh_in_flight) {
+        // At most one snapshot executes at a time. Repeated clicks collapse to
+        // one latest request and cooperatively stop the obsolete pass between
+        // wallet calls.
+        m_wallet_model->cancelStakingMiningSnapshot(m_detail_request_in_flight);
+        if (m_refresh_hint) m_refresh_hint->setText(tr("A newer detail refresh is queued..."));
+        return;
+    }
+    startFullDetailRefresh();
+}
+
+void StakingMiningPage::startFullDetailRefresh()
+{
+    if (!m_wallet_model || !m_detail_refresh_pending || m_detail_refresh_in_flight) return;
+
+    m_detail_refresh_pending = false;
+    m_detail_refresh_in_flight = true;
+    m_detail_request_in_flight = ++m_detail_request_sequence;
+
+    WalletModel::StakingMiningSnapshotRequest request;
+    request.request_id = m_detail_request_in_flight;
+    request.generation = m_wallet_generation;
+    request.expected_tip = m_wallet_model->getLastBlockProcessed().GetHex();
+    request.selfstake_address = m_selfstake_address->text().toStdString();
+    request.operator_address = m_operator_address->text().toStdString();
+    request.coldstake_address = m_coldstake_address->text().toStdString();
+
+    if (m_refresh_hint) m_refresh_hint->setText(tr("Loading detail panels in the background..."));
+    m_wallet_model->requestStakingMiningSnapshot(request);
+}
+
+void StakingMiningPage::onStakingMiningSnapshotReady(quint64 request_id, quint64 generation)
+{
+    WalletModel* const source = qobject_cast<WalletModel*>(sender());
+    if (!source || source != m_wallet_model ||
+        request_id != m_detail_request_in_flight ||
+        generation != m_wallet_generation) {
         return;
     }
 
-    // PoW
-    const interfaces::WalletPowMiningInfo info = w.getPowMiningInfo();
+    const std::shared_ptr<const WalletModel::StakingMiningSnapshot> snapshot =
+        source->takeStakingMiningSnapshot(request_id);
+    m_detail_refresh_in_flight = false;
+    m_detail_request_in_flight = 0;
+
+    // Do not apply an obsolete result when a click/action arrived while the
+    // worker was active. Run exactly one coalesced latest request instead.
+    if (m_detail_refresh_pending) {
+        startFullDetailRefresh();
+        return;
+    }
+    if (!snapshot) {
+        if (m_refresh_hint) m_refresh_hint->setText(tr("Detail refresh did not return a result. Press Refresh to retry."));
+        return;
+    }
+    if (snapshot->cancelled) {
+        if (m_refresh_hint) m_refresh_hint->setText(tr("Detail refresh was cancelled."));
+        return;
+    }
+    if (!snapshot->error.empty()) {
+        if (m_refresh_hint) m_refresh_hint->setText(tr("Detail refresh failed: %1").arg(QString::fromStdString(snapshot->error)));
+        return;
+    }
+
+    const std::string current_tip = m_wallet_model->getLastBlockProcessed().GetHex();
+    if (snapshot->stale_tip ||
+        snapshot->request.expected_tip != current_tip ||
+        snapshot->start_tip != current_tip ||
+        snapshot->end_tip != current_tip) {
+        if (m_refresh_hint) m_refresh_hint->setText(tr("The chain tip changed during refresh. Press Refresh to load a consistent snapshot."));
+        return;
+    }
+
+    applyFullDetailSnapshot(*snapshot);
+}
+
+void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMiningSnapshot& snapshot)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (!m_wallet_model || snapshot.request.generation != m_wallet_generation) return;
+
+    QScopedValueRollback<bool> updating_guard(m_updating, true);
+    m_selfstake_withdraw_available = false;
+    m_operator_withdraw_available = false;
+    m_coldstake_fund_available = false;
+    m_coldstake_withdraw_available = false;
+    m_demurrage_sweep_available = false;
+
+    interfaces::Wallet& w = m_wallet_model->wallet();
+    const interfaces::WalletBalances balances = m_wallet_model->getCachedBalance();
+    const bool staking = w.getEnabledStaking();
+    const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getCachedEncryptionStatus();
+    const bool normal_unlocked = encryption_status == WalletModel::Unlocked &&
+                                 !w.getWalletUnlockStakingOnly();
+    const bool normal_signing_available = encryption_status == WalletModel::Unencrypted || normal_unlocked;
+
+    // UI mutations happen only here, after the worker-owned immutable result
+    // has returned to this object's Qt event thread.
+    const interfaces::WalletPowMiningInfo& info = snapshot.pow;
     if (info.shadow_whitelist_height > 0) {
         QString eligibility;
         if (!info.wallet_goldrush_status_available) {
@@ -2550,7 +2667,7 @@ void StakingMiningPage::updateStatus()
     CAmount goldrush_reward_amount_needing_move{0};
     CAmount staked_quantum_amount{0};
     unsigned int goldrush_reward_outputs_needing_move{0};
-    const interfaces::WalletMigrationStatus migration = w.getMigrationStatus();
+    const interfaces::WalletMigrationStatus& migration = snapshot.migration;
     if (migration.available) {
         m_migration_phase->setText(QString::fromStdString(migration.phase));
         if (!migration.deadline_scheduled) {
@@ -2602,7 +2719,7 @@ void StakingMiningPage::updateStatus()
         m_coldstake_quantum_available->setText(tr("Wallet is busy; quantum balance will refresh shortly."));
     }
 
-    const interfaces::WalletDemurrageInfo demurrage = w.getDemurrageInfo();
+    const interfaces::WalletDemurrageInfo& demurrage = snapshot.demurrage;
     if (demurrage.available) {
         m_demurrage_status->setText(demurrage.demurrage_active
             ? tr("Demurrage active at evaluation height %1. Outputs due for attestation: %2.")
@@ -2630,7 +2747,7 @@ void StakingMiningPage::updateStatus()
         m_demurrage_sweep_available = false;
     }
 
-    const std::vector<interfaces::WalletRGBAssetInfo> rgb_assets = w.listRGBAssets(/*include_spent=*/false);
+    const std::vector<interfaces::WalletRGBAssetInfo>& rgb_assets = snapshot.rgb_assets;
     {
         QSignalBlocker rgb_blocker(m_rgb_assets);
         m_rgb_assets->setRowCount(static_cast<int>(rgb_assets.size()));
@@ -2652,7 +2769,7 @@ void StakingMiningPage::updateStatus()
         : tr("%1 RGB asset(s) loaded. Consignment import/export and transfer construction remain advanced console workflows.")
               .arg(static_cast<int>(rgb_assets.size())));
 
-    const std::vector<interfaces::WalletEUTXOStateInfo> eutxo_states = w.listEUTXOStates(/*include_spent=*/true);
+    const std::vector<interfaces::WalletEUTXOStateInfo>& eutxo_states = snapshot.eutxo_states;
     {
         QSignalBlocker eutxo_blocker(m_eutxo_states);
         m_eutxo_states->setRowCount(static_cast<int>(eutxo_states.size()));
@@ -2677,8 +2794,8 @@ void StakingMiningPage::updateStatus()
         : tr("%1 EUTXO metadata record(s) loaded for inspection only. Witness-v15 funding and spending are disabled in v30.1.1; do not send BLK to these addresses.")
               .arg(static_cast<int>(eutxo_states.size())));
 
-    const std::vector<interfaces::WalletQuantumAddressInfo> quantum_addresses = w.listQuantumAddresses();
-    const std::vector<interfaces::WalletQuantumColdStakeInfo> coldstake_delegations = w.listQuantumColdStakeDelegations();
+    const std::vector<interfaces::WalletQuantumAddressInfo>& quantum_addresses = snapshot.quantum_addresses;
+    const std::vector<interfaces::WalletQuantumColdStakeInfo>& coldstake_delegations = snapshot.coldstake_delegations;
     std::set<std::string> unverified_quantum_keys;
     for (const interfaces::WalletQuantumAddressInfo& info : quantum_addresses) {
         if (!info.backup_verified) unverified_quantum_keys.insert(info.public_key);
@@ -2779,10 +2896,11 @@ void StakingMiningPage::updateStatus()
         }
     }
 
-    std::vector<interfaces::WalletQuantumStakeOutputInfo> selfstake_outputs;
-    if (!m_selfstake_address->text().isEmpty()) {
-        selfstake_outputs = w.listQuantumStakeOutputs(m_selfstake_address->text().toStdString());
-    }
+    const bool selfstake_snapshot_matches = snapshot.selfstake_queried &&
+        snapshot.selfstake_query_address == m_selfstake_address->text().toStdString();
+    const std::vector<interfaces::WalletQuantumStakeOutputInfo> empty_selfstake_outputs;
+    const std::vector<interfaces::WalletQuantumStakeOutputInfo>& selfstake_outputs =
+        selfstake_snapshot_matches ? snapshot.selfstake_outputs : empty_selfstake_outputs;
     {
         QSignalBlocker output_blocker(m_selfstake_output_selector);
         m_selfstake_output_selector->clear();
@@ -2800,10 +2918,9 @@ void StakingMiningPage::updateStatus()
         }
     }
 
-    if (!m_selfstake_address->text().isEmpty()) {
+    if (!m_selfstake_address->text().isEmpty() && selfstake_snapshot_matches) {
         const uint16_t lock_blocks = stakingAddressLockBlocks(m_selfstake_address->text());
-        const interfaces::WalletQuantumOperatorBondInfo stake_info =
-            w.getQuantumStakeAddressBondInfo(m_selfstake_address->text().toStdString());
+        const interfaces::WalletQuantumOperatorBondInfo& stake_info = snapshot.selfstake_bond;
         if (stake_info.valid_operator_address) {
             if (stake_info.bonded_outputs > 0) {
                 m_selfstake_withdraw_available = true;
@@ -2850,9 +2967,10 @@ void StakingMiningPage::updateStatus()
             m_operator_status->setText(tr("No node key selected. Nodes must fund a 30-day bonded staking address before delegators can verify them."));
         }
     }
-    if (!m_operator_address->text().isEmpty()) {
-        const interfaces::WalletQuantumOperatorBondInfo bond_info =
-            w.getQuantumOperatorBondInfo(m_operator_address->text().toStdString());
+    const bool operator_snapshot_matches = snapshot.operator_queried &&
+        snapshot.operator_query_address == m_operator_address->text().toStdString();
+    if (!m_operator_address->text().isEmpty() && operator_snapshot_matches) {
+        const interfaces::WalletQuantumOperatorBondInfo& bond_info = snapshot.operator_bond;
         if (bond_info.valid_operator_address) {
             if (bond_info.bonded_outputs > 0) {
                 local_bonded_operator = true;
@@ -2896,8 +3014,11 @@ void StakingMiningPage::updateStatus()
     int selected_operator_pending_count{0};
     const QString selected_operator_hash = selectedColdStakeOperatorHash();
     for (const interfaces::WalletQuantumColdStakeInfo& info : coldstake_delegations) {
-        const interfaces::WalletQuantumColdStakeBalanceInfo balance =
-            w.getQuantumColdStakeBalanceInfo(info.address);
+        const auto balance_it = std::find_if(snapshot.coldstake_balances.begin(), snapshot.coldstake_balances.end(), [&info](const WalletModel::StakingMiningColdStakeBalance& entry) {
+            return entry.address == info.address;
+        });
+        if (balance_it == snapshot.coldstake_balances.end()) continue;
+        const interfaces::WalletQuantumColdStakeBalanceInfo& balance = balance_it->balance;
         wallet_delegated_amount += balance.confirmed_amount;
         wallet_delegated_outputs += balance.confirmed_outputs;
         wallet_pending_delegated_amount += balance.unconfirmed_amount;
@@ -2976,9 +3097,10 @@ void StakingMiningPage::updateStatus()
         m_dashboard_action->setText(tr("<b>Recommended next step</b><br>You have spendable quantum funds available. Choose <b>Stake my coins</b> to stake locally or <b>Delegate coins</b> to use a verified cold-staking node."));
     }
 
-    if (!m_coldstake_address->text().isEmpty()) {
-        const interfaces::WalletQuantumColdStakeBalanceInfo delegation_info =
-            w.getQuantumColdStakeBalanceInfo(m_coldstake_address->text().toStdString());
+    const bool selected_coldstake_snapshot_matches = snapshot.selected_coldstake_queried &&
+        snapshot.selected_coldstake_query_address == m_coldstake_address->text().toStdString();
+    if (!m_coldstake_address->text().isEmpty() && selected_coldstake_snapshot_matches) {
+        const interfaces::WalletQuantumColdStakeBalanceInfo& delegation_info = snapshot.selected_coldstake_balance;
         if (delegation_info.valid_delegation_address) {
             if (delegation_info.confirmed_outputs > 0) {
                 m_coldstake_withdraw_available = true;
@@ -3010,17 +3132,7 @@ void StakingMiningPage::updateStatus()
         m_coldstake_status->setText(m_coldstake_last_action_status + QStringLiteral("\n") + m_coldstake_status->text());
     }
 
-    ++m_operator_registry_refresh_seconds;
-    const bool registry_empty = m_operator_registry && m_operator_registry->rowCount() == 0;
-    const bool should_refresh_registry =
-        !m_operator_registry_loaded ||
-        (local_bonded_operator && registry_empty && m_operator_registry_refresh_seconds >= 10) ||
-        m_operator_registry_refresh_seconds >= 60;
-    if (should_refresh_registry) {
-        refreshOperatorRegistry();
-    } else {
-        refreshControlsEnabled();
-    }
+    applyOperatorRegistry(snapshot.pool);
     if (m_refresh_hint) m_refresh_hint->setText(tr("Detail panels updated. Press Refresh to reload."));
 }
 
@@ -3046,6 +3158,7 @@ void StakingMiningPage::resetStatusForNoWallet()
     m_dashboard_pos->setText(tr("<b>PoS Gold Rush</b><br>No wallet loaded."));
     m_dashboard_pow->setText(tr("<b>PoW Gold Rush</b><br>No wallet loaded."));
     m_dashboard_coldstake->setText(tr("<b>Cold staking</b><br>No wallet loaded."));
+    if (m_refresh_hint) m_refresh_hint->setText(tr("Load a wallet to refresh detail panels."));
 
     m_donation_enable->setChecked(false);
     m_donation_status->setText(tr("Load a wallet to configure staking reward donations."));

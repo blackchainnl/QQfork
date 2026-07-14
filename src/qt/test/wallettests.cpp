@@ -63,6 +63,8 @@
 #include <QListView>
 #include <QDialogButtonBox>
 #include <QElapsedTimer>
+#include <QEventLoop>
+#include <QSignalSpy>
 
 using wallet::AddWallet;
 using wallet::CWallet;
@@ -334,6 +336,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QLabel* pow_status = page.findChild<QLabel*>("powStatus");
     QLabel* pow_warning = page.findChild<QLabel*>("powWarning");
     QPushButton* refresh_details = page.findChild<QPushButton*>("stakingMiningRefresh");
+    QLabel* refresh_hint = page.findChild<QLabel*>("stakingMiningRefreshHint");
     QLabel* migration_phase = page.findChild<QLabel*>("migrationPhase");
     QLabel* migration_deadline = page.findChild<QLabel*>("migrationDeadline");
     QLabel* migration_legacy_amount = page.findChild<QLabel*>("migrationLegacyAmount");
@@ -400,6 +403,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(pow_status);
     QVERIFY(pow_warning);
     QVERIFY(refresh_details);
+    QVERIFY(refresh_hint);
     QVERIFY(migration_phase);
     QVERIFY(migration_deadline);
     QVERIFY(migration_legacy_amount);
@@ -452,7 +456,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(coldstake_status);
 
     refresh_details->click();
-    qApp->processEvents();
+    QTRY_VERIFY_WITH_TIMEOUT(refresh_hint->text().contains(QString("Detail panels updated")), 10000);
     QCOMPARE(staking_enable->isChecked(), false);
     QCOMPARE(unlock_staking_only->isChecked(), false);
     QVERIFY(!unlock_staking_only->isEnabled());
@@ -505,7 +509,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(!coldstake_withdraw->isEnabled());
 
     quantum_new->click();
-    qApp->processEvents();
+    QTRY_COMPARE_WITH_TIMEOUT(quantum_address_count->text(), QString("1"), 10000);
     const CTxDestination gui_quantum_dest = DecodeDestination(quantum_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_quantum_dest));
     QVERIFY(IsQuantumMigrationDestination(gui_quantum_dest));
@@ -522,7 +526,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
 
     selfstake_lock_period->setCurrentIndex(5);
     selfstake_new->click();
-    qApp->processEvents();
+    QTRY_VERIFY_WITH_TIMEOUT(selfstake_selector->findData(selfstake_address->text()) >= 0, 10000);
     const CTxDestination gui_selfstake_dest = DecodeDestination(selfstake_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_selfstake_dest));
     QVERIFY(IsQuantumMigrationDestination(gui_selfstake_dest));
@@ -539,7 +543,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QCOMPARE(QApplication::clipboard()->text(), selfstake_address->text());
 
     coldstake_operator_new->click();
-    qApp->processEvents();
+    QTRY_VERIFY_WITH_TIMEOUT(coldstake_operator_address_selector->findData(coldstake_operator_address->text()) >= 0, 10000);
     const CTxDestination gui_operator_dest = DecodeDestination(coldstake_operator_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_operator_dest));
     QVERIFY(IsQuantumMigrationDestination(gui_operator_dest));
@@ -563,7 +567,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     coldstake_lock_period->setCurrentIndex(5);
     QVERIFY(coldstake_new->isEnabled());
     coldstake_new->click();
-    qApp->processEvents();
+    QTRY_COMPARE_WITH_TIMEOUT(quantum_coldstake_count->text(), QString("1"), 10000);
 
     const CTxDestination gui_coldstake_dest = DecodeDestination(coldstake_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_coldstake_dest));
@@ -633,17 +637,10 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(IsValidDestination(payout_dest));
     QVERIFY(IsQuantumMigrationDestination(payout_dest));
     const QString expected_payout = QString::fromStdString(info.payout_address);
-    // The details page deliberately uses nonblocking wallet locks so an active
-    // miner or signer cannot freeze the Qt event loop. Under sanitizers the
-    // first refresh can legitimately observe that transient busy state. Retry
-    // the same user-visible refresh action instead of requiring the GUI thread
-    // to wait for the wallet mutex.
-    for (int attempt = 0; attempt < 50 && pow_payout->text() != expected_payout; ++attempt) {
-        refresh_details->click();
-        qApp->processEvents();
-        if (pow_payout->text() != expected_payout) QTest::qWait(20);
-    }
-    QCOMPARE(pow_payout->text(), expected_payout);
+    // Full-detail wallet walks run on WalletWorker. The Qt event thread only
+    // queues the refresh and applies one immutable result.
+    refresh_details->click();
+    QTRY_COMPARE_WITH_TIMEOUT(pow_payout->text(), expected_payout, 10000);
     QVERIFY(pow_copy->isEnabled());
 
     pow_copy->click();
@@ -763,6 +760,129 @@ void TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(interfaces::Node& node,
              qPrintable(QStringLiteral("Staking page heartbeat waited %1 ms for cs_wallet").arg(heartbeat_elapsed_ms)));
 }
 
+void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const PlatformStyle* platformStyle)
+{
+    auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-staking-async-refresh", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+
+    MiniGUI mini_gui(node, platformStyle);
+    mini_gui.initModelForWallet(node, wallet, platformStyle);
+    WalletModel& wallet_model = *mini_gui.walletModel;
+
+    auto page = std::make_unique<StakingMiningPage>(platformStyle);
+    page->setClientModel(mini_gui.clientModel.get());
+    page->setWalletModel(&wallet_model);
+    page->show();
+    qApp->processEvents();
+
+    QPushButton* refresh = page->findChild<QPushButton*>("stakingMiningRefresh");
+    QLabel* refresh_hint = page->findChild<QLabel*>("stakingMiningRefreshHint");
+    QLabel* staking_status = page->findChild<QLabel*>("stakingStatus");
+    QVERIFY(refresh);
+    QVERIFY(refresh_hint);
+    QVERIFY(staking_status);
+
+    QSignalSpy ready_spy(&wallet_model, &WalletModel::stakingMiningSnapshotReady);
+
+    // A result built for any other tip must be marked stale before wallet
+    // detail calls run, and must remain an immutable, inspectable result.
+    WalletModel::StakingMiningSnapshotRequest stale_request;
+    stale_request.request_id = 1000000;
+    stale_request.generation = 1000000;
+    stale_request.expected_tip = std::string(64, 'f');
+    wallet_model.requestStakingMiningSnapshot(stale_request);
+    QTRY_COMPARE_WITH_TIMEOUT(ready_spy.count(), 1, 5000);
+    const std::shared_ptr<const WalletModel::StakingMiningSnapshot> stale_snapshot =
+        wallet_model.takeStakingMiningSnapshot(stale_request.request_id);
+    QVERIFY(stale_snapshot);
+    QVERIFY(stale_snapshot->stale_tip);
+    ready_spy.clear();
+
+    std::promise<void> first_lock_held;
+    std::promise<void> release_first_lock;
+    std::shared_future<void> first_release = release_first_lock.get_future().share();
+    std::thread first_holder([&] {
+        LOCK(wallet->cs_wallet);
+        first_lock_held.set_value();
+        first_release.wait();
+    });
+    first_lock_held.get_future().wait();
+
+    QElapsedTimer click_timer;
+    click_timer.start();
+    refresh->click();
+    const qint64 click_elapsed_ms = click_timer.elapsed();
+
+    // Give WalletWorker time to reach a wallet read while keeping the GUI
+    // event queue free. A queued heartbeat must still run immediately.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    bool heartbeat_seen{false};
+    QTimer::singleShot(0, page.get(), [&] { heartbeat_seen = true; });
+    QElapsedTimer heartbeat_timer;
+    heartbeat_timer.start();
+    qApp->processEvents(QEventLoop::AllEvents, 50);
+    const qint64 heartbeat_elapsed_ms = heartbeat_timer.elapsed();
+
+    // Repeated refreshes while the worker is occupied must not create a queue
+    // of full wallet scans. They collapse to one pending latest request.
+    for (int i = 0; i < 20; ++i) refresh->click();
+    const bool queued_hint_seen = refresh_hint->text().contains(QString("queued"));
+
+    QElapsedTimer switch_timer;
+    switch_timer.start();
+    page->setWalletModel(nullptr);
+    const qint64 switch_elapsed_ms = switch_timer.elapsed();
+    release_first_lock.set_value();
+    first_holder.join();
+
+    QTRY_COMPARE_WITH_TIMEOUT(ready_spy.count(), 1, 5000);
+    const uint64_t first_request_id = ready_spy.at(0).at(0).toULongLong();
+    const std::shared_ptr<const WalletModel::StakingMiningSnapshot> cancelled =
+        wallet_model.takeStakingMiningSnapshot(first_request_id);
+    QVERIFY(cancelled);
+    QVERIFY(cancelled->cancelled);
+    QVERIFY(queued_hint_seen);
+    QCOMPARE(staking_status->text(), QString("No wallet loaded"));
+
+    // Reattach and prove that destroying the page also performs bounded,
+    // cooperative cancellation without waiting for the worker-held request.
+    page->setWalletModel(&wallet_model);
+    qApp->processEvents();
+    refresh = page->findChild<QPushButton*>("stakingMiningRefresh");
+    QVERIFY(refresh);
+
+    std::promise<void> second_lock_held;
+    std::promise<void> release_second_lock;
+    std::shared_future<void> second_release = release_second_lock.get_future().share();
+    std::thread second_holder([&] {
+        LOCK(wallet->cs_wallet);
+        second_lock_held.set_value();
+        second_release.wait();
+    });
+    second_lock_held.get_future().wait();
+    refresh->click();
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+    QElapsedTimer destroy_timer;
+    destroy_timer.start();
+    page.reset();
+    const qint64 destroy_elapsed_ms = destroy_timer.elapsed();
+    release_second_lock.set_value();
+    second_holder.join();
+
+    QTRY_COMPARE_WITH_TIMEOUT(ready_spy.count(), 2, 5000);
+
+    QVERIFY2(click_elapsed_ms < 100,
+             qPrintable(QStringLiteral("Full-detail click blocked the GUI for %1 ms").arg(click_elapsed_ms)));
+    QVERIFY(heartbeat_seen);
+    QVERIFY2(heartbeat_elapsed_ms < 100,
+             qPrintable(QStringLiteral("GUI heartbeat was delayed %1 ms during full refresh").arg(heartbeat_elapsed_ms)));
+    QVERIFY2(switch_elapsed_ms < 100,
+             qPrintable(QStringLiteral("Wallet switch waited %1 ms for full refresh").arg(switch_elapsed_ms)));
+    QVERIFY2(destroy_elapsed_ms < 100,
+             qPrintable(QStringLiteral("Page destruction waited %1 ms for full refresh").arg(destroy_elapsed_ms)));
+}
+
 void TestWalletPagesScale(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
 {
     TransactionView& transaction_view = mini_gui.transactionView;
@@ -823,6 +943,7 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     TestWalletPagesScale(mini_gui, platformStyle.get());
     TestStakingMiningPageSurvivesWalletModelDeletion(node, wallet, platformStyle.get());
     TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(node, platformStyle.get());
+    TestStakingMiningAsyncRefreshLifecycle(node, platformStyle.get());
 
     // Update walletModel cached balance which will trigger an update for the 'labelBalance' QLabel.
     walletModel.pollBalanceChanged();

@@ -5,13 +5,15 @@
 #ifndef BITCOIN_QT_STAKINGMININGPAGE_H
 #define BITCOIN_QT_STAKINGMININGPAGE_H
 
+#include <qt/walletmodel.h>
+
+#include <cstdint>
 #include <QPointer>
 #include <QSize>
 #include <QString>
 #include <QWidget>
 
 class ClientModel;
-class WalletModel;
 class PlatformStyle;
 class BitcoinAmountField;
 
@@ -91,6 +93,7 @@ private Q_SLOTS:
     void onRedelegateColdStake();
     void onOptimizeUTXOSet();
     void updateStatus();
+    void onStakingMiningSnapshotReady(quint64 request_id, quint64 generation);
 
 private:
     const PlatformStyle* m_platform_style{nullptr};
@@ -110,6 +113,11 @@ private:
     // when the user presses "Refresh details" (or after a wallet-changing
     // action), keeping the first click on this tab instant.
     bool m_force_full_refresh{false};
+    bool m_detail_refresh_in_flight{false};
+    bool m_detail_refresh_pending{false};
+    uint64_t m_wallet_generation{0};
+    uint64_t m_detail_request_sequence{0};
+    uint64_t m_detail_request_in_flight{0};
     bool m_selfstake_withdraw_available{false};
     bool m_operator_withdraw_available{false};
     bool m_coldstake_fund_available{false};
@@ -223,8 +231,11 @@ private:
     QLabel* m_coldstake_status{nullptr};
 
     void setupUi();
+    void queueFullDetailRefresh();
+    void startFullDetailRefresh();
+    void applyFullDetailSnapshot(const WalletModel::StakingMiningSnapshot& snapshot);
+    void applyOperatorRegistry(const interfaces::WalletQuantumPoolInfo& pool);
     void refreshControlsEnabled();
-    void refreshOperatorRegistry();
     void resetStatusForNoWallet();
     void applyDonationPercentage(unsigned int percentage);
     void applyDonationDefaults(bool wallet_migration_complete);
