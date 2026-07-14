@@ -83,6 +83,8 @@ jobs:
           REQUESTED_SHA: ${{ inputs.target_sha }}
           REQUESTED_PACKAGE_LABEL: ${{ inputs.package_label }}
           REQUESTED_TARGET: ${{ inputs.target }}
+          CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EVENT_SHA: ${{ github.sha }}
           RELEASE_GPG_FINGERPRINT: ${{ vars.RELEASE_GPG_FINGERPRINT }}
         run: |
           set -euo pipefail
@@ -110,6 +112,16 @@ jobs:
               exit 1
             }
             test "$TARGET_SHA" = "$REQUESTED_SHA"
+            [[ "$CALLER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$CALLER_WORKFLOW_SHA" = "$TARGET_SHA" || {
+              echo "::error::Run this workflow from a branch or tag whose head is target_sha; the local safety gate otherwise comes from a different revision"
+              exit 1
+            }
+            test "$EVENT_SHA" = "$TARGET_SHA" || {
+              echo "::error::The selected workflow_dispatch ref does not resolve to target_sha"
+              exit 1
+            }
             [[ "$REQUESTED_PACKAGE_LABEL" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)([1-9][0-9]*)$ ]] || {
               echo "::error::Manual builds require an explicit major.minor.patch-alphaN or major.minor.patch-betaN package label"
               exit 1

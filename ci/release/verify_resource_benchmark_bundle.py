@@ -22,6 +22,7 @@ EXPECTED_RUNNERS = {
     "macos-x86_64": ("macos", "x86_64"),
     "macos-arm64": ("macos", "arm64"),
 }
+EXPECTED_BINARY_FORMATS = {"linux": "elf", "windows": "pe", "macos": "mach-o"}
 NORMALIZED_PLATFORMS = {
     "linux": "linux",
     "darwin": "macos",
@@ -101,6 +102,15 @@ def verify_bundle(directory: Path, source_sha: str, repository: str,
                 f"resource evidence runner mismatch: {evidence_path.name}")
         require(runner_record.get("native_execution_verified") is True,
                 f"native execution is not verified: {evidence_path.name}")
+        require(runner_record.get("binary_format") ==
+                EXPECTED_BINARY_FORMATS[expected_platform] and
+                runner_record.get("binary_architecture") == expected_architecture,
+                f"benchmark binary identity mismatch: {evidence_path.name}")
+        expected_translation = (
+            "not-translated" if expected_platform == "macos" else "not-applicable"
+        )
+        require(runner_record.get("process_translation") == expected_translation,
+                f"benchmark process translation mismatch: {evidence_path.name}")
         reported_platform = runner_record.get("reported_platform")
         reported_architecture = runner_record.get("reported_architecture")
         require(isinstance(reported_platform, str) and

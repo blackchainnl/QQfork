@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -48,6 +49,29 @@ def load_path(name, path):
 
 
 class ReleaseToolTests(unittest.TestCase):
+    def write_native_binary(self, path, platform, architecture):
+        if platform == "linux":
+            machine = {"x86_64": 62, "arm64": 183}[architecture]
+            header = bytearray(64)
+            header[:6] = b"\x7fELF\x02\x01"
+            struct.pack_into("<H", header, 18, machine)
+        elif platform == "macos":
+            machine = {"x86_64": 0x01000007, "arm64": 0x0100000c}[architecture]
+            header = bytearray(64)
+            header[:4] = b"\xcf\xfa\xed\xfe"
+            struct.pack_into("<I", header, 4, machine)
+        elif platform == "windows":
+            machine = {"x86_64": 0x8664, "arm64": 0xaa64}[architecture]
+            header = bytearray(0x88)
+            header[:2] = b"MZ"
+            struct.pack_into("<I", header, 0x3c, 0x80)
+            header[0x80:0x84] = b"PE\0\0"
+            struct.pack_into("<H", header, 0x84, machine)
+        else:
+            raise AssertionError(f"unsupported test platform: {platform}")
+        path.write_bytes(header)
+        path.chmod(0o755)
+
     def make_resource_bundle(self, directory, source_sha, repository,
                              provenance_manifest):
         verifier = load_module("verify_resource_benchmark_bundle")
@@ -71,6 +95,13 @@ class ReleaseToolTests(unittest.TestCase):
                     "reported_platform": reported_platform,
                     "reported_architecture": reported_architecture,
                     "native_execution_verified": True,
+                    "binary_format": {
+                        "linux": "elf", "windows": "pe", "macos": "mach-o",
+                    }[platform],
+                    "binary_architecture": architecture,
+                    "process_translation": (
+                        "not-translated" if platform == "macos" else "not-applicable"
+                    ),
                 },
                 "inputs": {
                     "benchmark_binary_sha256": "ab" * 32,
@@ -179,7 +210,7 @@ class ReleaseToolTests(unittest.TestCase):
             raw = root / "nanobench.json"
             binary = root / "bench_blackcoin"
             raw.write_text(json.dumps(document), encoding="utf-8")
-            binary.write_bytes(b"exact-benchmark-binary")
+            self.write_native_binary(binary, native_platform, native_architecture)
             evidence = generator.generate_evidence(
                 nanobench_json=raw,
                 binary=binary,
@@ -203,6 +234,31 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertTrue(evidence["coverage"]["synthetic-state"])
             self.assertTrue(evidence["release_resource_evidence_complete"])
             self.assertTrue(evidence["runner"]["native_execution_verified"])
+            self.assertEqual(
+                evidence["runner"]["binary_architecture"], native_architecture
+            )
+
+            binary.write_bytes(b"not-an-executable")
+            with self.assertRaisesRegex(RuntimeError, "binary format"):
+                generator.generate_evidence(
+                    nanobench_json=raw,
+                    binary=binary,
+                    source_sha=source_sha,
+                    repo_root=repository,
+                    repository="Blackcoin-Dev/Blackcoin",
+                    platform=native_platform,
+                    architecture=native_architecture,
+                    toolchain="GCC 11.4.0",
+                    compiler_flags="-O2 -g",
+                    build_profile="native-test",
+                    minimum_runtime_ms=250,
+                    provenance_manifest=(
+                        TOOLS.parent.parent / "contrib" / "devtools" /
+                        "quantum-crypto-provenance.json"
+                    ),
+                    required_domains={"crypto", "large-block", "synthetic-state"},
+                )
+            self.write_native_binary(binary, native_platform, native_architecture)
             argon_bound = evidence["derived_upper_bounds"]["shadow_pow_argon2_block"]
             mldsa_bound = evidence["derived_upper_bounds"]["quantum_mldsa_block"]
             self.assertEqual(
@@ -1228,6 +1284,9 @@ class ReleaseToolTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("default: 30.1.1-alpha1", workflow)
+        self.assertIn("CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}", workflow)
+        self.assertIn('test "$CALLER_WORKFLOW_SHA" = "$TARGET_SHA"', workflow)
+        self.assertIn('test "$EVENT_SHA" = "$TARGET_SHA"', workflow)
         self.assertIn("-(alpha|beta)", workflow)
         self.assertIn(
             'test "$REQUESTED_PACKAGE_LABEL" = "$BASE_VERSION-$PRERELEASE_CHANNEL$RC"',

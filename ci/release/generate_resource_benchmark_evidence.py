@@ -8,10 +8,12 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import platform as host_platform
 import re
 import statistics
+import struct
 import subprocess
 import sys
 
@@ -74,6 +76,14 @@ NATIVE_ARCHITECTURES = {
     "aarch64": "arm64",
     "arm64": "arm64",
 }
+BINARY_FORMATS = {
+    "linux": "elf",
+    "macos": "mach-o",
+    "windows": "pe",
+}
+ELF_MACHINES = {62: "x86_64", 183: "arm64"}
+MACHO_MACHINES = {0x01000007: "x86_64", 0x0100000c: "arm64"}
+PE_MACHINES = {0x8664: "x86_64", 0xaa64: "arm64"}
 
 DOMAIN_BENCHMARKS = {
     "crypto": {
@@ -516,6 +526,82 @@ def verify_native_runner(
     return reported_platform, reported_architecture
 
 
+def verify_process_not_translated(native_platform: str) -> str:
+    if native_platform != "macos":
+        return "not-applicable"
+    result = subprocess.run(
+        ["sysctl", "-in", "sysctl.proc_translated"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    value = result.stdout.strip()
+    if result.returncode == 0 and value == "1":
+        raise RuntimeError("native benchmark process is running under Rosetta translation")
+    if result.returncode == 0 and value != "0":
+        raise RuntimeError(f"unexpected macOS process translation status: {value!r}")
+    return "not-translated"
+
+
+def native_binary_identity(binary: Path) -> tuple[str, str]:
+    try:
+        size = binary.stat().st_size
+        with binary.open("rb") as executable:
+            header = executable.read(64)
+            if header.startswith(b"\x7fELF"):
+                if len(header) < 20 or header[4:6] != b"\x02\x01":
+                    raise RuntimeError("benchmark ELF must be 64-bit little-endian")
+                machine = struct.unpack_from("<H", header, 18)[0]
+                architecture = ELF_MACHINES.get(machine)
+                if architecture is None:
+                    raise RuntimeError(f"unsupported benchmark ELF machine: {machine:#x}")
+                return "elf", architecture
+
+            if header[:4] == b"\xcf\xfa\xed\xfe":
+                if len(header) < 8:
+                    raise RuntimeError("truncated benchmark Mach-O header")
+                machine = struct.unpack_from("<I", header, 4)[0]
+                architecture = MACHO_MACHINES.get(machine)
+                if architecture is None:
+                    raise RuntimeError(f"unsupported benchmark Mach-O machine: {machine:#x}")
+                return "mach-o", architecture
+
+            if header[:2] == b"MZ":
+                if len(header) < 64:
+                    raise RuntimeError("truncated benchmark DOS header")
+                pe_offset = struct.unpack_from("<I", header, 0x3c)[0]
+                if pe_offset > size - 6:
+                    raise RuntimeError("benchmark PE header offset is out of bounds")
+                executable.seek(pe_offset)
+                pe_header = executable.read(6)
+                if pe_header[:4] != b"PE\0\0":
+                    raise RuntimeError("benchmark PE signature is invalid")
+                machine = struct.unpack_from("<H", pe_header, 4)[0]
+                architecture = PE_MACHINES.get(machine)
+                if architecture is None:
+                    raise RuntimeError(f"unsupported benchmark PE machine: {machine:#x}")
+                return "pe", architecture
+    except OSError as error:
+        raise RuntimeError(f"cannot inspect benchmark binary: {error}") from error
+    raise RuntimeError("benchmark binary format is not ELF, Mach-O, or PE")
+
+
+def verify_native_binary(binary: Path, requested_platform: str,
+                         requested_architecture: str) -> tuple[str, str]:
+    binary_format, binary_architecture = native_binary_identity(binary)
+    expected_format = BINARY_FORMATS[requested_platform]
+    if (binary_format != expected_format or
+            binary_architecture != requested_architecture):
+        raise RuntimeError(
+            "benchmark binary is not native for the requested runner: "
+            f"requested {requested_platform}/{requested_architecture}, "
+            f"binary is {binary_format}/{binary_architecture}"
+        )
+    if os.name != "nt" and not os.access(binary, os.X_OK):
+        raise RuntimeError("benchmark binary is not executable")
+    return binary_format, binary_architecture
+
+
 def verify_source_checkout(repo_root: Path, repository: str,
                            source_sha: str,
                            allowed_untracked: tuple[Path, ...] = ()) -> None:
@@ -709,11 +795,15 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
     reported_platform, reported_architecture = verify_native_runner(
         platform, architecture
     )
+    translation_status = verify_process_not_translated(platform)
     toolchain = checked_line(toolchain, "toolchain")
     compiler_flags = checked_line(compiler_flags, "compiler flags")
     build_profile = checked_line(build_profile, "build profile")
     if not binary.is_file():
         raise RuntimeError(f"benchmark binary does not exist: {binary}")
+    binary_format, binary_architecture = verify_native_binary(
+        binary, platform, architecture
+    )
     if not provenance_manifest.is_file():
         raise RuntimeError(f"provenance manifest does not exist: {provenance_manifest}")
     provenance = json.loads(provenance_manifest.read_text(encoding="utf-8"))
@@ -815,6 +905,9 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
             "reported_platform": reported_platform,
             "reported_architecture": reported_architecture,
             "native_execution_verified": True,
+            "binary_format": binary_format,
+            "binary_architecture": binary_architecture,
+            "process_translation": translation_status,
             "endianness": sys.byteorder,
             "toolchain": toolchain,
         },
