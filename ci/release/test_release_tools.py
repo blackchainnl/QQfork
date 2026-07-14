@@ -6,6 +6,7 @@
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -67,6 +68,162 @@ class ReleaseToolTests(unittest.TestCase):
                 builder.run(
                     [sys.executable, "-c", "raise SystemExit(9)"],
                     cwd=root,
+                )
+
+    def test_mixed_version_check_isolates_datadir_and_home(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy_home = root / "legacy-home"
+            legacy_home.mkdir()
+            (legacy_home / ".blackmore").mkdir()
+            binary = root / "blackcoind"
+            binary.write_text(
+                "#!/usr/bin/env python3\n"
+                "import os\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "datadirs = [a.split('=', 1)[1] for a in sys.argv "
+                "if a.startswith('-datadir=')]\n"
+                "isolated = (len(datadirs) == 1 "
+                "and Path(datadirs[0]).is_dir() "
+                "and not (Path(os.environ['HOME']) / '.blackmore').exists())\n"
+                "print('Blackcoin version v30.1.0' if isolated "
+                "else 'Blackcoin first-run migration: 0%')\n",
+                encoding="utf8",
+            )
+            binary.chmod(0o755)
+            with mock.patch.dict(os.environ, {"HOME": str(legacy_home)}):
+                self.assertEqual(
+                    builder.verified_reported_version(
+                        binary,
+                        "v30.1.0",
+                        expected_product="Blackcoin",
+                        scratch_root=root,
+                    ),
+                    "Blackcoin version v30.1.0",
+                )
+
+    def test_mixed_version_check_accepts_historical_product_roles(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        cases = (
+            ("blackcoind", "Blackcoin More version v26.2.0"),
+            ("blackcoin-cli", "Blackcoin More RPC client version v26.2.0"),
+        )
+        for role, banner in cases:
+            with self.subTest(role=role):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    binary = root / role
+                    binary.write_text(
+                        f"#!/bin/sh\nprintf '%s\\n' '{banner}'\n",
+                        encoding="utf8",
+                    )
+                    binary.chmod(0o755)
+                    self.assertEqual(
+                        builder.verified_reported_version(
+                            binary,
+                            "v26.2.0",
+                            expected_product="Blackcoin More",
+                            scratch_root=root,
+                        ),
+                        banner,
+                    )
+
+    def test_mixed_version_check_rejects_wrong_version(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "blackcoind"
+            binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'Blackcoin version v29.0.0'\n",
+                encoding="utf8",
+            )
+            binary.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "unexpected version"):
+                builder.verified_reported_version(
+                    binary,
+                    "v30.1.0",
+                    expected_product="Blackcoin",
+                    scratch_root=root,
+                )
+
+    def test_mixed_version_check_rejects_substring_collision(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "blackcoind"
+            binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'Blackcoin version v130.1.0'\n",
+                encoding="utf8",
+            )
+            binary.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "unexpected version"):
+                builder.verified_reported_version(
+                    binary,
+                    "v30.1.0",
+                    expected_product="Blackcoin",
+                    scratch_root=root,
+                )
+
+    def test_mixed_version_check_rejects_executable_role_mismatch(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "blackcoin-cli"
+            binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'Blackcoin version v30.1.0'\n",
+                encoding="utf8",
+            )
+            binary.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "unexpected version"):
+                builder.verified_reported_version(
+                    binary,
+                    "v30.1.0",
+                    expected_product="Blackcoin",
+                    scratch_root=root,
+                )
+
+    def test_mixed_version_check_rejects_untrusted_or_leading_banner(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        banners = (
+            "Othercoin version v30.1.0",
+            "Blackcoin first-run migration: 0%\\nBlackcoin version v30.1.0",
+        )
+        for banner in banners:
+            with self.subTest(banner=banner):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    binary = root / "blackcoind"
+                    binary.write_text(
+                        "#!/bin/sh\nprintf '%b\\n' " + repr(banner) + "\n",
+                        encoding="utf8",
+                    )
+                    binary.chmod(0o755)
+                    with self.assertRaisesRegex(RuntimeError, "unexpected version"):
+                        builder.verified_reported_version(
+                            binary,
+                            "v30.1.0",
+                            expected_product="Blackcoin",
+                            scratch_root=root,
+                        )
+
+    def test_mixed_version_check_rejects_cross_product_banner(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "blackcoind"
+            binary.write_text(
+                "#!/bin/sh\nprintf '%s\\n' 'Blackcoin More version v30.1.0'\n",
+                encoding="utf8",
+            )
+            binary.chmod(0o755)
+            with self.assertRaisesRegex(RuntimeError, "unexpected version"):
+                builder.verified_reported_version(
+                    binary,
+                    "v30.1.0",
+                    expected_product="Blackcoin",
+                    scratch_root=root,
                 )
 
     def test_reproducibility_requires_identical_bytes(self):

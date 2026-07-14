@@ -14,23 +14,84 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tempfile
 import urllib.request
 
 
 BINARIES = ("blackcoind", "blackcoin-cli")
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
+SEMANTIC_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+VERSION_BANNER_RE = re.compile(
+    r"^(?P<product>Blackcoin(?: More)?) "
+    r"(?P<rpc_client>RPC client )?version "
+    r"v(?P<version>[0-9]+\.[0-9]+\.[0-9]+)$"
+)
 
 
-def run(command, *, cwd=None, capture=False):
+def run(command, *, cwd=None, capture=False, env=None):
     print("+", " ".join(str(part) for part in command), flush=True)
     completed = subprocess.run(
         [str(part) for part in command],
         cwd=cwd,
         check=True,
+        env=env,
         text=True,
         stdout=subprocess.PIPE if capture else None,
     )
     return completed.stdout if capture else None
+
+
+def verified_reported_version(
+    binary,
+    expected_version,
+    *,
+    expected_product,
+    scratch_root,
+):
+    """Read --version without exposing a historical client to user state.
+
+    Some released daemons perform legacy-datadir migration before handling
+    --version unless an explicit datadir is supplied. A clean HOME and an
+    existing isolated datadir keep provenance checks read-only and prevent
+    migration progress from being mistaken for version output.
+    """
+    with tempfile.TemporaryDirectory(
+        prefix="version-check-", dir=scratch_root
+    ) as temporary:
+        root = Path(temporary)
+        home = root / "home"
+        datadir = root / "datadir"
+        home.mkdir()
+        datadir.mkdir()
+        isolated_env = os.environ.copy()
+        isolated_env.update({
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            "XDG_DATA_HOME": str(home / ".local" / "share"),
+        })
+        output = run(
+            [binary, f"-datadir={datadir}", "--version"],
+            capture=True,
+            env=isolated_env,
+        )
+    lines = output.splitlines()
+    if not lines:
+        raise RuntimeError(f"{binary} returned empty version output")
+    reported = lines[0].strip()
+    normalized_expected = expected_version.removeprefix("v")
+    binary_role = Path(binary).name
+    match = VERSION_BANNER_RE.fullmatch(reported)
+    expected_rpc_client = binary_role == "blackcoin-cli"
+    if (
+        binary_role not in BINARIES
+        or not SEMANTIC_VERSION_RE.fullmatch(normalized_expected)
+        or match is None
+        or match.group("product") != expected_product
+        or bool(match.group("rpc_client")) != expected_rpc_client
+        or match.group("version") != normalized_expected
+    ):
+        raise RuntimeError(f"{binary} reports unexpected version: {reported}")
+    return reported
 
 
 def file_sha256(path):
@@ -46,13 +107,15 @@ def load_manifest(path):
     if data.get("schema") != 1 or not data.get("sources"):
         raise ValueError("unsupported or empty mixed-version source manifest")
     required = {
-        "version", "install_dir", "repository", "source_ref",
+        "version", "product", "install_dir", "repository", "source_ref",
         "ref_object", "commit", "tag_kind", "source_daemon", "source_cli",
     }
     for source in data["sources"]:
         missing = required.difference(source)
         if missing:
             raise ValueError(f"{source.get('version', '<unknown>')} missing {sorted(missing)}")
+        if source["product"] not in ("Blackcoin", "Blackcoin More"):
+            raise ValueError(f"{source['version']} contains an unsupported product name")
         if not SHA1_RE.fullmatch(source["ref_object"]) or not SHA1_RE.fullmatch(source["commit"]):
             raise ValueError(f"{source['version']} contains a non-commit object identifier")
         install_dir = Path(source["install_dir"])
@@ -215,10 +278,12 @@ def download_exact_release(source, *, output_dir, build_root, host):
 
     reported_versions = {}
     for installed_name, installed_path in installed.items():
-        reported = run([installed_path, "--version"], capture=True).splitlines()[0]
-        if source["version"].removeprefix("v") not in reported:
-            raise RuntimeError(f"{installed_path} reports unexpected version: {reported}")
-        reported_versions[installed_name] = reported
+        reported_versions[installed_name] = verified_reported_version(
+            installed_path,
+            source["version"],
+            expected_product=source["product"],
+            scratch_root=build_root,
+        )
     return {
         "version": source["version"],
         "install_dir": source["install_dir"],
@@ -272,11 +337,13 @@ def build_source(source, *, build_root, output_dir, host, jobs):
         installed_binary = destination / binary
         shutil.copy2(built_binary, installed_binary)
         installed_binary.chmod(0o755)
-        reported = run([installed_binary, "--version"], capture=True).splitlines()[0]
-        if source["version"].removeprefix("v") not in reported:
-            raise RuntimeError(f"{installed_binary} reports unexpected version: {reported}")
         hashes[binary] = file_sha256(installed_binary)
-        reported_versions[binary] = reported
+        reported_versions[binary] = verified_reported_version(
+            installed_binary,
+            source["version"],
+            expected_product=source["product"],
+            scratch_root=build_root,
+        )
     return {
         "version": source["version"],
         "install_dir": source["install_dir"],

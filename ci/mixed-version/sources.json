@@ -3,6 +3,7 @@
   "sources": [
     {
       "version": "v26.2.0",
+      "product": "Blackcoin More",
       "install_dir": "v26.2",
       "repository": "https://github.com/CoinBlack/blackcoin-more.git",
       "source_ref": "refs/tags/v26.2.0",
@@ -23,6 +24,7 @@
     },
     {
       "version": "v28.4.0",
+      "product": "Blackcoin More",
       "install_dir": "v28.4",
       "repository": "https://github.com/CoinBlack/blackcoin-more.git",
       "source_ref": "refs/heads/28.x",
@@ -34,6 +36,7 @@
     },
     {
       "version": "v30.1.0",
+      "product": "Blackcoin",
       "install_dir": "v30.1",
       "repository": "https://github.com/Blackcoin-Dev/Blackcoin.git",
       "source_ref": "refs/tags/v30.1.0",
