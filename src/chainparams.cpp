@@ -297,6 +297,14 @@ void ReadRegTestArgs(const ArgsManager& args, CChainParams::RegTestOptions& opti
     if (options.shadow_gold_rush_start_height && *options.shadow_gold_rush_start_height <= options.shadow_whitelist_height.value_or(SHADOW_WHITELIST_HEIGHT)) {
         throw std::runtime_error("-shadowgoldrushstartheight must be greater than -shadowwhitelistheight.");
     }
+    if (args.IsArgSet("-shadowcompetingclaimsheight")) {
+        const int64_t height = args.GetIntArg("-shadowcompetingclaimsheight", std::numeric_limits<int>::max());
+        if (height < 0 || height >= std::numeric_limits<int>::max()) {
+            throw std::runtime_error(strprintf(
+                "Invalid height value (%d) for -shadowcompetingclaimsheight.", height));
+        }
+        options.shadow_competing_claims_activation_height = static_cast<int>(height);
+    }
 
     ReadVersionBitsArgs(args, options.version_bits_parameters);
 }

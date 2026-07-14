@@ -169,6 +169,7 @@ BASE_SCRIPTS = [
     'feature_goldrush_migration_rpc.py',
     'feature_goldrush_coldstake_auto_migration.py',
     'feature_goldrush_coinstatsindex.py',
+    'feature_shadowindex_claim_boundary.py',
     'feature_goldrush_reorg.py',
     'feature_goldrush_schedule_controls.py',
     'feature_quantum_lifecycle.py',

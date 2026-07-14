@@ -41,6 +41,13 @@ class GoldRushScheduleControlsTest(BitcoinTestFramework):
             match=ErrorMatch.PARTIAL_REGEX,
         )
 
+        self.log.info("Rejecting the compressed competing-claim boundary outside regtest")
+        node.assert_start_raises_init_error(
+            extra_args=["-shadowcompetingclaimsheight=110"],
+            expected_msg="-shadowcompetingclaimsheight is only supported on regtest",
+            match=ErrorMatch.PARTIAL_REGEX,
+        )
+
         self.log.info("Rejecting schedule controls on mainnet")
         mainnet_datadir = os.path.join(self.options.tmpdir, "mainnet_schedule_guard")
         os.makedirs(mainnet_datadir, exist_ok=True)

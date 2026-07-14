@@ -96,7 +96,13 @@ no synthetic output.
 On mainnet this canonical per-claim classification begins at height 5,993,200.
 Earlier Gold Rush blocks intentionally reproduce the v30.1.0 first-valid-claim
 allocation and therefore do not expose a retroactively invented canonical
-winner or loser reimbursement.
+winner or loser reimbursement. Their authenticated PoW synthetic payouts are
+still indexed, counted in supply, and returned by payout queries, but
+`pow_claim_accounting.active` is false, its records and totals are zero, and
+each payout's `pow_claim_source` is null. At and after height 5,993,200, every
+credited PoW payout must map to one canonical source record and the exact
+credited total; missing or inconsistent provenance stops the auxiliary index
+instead of publishing a partial result.
 
 Index construction authenticates the historical pool context while holding the
 chain/view lock, then releases that lock before the shared Argon2 evaluator is
@@ -238,6 +244,12 @@ test. It:
 9. forces an equal-tip ABA reorg while supply, script, and outpoint RPCs are in
    progress and requires an explicit retry instead of a mixed-branch result.
 
+`feature_shadowindex_claim_boundary.py` compresses the height-5,993,200
+boundary on regtest. It proves that a paid historical v30.1.0-style claim
+survives restart, disconnect/reconnect, and `-reindex` with explicit null source
+provenance, while the first post-activation payout requires and retains its
+exact canonical source and accounting totals through the same rebuild path.
+
 `interface_zmq_shadow.py` is the executable event-ingestion test. Enable the
 transport with:
 
@@ -253,9 +265,12 @@ uint32 sequence. One event is emitted only after the index has atomically
 applied or rewound the block. `shadow.block.connected` and
 `shadow.block.disconnected` use the same block, credit, spend, provenance, and
 exact-atomic-amount payload except for `event`, so disconnect is an exact
-inverse. Credits are ordered by claim index. Spends are ordered by transaction
-index and input index. Reorganizations publish former-branch disconnects from
-tip to ancestor, followed by replacement-branch connects from ancestor to tip.
+inverse. Historical preactivation PoW credits carry the same explicit null
+`pow_claim_source` as their RPC record; post-activation PoW credits carry the
+canonical source object. Credits are ordered by claim index. Spends are ordered
+by transaction index and input index. Reorganizations publish former-branch
+disconnects from tip to ancestor, followed by replacement-branch connects from
+ancestor to tip.
 
 The transport does not replay history during startup, initial index build,
 restart, or reindex. A reference consumer therefore:
@@ -298,7 +313,10 @@ in the base block.
   height; earlier blocks return an empty shadow page. Quantum witness history
   begins at genesis.
 - Corrupt or missing index entries produce RPC/index errors. They are never
-  converted into base-chain consensus invalidity.
+  converted into base-chain consensus invalidity. Primary records must match
+  their database key, active-chain anchor, deterministic payout shape, value
+  range, proof mode, and spend-value conservation before an RPC or event may
+  expose them.
 - A persisted BaseIndex locator inside the reward window is never accepted
   without the matching custom shadow tip. This rare interrupted-rewind seam
   fails closed and requires `-reindex` instead of advertising incomplete data

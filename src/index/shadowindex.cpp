@@ -288,9 +288,150 @@ bool IsCreditedPowDisposition(ShadowPowClaimDisposition disposition)
            disposition == ShadowPowClaimDisposition::REIMBURSED_LOSER;
 }
 
+bool IsValidShadowPowClaimSource(const ShadowIndexPowClaimSource& source)
+{
+    return !source.txid.IsNull() && !source.canonical_rank.IsNull() &&
+        (source.base_fee_known
+             ? source.base_fee >= 0 && MoneyRange(source.base_fee)
+             : source.base_fee == 0);
+}
+
+bool ShadowPowClaimSourcesEqual(const ShadowIndexPowClaimSource& lhs,
+                                const ShadowIndexPowClaimSource& rhs)
+{
+    return lhs.txid == rhs.txid && lhs.vout == rhs.vout &&
+        lhs.canonical_rank == rhs.canonical_rank &&
+        lhs.base_fee == rhs.base_fee &&
+        lhs.base_fee_known == rhs.base_fee_known &&
+        lhs.disposition == rhs.disposition;
+}
+
+bool IsValidShadowPowClaimRecord(const ShadowIndexPowClaimRecord& record)
+{
+    if (!IsValidShadowPowClaimSource(record.source) ||
+        record.credited_amount < 0 || !MoneyRange(record.credited_amount)) {
+        return false;
+    }
+    const bool credited_disposition =
+        IsCreditedPowDisposition(record.source.disposition);
+    if ((credited_disposition &&
+         (!record.source.base_fee_known ||
+          !IsBoundedShadowEventScript(record.payout_script))) ||
+        (!credited_disposition && record.credited_amount != 0) ||
+        record.synthetic_payout_present != (record.credited_amount > 0)) {
+        return false;
+    }
+    if (!record.synthetic_payout_present) {
+        return record.synthetic_payout_outpoint.IsNull();
+    }
+    return record.synthetic_payout_outpoint.n == 0 &&
+        !record.synthetic_payout_outpoint.hash.IsNull() &&
+        IsBoundedShadowEventScript(record.payout_script);
+}
+
+bool IsValidShadowIndexBlockRecord(const ShadowIndexBlockRecord& record)
+{
+    if (record.height < SHADOW_REWARD_START_HEIGHT || record.block_hash.IsNull() ||
+        record.block_time == 0 || record.median_time_past < 0 ||
+        record.median_time_past > record.block_time ||
+        record.supply.spent_count > record.supply.issued_count ||
+        record.supply.issued_count < record.payout_txids.size() ||
+        record.supply.spent_count < record.spent_outpoints.size() ||
+        record.supply.issued_nominal < 0 ||
+        !MoneyRange(record.supply.issued_nominal) ||
+        record.supply.spent_nominal < 0 ||
+        !MoneyRange(record.supply.spent_nominal) ||
+        record.supply.spent_effective < 0 ||
+        !MoneyRange(record.supply.spent_effective) ||
+        record.supply.spent_decayed < 0 ||
+        !MoneyRange(record.supply.spent_decayed) ||
+        record.supply.spent_nominal > record.supply.issued_nominal ||
+        record.supply.spent_effective + record.supply.spent_decayed !=
+            record.supply.spent_nominal) {
+        return false;
+    }
+
+    const ShadowIndexPowClaimSummary& summary = record.pow_claims;
+    if (summary.winner_count > 1 ||
+        static_cast<uint64_t>(summary.winner_count) +
+                summary.reimbursed_loser_count + summary.rejected_count !=
+            summary.record_count ||
+        summary.credited_total < 0 || !MoneyRange(summary.credited_total) ||
+        summary.winner_credited_total < 0 ||
+        !MoneyRange(summary.winner_credited_total) ||
+        summary.reimbursed_credited_total < 0 ||
+        !MoneyRange(summary.reimbursed_credited_total) ||
+        summary.winner_credited_total + summary.reimbursed_credited_total !=
+            summary.credited_total) {
+        return false;
+    }
+    const bool accounting_expected = record.height <= SHADOW_REWARD_END_HEIGHT &&
+        Params().GetConsensus().IsShadowCompetingClaimsActive(record.height);
+    if (summary.active != accounting_expected ||
+        (!summary.active &&
+         (summary.record_count != 0 || summary.credited_total != 0))) {
+        return false;
+    }
+
+    std::set<uint256> payout_txids;
+    for (const uint256& txid : record.payout_txids) {
+        if (txid.IsNull() || !payout_txids.insert(txid).second) return false;
+    }
+    std::set<COutPoint> spent_outpoints;
+    for (const COutPoint& outpoint : record.spent_outpoints) {
+        if (outpoint.n != 0 || outpoint.hash.IsNull() ||
+            !spent_outpoints.insert(outpoint).second) {
+            return false;
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 std::unique_ptr<ShadowIndex> g_shadow_index;
+
+bool IsValidShadowIndexRecord(const ShadowIndexRecord& record)
+{
+    if (record.outpoint.hash.IsNull() || record.outpoint.n != 0 ||
+        record.origin_height < static_cast<uint32_t>(SHADOW_REWARD_START_HEIGHT) ||
+        record.origin_height > static_cast<uint32_t>(SHADOW_REWARD_END_HEIGHT) ||
+        record.origin_block_hash.IsNull() || record.nominal_amount <= 0 ||
+        !MoneyRange(record.nominal_amount) ||
+        !IsBoundedShadowEventScript(record.script_pub_key)) {
+        return false;
+    }
+    const bool source_required = record.proof_of_work &&
+        Params().GetConsensus().IsShadowCompetingClaimsActive(
+            static_cast<int>(record.origin_height));
+    if ((!record.proof_of_work && record.pow_claim_source_present) ||
+        record.pow_claim_source_present != source_required) {
+        return false;
+    }
+    if (record.pow_claim_source_present) {
+        if (!IsValidShadowPowClaimSource(record.pow_claim_source) ||
+            !record.pow_claim_source.base_fee_known ||
+            !IsCreditedPowDisposition(record.pow_claim_source.disposition)) {
+            return false;
+        }
+    }
+    if (!record.spent) {
+        return record.spend_height == 0 && record.spend_block_hash.IsNull() &&
+            record.spending_txid.IsNull() && record.spend_tx_index == 0 &&
+            record.spend_input_index == 0 && record.effective_amount_at_spend == 0 &&
+            record.decayed_amount_at_spend == 0;
+    }
+    return record.spend_height >= record.origin_height &&
+        !record.spend_block_hash.IsNull() && !record.spending_txid.IsNull() &&
+        record.effective_amount_at_spend >= 0 &&
+        MoneyRange(record.effective_amount_at_spend) &&
+        record.decayed_amount_at_spend >= 0 &&
+        MoneyRange(record.decayed_amount_at_spend) &&
+        record.effective_amount_at_spend <=
+            record.nominal_amount - record.decayed_amount_at_spend &&
+        record.effective_amount_at_spend + record.decayed_amount_at_spend ==
+            record.nominal_amount;
+}
 
 class ShadowIndex::DB final : public BaseIndex::DB
 {
@@ -389,7 +530,7 @@ bool ShadowIndex::BuildBlockEvent(const CBlock& block, const CBlockIndex* pindex
             record.origin_height != static_cast<uint32_t>(pindex->nHeight) ||
             record.origin_block_hash != pindex->GetBlockHash() ||
             record.claim_index != claim_index ||
-            !IsBoundedShadowEventScript(record.script_pub_key)) {
+            !IsValidShadowIndexRecord(record)) {
             return false;
         }
         result.credits.push_back(std::move(record));
@@ -407,7 +548,7 @@ bool ShadowIndex::BuildBlockEvent(const CBlock& block, const CBlockIndex* pindex
             record.spend_height != static_cast<uint32_t>(pindex->nHeight) ||
             record.spend_block_hash != pindex->GetBlockHash() ||
             record.spending_txid != spending_tx.GetHash() ||
-            !IsBoundedShadowEventScript(record.script_pub_key)) {
+            !IsValidShadowIndexRecord(record)) {
             return false;
         }
         result.spends.push_back(std::move(record));
@@ -1009,8 +1150,7 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         }
         batch.Write(DBPowClaimKey{block.hash, accounting_index}, claim_record);
     }
-    if (next_pow_payout != pow_payouts.size() ||
-        block_record.pow_claims.record_count != pow_accounting.size() ||
+    if (block_record.pow_claims.record_count != pow_accounting.size() ||
         block_record.pow_claims.winner_count > 1 ||
         block_record.pow_claims.winner_count +
                 block_record.pow_claims.reimbursed_loser_count +
@@ -1019,7 +1159,12 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         block_record.pow_claims.winner_credited_total +
                 block_record.pow_claims.reimbursed_credited_total !=
             block_record.pow_claims.credited_total ||
-        block_record.pow_claims.credited_total != pow_payout_total) {
+        (block_record.pow_claims.active &&
+         (next_pow_payout != pow_payouts.size() ||
+          block_record.pow_claims.credited_total != pow_payout_total)) ||
+        (!block_record.pow_claims.active &&
+         (next_pow_payout != 0 || block_record.pow_claims.record_count != 0 ||
+          block_record.pow_claims.credited_total != 0))) {
         return error("%s: inconsistent POW claim accounting summary", __func__);
     }
 
@@ -1043,11 +1188,12 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         record.script_pub_key = payout.target;
         if (record.proof_of_work) {
             const auto source = pow_payout_sources.find(outpoint.hash);
-            if (source == pow_payout_sources.end()) {
+            if (source != pow_payout_sources.end()) {
+                record.pow_claim_source_present = true;
+                record.pow_claim_source = source->second;
+            } else if (block_record.pow_claims.active) {
                 return error("%s: POW payout is missing canonical source provenance", __func__);
             }
-            record.pow_claim_source_present = true;
-            record.pow_claim_source = source->second;
         }
         if (record.nominal_amount <= 0 || !MoneyRange(record.nominal_amount)) {
             return error("%s: invalid synthetic payout amount", __func__);
@@ -1249,23 +1395,27 @@ bool ShadowIndex::CustomRewind(const interfaces::BlockKey& current_tip,
 
 bool ShadowIndex::LookupBlock(const uint256& block_hash, ShadowIndexBlockRecord& record) const
 {
-    return m_db->ReadBlock(block_hash, record);
+    return m_db->ReadBlock(block_hash, record) && record.block_hash == block_hash &&
+        IsValidShadowIndexBlockRecord(record);
 }
 
 bool ShadowIndex::LookupTransaction(const uint256& synthetic_txid, ShadowIndexRecord& record) const
 {
-    return m_db->ReadTransaction(synthetic_txid, record);
+    return m_db->ReadTransaction(synthetic_txid, record) &&
+        record.outpoint.hash == synthetic_txid && IsValidShadowIndexRecord(record);
 }
 
 bool ShadowIndex::LookupSpentOutpoint(const COutPoint& outpoint, ShadowIndexRecord& record) const
 {
-    return m_db->Read(DBSpentOutpointKey{outpoint}, record);
+    return m_db->Read(DBSpentOutpointKey{outpoint}, record) &&
+        record.outpoint == outpoint && record.spent &&
+        IsValidShadowIndexRecord(record);
 }
 
 bool ShadowIndex::LookupSupply(const uint256& block_hash, ShadowIndexSupply& supply) const
 {
     ShadowIndexBlockRecord block;
-    if (!m_db->ReadBlock(block_hash, block)) return false;
+    if (!LookupBlock(block_hash, block)) return false;
     supply = block.supply;
     return true;
 }
@@ -1279,7 +1429,7 @@ bool ShadowIndex::LookupPowClaims(
     next.reset();
     if (limit == 0 || limit > MAX_SCRIPT_QUERY_RESULTS) return false;
     ShadowIndexBlockRecord block;
-    if (!m_db->ReadBlock(block_hash, block)) return false;
+    if (!LookupBlock(block_hash, block)) return false;
     const size_t total = block.pow_claims.record_count;
     if (offset > total) offset = total;
     const size_t end = std::min(total, offset + limit);
@@ -1287,8 +1437,22 @@ bool ShadowIndex::LookupPowClaims(
     for (size_t index = offset; index < end; ++index) {
         ShadowIndexPowClaimRecord record;
         if (!m_db->Read(DBPowClaimKey{block_hash, static_cast<uint32_t>(index)},
-                        record)) {
+                        record) || !IsValidShadowPowClaimRecord(record)) {
             return false;
+        }
+        if (record.synthetic_payout_present) {
+            ShadowIndexRecord payout;
+            if (!m_db->ReadTransaction(record.synthetic_payout_outpoint.hash, payout) ||
+                !IsValidShadowIndexRecord(payout) ||
+                payout.outpoint != record.synthetic_payout_outpoint ||
+                payout.origin_height != static_cast<uint32_t>(block.height) ||
+                payout.origin_block_hash != block_hash || !payout.proof_of_work ||
+                payout.nominal_amount != record.credited_amount ||
+                payout.script_pub_key != record.payout_script ||
+                !payout.pow_claim_source_present ||
+                !ShadowPowClaimSourcesEqual(payout.pow_claim_source, record.source)) {
+                return false;
+            }
         }
         records.push_back(std::move(record));
     }
@@ -1334,6 +1498,7 @@ bool ShadowIndex::ForEachTransaction(
         }
         ShadowIndexRecord record;
         if (!iterator->GetValue(record) || record.outpoint.hash != key.txid ||
+            !IsValidShadowIndexRecord(record) ||
             !callback(record)) {
             return false;
         }
@@ -1394,7 +1559,9 @@ bool ShadowIndex::LookupScript(const CScript& script_pub_key,
         if (!iterator->GetKey(key) || key.script_hash != script_hash) break;
         ShadowIndexRecord record;
         if (!m_db->ReadTransaction(key.txid, record) ||
-            record.origin_height != key.height || record.script_pub_key != script_pub_key) {
+            record.outpoint.hash != key.txid || record.origin_height != key.height ||
+            record.script_pub_key != script_pub_key ||
+            !IsValidShadowIndexRecord(record)) {
             return false;
         }
         if (records.size() == limit) {

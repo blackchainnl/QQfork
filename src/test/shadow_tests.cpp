@@ -10,6 +10,7 @@
 #include <chain.h>
 #include <consensus/params.h>
 #include <hash.h>
+#include <index/shadowindex.h>
 #include <primitives/block.h>
 #include <primitives/transaction.h>
 #include <script/script.h>
@@ -374,6 +375,45 @@ BOOST_AUTO_TEST_CASE(synthetic_claim_limit_preserves_history_and_tightens_at_act
                           consensus, 100,
                           std::numeric_limits<uint32_t>::max()),
                       legacy_limit);
+}
+
+BOOST_AUTO_TEST_CASE(shadow_index_record_validation_respects_claim_boundary)
+{
+    ShadowIndexRecord record;
+    record.outpoint = COutPoint{uint256::ONE, 0};
+    record.origin_height = MAINNET_SHADOW_REWARD_START_HEIGHT;
+    record.origin_block_hash = uint256S("02");
+    record.origin_block_time = 1;
+    record.proof_of_work = true;
+    record.nominal_amount = 10 * COIN;
+    record.script_pub_key = QuantumScript(0x51);
+
+    BOOST_CHECK(IsValidShadowIndexRecord(record));
+
+    record.pow_claim_source_present = true;
+    record.pow_claim_source.txid = uint256S("03");
+    record.pow_claim_source.canonical_rank = uint256S("04");
+    record.pow_claim_source.base_fee_known = true;
+    record.pow_claim_source.base_fee = CENT;
+    record.pow_claim_source.disposition = ShadowPowClaimDisposition::WINNER;
+    BOOST_CHECK(!IsValidShadowIndexRecord(record));
+
+    record.origin_height = MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
+    BOOST_CHECK(IsValidShadowIndexRecord(record));
+    record.pow_claim_source_present = false;
+    BOOST_CHECK(!IsValidShadowIndexRecord(record));
+
+    record.pow_claim_source_present = true;
+    record.spent = true;
+    record.spend_height = record.origin_height + 1;
+    record.spend_block_hash = uint256S("05");
+    record.spending_txid = uint256S("06");
+    record.effective_amount_at_spend = 9 * COIN;
+    record.decayed_amount_at_spend = COIN;
+    BOOST_CHECK(IsValidShadowIndexRecord(record));
+
+    record.decayed_amount_at_spend = 2 * COIN;
+    BOOST_CHECK(!IsValidShadowIndexRecord(record));
 }
 
 BOOST_AUTO_TEST_CASE(legacy_whitelist_uses_aggregate_script_balance)

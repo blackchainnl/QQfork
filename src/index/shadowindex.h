@@ -129,6 +129,9 @@ struct ShadowIndexRecord {
     }
 };
 
+/** Reject malformed or cross-key primary records before explorer use. */
+bool IsValidShadowIndexRecord(const ShadowIndexRecord& record);
+
 /** Deterministic active-chain delta transported to shadow-ledger subscribers. */
 struct ShadowIndexBlockEvent {
     int32_t height{-1};

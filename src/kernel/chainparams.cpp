@@ -678,7 +678,16 @@ public:
         if (opts.quantum_stake_reward_split_activation_height) consensus.nStakeRewardSplitActivationHeight = *opts.quantum_stake_reward_split_activation_height;
         if (opts.quantum_demurrage_activation_height) consensus.nDemurrageActivationHeight = *opts.quantum_demurrage_activation_height;
         if (opts.quantum_demurrage_blocks_per_month) consensus.nDemurrageBlocksPerMonth = *opts.quantum_demurrage_blocks_per_month;
-        consensus.nShadowCompetingClaimsActivationHeight = SHADOW_REWARD_START_HEIGHT;
+        consensus.nShadowCompetingClaimsActivationHeight =
+            opts.shadow_competing_claims_activation_height.value_or(SHADOW_REWARD_START_HEIGHT);
+        if (consensus.nShadowCompetingClaimsActivationHeight < SHADOW_REWARD_START_HEIGHT ||
+            consensus.nShadowCompetingClaimsActivationHeight > SHADOW_REWARD_END_HEIGHT) {
+            throw std::runtime_error(strprintf(
+                "-shadowcompetingclaimsheight (%d) must be inside the Gold Rush reward window [%d, %d].",
+                consensus.nShadowCompetingClaimsActivationHeight,
+                SHADOW_REWARD_START_HEIGHT,
+                SHADOW_REWARD_END_HEIGHT));
+        }
         if (consensus.UsesHeightLifecycle() && consensus.IsQuantumLifecycleScheduleOrdered()) {
             const int automatic_demurrage_height = consensus.nQuantumMigrationEndHeight + 1;
             if (opts.quantum_demurrage_activation_height &&

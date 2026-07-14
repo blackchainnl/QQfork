@@ -942,6 +942,10 @@ bool AppInitParameterInteraction(const ArgsManager& args)
                   ChainTypeToString(chain), SHADOW_WHITELIST_HEIGHT, SHADOW_REWARD_START_HEIGHT, SHADOW_REWARD_END_HEIGHT);
     }
 
+    if (args.IsArgSet("-shadowcompetingclaimsheight") && chain != ChainType::REGTEST) {
+        return InitError(_("-shadowcompetingclaimsheight is only supported on regtest."));
+    }
+
     if (args.IsArgSet("-solostaking") && chain != ChainType::TESTNET && chain != ChainType::REGTEST) {
         return InitError(_("-solostaking is only supported on testnet/regtest in the test schedule branch."));
     }

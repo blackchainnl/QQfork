@@ -543,14 +543,33 @@ RPCHelpMan getshadowblock()
                 indexed.block_time = pindex->GetBlockTime();
                 indexed.median_time_past = pindex->pprev ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
             }
+            const int64_t expected_mtp = pindex->pprev
+                ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
+            if (indexed.height != pindex->nHeight ||
+                indexed.block_hash != pindex->GetBlockHash() ||
+                indexed.block_time != static_cast<uint32_t>(pindex->GetBlockTime()) ||
+                indexed.median_time_past != expected_mtp) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                   "Shadow block index record does not match its active-chain anchor");
+            }
 
             CAmount pow_total{0};
             CAmount pos_total{0};
-            for (const uint256& txid : indexed.payout_txids) {
+            for (size_t claim_index = 0;
+                 claim_index < indexed.payout_txids.size(); ++claim_index) {
+                const uint256& txid = indexed.payout_txids[claim_index];
                 ShadowIndexRecord record;
                 if (!g_shadow_index->LookupTransaction(txid, record)) {
                     EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
                     throw JSONRPCError(RPC_INTERNAL_ERROR, "Shadow block references a missing synthetic transaction");
+                }
+                if (record.origin_height != static_cast<uint32_t>(pindex->nHeight) ||
+                    record.origin_block_hash != pindex->GetBlockHash() ||
+                    record.origin_block_time != indexed.block_time ||
+                    record.claim_index != claim_index) {
+                    throw JSONRPCError(
+                        RPC_INTERNAL_ERROR,
+                        "Shadow block references a synthetic transaction from a different anchor");
                 }
                 CAmount& mode_total = record.proof_of_work ? pow_total : pos_total;
                 if (record.nominal_amount <= 0 || !MoneyRange(record.nominal_amount) ||
@@ -1369,10 +1388,17 @@ RPCHelpMan getshadowsupply()
             }
 
             ShadowIndexSupply supply;
-            if (tip->nHeight >= SHADOW_REWARD_START_HEIGHT &&
-                !g_shadow_index->LookupSupply(tip->GetBlockHash(), supply)) {
-                EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
-                throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read current shadow supply from shadowindex");
+            if (tip->nHeight >= SHADOW_REWARD_START_HEIGHT) {
+                ShadowIndexBlockRecord supply_block;
+                if (!g_shadow_index->LookupBlock(tip->GetBlockHash(), supply_block) ||
+                    supply_block.height != tip->nHeight ||
+                    supply_block.block_time != static_cast<uint32_t>(tip->GetBlockTime())) {
+                    EnsureShadowRPCSnapshotUnchanged(chainman, snapshot);
+                    throw JSONRPCError(
+                        RPC_INTERNAL_ERROR,
+                        "Unable to read an anchored current shadow supply from shadowindex");
+                }
+                supply = supply_block.supply;
             }
             if (!MoneyRange(supply.issued_nominal) ||
                 !MoneyRange(supply.spent_nominal) ||
