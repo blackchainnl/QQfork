@@ -662,6 +662,49 @@ BOOST_FIXTURE_TEST_CASE(chainstatemanager_staged_rebuild_crash_rolls_back, Snaps
     });
 }
 
+//! Refuse a protected rebuild before its journal or source moves when there is
+//! not enough free space to retain the source and build a replacement of at
+//! least the same logical size.
+BOOST_FIXTURE_TEST_CASE(chainstatemanager_rebuild_low_disk_is_nonmutating, SnapshotTestSetup)
+{
+    ChainstateManager& original = *Assert(m_node.chainman);
+    const fs::path datadir = original.m_options.datadir;
+    const fs::path source = datadir / "chainstate";
+    const uint256 source_tip = WITH_LOCK(
+        ::cs_main, return original.ActiveTip()->GetBlockHash());
+
+    ChainstateManager& restarted = this->SimulateNodeRestart();
+    uint64_t required_bytes{0};
+    node::ChainstateLoadOptions rebuild;
+    rebuild.mempool = Assert(m_node.mempool.get());
+    rebuild.reindex_chainstate = true;
+    rebuild.check_rebuild_disk_space = [&](const fs::path& checked_datadir,
+                                           uint64_t required) {
+        BOOST_CHECK_EQUAL(checked_datadir, datadir);
+        required_bytes = required;
+        return false;
+    };
+    const auto [status, error] = node::LoadChainstate(
+        restarted, m_cache_sizes, rebuild);
+
+    BOOST_CHECK(status == node::ChainstateLoadStatus::FAILURE_FATAL);
+    BOOST_CHECK(error.original.find("Insufficient free disk space") !=
+                std::string::npos);
+    BOOST_CHECK_GT(required_bytes, 0U);
+    BOOST_CHECK(fs::exists(source));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate-rebuild.journal"));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate.rebuild-backup"));
+    BOOST_CHECK(!fs::exists(datadir / "chainstate.rebuild-partial"));
+
+    CCoinsViewDB preserved{DBParams{
+        .path = source,
+        .cache_bytes = 1 << 20,
+        .memory_only = false,
+        .wipe_data = false,
+        .obfuscate = true}, CoinsViewOptions{}};
+    BOOST_CHECK_EQUAL(preserved.GetBestBlock(), source_tip);
+}
+
 //! COMMIT_READY is only a durable build marker. A fresh manager must complete
 //! VerifyLoadedChainstate successfully before it can retire source backups,
 //! and a later failed or interrupted verification must clear stale success.

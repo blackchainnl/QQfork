@@ -124,6 +124,9 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
             first_restore.signmessage(legacy_address, legacy_message),
             legacy_message,
         )
+        first_roundtrip = node.datadir_path / "quantum-first-roundtrip.dat"
+        first_restore.backupwallet(first_roundtrip)
+        assert first_roundtrip.is_file()
 
         node.restorewallet("quantum_current_restore", current_backup)
         current_restore = node.get_wallet_rpc("quantum_current_restore")
@@ -140,6 +143,9 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
             current_restore.signmessage(legacy_address, legacy_message),
             legacy_message,
         )
+        current_roundtrip = node.datadir_path / "quantum-current-roundtrip.dat"
+        current_restore.backupwallet(current_roundtrip)
+        assert current_roundtrip.is_file()
 
         self.log.info("A locked-wallet failure cannot replace an existing good backup")
         passphrase = "quantum-backup-passphrase"

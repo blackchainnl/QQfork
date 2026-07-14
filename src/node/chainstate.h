@@ -7,6 +7,7 @@
 #ifndef BITCOIN_NODE_CHAINSTATE_H
 #define BITCOIN_NODE_CHAINSTATE_H
 
+#include <util/fs.h>
 #include <util/translation.h>
 #include <validation.h>
 
@@ -43,6 +44,9 @@ struct ChainstateLoadOptions {
     int64_t check_blocks{DEFAULT_CHECKBLOCKS};
     int64_t check_level{DEFAULT_CHECKLEVEL};
     std::function<bool()> check_interrupt;
+    //! Override only for deterministic recovery failure-injection tests. The
+    //! production path uses CheckDiskSpace() directly.
+    std::function<bool(const fs::path&, uint64_t)> check_rebuild_disk_space;
     std::function<void()> coins_error_cb;
 };
 

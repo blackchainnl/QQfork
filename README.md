@@ -17,7 +17,7 @@ helping secure the chain**.
 
 - **Quantum-safe signatures.** ML-DSA-44 (FIPS 204) via liboqs as the
   consensus-verified spending path for quantum migration (witness v16) and
-  quantum cold-staking (v14). Witness v15 is reserved for a future EUTXO
+  quantum cold-staking (v14). Witness v15 is frozen and reserved for a future EUTXO
   design, but v30.1.1 provides no supported v15 funding or spending workflow
   because it has no quantum ownership authorization. Consensus rejects v15
   funding and spending from Migration onward.
@@ -94,10 +94,16 @@ delete wallet files or available block files. v30.1.1 checks required block
 availability before staging and leaves the existing chainstate intact if known
 pruned history makes a chainstate-only rebuild impossible.
 
-The v30.1.1 alpha supports archival `prune=0` operation only. The inherited
-option parser accepts `-prune`, but this Blackcoin branch's block-file pruning
-engine is disabled and the release does not claim a verified pruned-node path.
-Keep complete active-chain block files for authenticated Quantum Quasar replay.
+The v30.1.1 beta supports archival `prune=0` operation only. Startup rejects a
+nonzero `-prune` value on mainnet, testnet, and signet because this Blackcoin
+branch does not have an audited proof-of-stake pruning and recovery path.
+Nonzero values remain available only on regtest for test coverage. Keep
+complete active-chain block files for authenticated Quantum Quasar replay.
+
+Before moving either source chainstate, the protected rebuild scans its stable
+directory topology and requires enough free space for at least the logical
+size of the existing chainstate plus a 50 MiB safety reserve. A failed scan or
+space check leaves the source in place without creating a rebuild journal.
 
 The rebuilding process preserves the original chainstate in a journaled backup
 and leaves that backup in place after reconstruction commits. Stop cleanly and

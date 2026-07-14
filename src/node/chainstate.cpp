@@ -254,6 +254,96 @@ bool CleanupTree(const fs::path& path)
     return !ec && !PathExists(path);
 }
 
+bool AddRebuildSourceBytes(const fs::path& root, uint64_t& total,
+                           std::string& error)
+{
+    if (!PathExists(root)) return true;
+
+    std::error_code ec;
+    const fs::file_status root_status = fs::symlink_status(root, ec);
+    if (ec || !fs::is_directory(root_status)) {
+        error = strprintf("chainstate rebuild source is not a readable directory: %s",
+                          fs::PathToString(root));
+        return false;
+    }
+
+    fs::recursive_directory_iterator it{root, ec};
+    const fs::recursive_directory_iterator end{};
+    if (ec) {
+        error = strprintf("cannot scan chainstate rebuild source %s: %s",
+                          fs::PathToString(root), ec.message());
+        return false;
+    }
+    while (it != end) {
+        const fs::file_status status = it->symlink_status(ec);
+        if (ec) {
+            error = strprintf("cannot inspect chainstate rebuild source %s: %s",
+                              fs::PathToString(it->path()), ec.message());
+            return false;
+        }
+        if (fs::is_regular_file(status)) {
+            const uintmax_t size = it->file_size(ec);
+            if (ec) {
+                error = strprintf("cannot size chainstate rebuild source %s: %s",
+                                  fs::PathToString(it->path()), ec.message());
+                return false;
+            }
+            if (size > std::numeric_limits<uint64_t>::max() - total) {
+                error = strprintf("chainstate rebuild source size overflows at %s",
+                                  fs::PathToString(it->path()));
+                return false;
+            }
+            total += static_cast<uint64_t>(size);
+        } else if (!fs::is_directory(status)) {
+            // A symlink or special file can change after this scan or hide
+            // storage outside the locked datadir. Refuse it rather than make
+            // a disk-space claim from an unstable source topology.
+            error = strprintf("unsupported entry in chainstate rebuild source: %s",
+                              fs::PathToString(it->path()));
+            return false;
+        }
+
+        it.increment(ec);
+        if (ec) {
+            error = strprintf("cannot complete chainstate rebuild source scan at %s: %s",
+                              fs::PathToString(root), ec.message());
+            return false;
+        }
+    }
+    return true;
+}
+
+ChainstateLoadResult CheckRebuildDiskSpace(
+    const fs::path& datadir,
+    const ChainstateLoadOptions& options)
+{
+    uint64_t source_bytes{0};
+    std::string scan_error;
+    if (!AddRebuildSourceBytes(BasePath(datadir), source_bytes, scan_error) ||
+        !AddRebuildSourceBytes(SnapshotPath(datadir), source_bytes, scan_error)) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                strprintf(_("Cannot establish chainstate rebuild disk requirements (%s). No chainstate was moved or wiped."),
+                          scan_error)};
+    }
+
+    bool sufficient{false};
+    try {
+        sufficient = options.check_rebuild_disk_space
+            ? options.check_rebuild_disk_space(datadir, source_bytes)
+            : CheckDiskSpace(datadir, source_bytes);
+    } catch (const std::exception& e) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                strprintf(_("Cannot query free disk space for the protected chainstate rebuild (%s). No chainstate was moved or wiped."),
+                          e.what())};
+    }
+    if (!sufficient) {
+        return {ChainstateLoadStatus::FAILURE_FATAL,
+                strprintf(_("Insufficient free disk space for a protected chainstate rebuild. At least %u bytes plus the 50 MiB safety reserve must be available before preserving the existing chainstate. No chainstate was moved or wiped."),
+                          source_bytes)};
+    }
+    return {ChainstateLoadStatus::SUCCESS, {}};
+}
+
 ChainstateLoadResult RecoverInterruptedRebuild(const fs::path& datadir)
 {
     std::string parse_error;
@@ -478,6 +568,10 @@ static ChainstateLoadResult BeginStagedChainstateRebuild(
         PathExists(JournalPath(datadir))) {
         return {ChainstateLoadStatus::FAILURE_FATAL,
                 _("Refusing to stage a chainstate rebuild because a journal, backup, or partial rebuild already exists. No data was changed.")};
+    }
+    auto [space_status, space_error] = CheckRebuildDiskSpace(datadir, options);
+    if (space_status != ChainstateLoadStatus::SUCCESS) {
+        return {space_status, space_error};
     }
     if (options.check_interrupt && options.check_interrupt()) {
         return {ChainstateLoadStatus::INTERRUPTED, {}};
