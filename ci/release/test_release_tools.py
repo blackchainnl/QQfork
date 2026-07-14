@@ -731,6 +731,24 @@ class ReleaseToolTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "is not native"):
             generator.verify_native_runner(wrong_platform, native_architecture)
 
+        for value in ("", "0"):
+            with self.subTest(macos_translation=value or "intel-oid-absent"):
+                completed = subprocess.CompletedProcess(
+                    ["sysctl"], 0, stdout=value + "\n", stderr=""
+                )
+                with mock.patch.object(generator.subprocess, "run",
+                                       return_value=completed):
+                    self.assertEqual(
+                        generator.verify_process_not_translated("macos"),
+                        "not-translated",
+                    )
+        completed = subprocess.CompletedProcess(
+            ["sysctl"], 0, stdout="1\n", stderr=""
+        )
+        with mock.patch.object(generator.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "Rosetta"):
+                generator.verify_process_not_translated("macos")
+
     def test_resource_benchmark_normalizes_supported_native_runners(self):
         generator = load_module("generate_resource_benchmark_evidence")
         cases = (

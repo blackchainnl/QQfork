@@ -536,9 +536,11 @@ def verify_process_not_translated(native_platform: str) -> str:
         text=True,
     )
     value = result.stdout.strip()
-    if result.returncode == 0 and value == "1":
+    if value == "1":
         raise RuntimeError("native benchmark process is running under Rosetta translation")
-    if result.returncode == 0 and value != "0":
+    # Intel hosts do not expose this Apple-silicon OID. With sysctl -i that is
+    # a successful empty result, which is also affirmative non-translation.
+    if value not in ("", "0"):
         raise RuntimeError(f"unexpected macOS process translation status: {value!r}")
     return "not-translated"
 
