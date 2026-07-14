@@ -5,6 +5,7 @@
 #include <addresstype.h>
 #include <chain.h>
 #include <coins.h>
+#include <common/args.h>
 #include <consensus/demurrage.h>
 #include <consensus/tx_verify.h>
 #include <core_io.h>
@@ -41,9 +42,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <limits>
 #include <map>
 #include <optional>
+#include <thread>
 #include <vector>
 
 using node::BlockAssembler;
@@ -77,7 +80,34 @@ static bool IsDirectQuantumMigrationScript(const CScript& script_pub_key)
 static void CommitWalletTransactionOrThrow(CWallet& wallet, const CTransactionRef& tx, mapValue_t map_value, const std::string& action)
 {
     std::string broadcast_error;
-    if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error)) {
+    bool committed{false};
+    try {
+        committed = wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error);
+    } catch (const std::exception& e) {
+        if (!TransactionHasShadowProof(*tx)) throw;
+        const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
+        if (added_to_wallet) {
+            if (wallet.AbandonTransaction(tx->GetHash())) {
+                wallet.WalletLogPrintf("Abandoned %s transaction %s after broadcast exception and released its input\n",
+                                       action, tx->GetHash().ToString());
+            } else {
+                wallet.WalletLogPrintf("%s transaction could not be abandoned after broadcast exception: txid=%s\n",
+                                       action, tx->GetHash().ToString());
+            }
+        }
+        throw JSONRPCError(RPC_WALLET_ERROR,
+                           strprintf("%s transaction broadcast raised an exception: %s", action, e.what()));
+    } catch (...) {
+        if (TransactionHasShadowProof(*tx)) {
+            const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
+            if (added_to_wallet && !wallet.AbandonTransaction(tx->GetHash())) {
+                wallet.WalletLogPrintf("%s transaction could not be abandoned after unknown broadcast exception: txid=%s\n",
+                                       action, tx->GetHash().ToString());
+            }
+        }
+        throw;
+    }
+    if (!committed) {
         const std::string reason = broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error;
         const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
         if (added_to_wallet && !wallet.AbandonTransaction(tx->GetHash())) {
@@ -1322,6 +1352,20 @@ static RPCHelpMan sendshadowpowclaim()
     }
     if (pwallet->m_wallet_unlock_staking_only) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to create claim transaction");
+    }
+
+    ShadowPowClaimSubmissionGuard submission_guard(*pwallet);
+    if (!submission_guard) {
+        throw JSONRPCError(RPC_WALLET_ERROR,
+                           "Another Gold Rush PoW claim submission is already in progress for this wallet");
+    }
+    if (Params().IsTestChain()) {
+        const int64_t delay_ms = std::clamp<int64_t>(
+            gArgs.GetIntArg("-qqshadowpowclaimsubmissiondelaymillis", 0), 0, 10000);
+        if (delay_ms > 0) {
+            pwallet->WalletLogPrintf("Gold Rush PoW claim submission test barrier reached; delaying %dms\n", delay_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds{delay_ms});
+        }
     }
 
     const std::string address = request.params[0].get_str();

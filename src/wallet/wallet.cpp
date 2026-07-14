@@ -3765,6 +3765,12 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
 {
     if (commit_status) *commit_status = WalletCommitStatus::REJECTED_NOT_ADDED;
 
+    const auto comment = mapValue.find("comment");
+    const bool inject_shadow_pow_broadcast_exception =
+        Params().IsTestChain() && TransactionHasShadowProof(*tx) &&
+        comment != mapValue.end() && comment->second == "PoW Claim" &&
+        gArgs.GetBoolArg("-qqshadowpowbroadcastthrow", false);
+
     // Reject phase-ineligible quantum outputs before AddToWallet reserves
     // inputs or persists a transaction. Raw/PSBT construction remains
     // available; commitment is the final wallet safety boundary.
@@ -3807,6 +3813,14 @@ bool CWallet::CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::ve
             if (commit_status) *commit_status = WalletCommitStatus::ACCEPTED;
             return true;
         }
+    }
+
+    // Test-chain fault injection deliberately runs after AddToWallet so the
+    // caller must prove that an exceptional broadcast path releases the
+    // persisted QQSPROOF input. It is unavailable on production chains.
+    if (inject_shadow_pow_broadcast_exception) {
+        WalletLogPrintf("Injecting Gold Rush PoW broadcast exception for %s\n", tx->GetHash().ToString());
+        throw std::runtime_error("injected Gold Rush PoW broadcast exception");
     }
 
     std::string err_string;
@@ -8239,6 +8253,12 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created)
 
 bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& dest, const std::vector<unsigned char>& proof, bilingual_str& error)
 {
+    ShadowPowClaimSubmissionGuard submission_guard(*this);
+    if (!submission_guard) {
+        error = _("Another Gold Rush PoW claim submission is already in progress for this wallet.");
+        return false;
+    }
+
     CCoinControl coin_control;
     coin_control.destChange = dest;
     coin_control.m_allow_other_inputs = false;
@@ -8339,6 +8359,24 @@ bool CWallet::SubmitShadowPowClaim(const CScript& target, const CTxDestination& 
         }
     } catch (const std::exception& e) {
         error = strprintf(_("Broadcasting Gold Rush PoW claim failed: %s"), e.what());
+        const bool added_to_wallet = WITH_LOCK(cs_wallet, return GetWalletTx(tx->GetHash()) != nullptr);
+        if (added_to_wallet) {
+            if (AbandonTransaction(tx->GetHash())) {
+                WalletLogPrintf("Abandoned Gold Rush PoW claim %s after broadcast exception and released its input\n",
+                                tx->GetHash().ToString());
+            } else {
+                WalletLogPrintf("Gold Rush PoW claim %s could not be abandoned after broadcast exception\n",
+                                tx->GetHash().ToString());
+            }
+        }
+        return false;
+    } catch (...) {
+        error = _("Broadcasting Gold Rush PoW claim failed with an unknown exception.");
+        const bool added_to_wallet = WITH_LOCK(cs_wallet, return GetWalletTx(tx->GetHash()) != nullptr);
+        if (added_to_wallet && !AbandonTransaction(tx->GetHash())) {
+            WalletLogPrintf("Gold Rush PoW claim %s could not be abandoned after unknown broadcast exception\n",
+                            tx->GetHash().ToString());
+        }
         return false;
     }
     WalletLogPrintf("Gold Rush PoW claim submitted: txid=%s fee=%s\n", tx->GetHash().ToString(), FormatMoney(fee));

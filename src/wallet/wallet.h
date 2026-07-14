@@ -1088,6 +1088,11 @@ public:
     std::atomic<uint64_t> m_pow_next_nonce{0};
     std::atomic<uint64_t> m_pow_total_tries{0};
     std::atomic<int64_t> m_pow_hashrate_start_ms{0};
+    // Serializes the fee-paying claim path across the built-in miner and
+    // sendshadowpowclaim RPC. Grinding workers may still search in parallel,
+    // but only one caller per wallet may select an input, sign, and commit a
+    // QQSPROOF transaction at a time.
+    std::atomic<bool> m_shadow_pow_claim_submission_inflight{false};
     std::string m_pow_payout_quantum GUARDED_BY(cs_wallet); // auto-created ML-DSA payout address
     Mutex m_pow_miner_mutex;
     uint256 m_pow_tip_hash GUARDED_BY(m_pow_miner_mutex);
@@ -1510,11 +1515,45 @@ public:
     bool IsPowMiningClosing() const;
     void ThreadShadowPoWMiner(int worker_id);
     bool EnsurePowPayoutAddress(bilingual_str& error, bool* created = nullptr);
+    bool TryBeginShadowPowClaimSubmission()
+    {
+        bool expected{false};
+        return m_shadow_pow_claim_submission_inflight.compare_exchange_strong(
+            expected, true, std::memory_order_acquire, std::memory_order_relaxed);
+    }
+    void EndShadowPowClaimSubmission()
+    {
+        m_shadow_pow_claim_submission_inflight.store(false, std::memory_order_release);
+    }
     bool SubmitShadowPowClaim(const CScript& target, const CTxDestination& dest, const std::vector<unsigned char>& proof, bilingual_str& error);
     std::unique_ptr<std::vector<std::thread>> threadPowMinerGroup GUARDED_BY(m_pow_miner_mutex);
 
     //! Whether the (external) signer performs R-value signature grinding
     bool CanGrindR() const;
+};
+
+/** Non-blocking, exception-safe reservation for one wallet QQSPROOF submitter. */
+class ShadowPowClaimSubmissionGuard
+{
+public:
+    explicit ShadowPowClaimSubmissionGuard(CWallet& wallet)
+        : m_wallet(wallet), m_acquired(wallet.TryBeginShadowPowClaimSubmission())
+    {
+    }
+
+    ShadowPowClaimSubmissionGuard(const ShadowPowClaimSubmissionGuard&) = delete;
+    ShadowPowClaimSubmissionGuard& operator=(const ShadowPowClaimSubmissionGuard&) = delete;
+
+    ~ShadowPowClaimSubmissionGuard()
+    {
+        if (m_acquired) m_wallet.EndShadowPowClaimSubmission();
+    }
+
+    explicit operator bool() const { return m_acquired; }
+
+private:
+    CWallet& m_wallet;
+    bool m_acquired{false};
 };
 
 /**
