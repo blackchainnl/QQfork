@@ -306,9 +306,11 @@ public:
 };
 
 ShadowIndex::ShadowIndex(std::unique_ptr<interfaces::Chain> chain, size_t cache_size,
-                         bool memory, bool wipe)
+                         bool memory, bool wipe,
+                         ShadowIndexEventCallback event_callback)
     : BaseIndex(std::move(chain), "shadowindex"),
-      m_db(std::make_unique<ShadowIndex::DB>(cache_size, memory, wipe))
+      m_db(std::make_unique<ShadowIndex::DB>(cache_size, memory, wipe)),
+      m_event_callback(std::move(event_callback))
 {
     uint32_t stored_version{0};
     const bool has_version = m_db->Read(DB_SCHEMA_VERSION, stored_version);
@@ -335,6 +337,119 @@ ShadowIndex::ShadowIndex(std::unique_ptr<interfaces::Chain> chain, size_t cache_
 }
 
 ShadowIndex::~ShadowIndex() = default;
+
+bool ShadowIndex::BuildBlockEvent(const CBlock& block, const CBlockIndex* pindex,
+                                  ShadowIndexBlockEvent& event) const
+{
+    if (!pindex || pindex->nHeight < SHADOW_REWARD_START_HEIGHT ||
+        pindex->GetBlockHash() != block.GetHash()) {
+        return false;
+    }
+
+    ShadowIndexBlockRecord indexed;
+    if (!m_db->ReadBlock(pindex->GetBlockHash(), indexed) ||
+        indexed.height != pindex->nHeight ||
+        indexed.block_hash != pindex->GetBlockHash() ||
+        indexed.block_time != static_cast<uint32_t>(block.GetBlockTime())) {
+        return false;
+    }
+
+    ShadowIndexBlockEvent result;
+    result.height = pindex->nHeight;
+    result.block_hash = pindex->GetBlockHash();
+    result.previous_block_hash = pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{};
+    result.block_time = indexed.block_time;
+    result.credits.reserve(indexed.payout_txids.size());
+    for (size_t claim_index = 0; claim_index < indexed.payout_txids.size(); ++claim_index) {
+        ShadowIndexRecord record;
+        const uint256& txid = indexed.payout_txids[claim_index];
+        if (!m_db->ReadTransaction(txid, record) ||
+            record.outpoint.hash != txid ||
+            record.origin_height != static_cast<uint32_t>(pindex->nHeight) ||
+            record.origin_block_hash != pindex->GetBlockHash() ||
+            record.claim_index != claim_index) {
+            return false;
+        }
+        result.credits.push_back(std::move(record));
+    }
+
+    for (uint32_t tx_index = 0; tx_index < block.vtx.size(); ++tx_index) {
+        const CTransaction& tx = *block.vtx[tx_index];
+        for (uint32_t input_index = 0; input_index < tx.vin.size(); ++input_index) {
+            const COutPoint& prevout = tx.vin[input_index].prevout;
+            ShadowIndexRecord record;
+            if (!m_db->Read(DBSpentOutpointKey{prevout}, record)) {
+                if (m_db->Exists(DBSpentOutpointKey{prevout})) return false;
+                continue;
+            }
+            if (!record.spent || record.outpoint != prevout ||
+                record.spend_height != static_cast<uint32_t>(pindex->nHeight) ||
+                record.spend_block_hash != pindex->GetBlockHash() ||
+                record.spending_txid != tx.GetHash() ||
+                record.spend_tx_index != tx_index ||
+                record.spend_input_index != input_index) {
+                return false;
+            }
+            result.spends.push_back(std::move(record));
+        }
+    }
+
+    event = std::move(result);
+    return true;
+}
+
+void ShadowIndex::BlockConnected(ChainstateRole role,
+                                 const std::shared_ptr<const CBlock>& block,
+                                 const CBlockIndex* pindex)
+{
+    BaseIndex::BlockConnected(role, block, pindex);
+    if (!m_event_callback || role != ChainstateRole::NORMAL || !pindex ||
+        pindex->nHeight < SHADOW_REWARD_START_HEIGHT) {
+        return;
+    }
+
+    const IndexSummary summary = GetSummary();
+    if (!summary.synced || summary.best_block_height != pindex->nHeight ||
+        summary.best_block_hash != pindex->GetBlockHash()) {
+        return;
+    }
+
+    ShadowIndexBlockEvent event;
+    if (!BuildBlockEvent(*block, pindex, event)) {
+        LogPrintf("ShadowIndex: unable to construct connected event for %s; subscribers must reconcile by RPC\n",
+                  pindex->GetBlockHash().ToString());
+        return;
+    }
+    m_event_callback(/*connected=*/true, event);
+}
+
+void ShadowIndex::BlockDisconnected(const std::shared_ptr<const CBlock>& block,
+                                    const CBlockIndex* pindex)
+{
+    std::optional<ShadowIndexBlockEvent> event;
+    if (m_event_callback && pindex && pindex->nHeight >= SHADOW_REWARD_START_HEIGHT) {
+        const IndexSummary before = GetSummary();
+        if (before.synced && before.best_block_height == pindex->nHeight &&
+            before.best_block_hash == pindex->GetBlockHash()) {
+            ShadowIndexBlockEvent candidate;
+            if (BuildBlockEvent(*block, pindex, candidate)) {
+                event = std::move(candidate);
+            } else {
+                LogPrintf("ShadowIndex: unable to construct disconnected event for %s; subscribers must reconcile by RPC\n",
+                          pindex->GetBlockHash().ToString());
+            }
+        }
+    }
+
+    BaseIndex::BlockDisconnected(block, pindex);
+    if (!event || !pindex || !pindex->pprev) return;
+
+    const IndexSummary after = GetSummary();
+    if (after.synced && after.best_block_height == pindex->pprev->nHeight &&
+        after.best_block_hash == pindex->pprev->GetBlockHash()) {
+        m_event_callback(/*connected=*/false, *event);
+    }
+}
 
 BaseIndex::DB& ShadowIndex::GetDB() const
 {

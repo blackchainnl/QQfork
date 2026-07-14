@@ -584,22 +584,26 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-zmqpubrawblock=<address>", "Enable publish raw block in <address>", ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubrawtx=<address>", "Enable publish raw transaction in <address>", ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubsequence=<address>", "Enable publish hash block and tx sequence in <address>", ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
+    argsman.AddArg("-zmqpubshadow=<address>", "Enable versioned shadow-ledger block delta notifications in <address> (requires -shadowindex=1)", ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubhashblockhwm=<n>", strprintf("Set publish hash block outbound message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubhashtxhwm=<n>", strprintf("Set publish hash transaction outbound message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubrawblockhwm=<n>", strprintf("Set publish raw block outbound message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubrawtxhwm=<n>", strprintf("Set publish raw transaction outbound message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubsequencehwm=<n>", strprintf("Set publish hash sequence message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
+    argsman.AddArg("-zmqpubshadowhwm=<n>", strprintf("Set publish shadow-ledger outbound message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
 #else
     hidden_args.emplace_back("-zmqpubhashblock=<address>");
     hidden_args.emplace_back("-zmqpubhashtx=<address>");
     hidden_args.emplace_back("-zmqpubrawblock=<address>");
     hidden_args.emplace_back("-zmqpubrawtx=<address>");
     hidden_args.emplace_back("-zmqpubsequence=<n>");
+    hidden_args.emplace_back("-zmqpubshadow=<address>");
     hidden_args.emplace_back("-zmqpubhashblockhwm=<n>");
     hidden_args.emplace_back("-zmqpubhashtxhwm=<n>");
     hidden_args.emplace_back("-zmqpubrawblockhwm=<n>");
     hidden_args.emplace_back("-zmqpubrawtxhwm=<n>");
     hidden_args.emplace_back("-zmqpubsequencehwm=<n>");
+    hidden_args.emplace_back("-zmqpubshadowhwm=<n>");
 #endif
 
     argsman.AddArg("-checkblocks=<n>", strprintf("How many blocks to check at startup (default: %u, 0 = all)", DEFAULT_CHECKBLOCKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
@@ -907,6 +911,12 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     // specified in default section of config file, but not overridden
     // on the command line or in this chain's section of the config file.
     ChainType chain = args.GetChainType();
+#if ENABLE_ZMQ
+    if (args.IsArgSet("-zmqpubshadow") &&
+        !args.GetBoolArg("-shadowindex", DEFAULT_SHADOWINDEX)) {
+        return InitError(_("-zmqpubshadow requires -shadowindex=1 so every notification follows an atomically persisted, reorg-aware delta."));
+    }
+#endif
     if (chain == ChainType::SIGNET) {
         LogPrintf("Signet derived magic (message start): %s\n", HexStr(chainparams.MessageStart()));
     }
@@ -1399,6 +1409,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         "-zmqpubrawblock",
         "-zmqpubrawtx",
         "-zmqpubsequence",
+        "-zmqpubshadow",
     }) {
         for (const std::string& socket_addr : args.GetArgs(port_option)) {
             std::string host_out;
@@ -1729,7 +1740,17 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     if (args.GetBoolArg("-shadowindex", DEFAULT_SHADOWINDEX)) {
-        g_shadow_index = std::make_unique<ShadowIndex>(interfaces::MakeChain(node), /*cache_size=*/0, false, fReindex);
+        ShadowIndexEventCallback event_callback;
+#if ENABLE_ZMQ
+        event_callback = [](bool connected, const ShadowIndexBlockEvent& event) {
+            if (g_zmq_notification_interface) {
+                g_zmq_notification_interface->NotifyShadowBlock(connected, event);
+            }
+        };
+#endif
+        g_shadow_index = std::make_unique<ShadowIndex>(
+            interfaces::MakeChain(node), /*cache_size=*/0, false, fReindex,
+            std::move(event_callback));
         node.indexes.emplace_back(g_shadow_index.get());
     }
 

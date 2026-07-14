@@ -125,6 +125,19 @@ struct ShadowIndexRecord {
     }
 };
 
+/** Deterministic active-chain delta transported to shadow-ledger subscribers. */
+struct ShadowIndexBlockEvent {
+    int32_t height{-1};
+    uint256 block_hash;
+    uint256 previous_block_hash;
+    uint32_t block_time{0};
+    std::vector<ShadowIndexRecord> credits;
+    std::vector<ShadowIndexRecord> spends;
+};
+
+using ShadowIndexEventCallback =
+    std::function<void(bool connected, const ShadowIndexBlockEvent& event)>;
+
 /** Cumulative active-chain accounting at an exact indexed block. */
 struct ShadowIndexSupply {
     uint64_t issued_count{0};
@@ -228,8 +241,16 @@ protected:
 
 private:
     std::unique_ptr<DB> m_db;
+    ShadowIndexEventCallback m_event_callback;
+
+    bool BuildBlockEvent(const CBlock& block, const CBlockIndex* pindex,
+                         ShadowIndexBlockEvent& event) const;
 
 protected:
+    void BlockConnected(ChainstateRole role, const std::shared_ptr<const CBlock>& block,
+                        const CBlockIndex* pindex) override;
+    void BlockDisconnected(const std::shared_ptr<const CBlock>& block,
+                           const CBlockIndex* pindex) override;
     bool CustomInit(const std::optional<interfaces::BlockKey>& block) override;
     bool CustomAppend(const interfaces::BlockInfo& block) override;
     bool CustomRewind(const interfaces::BlockKey& current_tip,
@@ -238,7 +259,8 @@ protected:
 
 public:
     explicit ShadowIndex(std::unique_ptr<interfaces::Chain> chain, size_t cache_size,
-                         bool memory = false, bool wipe = false);
+                         bool memory = false, bool wipe = false,
+                         ShadowIndexEventCallback event_callback = {});
     ~ShadowIndex() override;
 
     bool LookupBlock(const uint256& block_hash, ShadowIndexBlockRecord& record) const;

@@ -17,6 +17,7 @@
 class CBlock;
 class CBlockIndex;
 class CTransaction;
+struct ShadowIndexBlockEvent;
 
 class CZMQAbstractPublishNotifier : public CZMQAbstractNotifier
 {
@@ -73,6 +74,12 @@ public:
     bool NotifyBlockDisconnect(const CBlockIndex *pindex) override;
     bool NotifyTransactionAcceptance(const CTransaction &transaction, uint64_t mempool_sequence) override;
     bool NotifyTransactionRemoval(const CTransaction &transaction, uint64_t mempool_sequence) override;
+};
+
+class CZMQPublishShadowNotifier : public CZMQAbstractPublishNotifier
+{
+public:
+    bool NotifyShadowBlock(bool connected, const ShadowIndexBlockEvent& event) override;
 };
 
 #endif // BITCOIN_ZMQ_ZMQPUBLISHNOTIFIER_H

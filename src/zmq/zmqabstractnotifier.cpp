@@ -36,6 +36,11 @@ bool CZMQAbstractNotifier::NotifyBlockDisconnect(const CBlockIndex * /*CBlockInd
     return true;
 }
 
+bool CZMQAbstractNotifier::NotifyShadowBlock(bool /*connected*/, const ShadowIndexBlockEvent& /*event*/)
+{
+    return true;
+}
+
 bool CZMQAbstractNotifier::NotifyTransactionAcceptance(const CTransaction &/*transaction*/, uint64_t mempool_sequence)
 {
     return true;

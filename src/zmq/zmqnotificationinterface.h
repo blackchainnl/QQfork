@@ -18,6 +18,7 @@
 class CBlock;
 class CBlockIndex;
 class CZMQAbstractNotifier;
+struct ShadowIndexBlockEvent;
 
 class CZMQNotificationInterface final : public CValidationInterface
 {
@@ -27,6 +28,9 @@ public:
     std::list<const CZMQAbstractNotifier*> GetActiveNotifiers() const;
 
     static std::unique_ptr<CZMQNotificationInterface> Create(std::function<bool(CBlock&, const CBlockIndex&)> get_block_by_index);
+
+    /** Publish a delta only after shadowindex has atomically applied or rewound it. */
+    void NotifyShadowBlock(bool connected, const ShadowIndexBlockEvent& event);
 
 protected:
     bool Initialize();

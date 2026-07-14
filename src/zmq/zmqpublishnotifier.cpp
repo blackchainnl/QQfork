@@ -9,8 +9,11 @@
 
 #include <chain.h>
 #include <chainparams.h>
+#include <core_io.h>
 #include <crypto/common.h>
+#include <index/shadowindex.h>
 #include <kernel/cs_main.h>
+#include <key_io.h>
 #include <logging.h>
 #include <netaddress.h>
 #include <netbase.h>
@@ -19,11 +22,14 @@
 #include <primitives/transaction.h>
 #include <rpc/server.h>
 #include <serialize.h>
+#include <script/solver.h>
 #include <streams.h>
 #include <sync.h>
 #include <uint256.h>
 #include <version.h>
 #include <zmq/zmqutil.h>
+
+#include <univalue.h>
 
 #include <zmq.h>
 
@@ -49,6 +55,96 @@ static const char *MSG_HASHTX    = "hashtx";
 static const char *MSG_RAWBLOCK  = "rawblock";
 static const char *MSG_RAWTX     = "rawtx";
 static const char *MSG_SEQUENCE  = "sequence";
+static const char *MSG_SHADOW    = "shadow";
+
+namespace {
+
+const char* ShadowPowDispositionName(ShadowPowClaimDisposition disposition)
+{
+    switch (disposition) {
+    case ShadowPowClaimDisposition::INVALID_LOCATION: return "invalid_location";
+    case ShadowPowClaimDisposition::MALFORMED_TRANSACTION: return "malformed_transaction";
+    case ShadowPowClaimDisposition::INVALID_PROOF: return "invalid_proof";
+    case ShadowPowClaimDisposition::INPUT_MISMATCH: return "input_mismatch";
+    case ShadowPowClaimDisposition::INVALID_BASE_FEE: return "invalid_base_fee";
+    case ShadowPowClaimDisposition::EVALUATION_LIMIT: return "evaluation_limit";
+    case ShadowPowClaimDisposition::WINNER: return "winner";
+    case ShadowPowClaimDisposition::REIMBURSED_LOSER: return "reimbursed_loser";
+    }
+    return "unknown";
+}
+
+UniValue ShadowEventUnits()
+{
+    UniValue units(UniValue::VOBJ);
+    units.pushKV("display", "BLK");
+    units.pushKV("atomic", "satoshi");
+    units.pushKV("atomic_decimals", 8);
+    units.pushKV("atomic_encoding", "base-10 string");
+    return units;
+}
+
+void PushShadowDestination(UniValue& object, const CScript& script)
+{
+    object.pushKV("scriptPubKey", HexStr(script));
+    CTxDestination destination;
+    object.pushKV("address", ExtractDestination(script, destination)
+        ? UniValue(EncodeDestination(destination)) : UniValue{});
+}
+
+UniValue ShadowCreditJSON(const ShadowIndexRecord& record)
+{
+    UniValue credit(UniValue::VOBJ);
+    credit.pushKV("synthetic", true);
+    credit.pushKV("merkle_included", false);
+    credit.pushKV("synthetic_txid", record.outpoint.hash.GetHex());
+    credit.pushKV("vout", record.outpoint.n);
+    credit.pushKV("claim_index", record.claim_index);
+    credit.pushKV("mode", record.proof_of_work ? "pow" : "pos");
+    credit.pushKV("nominal_amount", ValueFromAmount(record.nominal_amount));
+    credit.pushKV("nominal_amount_atomic", strprintf("%d", record.nominal_amount));
+    PushShadowDestination(credit, record.script_pub_key);
+
+    UniValue source;
+    if (record.pow_claim_source_present) {
+        source.setObject();
+        source.pushKV("txid", record.pow_claim_source.txid.GetHex());
+        source.pushKV("vout", record.pow_claim_source.vout);
+        source.pushKV("canonical_rank", record.pow_claim_source.canonical_rank.GetHex());
+        source.pushKV("disposition", ShadowPowDispositionName(record.pow_claim_source.disposition));
+        source.pushKV("base_fee_known", record.pow_claim_source.base_fee_known);
+        source.pushKV("base_fee", record.pow_claim_source.base_fee_known
+            ? UniValue(ValueFromAmount(record.pow_claim_source.base_fee)) : UniValue{});
+        source.pushKV("base_fee_atomic", record.pow_claim_source.base_fee_known
+            ? UniValue(strprintf("%d", record.pow_claim_source.base_fee)) : UniValue{});
+    }
+    credit.pushKV("pow_claim_source", std::move(source));
+    return credit;
+}
+
+UniValue ShadowSpendJSON(const ShadowIndexRecord& record)
+{
+    UniValue spend(UniValue::VOBJ);
+    spend.pushKV("synthetic", true);
+    spend.pushKV("merkle_included", false);
+    spend.pushKV("synthetic_txid", record.outpoint.hash.GetHex());
+    spend.pushKV("vout", record.outpoint.n);
+    spend.pushKV("origin_height", record.origin_height);
+    spend.pushKV("origin_blockhash", record.origin_block_hash.GetHex());
+    spend.pushKV("spending_txid", record.spending_txid.GetHex());
+    spend.pushKV("tx_index", record.spend_tx_index);
+    spend.pushKV("input_index", record.spend_input_index);
+    spend.pushKV("nominal_amount", ValueFromAmount(record.nominal_amount));
+    spend.pushKV("nominal_amount_atomic", strprintf("%d", record.nominal_amount));
+    spend.pushKV("effective_amount", ValueFromAmount(record.effective_amount_at_spend));
+    spend.pushKV("effective_amount_atomic", strprintf("%d", record.effective_amount_at_spend));
+    spend.pushKV("burned_amount", ValueFromAmount(record.decayed_amount_at_spend));
+    spend.pushKV("burned_amount_atomic", strprintf("%d", record.decayed_amount_at_spend));
+    PushShadowDestination(spend, record.script_pub_key);
+    return spend;
+}
+
+} // namespace
 
 // Internal function to send multipart message
 static int zmq_send_multipart(void *sock, const void* data, size_t size, ...)
@@ -307,4 +403,40 @@ bool CZMQPublishSequenceNotifier::NotifyTransactionRemoval(const CTransaction &t
     uint256 hash = transaction.GetHash();
     LogPrint(BCLog::ZMQ, "Publish hashtx mempool removal %s to %s\n", hash.GetHex(), this->address);
     return SendSequenceMsg(*this, hash, /* Mempool (R)emoval */ 'R', mempool_sequence);
+}
+
+bool CZMQPublishShadowNotifier::NotifyShadowBlock(bool connected,
+                                                  const ShadowIndexBlockEvent& event)
+{
+    UniValue credits(UniValue::VARR);
+    for (const ShadowIndexRecord& record : event.credits) {
+        credits.push_back(ShadowCreditJSON(record));
+    }
+    UniValue spends(UniValue::VARR);
+    for (const ShadowIndexRecord& record : event.spends) {
+        spends.push_back(ShadowSpendJSON(record));
+    }
+
+    UniValue payload(UniValue::VOBJ);
+    payload.pushKV("schema", "blackcoin.shadow.event.v1");
+    payload.pushKV("event", connected ? "shadow.block.connected" : "shadow.block.disconnected");
+    payload.pushKV("height", event.height);
+    payload.pushKV("blockhash", event.block_hash.GetHex());
+    payload.pushKV("previousblockhash", event.previous_block_hash.GetHex());
+    payload.pushKV("time", event.block_time);
+    payload.pushKV("synthetic", true);
+    payload.pushKV("merkle_included", false);
+    payload.pushKV("credit_count", static_cast<uint64_t>(event.credits.size()));
+    payload.pushKV("spend_count", static_cast<uint64_t>(event.spends.size()));
+    payload.pushKV("units", ShadowEventUnits());
+    payload.pushKV("credits", std::move(credits));
+    payload.pushKV("spends", std::move(spends));
+
+    const std::string body = payload.write();
+    LogPrint(BCLog::ZMQ,
+             "Publish shadow %s height=%d block=%s credits=%u spends=%u to %s\n",
+             connected ? "connect" : "disconnect", event.height,
+             event.block_hash.GetHex(), static_cast<unsigned int>(event.credits.size()),
+             static_cast<unsigned int>(event.spends.size()), this->address);
+    return SendZmqMessage(MSG_SHADOW, body.data(), body.size());
 }
