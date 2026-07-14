@@ -292,7 +292,7 @@ BOOST_AUTO_TEST_CASE(shadow_qqp2_exact_encoding_boundaries)
                     ShadowProofValidationResult::INVALID);
     };
 
-    // Every strict prefix is truncated and must fail before Argon2 evaluation.
+    // Every strict prefix is truncated and must be rejected.
     for (size_t size = 0; size < proof.size(); ++size) {
         check_invalid(std::vector<unsigned char>{proof.begin(), proof.begin() + size});
     }
@@ -342,7 +342,7 @@ BOOST_AUTO_TEST_CASE(shadow_qqp2_exact_encoding_boundaries)
 
     // The 520-byte script-element ceiling is inclusive. Construct a valid
     // byte-exact QQP2 proof at the ceiling, then prove one additional byte is
-    // rejected before it can reach Argon2.
+    // rejected.
     const size_t fixed_size = proof.size() - work.target.size() - work.quantum_payout_script.size();
     BOOST_REQUIRE_LT(fixed_size + work.quantum_payout_script.size(), MAX_SCRIPT_ELEMENT_SIZE);
     const size_t boundary_target_size =
