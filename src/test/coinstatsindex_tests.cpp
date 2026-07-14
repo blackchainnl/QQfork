@@ -27,7 +27,7 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
     static constexpr uint32_t PRERELEASE_COINSTATS_SCHEMA{2};
     static constexpr uint32_t CURRENT_COINSTATS_SCHEMA{3};
     static constexpr uint32_t PRERELEASE_SHADOW_SCHEMA{4};
-    static constexpr uint32_t CURRENT_SHADOW_SCHEMA{5};
+    static constexpr uint32_t CURRENT_SHADOW_SCHEMA{6};
     const std::string sentinel{"prerelease-claim-allocation"};
 
     const auto build_index = [](BaseIndex& index) {
