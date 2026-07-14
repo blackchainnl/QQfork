@@ -112,7 +112,7 @@ the replacement before retiring the backup. Do not request a full `-reindex`
 between those two starts; v30.1.1 refuses that transition rather than risking
 the preserved recovery point.
 
-The v30.1.1 alpha does not claim power-loss-atomic directory renames on Windows.
+The v30.1.1 beta does not claim power-loss-atomic directory renames on Windows.
 Keep a cold datadir copy, use stable power, and do not force-stop or power-cycle
 Windows during the rebuild or its verification restart. If startup reports a
 chainstate-rebuild journal or backup-topology error, preserve the entire datadir

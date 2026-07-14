@@ -20,18 +20,18 @@ To receive security and update notifications, please subscribe to:
 
   <https://github.com/Blackcoin-Dev/Blackcoin/releases>
 
-Alpha 1 canary identity
-=======================
+Beta 1 canary identity
+======================
 
-The v30.1.1 alpha 1 packages are unpublished, unsigned canary artifacts. They
+The v30.1.1 beta 1 packages are unpublished, unsigned canary artifacts. They
 are not the signed v30.1.1 production release. A manual exact-SHA build accepts
-only the `30.1.1-alpha1` package label while the source remains configured as
+only the `30.1.1-beta1` package label while the source remains configured as
 `30.1.1rc1` with `CLIENT_VERSION_IS_RELEASE=false`.
 
 Every downloadable canary archive name includes both
-`Blackcoin-30.1.1-alpha1` and the full 40-character source commit. The combined
+`Blackcoin-30.1.1-beta1` and the full 40-character source commit. The combined
 Actions artifact is named
-`unsigned-canary-30.1.1-alpha1-<FULL_SOURCE_COMMIT>`. It contains a conspicuous
+`unsigned-canary-30.1.1-beta1-<FULL_SOURCE_COMMIT>`. It contains a conspicuous
 `UNSIGNED-CANARY` marker, an unsigned JSON manifest, unsigned SHA256 sums, exact
 source-commit markers, and the two-builder byte-for-byte reproducibility report.
 
@@ -39,7 +39,7 @@ Confirm that the commit in every filename, source marker, manifest, and
 reproducibility report is identical before testing. Then verify the included
 `SHA256SUMS-UNSIGNED.txt` file. These checks detect corruption and identity
 mismatches; they are not a signature and do not authenticate a production
-release. Do not redistribute an alpha archive without its marker, manifest,
+release. Do not redistribute a beta archive without its marker, manifest,
 checksums, and full source commit.
 
 The production workflow remains separate. Only a signed `v30.1.1` tag may enter
@@ -87,7 +87,7 @@ without a reindex option; that separate process reopens and verifies the
 replacement before retiring the backup. A full `-reindex` is intentionally
 refused while this verification restart is pending.
 
-For this alpha, sudden-power-loss durability of directory renames is not yet
+For this beta, sudden-power-loss durability of directory renames is not yet
 claimed on Windows. Keep a cold datadir copy and stable power, and do not
 force-stop Windows during either rebuild start. Preserve the full datadir if a
 journal or backup-topology diagnostic appears.

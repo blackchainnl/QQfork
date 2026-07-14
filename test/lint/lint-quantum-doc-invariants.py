@@ -45,6 +45,11 @@ WALLET_RECOVERY_DOCUMENTS = (
     "src/wallet/rpc/backup.cpp",
 )
 
+CURRENT_BETA_OPERATOR_DOCUMENTS = (
+    "README.md",
+    "doc/release-notes.md",
+)
+
 
 def read_text(root, relative):
     return (root / relative).read_text(encoding="utf-8")
@@ -458,6 +463,41 @@ def check_release_status(root, failures):
         )
 
 
+def check_beta_channel_identity(root, failures):
+    for relative in CURRENT_BETA_OPERATOR_DOCUMENTS:
+        text = normalized(read_text(root, relative))
+        if re.search(r"\balpha(?:\s*1|1)?\b", text):
+            failures.append(
+                f"{relative}: current beta operator document contains an alpha channel label"
+            )
+
+    release_notes = read_text(root, "doc/release-notes.md")
+    for fragment in (
+        "Beta 1 canary identity",
+        "The v30.1.1 beta 1 packages are unpublished, unsigned canary artifacts.",
+        "`30.1.1-beta1`",
+        "`Blackcoin-30.1.1-beta1`",
+        "`unsigned-canary-30.1.1-beta1-<FULL_SOURCE_COMMIT>`",
+        "For this beta, sudden-power-loss durability",
+    ):
+        require_fragment(
+            failures,
+            "doc/release-notes.md",
+            release_notes,
+            fragment,
+            "current beta 1 canary identity",
+        )
+
+    readme = read_text(root, "README.md")
+    require_fragment(
+        failures,
+        "README.md",
+        readme,
+        "The v30.1.1 beta does not claim power-loss-atomic directory renames on Windows.",
+        "current beta Windows recovery warning",
+    )
+
+
 def check_pdf_provenance(root, failures):
     whitepaper = root / "doc/whitepaper-quantum-quasar.md"
     pdf = root / "doc/whitepaper-quantum-quasar.pdf"
@@ -505,6 +545,7 @@ def verify(root):
         check_whitepaper_appendix(root, failures, heights)
         check_documentation_surfaces(root, failures, heights)
         check_release_status(root, failures)
+        check_beta_channel_identity(root, failures)
         check_pdf_provenance(root, failures)
     except (OSError, ValueError) as error:
         failures.append(str(error))
