@@ -331,6 +331,7 @@ def main() -> None:
     if args.require_upstream and set(upstream) != {"liboqs", "argon2", "wycheproof"}:
         raise SystemExit("complete liboqs, Argon2, and Wycheproof provenance is required")
     if args.evidence:
+        assert source is not None
         write_evidence(
             args.evidence, args.manifest, args.repo_root, source, local, upstream
         )
