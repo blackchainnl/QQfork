@@ -36,11 +36,11 @@ static constexpr uint8_t DB_QUANTUM_WITNESS_OUTPUT{'w'};
 static constexpr uint8_t DB_QUANTUM_WITNESS_BLOCK{'W'};
 static constexpr uint8_t DB_POW_CLAIM{'c'};
 static constexpr uint8_t DB_CUSTOM_TIP{'T'};
-// Schema 5 invalidates prerelease schema-4 records whose competing-claim
-// classification was derived with the superseded height-5,950,000 activation
-// boundary. The index is auxiliary and fully reconstructible, so a recognized
-// older schema is wiped and rebuilt instead of being interpreted in place.
-static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{5};
+// Schema 6 adds explicit wrong/unknown QQSPROOF mode dispositions. Rebuild
+// prerelease schema-5 data so restart and reindex cannot disagree about those
+// reasons. Historical numeric meanings remain unchanged, and the index is
+// auxiliary and fully reconstructible from active-chain block data.
+static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{6};
 static constexpr size_t MAX_SCRIPT_QUERY_RESULTS{1000};
 
 uint256 ShadowScriptHash(const CScript& script)

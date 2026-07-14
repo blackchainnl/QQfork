@@ -21,9 +21,10 @@ index can continue following new blocks on a pruned node, but a later rebuild
 cannot cross deleted block data. Explorer operators should therefore use
 `-prune=0`. `-reindex` wipes and deterministically rebuilds the index.
 
-v30.1.1 uses shadowindex schema 5. It automatically discards and rebuilds
+v30.1.1 uses shadowindex schema 6. It automatically discards and rebuilds
 prerelease schema-4 data, which classified historical claims under the
-superseded height-5,950,000 activation. Coinstatsindex schema 3 performs the
+superseded height-5,950,000 activation, and schema-5 data, which lacked exact
+wrong/unknown QQSPROOF mode dispositions. Coinstatsindex schema 3 performs the
 same invalidation for prerelease schema-2 synthetic-payout statistics. This
 index-only rebuild does not require a full block or chainstate reindex when all
 active-chain block files remain available. A pruned operator without the
@@ -54,6 +55,10 @@ bounded accounting engine used by chainstate. The record identifies its source
 transaction/output, canonical rank, decoded payout destination, actual base fee
 when known, credited amount, exact disposition, and linked synthetic payout (if
 one exists). The index does not reimplement winner selection or fee arithmetic.
+Fee-paying `QQSPROOF` is a PoW-only channel. A payload carrying mode byte `1`
+(`pos`) or an unknown mode remains ordinary base-block data but cannot consume,
+clear, count, or retarget either shadow pool. `QQSIGNAL` plus a qualified
+coinstake is the only PoS credit path.
 
 Amounts are JSON numbers denominated in BLK with eight decimal places. Internal
 accounting remains integer atomic units.
@@ -74,9 +79,11 @@ anchor hash is rejected or no longer matches `getblockhash(height)`.
 plus exact winner, reimbursement, and combined credited totals. Stable claim
 dispositions are `invalid_location`, `malformed_transaction`, `invalid_proof`,
 `input_mismatch`, `invalid_base_fee`, `evaluation_limit`, `winner`, and
-`reimbursed_loser`. A positive winner or reimbursed-loser credit carries the
-exact synthetic transaction ID. Zero-fee valid losers remain visible as
-`reimbursed_loser` records with zero credit and no synthetic output.
+`reimbursed_loser`, with `wrong_mode_pos` and `unknown_mode` identifying the
+two type-specific non-credit outcomes. A positive winner or reimbursed-loser
+credit carries the exact synthetic transaction ID. Zero-fee valid losers
+remain visible as `reimbursed_loser` records with zero credit and no synthetic
+output.
 
 On mainnet this canonical per-claim classification begins at height 5,993,200.
 Earlier Gold Rush blocks intentionally reproduce the v30.1.0 first-valid-claim

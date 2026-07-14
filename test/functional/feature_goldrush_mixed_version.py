@@ -291,6 +291,91 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
             tx_hex = self.signed_coin_spend(coin, outputs)
             self.generate_raw_block(producer, [tx_hex])
 
+    @staticmethod
+    def shaped_shadow_proof(mode, nonce, target_script, payout_script):
+        return b"".join((
+            QQSPROOF,
+            b"QQP2",
+            bytes([mode]),
+            nonce.to_bytes(8, byteorder="little"),
+            len(target_script).to_bytes(2, byteorder="little"),
+            bytes(target_script),
+            len(payout_script).to_bytes(2, byteorder="little"),
+            bytes(payout_script),
+        ))
+
+    def exercise_shadow_modes_both_directions(self, coins, change_script):
+        """Wrong QQSPROOF channels remain ordinary legacy-visible block data."""
+        quantum_script = program_to_witness_script(16, b"\x42" * 32)
+        pow_proof = self.shaped_shadow_proof(
+            0, 11, change_script, quantum_script
+        )
+        pos_proof = self.shaped_shadow_proof(
+            1, 12, change_script, quantum_script
+        )
+        unknown_proof = self.shaped_shadow_proof(
+            0x7f, 13, change_script, quantum_script
+        )
+
+        for producer in (self.nodes[REFERENCE], self.nodes[CANDIDATE]):
+            state_before = self.nodes[CANDIDATE].getgoldrushstate()
+            proof_scripts = (
+                [CScript([OP_RETURN, pos_proof])],
+                [CScript([OP_RETURN, unknown_proof])],
+                [CScript([OP_RETURN, pow_proof])],
+                [CScript([OP_RETURN, pow_proof]),
+                 CScript([OP_RETURN, pow_proof])],
+            )
+            transactions = []
+            for scripts in proof_scripts:
+                coin = coins.pop()
+                outputs = [CTxOut(0, script) for script in scripts]
+                outputs.append(CTxOut(coin["value"] - FEE, change_script))
+                transactions.append(self.signed_coin_spend(coin, outputs))
+
+            block_hash = self.generate_raw_block(producer, transactions)
+            # Acceptance by both the exact v26 authority and the candidate is
+            # the base-consensus invariant. Shadow policy is evaluated only
+            # after that shared block-validity decision.
+            assert_equal(
+                self.nodes[REFERENCE].getblock(block_hash, 0),
+                self.nodes[CANDIDATE].getblock(block_hash, 0),
+            )
+            state_after = self.nodes[CANDIDATE].getgoldrushstate()
+            for field in (
+                "claimed_amount",
+                "pow_count",
+                "pos_count",
+                "last_pow_height",
+                "last_pos_height",
+                "recent_count",
+            ):
+                assert_equal(state_after[field], state_before[field])
+            assert state_after["pow_amount"] > state_before["pow_amount"]
+            assert state_after["pos_amount"] > state_before["pos_amount"]
+
+            explorer = self.nodes[CANDIDATE].getgoldrushblock(block_hash)
+            assert_equal(explorer["total_payouts"], 0)
+            assert_equal(explorer["pow_payout_total"], 0)
+            assert_equal(explorer["pos_payout_total"], 0)
+            assert_equal(explorer["observed_pow_claim_txids"], [])
+            observations = explorer["proof_observations"]
+            assert_equal(len(observations), 5)
+            assert_equal(
+                sorted(observation["mode"] for observation in observations),
+                ["pos", "pow", "pow", "pow", "unknown"],
+            )
+            assert_equal(
+                sum(observation["duplicate_in_transaction"]
+                    for observation in observations),
+                2,
+            )
+            for observation in observations:
+                assert_equal(observation["fee_paying_location"], False)
+                assert_equal(observation["credit_channel"], "none")
+                assert_equal(observation["non_credit_reason"],
+                             "invalid_location")
+
     def exercise_v2_clock_determinism(self, coin, change_script):
         """Prove candidate/v30.1.0 block validity never depends on node time.
 
@@ -454,7 +539,7 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         self.log.info("Stopping diagnostic builds before known split-path fixtures")
         self.stop_node(1)
         self.stop_node(2)
-        coins = [self.coinbase_utxo(block_hash) for block_hash in mined[1:13]]
+        coins = [self.coinbase_utxo(block_hash) for block_hash in mined[1:21]]
 
         self.log.info("Crossing NOP4 discriminator blocks in both directions")
         self.exercise_nop4_both_directions(coins, change_script)
@@ -464,6 +549,8 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         self.exercise_future_witness_both_directions(coins, change_script)
         self.log.info("Crossing marker, malformed, duplicate, oversized, and excess QQ notes")
         self.exercise_shadow_lookalikes_both_directions(coins, change_script)
+        self.log.info("Crossing PoS-mode, unknown-mode, duplicate, and PoW-mode QQSPROOF data")
+        self.exercise_shadow_modes_both_directions(coins, change_script)
 
         self.log.info("A longer reference branch reorganizes the candidate")
         self.disconnect_nodes(CANDIDATE, REFERENCE)

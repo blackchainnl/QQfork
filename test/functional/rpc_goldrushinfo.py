@@ -116,6 +116,8 @@ class GoldRushInfoTest(BitcoinTestFramework):
         work = node.getshadowpowwork(rpc_target, rpc_quantum)
         assert_equal(work["active"], True)
         assert_equal(work["prefix"], "QQSPROOF")
+        assert_equal(work["proof_mode"], "pow")
+        assert_equal(work["proof_mode_byte"], 0)
         assert "target_whitelisted" not in work
         assert "target_script" in work
         assert_equal(work["quantum_address"], rpc_quantum)
@@ -149,13 +151,39 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert_equal(stale_claim["address"], rpc_target)
         assert_equal(stale_claim["quantum_address"], rpc_quantum)
         assert_equal(stale_claim["external_proof"], False)
+        assert_equal(stale_claim["proof_mode"], "pow")
+        assert_equal(stale_claim["proof_mode_byte"], 0)
         assert stale_claim["proof"].startswith(QQSPROOF_HEX)
         assert stale_claim["txid"] in node.getrawmempool()
         rpc_decoded = node.decoderawtransaction(stale_claim["hex"])
         assert any(QQSPROOF_HEX in vout["scriptPubKey"]["hex"] for vout in rpc_decoded["vout"])
         assert all(vout["scriptPubKey"].get("address") != rpc_quantum for vout in rpc_decoded["vout"] if "scriptPubKey" in vout)
-        proof_mismatch_error = "proof does not match the current tip, target address, and quantum payout address"
+        proof_mismatch_error = "proof does not match the current tip, target address, quantum payout address, and PoW channel"
         assert_raises_rpc_error(-8, proof_mismatch_error, wallet.sendshadowpowclaim, rpc_target, rpc_quantum, 1, None, QQSPROOF_HEX + "00")
+        pos_proof = bytearray.fromhex(stale_claim["proof"])
+        pos_proof[len(bytes.fromhex(QQSPROOF_HEX)) + 4] = 1
+        assert_raises_rpc_error(
+            -8,
+            "proof encodes PoS mode; fee-paying QQSPROOF claims require PoW mode byte 0",
+            wallet.sendshadowpowclaim,
+            rpc_target,
+            rpc_quantum,
+            1,
+            None,
+            pos_proof.hex(),
+        )
+        unknown_proof = bytearray.fromhex(stale_claim["proof"])
+        unknown_proof[len(bytes.fromhex(QQSPROOF_HEX)) + 4] = 0x7f
+        assert_raises_rpc_error(
+            -8,
+            "proof encodes an unknown mode; fee-paying QQSPROOF claims require PoW mode byte 0",
+            wallet.sendshadowpowclaim,
+            rpc_target,
+            rpc_quantum,
+            1,
+            None,
+            unknown_proof.hex(),
+        )
         stolen_quantum = wallet.getnewquantumaddress()["address"]
         assert_raises_rpc_error(-8, proof_mismatch_error, wallet.sendshadowpowclaim, rpc_target, stolen_quantum, 1, None, stale_claim["proof"])
         assert_raises_rpc_error(-26, "shadow-proof-mempool-conflict", wallet.sendshadowpowclaim, rpc_target, rpc_quantum, 1, None, stale_claim["proof"])
@@ -176,6 +204,8 @@ class GoldRushInfoTest(BitcoinTestFramework):
             cli_quantum = wallet.getnewquantumaddress()["address"]
             cli_work = node.cli.getshadowpowwork(cli_target, cli_quantum)
             assert_equal(cli_work["prefix"], "QQSPROOF")
+            assert_equal(cli_work["proof_mode"], "pow")
+            assert_equal(cli_work["proof_mode_byte"], 0)
             assert "target_whitelisted" not in cli_work
             assert_equal(cli_work["quantum_address"], cli_quantum)
             assert_equal(cli_work["quantum_payout_script"], node.validateaddress(cli_quantum)["scriptPubKey"])
@@ -185,6 +215,8 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(cli_claim["address"], cli_target)
             assert_equal(cli_claim["quantum_address"], cli_quantum)
             assert_equal(cli_claim["external_proof"], False)
+            assert_equal(cli_claim["proof_mode"], "pow")
+            assert_equal(cli_claim["proof_mode_byte"], 0)
             assert cli_claim["proof"].startswith(QQSPROOF_HEX)
             assert cli_claim["txid"] in node.getrawmempool()
 

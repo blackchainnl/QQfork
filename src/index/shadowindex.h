@@ -38,7 +38,7 @@ struct ShadowIndexPowClaimSource {
         READWRITE(obj.txid, obj.vout, obj.canonical_rank, obj.base_fee,
                   obj.base_fee_known, disposition);
         SER_READ(obj, {
-            if (disposition > static_cast<uint8_t>(ShadowPowClaimDisposition::REIMBURSED_LOSER)) {
+            if (disposition > static_cast<uint8_t>(ShadowPowClaimDisposition::UNKNOWN_MODE)) {
                 throw std::ios_base::failure("Invalid shadow POW claim disposition");
             }
             obj.disposition = static_cast<ShadowPowClaimDisposition>(disposition);

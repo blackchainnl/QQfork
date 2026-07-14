@@ -131,6 +131,22 @@ enum class ShadowProofMode : unsigned char {
     POS = 1,
 };
 
+ShadowProofPayloadMode ClassifyProofPayloadMode(const valtype& proof)
+{
+    if (proof.size() < PROOF_SIZE ||
+        (!std::equal(PROOF_MAGIC_V1.begin(), PROOF_MAGIC_V1.end(), proof.begin()) &&
+         !std::equal(PROOF_MAGIC_V2.begin(), PROOF_MAGIC_V2.end(), proof.begin()))) {
+        return ShadowProofPayloadMode::MALFORMED;
+    }
+    if (proof[4] == static_cast<unsigned char>(ShadowProofMode::POW)) {
+        return ShadowProofPayloadMode::POW;
+    }
+    if (proof[4] == static_cast<unsigned char>(ShadowProofMode::POS)) {
+        return ShadowProofPayloadMode::POS;
+    }
+    return ShadowProofPayloadMode::UNKNOWN;
+}
+
 struct ShadowPoolState {
     CAmount pow_amount{0};
     CAmount pos_amount{0};
@@ -167,14 +183,23 @@ struct ShadowClaim {
 
 uint256 HashBlockClaims(const CBlockIndex* pindex, const std::vector<ShadowClaim>& claims);
 
-struct ShadowClaimResult {
-    std::vector<ShadowClaim> claims;
+/** A fee-paying QQSPROOF can produce only this PoW-specific value. The generic
+ * ShadowClaim mode is assigned later at the single marker-construction seam. */
+struct ShadowPowCredit {
+    CScript payout_script;
+    CAmount amount{0};
+};
+
+struct ShadowPowClaimResult {
+    std::vector<ShadowPowCredit> credits;
     std::vector<ShadowPowClaimAccounting> accounting;
     bool internal_error{false};
     bool proof_limit_exceeded{false};
     bool competing_claims{false};
     bool malformed_claim{false};
     bool invalid_claim_location{false};
+    bool wrong_mode_claim{false};
+    bool unknown_mode_claim{false};
     uint32_t valid_claim_count{0};
     uint32_t reimbursed_claim_count{0};
 };
@@ -1829,11 +1854,6 @@ std::optional<ShadowClaim> DecodeClaimScript(const CScript& script)
     return ShadowClaim{target, *amount, mode, undo_pool, true};
 }
 
-CAmount ClaimablePoolAmount(const ShadowPoolState& pool, ShadowProofMode mode)
-{
-    return mode == ShadowProofMode::POW ? pool.pow_amount : pool.pos_amount;
-}
-
 unsigned int RetargetedBits(ShadowProofMode mode, const ShadowPoolState& pool, int height)
 {
     if (mode != ShadowProofMode::POW || height <= SHADOW_REWARD_START_HEIGHT) {
@@ -2016,16 +2036,19 @@ ShadowProofValidationResult ValidateQQProof(const valtype& proof, const CBlockIn
     return ValidateQQProofAt(proof, pindex->nHeight, pindex->pprev ? pindex->pprev->GetBlockHash() : uint256{}, pool, decoded_out, proof_evals, proof_limit_exceeded);
 }
 
-void AddSolvedProof(ShadowPoolState& pool, ShadowProofMode mode, int height)
+void AddPowSolve(ShadowPoolState& pool, int height)
 {
-    if (mode == ShadowProofMode::POW) {
-        ++pool.pow_count;
-        pool.last_pow_height = height;
-    } else {
-        ++pool.pos_count;
-        pool.last_pos_height = height;
-    }
-    pool.recent_modes = ((pool.recent_modes << 1) | (mode == ShadowProofMode::POS ? uint64_t{1} : uint64_t{0}));
+    ++pool.pow_count;
+    pool.last_pow_height = height;
+    pool.recent_modes <<= 1;
+    if (pool.recent_count < SHADOW_RETARGET_WINDOW) ++pool.recent_count;
+}
+
+void AddPosSolve(ShadowPoolState& pool, int height)
+{
+    ++pool.pos_count;
+    pool.last_pos_height = height;
+    pool.recent_modes = (pool.recent_modes << 1) | uint64_t{1};
     if (pool.recent_count < SHADOW_RETARGET_WINDOW) ++pool.recent_count;
 }
 
@@ -2425,13 +2448,13 @@ bool BuildPosPayouts(const ShadowPoolState& credited_pool, const std::optional<C
     return true;
 }
 
-ShadowClaimResult FindLegacyPowShadowClaims(const CBlock& block, const CBlockIndex* pindex,
-                                            const CBlockUndo* blockundo,
-                                            const ShadowPoolState& pool)
+ShadowPowClaimResult FindLegacyPowShadowClaims(const CBlock& block, const CBlockIndex* pindex,
+                                               const CBlockUndo* blockundo,
+                                               const ShadowPoolState& pool)
 {
     unsigned int proof_evals = 0;
     bool proof_limit_exceeded = false;
-    ShadowClaimResult result;
+    ShadowPowClaimResult result;
     // QQSPROOF is merged-mined by fee-paying transactions inside regular PoS
     // blocks. A proof accidentally included by a proof-of-work block remains a
     // legacy-visible transaction, but it is not a Gold Rush payout venue.
@@ -2448,6 +2471,12 @@ ShadowClaimResult FindLegacyPowShadowClaims(const CBlock& block, const CBlockInd
         for (const CTxOut& out : tx.vout) {
             const auto proof = ExtractProofPayload(out.scriptPubKey);
             if (!proof) continue;
+            const ShadowProofPayloadMode payload_mode = ClassifyProofPayloadMode(*proof);
+            if (payload_mode == ShadowProofPayloadMode::POS) {
+                result.wrong_mode_claim = true;
+            } else if (payload_mode == ShadowProofPayloadMode::UNKNOWN) {
+                result.unknown_mode_claim = true;
+            }
             // DoS bound (H-2): stop after a fixed number of Argon2id evaluations per block.
             // During the staged legacy-compatible Gold Rush, malformed or excess QQPROOF
             // notes do not make an otherwise legacy-valid block invalid; they simply receive
@@ -2464,13 +2493,13 @@ ShadowClaimResult FindLegacyPowShadowClaims(const CBlock& block, const CBlockInd
             }
             if (status == ShadowProofValidationResult::VALID) {
                 if (!TxSpendsFromScript(tx, tx_index, blockundo, decoded.target)) continue;
-                const CAmount amount = ClaimablePoolAmount(pool, decoded.mode);
+                const CAmount amount = pool.pow_amount;
                 if (amount <= 0) continue;
-                if (!result.claims.empty()) {
+                if (!result.credits.empty()) {
                     result.competing_claims = true;
                     return result;
                 }
-                result.claims.push_back(ShadowClaim{decoded.payout_script, amount, decoded.mode, pool, true});
+                result.credits.push_back(ShadowPowCredit{decoded.payout_script, amount});
                 result.valid_claim_count = 1;
             }
         }
@@ -2525,11 +2554,11 @@ void SortPowClaimAccounting(std::vector<ShadowPowClaimAccounting>& accounting)
               });
 }
 
-ShadowClaimResult FindCanonicalPowShadowClaimsImpl(
+ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
     const CBlock& block, const CBlockUndo* blockundo,
     const ShadowPowAccountingContext& context)
 {
-    ShadowClaimResult result;
+    ShadowPowClaimResult result;
     if (!context.valid || !context.canonical_rule_active ||
         context.credited_pow_pool <= 0) return result;
     const bool proof_of_stake_block = block.IsProofOfStake();
@@ -2575,6 +2604,22 @@ ShadowClaimResult FindCanonicalPowShadowClaimsImpl(
             continue;
         }
         auto [output_index, proof] = std::move(proof_outputs.front());
+        const ShadowProofPayloadMode payload_mode = ClassifyProofPayloadMode(proof);
+        if (payload_mode == ShadowProofPayloadMode::POS ||
+            payload_mode == ShadowProofPayloadMode::UNKNOWN) {
+            result.wrong_mode_claim |= payload_mode == ShadowProofPayloadMode::POS;
+            result.unknown_mode_claim |= payload_mode == ShadowProofPayloadMode::UNKNOWN;
+            result.accounting.push_back(ShadowPowClaimAccounting{
+                txid, output_index,
+                CanonicalPowCandidateRank(context.height,
+                                          context.previous_block_hash, txid,
+                                          output_index, proof),
+                {}, 0, 0, false,
+                payload_mode == ShadowProofPayloadMode::POS
+                    ? ShadowPowClaimDisposition::WRONG_MODE
+                    : ShadowPowClaimDisposition::UNKNOWN_MODE});
+            continue;
+        }
         CanonicalPowCandidate candidate;
         candidate.tx_index = tx_index;
         candidate.accounting_index = result.accounting.size();
@@ -2671,7 +2716,7 @@ ShadowClaimResult FindCanonicalPowShadowClaimsImpl(
         return result;
     }
 
-    result.claims.reserve(valid.size());
+    result.credits.reserve(valid.size());
     for (size_t i = 0; i < valid.size(); ++i) {
         const CAmount amount = i == 0
             ? context.credited_pow_pool - total_reimbursements
@@ -2682,16 +2727,15 @@ ShadowClaimResult FindCanonicalPowShadowClaimsImpl(
             : ShadowPowClaimDisposition::REIMBURSED_LOSER;
         accounting.credited_amount = amount;
         if (amount <= 0) continue;
-        result.claims.push_back(ShadowClaim{
-            valid[i].decoded.payout_script, amount, ShadowProofMode::POW,
-            {}, true});
+        result.credits.push_back(ShadowPowCredit{
+            valid[i].decoded.payout_script, amount});
         if (i != 0) ++result.reimbursed_claim_count;
     }
     SortPowClaimAccounting(result.accounting);
     return result;
 }
 
-ShadowClaimResult FindCanonicalPowShadowClaims(
+ShadowPowClaimResult FindCanonicalPowShadowClaims(
     const CBlock& block, const CBlockUndo* blockundo,
     const ShadowPowAccountingContext& context)
 {
@@ -2704,15 +2748,15 @@ ShadowClaimResult FindCanonicalPowShadowClaims(
         LogPrintf("ERROR: Quantum Quasar canonical claim accounting exceeded a local container bound at height %d\n",
                   context.height);
     }
-    ShadowClaimResult result;
+    ShadowPowClaimResult result;
     result.internal_error = true;
     return result;
 }
 
-ShadowClaimResult FindPowShadowClaims(const CBlock& block, const CBlockIndex* pindex,
-                                      const CBlockUndo* blockundo,
-                                      const ShadowPoolState& pool,
-                                      const Consensus::Params& consensus)
+ShadowPowClaimResult FindPowShadowClaims(const CBlock& block, const CBlockIndex* pindex,
+                                         const CBlockUndo* blockundo,
+                                         const ShadowPoolState& pool,
+                                         const Consensus::Params& consensus)
 {
     if (pindex && consensus.IsShadowCompetingClaimsActive(pindex->nHeight)) {
         ShadowPowAccountingContext context;
@@ -3677,16 +3721,17 @@ bool GetShadowPowDirectPayouts(const CCoinsViewCache& view, const CBlock& block,
     if (!next_pow_amount) return false;
     pool.pow_amount = *next_pow_amount;
 
-    ShadowClaimResult pow_claim = FindPowShadowClaims(
+    ShadowPowClaimResult pow_claim = FindPowShadowClaims(
         block, pindex, blockundo, pool, consensus);
     if (pow_claim.internal_error) return false;
-    for (const ShadowClaim& claim : pow_claim.claims) {
-        if (!claim.direct || !IsDirectQuantumMigrationScript(claim.target)) return false;
-        const auto next_total = CheckedAddMoney(total_out, claim.amount);
-        const auto next_script = CheckedAddMoney(payouts_out[claim.target], claim.amount);
+    for (const ShadowPowCredit& credit : pow_claim.credits) {
+        if (!IsDirectQuantumMigrationScript(credit.payout_script)) return false;
+        const auto next_total = CheckedAddMoney(total_out, credit.amount);
+        const auto next_script = CheckedAddMoney(
+            payouts_out[credit.payout_script], credit.amount);
         if (!next_total || !next_script) return false;
         total_out = *next_total;
-        payouts_out[claim.target] = *next_script;
+        payouts_out[credit.payout_script] = *next_script;
     }
     return MoneyRange(total_out);
 }
@@ -3788,7 +3833,7 @@ ShadowPowAccountingResult EvaluateShadowPowClaimAccounting(
     if (!context.valid || !context.canonical_rule_active) {
         return ShadowPowAccountingResult::OK;
     }
-    ShadowClaimResult result = FindCanonicalPowShadowClaims(
+    ShadowPowClaimResult result = FindCanonicalPowShadowClaims(
         block, blockundo, context);
     accounting_out = std::move(result.accounting);
     return result.internal_error ? ShadowPowAccountingResult::LOCAL_INTERNAL_ERROR
@@ -4395,6 +4440,17 @@ const std::vector<unsigned char>& GetShadowPrefix()
     return SHADOW_PREFIX;
 }
 
+ShadowProofPayloadMode ClassifyShadowProofPayload(const std::vector<unsigned char>& prefixed_proof)
+{
+    if (prefixed_proof.size() <= SHADOW_PREFIX.size() ||
+        !std::equal(SHADOW_PREFIX.begin(), SHADOW_PREFIX.end(),
+                    prefixed_proof.begin())) {
+        return ShadowProofPayloadMode::MALFORMED;
+    }
+    return ClassifyProofPayloadMode(valtype{
+        prefixed_proof.begin() + SHADOW_PREFIX.size(), prefixed_proof.end()});
+}
+
 void SetShadowArgon2FailuresForTesting(uint64_t count)
 {
     g_shadow_argon2_test_failures.store(count, std::memory_order_relaxed);
@@ -4416,6 +4472,29 @@ bool TransactionHasShadowProof(const CTransaction& tx)
         if (ExtractProofPayload(out.scriptPubKey)) return true;
     }
     return false;
+}
+
+std::vector<ShadowProofObservation> GetShadowProofObservations(const CBlock& block)
+{
+    std::vector<ShadowProofObservation> observations;
+    const bool proof_of_stake_block = block.IsProofOfStake();
+    for (const CTransactionRef& tx_ref : block.vtx) {
+        const CTransaction& tx = *tx_ref;
+        std::vector<std::pair<uint32_t, valtype>> proof_outputs;
+        for (uint32_t output_index = 0; output_index < tx.vout.size(); ++output_index) {
+            const auto proof = ExtractProofPayload(tx.vout[output_index].scriptPubKey);
+            if (proof) proof_outputs.emplace_back(output_index, *proof);
+        }
+        const bool fee_paying_location = proof_of_stake_block &&
+            !tx.IsCoinBase() && !tx.IsCoinStake();
+        const bool duplicate = proof_outputs.size() > 1;
+        for (const auto& [output_index, proof] : proof_outputs) {
+            observations.push_back(ShadowProofObservation{
+                tx.GetHash(), output_index, ClassifyProofPayloadMode(proof),
+                fee_paying_location, duplicate});
+        }
+    }
+    return observations;
 }
 
 bool IsAuthenticatedShadowMarkerOutpoint(const COutPoint& outpoint, const Coin& coin, const CBlockIndex* pindexTip)
@@ -4817,45 +4896,56 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
     }
     pool.pow_amount = *next_pow_amount;
 
-    bool seen_proof = false;
-    unsigned int proof_evals = 0;
-    bool proof_limit_exceeded = false;
+    std::vector<valtype> proofs;
     for (const CTxOut& out : tx.vout) {
         const auto proof = ExtractProofPayload(out.scriptPubKey);
-        if (!proof) continue;
-        if (seen_proof) {
-            reject_reason = "shadow-proof-duplicate";
-            return ShadowProofValidationResult::INVALID;
-        }
-        seen_proof = true;
+        if (proof) proofs.push_back(*proof);
+    }
+    if (proofs.size() != 1) {
+        reject_reason = "shadow-proof-duplicate";
+        return ShadowProofValidationResult::INVALID;
+    }
 
-        ShadowProof decoded;
-        const ShadowProofValidationResult status = ValidateQQProofAt(*proof, height, pindexPrev->GetBlockHash(), pool, decoded, proof_evals, proof_limit_exceeded);
-        if (proof_limit_exceeded) {
-            reject_reason = "shadow-proof-limit";
-            return ShadowProofValidationResult::INVALID;
-        }
-        if (status != ShadowProofValidationResult::VALID) {
-            reject_reason = status == ShadowProofValidationResult::LOCAL_INTERNAL_ERROR
-                ? "local-shadow-proof-error"
-                : "shadow-proof-invalid";
-            return status;
-        }
+    unsigned int proof_evals = 0;
+    bool proof_limit_exceeded = false;
+    const ShadowProofPayloadMode payload_mode = ClassifyProofPayloadMode(proofs.front());
+    if (payload_mode == ShadowProofPayloadMode::POS) {
+        reject_reason = "shadow-proof-wrong-mode-pos";
+        return ShadowProofValidationResult::INVALID;
+    }
+    if (payload_mode == ShadowProofPayloadMode::UNKNOWN) {
+        reject_reason = "shadow-proof-unknown-mode";
+        return ShadowProofValidationResult::INVALID;
+    }
 
-        bool spends_target = false;
-        const CScript canonical_target = CanonicalLegacyStakeScript(decoded.target);
-        for (const CTxIn& txin : tx.vin) {
-            Coin coin;
-            if (view.GetCoin(txin.prevout, coin) && !coin.IsSpent() &&
-                CanonicalLegacyStakeScript(coin.out.scriptPubKey) == canonical_target) {
-                spends_target = true;
-                break;
-            }
+    ShadowProof decoded;
+    const ShadowProofValidationResult status = ValidateQQProofAt(
+        proofs.front(), height, pindexPrev->GetBlockHash(), pool, decoded,
+        proof_evals, proof_limit_exceeded);
+    if (proof_limit_exceeded) {
+        reject_reason = "shadow-proof-limit";
+        return ShadowProofValidationResult::INVALID;
+    }
+    if (status != ShadowProofValidationResult::VALID) {
+        reject_reason = status == ShadowProofValidationResult::LOCAL_INTERNAL_ERROR
+            ? "local-shadow-proof-error"
+            : "shadow-proof-invalid";
+        return status;
+    }
+
+    bool spends_target = false;
+    const CScript canonical_target = CanonicalLegacyStakeScript(decoded.target);
+    for (const CTxIn& txin : tx.vin) {
+        Coin coin;
+        if (view.GetCoin(txin.prevout, coin) && !coin.IsSpent() &&
+            CanonicalLegacyStakeScript(coin.out.scriptPubKey) == canonical_target) {
+            spends_target = true;
+            break;
         }
-        if (!spends_target) {
-            reject_reason = "shadow-proof-input-mismatch";
-            return ShadowProofValidationResult::INVALID;
-        }
+    }
+    if (!spends_target) {
+        reject_reason = "shadow-proof-input-mismatch";
+        return ShadowProofValidationResult::INVALID;
     }
 
     return ShadowProofValidationResult::VALID;
@@ -5304,7 +5394,7 @@ ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& bl
         return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
     }
     const std::map<CScript, CScript> active_signals = ActiveSignalPayoutScripts(active_signal_state);
-    ShadowClaimResult pow_claim = FindPowShadowClaims(
+    ShadowPowClaimResult pow_claim = FindPowShadowClaims(
         block, pindex, blockundo, credited_pool, Params().GetConsensus());
     if (pow_claim.internal_error) return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
     if (pow_claim.competing_claims) {
@@ -5317,6 +5407,14 @@ ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& bl
     }
     if (pow_claim.invalid_claim_location) {
         LogPrintf("Quantum Quasar: ignored QQPROOF outside a regular fee-paying transaction in a PoS block at height %d\n",
+            pindex->nHeight);
+    }
+    if (pow_claim.wrong_mode_claim) {
+        LogPrintf("Quantum Quasar: ignored fee-paying QQSPROOF with PoS mode at height %d; PoS mode cannot consume either shadow pool\n",
+            pindex->nHeight);
+    }
+    if (pow_claim.unknown_mode_claim) {
+        LogPrintf("Quantum Quasar: ignored fee-paying QQSPROOF with an unknown mode at height %d; unknown modes receive no shadow credit\n",
             pindex->nHeight);
     }
     if (pow_claim.proof_limit_exceeded) {
@@ -5340,23 +5438,24 @@ ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& bl
             if (!IsValidDirectClaimMarker(pindex, claim)) return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
             claims_to_apply.push_back(std::move(claim));
         }
-        AddSolvedProof(pool, ShadowProofMode::POS, pindex->nHeight);
+        AddPosSolve(pool, pindex->nHeight);
         pool.pos_amount = 0;
         LogPrintf("Quantum Quasar: Accepted quantum-linked POS shadow-ledger credit at height %d for %u active participants\n",
             pindex->nHeight,
             active_signals.size());
     }
 
-    if (!pow_claim.claims.empty()) {
+    if (!pow_claim.credits.empty()) {
         CAmount pow_claim_total{0};
-        for (ShadowClaim& claim : pow_claim.claims) {
-            claim.undo_pool = undo_pool;
-            const auto next_total = CheckedAddMoney(pow_claim_total, claim.amount);
-            if (!next_total || !AddClaimedAmount(pool, claim.amount)) {
+        for (const ShadowPowCredit& credit : pow_claim.credits) {
+            const auto next_total = CheckedAddMoney(pow_claim_total, credit.amount);
+            if (!next_total || !AddClaimedAmount(pool, credit.amount)) {
                 LogPrintf("ERROR: Quantum Quasar POW shadow claims exceed the pool or emission cap at height %d\n", pindex->nHeight);
                 return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
             }
             pow_claim_total = *next_total;
+            ShadowClaim claim{credit.payout_script, credit.amount,
+                              ShadowProofMode::POW, undo_pool, true};
             if (!IsValidDirectClaimMarker(pindex, claim)) return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
             claims_to_apply.push_back(std::move(claim));
         }
@@ -5364,10 +5463,10 @@ ShadowApplyResult ApplyShadowBlockResult(CCoinsViewCache& view, const CBlock& bl
             LogPrintf("ERROR: Quantum Quasar canonical POW claims do not exhaust exactly the fixed pool at height %d\n", pindex->nHeight);
             return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
         }
-        AddSolvedProof(pool, ShadowProofMode::POW, pindex->nHeight);
+        AddPowSolve(pool, pindex->nHeight);
         pool.pow_amount = 0;
         LogPrintf("Quantum Quasar: accepted %u quantum-linked POW shadow-ledger credits at height %d for a fixed total of %d satoshis\n",
-            pow_claim.claims.size(), pindex->nHeight, pow_claim_total);
+            pow_claim.credits.size(), pindex->nHeight, pow_claim_total);
     }
     if (!ShadowObligationWithinCap(pool)) {
         LogPrintf("ERROR: Quantum Quasar shadow obligation cap exceeded at height %d\n", pindex->nHeight);

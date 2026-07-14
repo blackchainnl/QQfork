@@ -174,7 +174,7 @@ repeat once more with `-reindex-chainstate` at the same pinned tip and compare
 again before enabling networking, staking, or mining.
 
 Optional indexes have independent replay state. v30.1.1 automatically wipes
-and rebuilds prerelease shadowindex schema 4 as schema 5 and prerelease
+and rebuilds prerelease shadowindex schemas 4 and 5 as schema 6 and prerelease
 coinstatsindex schema 2 as schema 3. The automatic index-only rebuild is enough
 when complete active-chain block files are present; `-reindex-chainstate` does
 not itself wipe either index. If required block files were pruned, disable the

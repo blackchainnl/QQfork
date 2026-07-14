@@ -118,9 +118,10 @@ Notable changes
   recover their actual base fee up to 0.01 BLK from the fixed pool, the canonical
   winner receives the remainder, and authenticated shadow replay commits to the
   activation boundary under schema 11.
-- Optional shadowindex schema 5 and coinstatsindex schema 3 automatically
+- Optional shadowindex schema 6 and coinstatsindex schema 3 automatically
   invalidate and rebuild prerelease index records derived with the superseded
-  height-5,950,000 competing-claim boundary.
+  height-5,950,000 competing-claim boundary or incomplete proof-mode
+  classification.
 - ML-DSA quantum spends, EUTXO spends, larger post-quantum script elements, and
   expanded block limits are deferred until after the Gold Rush reward-height
   window, during the migration/final-lockout phases.

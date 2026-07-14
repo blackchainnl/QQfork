@@ -2121,8 +2121,19 @@ static RPCHelpMan getgoldrushblock()
                 {RPCResult::Type::NUM, "count", "Number of payouts in this page"},
                 {RPCResult::Type::STR_AMOUNT, "pow_payout_total", "Total PoW payout value in this block"},
                 {RPCResult::Type::STR_AMOUNT, "pos_payout_total", "Total PoS payout value in this block"},
-                {RPCResult::Type::ARR, "observed_pow_claim_txids", "Base-block transactions carrying QQSPROOF data",
+                {RPCResult::Type::ARR, "observed_pow_claim_txids", "Fee-paying base transactions carrying exactly one PoW-mode QQSPROOF note; inclusion does not imply proof validity or credit",
                     {{RPCResult::Type::STR_HEX, "txid", "Base transaction id"}}},
+                {RPCResult::Type::ARR, "proof_observations", "Byte-level classification of every QQSPROOF note in the base block",
+                    {{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::STR_HEX, "txid", "Base transaction id"},
+                            {RPCResult::Type::NUM, "vout", "Base transaction output containing the note"},
+                            {RPCResult::Type::STR, "mode", "pow, pos, unknown, or malformed"},
+                            {RPCResult::Type::STR, "credit_channel", "pow for a structurally eligible PoW-mode note, otherwise none"},
+                            {RPCResult::Type::BOOL, "fee_paying_location", "Whether the note is in a regular fee-paying transaction inside a PoS block"},
+                            {RPCResult::Type::BOOL, "duplicate_in_transaction", "Whether its transaction contains multiple QQSPROOF notes"},
+                            {RPCResult::Type::STR, "non_credit_reason", "Exact structural reason this note cannot receive credit, empty when full proof/accounting validation is still required"},
+                        }}}},
                 {RPCResult::Type::ARR, "observed_signal_txids", "Base-block transactions carrying QQSIGNAL data",
                     {{RPCResult::Type::STR_HEX, "txid", "Base transaction id"}}},
                 {RPCResult::Type::ARR, "payouts", "Synthetic upgraded-ledger payouts",
@@ -2176,9 +2187,52 @@ static RPCHelpMan getgoldrushblock()
     }
 
     UniValue observed_pow(UniValue::VARR);
+    UniValue proof_observations(UniValue::VARR);
     UniValue observed_signals(UniValue::VARR);
+    for (const ShadowProofObservation& observation : GetShadowProofObservations(block)) {
+        std::string mode;
+        std::string non_credit_reason;
+        switch (observation.mode) {
+        case ShadowProofPayloadMode::POW:
+            mode = "pow";
+            break;
+        case ShadowProofPayloadMode::POS:
+            mode = "pos";
+            non_credit_reason = "wrong_mode_pos";
+            break;
+        case ShadowProofPayloadMode::UNKNOWN:
+            mode = "unknown";
+            non_credit_reason = "unknown_mode";
+            break;
+        case ShadowProofPayloadMode::MALFORMED:
+            mode = "malformed";
+            non_credit_reason = "malformed_proof";
+            break;
+        }
+        if (!observation.fee_paying_location) {
+            non_credit_reason = "invalid_location";
+        } else if (observation.duplicate_in_transaction) {
+            non_credit_reason = "duplicate_proof_payload";
+        }
+        const bool pow_channel_candidate =
+            observation.mode == ShadowProofPayloadMode::POW &&
+            observation.fee_paying_location &&
+            !observation.duplicate_in_transaction;
+        if (pow_channel_candidate) {
+            observed_pow.push_back(observation.source_txid.GetHex());
+        }
+
+        UniValue item(UniValue::VOBJ);
+        item.pushKV("txid", observation.source_txid.GetHex());
+        item.pushKV("vout", observation.source_vout);
+        item.pushKV("mode", mode);
+        item.pushKV("credit_channel", pow_channel_candidate ? "pow" : "none");
+        item.pushKV("fee_paying_location", observation.fee_paying_location);
+        item.pushKV("duplicate_in_transaction", observation.duplicate_in_transaction);
+        item.pushKV("non_credit_reason", non_credit_reason);
+        proof_observations.push_back(std::move(item));
+    }
     for (const CTransactionRef& tx : block.vtx) {
-        if (TransactionHasShadowProof(*tx)) observed_pow.push_back(tx->GetHash().GetHex());
         if (TransactionHasShadowSignal(*tx)) observed_signals.push_back(tx->GetHash().GetHex());
     }
 
@@ -2218,6 +2272,7 @@ static RPCHelpMan getgoldrushblock()
     result.pushKV("pow_payout_total", ValueFromAmount(pow_total));
     result.pushKV("pos_payout_total", ValueFromAmount(pos_total));
     result.pushKV("observed_pow_claim_txids", std::move(observed_pow));
+    result.pushKV("proof_observations", std::move(proof_observations));
     result.pushKV("observed_signal_txids", std::move(observed_signals));
     result.pushKV("payouts", std::move(payout_values));
     return result;

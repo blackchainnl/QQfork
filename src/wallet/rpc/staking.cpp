@@ -1295,6 +1295,8 @@ static RPCHelpMan sendshadowpowclaim()
                         {RPCResult::Type::STR_HEX, "txid", "The broadcast claim transaction id."},
                         {RPCResult::Type::STR_HEX, "hex", "The signed claim transaction hex."},
                         {RPCResult::Type::STR_HEX, "proof", "The QQSPROOF payload committed by the transaction."},
+                        {RPCResult::Type::STR, "proof_mode", "Always pow for a wallet-created fee-paying QQSPROOF claim."},
+                        {RPCResult::Type::NUM, "proof_mode_byte", "Canonical PoW mode byte (0)."},
                         {RPCResult::Type::BOOL, "external_proof", "Whether the proof was supplied by the caller instead of ground by this RPC."},
                         {RPCResult::Type::STR_AMOUNT, "fee", "The fee paid by the claim transaction."},
                         {RPCResult::Type::STR_AMOUNT, "change", "The amount paid back to the target address."},
@@ -1391,8 +1393,17 @@ static RPCHelpMan sendshadowpowclaim()
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Failed to prepare shadow PoW work (outside the reward window or invalid payout script)");
         }
     }
-    if (supplied_proof && !ValidateShadowPowProofForWork(pow_work, *supplied_proof)) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "proof does not match the current tip, target address, and quantum payout address");
+    if (supplied_proof) {
+        const ShadowProofPayloadMode mode = ClassifyShadowProofPayload(*supplied_proof);
+        if (mode == ShadowProofPayloadMode::POS) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof encodes PoS mode; fee-paying QQSPROOF claims require PoW mode byte 0");
+        }
+        if (mode == ShadowProofPayloadMode::UNKNOWN) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof encodes an unknown mode; fee-paying QQSPROOF claims require PoW mode byte 0");
+        }
+        if (!ValidateShadowPowProofForWork(pow_work, *supplied_proof)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof does not match the current tip, target address, quantum payout address, and PoW channel");
+        }
     }
 
     {
@@ -1533,6 +1544,8 @@ static RPCHelpMan sendshadowpowclaim()
     result.pushKV("txid", tx->GetHash().GetHex());
     result.pushKV("hex", hex);
     result.pushKV("proof", HexStr(proof));
+    result.pushKV("proof_mode", "pow");
+    result.pushKV("proof_mode_byte", 0);
     result.pushKV("external_proof", supplied_proof.has_value());
     result.pushKV("fee", ValueFromAmount(fee));
     result.pushKV("change", ValueFromAmount(change));

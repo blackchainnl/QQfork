@@ -59,15 +59,37 @@ struct ShadowClaimMarkerInfo {
     bool proof_of_work{false};
 };
 
+/** Byte-level QQSPROOF channel classification. This deliberately does not
+ * imply that the proof, input binding, or claim location is valid. */
+enum class ShadowProofPayloadMode : uint8_t {
+    POW,
+    POS,
+    UNKNOWN,
+    MALFORMED,
+};
+
+/** Explorer-facing classification of an on-chain QQSPROOF note. */
+struct ShadowProofObservation {
+    uint256 source_txid;
+    uint32_t source_vout{0};
+    ShadowProofPayloadMode mode{ShadowProofPayloadMode::MALFORMED};
+    bool fee_paying_location{false};
+    bool duplicate_in_transaction{false};
+};
+
 enum class ShadowPowClaimDisposition : uint8_t {
-    INVALID_LOCATION,
-    MALFORMED_TRANSACTION,
-    INVALID_PROOF,
-    INPUT_MISMATCH,
-    INVALID_BASE_FEE,
-    EVALUATION_LIMIT,
-    WINNER,
-    REIMBURSED_LOSER,
+    // Values 0-7 were persisted by the first canonical-accounting release.
+    // Keep them explicit so old shadow indexes retain their exact meaning.
+    INVALID_LOCATION = 0,
+    MALFORMED_TRANSACTION = 1,
+    INVALID_PROOF = 2,
+    INPUT_MISMATCH = 3,
+    INVALID_BASE_FEE = 4,
+    EVALUATION_LIMIT = 5,
+    WINNER = 6,
+    REIMBURSED_LOSER = 7,
+    WRONG_MODE = 8,
+    UNKNOWN_MODE = 9,
 };
 
 struct ShadowPowClaimAccounting {
@@ -334,6 +356,8 @@ ShadowPowAccountingResult EvaluateShadowPowClaimAccounting(
     std::vector<ShadowPowClaimAccounting>& accounting_out);
 
 /** Mempool policy helpers for next-block-only QQSPROOF claims. */
+ShadowProofPayloadMode ClassifyShadowProofPayload(const std::vector<unsigned char>& prefixed_proof);
+std::vector<ShadowProofObservation> GetShadowProofObservations(const CBlock& block);
 bool TransactionHasShadowProof(const CTransaction& tx);
 bool TransactionHasShadowSignal(const CTransaction& tx);
 ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);

@@ -178,6 +178,8 @@ std::string PowClaimDispositionName(ShadowPowClaimDisposition disposition)
     switch (disposition) {
     case ShadowPowClaimDisposition::INVALID_LOCATION: return "invalid_location";
     case ShadowPowClaimDisposition::MALFORMED_TRANSACTION: return "malformed_transaction";
+    case ShadowPowClaimDisposition::WRONG_MODE: return "wrong_mode_pos";
+    case ShadowPowClaimDisposition::UNKNOWN_MODE: return "unknown_mode";
     case ShadowPowClaimDisposition::INVALID_PROOF: return "invalid_proof";
     case ShadowPowClaimDisposition::INPUT_MISMATCH: return "input_mismatch";
     case ShadowPowClaimDisposition::INVALID_BASE_FEE: return "invalid_base_fee";

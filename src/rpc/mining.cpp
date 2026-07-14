@@ -1251,6 +1251,8 @@ static RPCHelpMan getshadowpowwork()
             {RPCResult::Type::NUM, "claimed_amount", "Total Gold Rush amount already materialized to quantum payout coins in satoshis."},
             {RPCResult::Type::NUM, "last_pow_height", "Last accepted PoW claim height (retarget anchor), 0 if none."},
             {RPCResult::Type::STR, "prefix", "ASCII OP_RETURN magic prefix for shadow proofs (\"QQSPROOF\")."},
+            {RPCResult::Type::STR, "proof_mode", "Required fee-paying claim channel (pow)."},
+            {RPCResult::Type::NUM, "proof_mode_byte", "Required serialized PoW mode byte (0)."},
             {RPCResult::Type::NUM, "reward_start_height", "First height at which PoW claims are valid."},
             {RPCResult::Type::NUM, "reward_end_height", "Last height at which PoW claims are valid."},
             {RPCResult::Type::STR_HEX, "target_script", /*optional=*/true, "scriptPubKey to grind for, if target_address supplied."},
@@ -1288,6 +1290,8 @@ static RPCHelpMan getshadowpowwork()
     obj.pushKV("claimed_amount", info.claimed_amount);
     obj.pushKV("last_pow_height", (uint64_t)info.last_pow_height);
     obj.pushKV("prefix", std::string(GetShadowPrefix().begin(), GetShadowPrefix().end()));
+    obj.pushKV("proof_mode", "pow");
+    obj.pushKV("proof_mode_byte", 0);
     obj.pushKV("reward_start_height", SHADOW_REWARD_START_HEIGHT);
     obj.pushKV("reward_end_height", SHADOW_REWARD_END_HEIGHT);
 
