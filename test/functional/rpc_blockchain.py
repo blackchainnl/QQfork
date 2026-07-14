@@ -260,6 +260,12 @@ class BlockchainTest(BitcoinTestFramework):
         # calling with an explicit hash works
         self.check_signalling_deploymentinfo_result(self.nodes[0].getdeploymentinfo(gbci207["bestblockhash"]), gbci207["blocks"], gbci207["bestblockhash"], "started")
 
+        # Restore the activation schedule used to create the existing chain.
+        # Leaving the temporary segwit@6 override in place makes level-4
+        # verification reinterpret blocks 1 through 5, which were mined with
+        # the default regtest SegWit activation height.
+        self.restart_node(0)
+
     def _test_y2106(self):
         self.log.info("Check that block timestamps work until year 2106")
         self.nodes[0].setmocktime(self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"] + 1)
