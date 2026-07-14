@@ -102,9 +102,7 @@ class WalletFastRescanTest(BitcoinTestFramework):
         txids_slow_nonactive = self.get_wallet_txids(node, 'rescan_slow_nonactive')
 
         self.log.info("Verify that all rescans found the same txs in slow and fast variants")
-        # Non-active watch-only imports do not recover the two Taproot ranged descriptors here.
-        # The backup/restore path above still verifies top-up recovery for the full active wallet.
-        expected_nonactive_txs = sum(1 for descriptor in descriptors if not descriptor['desc'].startswith('tr(')) * NUM_BLOCKS
+        expected_nonactive_txs = NUM_DESCRIPTORS * NUM_BLOCKS
         assert_equal(len(txids_slow), NUM_DESCRIPTORS * NUM_BLOCKS)
         assert_equal(len(txids_fast), NUM_DESCRIPTORS * NUM_BLOCKS)
         assert_equal(len(txids_slow_nonactive), expected_nonactive_txs)
