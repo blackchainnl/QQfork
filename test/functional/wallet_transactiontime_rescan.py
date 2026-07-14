@@ -207,6 +207,7 @@ class TransactionTimeRescanTest(BitcoinTestFramework):
 
             encrypted_wallet.walletpassphrase("passphrase", 99999)
             encrypted_wallet.sethdseed(seed=hd_seed)
+            expected_stop_height = minernode.getblockcount()
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as thread:
                 genesis_hash = minernode.getblockhash(0)
@@ -226,7 +227,7 @@ class TransactionTimeRescanTest(BitcoinTestFramework):
                 except JSONRPCException as e:
                     assert e.error["code"] == -4 and "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before changing the passphrase." in e.error["message"]
 
-                assert_equal(rescanning.result(), {"start_height": 0, "stop_height": 803})
+                assert_equal(rescanning.result(), {"start_height": 0, "stop_height": expected_stop_height})
 
             assert_equal(encrypted_wallet.getbalance(), temp_wallet.getbalance())
 

@@ -758,7 +758,7 @@ class ImportMultiTest(BitcoinTestFramework):
         self.log.info("Bech32m addresses and descriptors cannot be imported")
         self.test_importmulti(
             {
-                "scriptPubKey": {"address": "bcrt1p0xlxvlhemja6c4dqv22uapctqupfhlxm9h8z3k2e72q4k9hcz7vqc8gma6"},
+                "scriptPubKey": {"address": "blrt1p39a4s4vdcw9kqa8w2t0rp7aj8kfxyw7mce5sk5d70x6wnnmpvt7s2ak8pu"},
                 "timestamp": "now",
             },
             success=False,
