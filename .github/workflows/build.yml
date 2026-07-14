@@ -1047,6 +1047,11 @@ jobs:
             "dist/Blackcoin-$VERSION-quantum-crypto-provenance.json"
           cp contrib/devtools/quantum-crypto-provenance.json \
             "dist/Blackcoin-$VERSION-quantum-crypto-manifest.json"
+          python3 ci/release/verify_resource_benchmark_bundle.py \
+            --directory gate-evidence/resource-benchmarks \
+            --source-sha "$TARGET_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --provenance-manifest contrib/devtools/quantum-crypto-provenance.json
           mapfile -t resource_evidence < <(
             find gate-evidence/resource-benchmarks -maxdepth 1 -type f \
               -name 'quantum-resource-*-evidence.json' -print | sort

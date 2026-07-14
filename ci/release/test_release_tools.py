@@ -48,6 +48,90 @@ def load_path(name, path):
 
 
 class ReleaseToolTests(unittest.TestCase):
+    def make_resource_bundle(self, directory, source_sha, repository,
+                             provenance_manifest):
+        verifier = load_module("verify_resource_benchmark_bundle")
+        manifest_hash = verifier.sha256_file(provenance_manifest)
+        for runner, (platform, architecture) in verifier.EXPECTED_RUNNERS.items():
+            raw = directory / f"quantum-resource-{runner}-nanobench.json"
+            raw.write_text('{"results": []}\n', encoding="utf-8")
+            reported_platform = {
+                "linux": "Linux", "windows": "Windows", "macos": "Darwin",
+            }[platform]
+            reported_architecture = {
+                "x86_64": "AMD64" if platform == "windows" else "x86_64",
+                "arm64": "arm64",
+            }[architecture]
+            evidence = {
+                "schema": 1,
+                "source": {"repository": repository, "commit": source_sha},
+                "runner": {
+                    "platform": platform,
+                    "architecture": architecture,
+                    "reported_platform": reported_platform,
+                    "reported_architecture": reported_architecture,
+                    "native_execution_verified": True,
+                },
+                "inputs": {
+                    "benchmark_binary_sha256": "ab" * 32,
+                    "nanobench_json_sha256": verifier.sha256_file(raw),
+                    "quantum_crypto_provenance_manifest_sha256": manifest_hash,
+                },
+                "coverage": {
+                    "crypto": True,
+                    "large-block": True,
+                    "synthetic-state": True,
+                },
+                "release_resource_evidence_complete": True,
+            }
+            (directory / f"quantum-resource-{runner}-evidence.json").write_text(
+                json.dumps(evidence), encoding="utf-8"
+            )
+
+    def test_resource_bundle_requires_exact_native_platform_set(self):
+        verifier = load_module("verify_resource_benchmark_bundle")
+        repository = "Blackcoin-Dev/Blackcoin"
+        source_sha = "12" * 20
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            manifest = directory.parent / f"{directory.name}-manifest.json"
+            manifest.write_text('{"schema": 1}\n', encoding="utf-8")
+            try:
+                self.make_resource_bundle(directory, source_sha, repository, manifest)
+                verifier.verify_bundle(directory, source_sha, repository, manifest)
+
+                missing = directory / "quantum-resource-linux-arm64-evidence.json"
+                missing.unlink()
+                with self.assertRaisesRegex(RuntimeError, "inventory differs"):
+                    verifier.verify_bundle(directory, source_sha, repository, manifest)
+            finally:
+                manifest.unlink(missing_ok=True)
+
+    def test_resource_bundle_rejects_mislabeled_or_substituted_evidence(self):
+        verifier = load_module("verify_resource_benchmark_bundle")
+        repository = "Blackcoin-Dev/Blackcoin"
+        source_sha = "34" * 20
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            manifest = directory.parent / f"{directory.name}-manifest.json"
+            manifest.write_text('{"schema": 1}\n', encoding="utf-8")
+            try:
+                self.make_resource_bundle(directory, source_sha, repository, manifest)
+                evidence_path = directory / "quantum-resource-linux-arm64-evidence.json"
+                evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+                evidence["runner"]["architecture"] = "x86_64"
+                evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "runner mismatch"):
+                    verifier.verify_bundle(directory, source_sha, repository, manifest)
+
+                self.make_resource_bundle(directory, source_sha, repository, manifest)
+                raw_path = directory / "quantum-resource-windows-x86_64-nanobench.json"
+                raw_path.write_text('{"substituted": true}\n', encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "nanobench input hash mismatch"):
+                    verifier.verify_bundle(directory, source_sha, repository, manifest)
+            finally:
+                manifest.unlink(missing_ok=True)
+
     def test_resource_benchmark_evidence_is_source_bound_and_fail_closed(self):
         generator = load_module("generate_resource_benchmark_evidence")
         native_platform, native_architecture, _, _ = generator.native_runner_identity()
@@ -587,6 +671,7 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("--minimum-runtime-ms 250", gate)
         self.assertIn("--provenance-manifest", gate)
         self.assertIn("pattern: quantum-resource-benchmarks-*", release)
+        self.assertIn("verify_resource_benchmark_bundle.py", release)
         self.assertIn("test \"${#resource_evidence[@]}\" -eq 5", release)
         self.assertIn("test \"${#resource_raw[@]}\" -eq 5", release)
 
