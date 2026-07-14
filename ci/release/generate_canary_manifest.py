@@ -39,6 +39,7 @@ def generate_manifest(
     release_candidate,
     workflow_run_id,
     output,
+    macos_adhoc_signed=False,
 ):
     label_match = PRERELEASE_LABEL_RE.fullmatch(package_label)
     if label_match is None:
@@ -59,6 +60,8 @@ def generate_manifest(
         raise RuntimeError("source-sha must be a full lowercase commit identifier")
     if not re.fullmatch(r"[0-9]+", workflow_run_id):
         raise RuntimeError("workflow-run-id must be numeric")
+    if not isinstance(macos_adhoc_signed, bool):
+        raise RuntimeError("macos-adhoc-signed must be a boolean")
     if not artifacts.is_dir():
         raise RuntimeError("artifact directory does not exist")
     if output.parent.resolve() != artifacts.resolve():
@@ -115,6 +118,8 @@ def generate_manifest(
         f"source_commit={source_sha}",
         f"workflow_run_id={workflow_run_id}",
         "signed=false",
+        "developer_id_signed=false",
+        f"macos_adhoc_signed={'true' if macos_adhoc_signed else 'false'}",
         "notarized=false",
         "published=false",
     )
@@ -152,6 +157,8 @@ def generate_manifest(
         "release": {
             "published": False,
             "signed": False,
+            "developer_id_signed": False,
+            "macos_adhoc_signed": macos_adhoc_signed,
             "notarized": False,
             "tag": None,
         },
@@ -175,6 +182,11 @@ def main():
     parser.add_argument("--release-candidate", required=True)
     parser.add_argument("--workflow-run-id", required=True)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument(
+        "--macos-adhoc-signed",
+        action="store_true",
+        help="record that selected macOS apps carry identity-free ad-hoc launch signatures",
+    )
     args = parser.parse_args()
 
     manifest = generate_manifest(
@@ -186,6 +198,7 @@ def main():
         release_candidate=args.release_candidate,
         workflow_run_id=args.workflow_run_id,
         output=args.output,
+        macos_adhoc_signed=args.macos_adhoc_signed,
     )
     print(f"Wrote unsigned canary manifest for {len(manifest['artifacts'])} artifact(s) to {args.output}")
     return 0

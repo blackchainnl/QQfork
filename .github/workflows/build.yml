@@ -222,6 +222,8 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       macos_selected: ${{ steps.matrix.outputs.macos_selected }}
+      macos_intel_selected: ${{ steps.matrix.outputs.macos_intel_selected }}
+      macos_arm_selected: ${{ steps.matrix.outputs.macos_arm_selected }}
       windows_selected: ${{ steps.matrix.outputs.windows_selected }}
     steps:
       - id: matrix
@@ -263,6 +265,16 @@ jobs:
             echo "macos_selected=true" >> "$GITHUB_OUTPUT"
           else
             echo "macos_selected=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$matrix" == *macos-64-bit* ]]; then
+            echo "macos_intel_selected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "macos_intel_selected=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$matrix" == *macos-arm-64-bit* ]]; then
+            echo "macos_arm_selected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "macos_arm_selected=false" >> "$GITHUB_OUTPUT"
           fi
           if [[ "$matrix" == *windows-64-bit* ]]; then
             echo "windows_selected=true" >> "$GITHUB_OUTPUT"
@@ -454,10 +466,20 @@ jobs:
           esac
           printf '%s\n' "$TARGET_SHA" > "$OUT/$ASSET_PREFIX-${{ matrix.name }}-SOURCE_COMMIT.txt"
 
-      - name: Upload release assets
+      - name: Upload non-macOS release assets
+        if: ${{ !startsWith(matrix.name, 'macos-') }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.name }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload isolated raw macOS cross-build assets
+        if: ${{ startsWith(matrix.name, 'macos-') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: raw-release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.name }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
@@ -471,12 +493,284 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  macos-adhoc:
+    name: Ad-hoc sign and validate macOS ${{ matrix.label }} (${{ matrix.builder }})
+    needs:
+      - resolve-target
+      - select-targets
+      - build
+    if: ${{ needs.select-targets.outputs.macos_selected == 'true' }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
+      TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
+      PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
+      CONFIGURED_VERSION: ${{ needs.resolve-target.outputs.configured_version }}
+      ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-64-bit
+            label: Intel-x86_64
+            arch: x86_64
+            runner: macos-15-intel
+            builder: primary
+            selected: ${{ needs.select-targets.outputs.macos_intel_selected }}
+          - target: macos-64-bit
+            label: Intel-x86_64
+            arch: x86_64
+            runner: macos-15-intel
+            builder: verifier
+            selected: ${{ needs.select-targets.outputs.macos_intel_selected }}
+          - target: macos-arm-64-bit
+            label: Apple-Silicon-ARM64
+            arch: arm64
+            runner: macos-15
+            builder: primary
+            selected: ${{ needs.select-targets.outputs.macos_arm_selected }}
+          - target: macos-arm-64-bit
+            label: Apple-Silicon-ARM64
+            arch: arm64
+            runner: macos-15
+            builder: verifier
+            selected: ${{ needs.select-targets.outputs.macos_arm_selected }}
+    steps:
+      - name: Download one exact isolated raw macOS cross-build
+        if: ${{ matrix.selected == 'true' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: raw-release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.target }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
+          path: raw-artifact
+
+      - name: Ad-hoc sign, execute, deterministically repack, and reverify
+        if: ${{ matrix.selected == 'true' }}
+        shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          PLATFORM_LABEL: ${{ matrix.label }}
+          TARGET_NAME: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          umask 077
+
+          raw_tar="raw-artifact/$ASSET_PREFIX-macOS-$PLATFORM_LABEL-Qt-app.tar.gz"
+          raw_zip="raw-artifact/$ASSET_PREFIX-macOS-$PLATFORM_LABEL-Qt-app.zip"
+          raw_source="raw-artifact/$ASSET_PREFIX-$TARGET_NAME-SOURCE_COMMIT.txt"
+          test -s "$raw_tar" && test -f "$raw_tar" && test ! -L "$raw_tar"
+          test -s "$raw_zip" && test -f "$raw_zip" && test ! -L "$raw_zip"
+          test -s "$raw_source" && test -f "$raw_source" && test ! -L "$raw_source"
+          test "$(find raw-artifact -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 3
+          test "$(tr -d '\r\n' < "$raw_source")" = "$TARGET_SHA"
+
+          mkdir -p work/tar work/zip work/verify-tar work/verify-zip release-assets
+          tar -tzf "$raw_tar" > work/tar-members.txt
+          zipinfo -1 "$raw_zip" > work/zip-members.txt
+          for members in work/tar-members.txt work/zip-members.txt; do
+            test -s "$members"
+            awk '
+              function unsafe(path, count, part, i) {
+                if (substr(path, 1, 1) == "/" || path ~ /\\\\/) return 1
+                count = split(path, part, "/")
+                for (i = 1; i <= count; ++i) {
+                  if (part[i] == "..") return 1
+                }
+                return 0
+              }
+              unsafe($0) || $0 !~ /^blackcoin-qt[.]app(\/|$)/ { exit 1 }
+            ' "$members"
+            test -z "$(sort "$members" | uniq -d)"
+          done
+          tar -tzvf "$raw_tar" | awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { exit 1 }'
+          RAW_ZIP="$raw_zip" python3 - <<'PY'
+          import os
+          import stat
+          import zipfile
+          from pathlib import PurePosixPath
+
+          seen = set()
+          total_size = 0
+          with zipfile.ZipFile(os.environ["RAW_ZIP"]) as archive:
+              for entry in archive.infolist():
+                  path = PurePosixPath(entry.filename)
+                  if (entry.filename in seen or path.is_absolute() or ".." in path.parts or
+                          "\\" in entry.filename or not path.parts or path.parts[0] != "blackcoin-qt.app"):
+                      raise SystemExit(f"unsafe or duplicate ZIP member: {entry.filename}")
+                  seen.add(entry.filename)
+                  if entry.flag_bits & 0x1:
+                      raise SystemExit(f"encrypted ZIP member: {entry.filename}")
+                  mode = (entry.external_attr >> 16) & 0xFFFF
+                  if mode and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                      raise SystemExit(f"unsupported ZIP member type: {entry.filename}")
+                  total_size += entry.file_size
+                  if entry.file_size > 512 * 1024 * 1024 or total_size > 1024 * 1024 * 1024:
+                      raise SystemExit("ZIP payload exceeds the fail-closed size limit")
+          if not seen:
+              raise SystemExit("empty ZIP archive")
+          PY
+
+          tar -xzf "$raw_tar" -C work/tar
+          ditto -x -k "$raw_zip" work/zip
+          test -d work/tar/blackcoin-qt.app
+          test -d work/zip/blackcoin-qt.app
+          test "$(find work/tar -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 1
+          test "$(find work/zip -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 1
+          test -z "$(find work/tar work/zip -type l -print -quit)"
+          diff -qr work/tar/blackcoin-qt.app work/zip/blackcoin-qt.app
+
+          app=work/tar/blackcoin-qt.app
+          binary="$app/Contents/MacOS/blackcoin-qt"
+          plist="$app/Contents/Info.plist"
+          test -x "$binary" && test -f "$binary" && test ! -L "$binary"
+          test -s "$plist" && test -f "$plist" && test ! -L "$plist"
+          test "$(lipo -archs "$binary")" = "$EXPECTED_ARCH"
+          file "$binary" | grep -F "Mach-O 64-bit executable $EXPECTED_ARCH"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")" = blackcoin-qt
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = 30.1.1
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = 30.1.1
+
+          xattr -cr "$app"
+          codesign --force --deep --sign - --timestamp=none "$app"
+          codesign --verify --deep --strict --verbose=4 "$app"
+          codesign --verify --strict --verbose=4 "$binary"
+          codesign --display --verbose=4 "$app" 2> work/codesign.txt
+          grep -Fx 'Signature=adhoc' work/codesign.txt
+          grep -Fx 'TeamIdentifier=not set' work/codesign.txt
+          grep -E '^Info[.]plist entries=[1-9][0-9]*$' work/codesign.txt
+          grep -E '^Sealed Resources version=2 rules=[1-9][0-9]* files=[1-9][0-9]*$' work/codesign.txt
+          if grep -q '^Authority=' work/codesign.txt; then
+            echo 'Unexpected signing authority in ad-hoc prerelease app' >&2
+            exit 1
+          fi
+
+          expected_line="Blackcoin version v$CONFIGURED_VERSION-${TARGET_SHA:0:12}"
+          mkdir -p "$RUNNER_TEMP/blackcoin-version-home"
+          version_output=$(HOME="$RUNNER_TEMP/blackcoin-version-home" "$binary" -version 2>&1)
+          test "$(printf '%s\n' "$version_output" | sed -n '1p')" = "$expected_line"
+          printf '%s\n' "$version_output"
+
+          signed_tar="release-assets/$ASSET_PREFIX-macOS-$PLATFORM_LABEL-Qt-app.tar.gz"
+          signed_zip="release-assets/$ASSET_PREFIX-macOS-$PLATFORM_LABEL-Qt-app.zip"
+          APP_ROOT="$app" TAR_OUTPUT="$signed_tar" ZIP_OUTPUT="$signed_zip" python3 - <<'PY'
+          import datetime
+          import gzip
+          import os
+          import shutil
+          import stat
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          app = Path(os.environ["APP_ROOT"])
+          tar_output = Path(os.environ["TAR_OUTPUT"])
+          zip_output = Path(os.environ["ZIP_OUTPUT"])
+          epoch = int(os.environ["SOURCE_DATE_EPOCH"])
+          if epoch < 315532800:
+              raise SystemExit("SOURCE_DATE_EPOCH predates the ZIP format minimum")
+
+          parent = app.parent
+          entries = [app, *sorted(app.rglob("*"), key=lambda path: path.relative_to(parent).as_posix())]
+          for path in entries:
+              mode = path.lstat().st_mode
+              if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                  raise SystemExit(f"unsupported app-bundle entry: {path}")
+
+          with tar_output.open("wb") as raw:
+              with gzip.GzipFile(filename="", mode="wb", compresslevel=9, fileobj=raw, mtime=epoch) as compressed:
+                  with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                      for path in entries:
+                          arcname = path.relative_to(parent).as_posix()
+                          info = archive.gettarinfo(str(path), arcname=arcname)
+                          info.uid = 0
+                          info.gid = 0
+                          info.uname = ""
+                          info.gname = ""
+                          info.mtime = epoch
+                          info.pax_headers = {}
+                          if info.isfile():
+                              with path.open("rb") as source:
+                                  archive.addfile(info, source)
+                          else:
+                              archive.addfile(info)
+
+          timestamp = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+          zip_timestamp = (timestamp.year, timestamp.month, timestamp.day,
+                           timestamp.hour, timestamp.minute, timestamp.second)
+          with zipfile.ZipFile(zip_output, "w", compression=zipfile.ZIP_DEFLATED,
+                               compresslevel=9, strict_timestamps=True) as archive:
+              for path in entries:
+                  mode = path.lstat().st_mode
+                  arcname = path.relative_to(parent).as_posix()
+                  is_directory = stat.S_ISDIR(mode)
+                  if is_directory:
+                      arcname += "/"
+                  info = zipfile.ZipInfo(arcname, zip_timestamp)
+                  info.create_system = 3
+                  info.compress_type = zipfile.ZIP_STORED if is_directory else zipfile.ZIP_DEFLATED
+                  info.external_attr = (mode & 0xFFFF) << 16
+                  if is_directory:
+                      info.external_attr |= 0x10
+                      archive.writestr(info, b"")
+                  else:
+                      with path.open("rb") as source, archive.open(info, "w") as destination:
+                          shutil.copyfileobj(source, destination)
+          PY
+
+          test -s "$signed_tar" && test ! -L "$signed_tar"
+          test -s "$signed_zip" && test ! -L "$signed_zip"
+          tar -xzf "$signed_tar" -C work/verify-tar
+          ditto -x -k "$signed_zip" work/verify-zip
+          diff -qr "$app" work/verify-tar/blackcoin-qt.app
+          diff -qr "$app" work/verify-zip/blackcoin-qt.app
+          for verified_app in work/verify-tar/blackcoin-qt.app work/verify-zip/blackcoin-qt.app; do
+            verified_binary="$verified_app/Contents/MacOS/blackcoin-qt"
+            test "$(lipo -archs "$verified_binary")" = "$EXPECTED_ARCH"
+            codesign --verify --deep --strict --verbose=4 "$verified_app"
+            codesign --verify --strict --verbose=4 "$verified_binary"
+            verified_output=$(HOME="$RUNNER_TEMP/blackcoin-version-home" "$verified_binary" -version 2>&1)
+            test "$(printf '%s\n' "$verified_output" | sed -n '1p')" = "$expected_line"
+          done
+          printf '%s\n' "$TARGET_SHA" > "release-assets/$ASSET_PREFIX-$TARGET_NAME-SOURCE_COMMIT.txt"
+
+      - name: Upload only native-validated macOS artifacts
+        if: ${{ matrix.selected == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.target }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-adhoc-gate:
+    name: Require native macOS validation when selected
+    needs:
+      - select-targets
+      - macos-adhoc
+    if: ${{ always() }}
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Fail closed on a skipped or failed required macOS gate
+        shell: bash
+        env:
+          SELECT_TARGETS_RESULT: ${{ needs.select-targets.result }}
+          MACOS_SELECTED: ${{ needs.select-targets.outputs.macos_selected }}
+          MACOS_ADHOC_RESULT: ${{ needs.macos-adhoc.result }}
+        run: |
+          set -euo pipefail
+          test "$SELECT_TARGETS_RESULT" = success
+          if [[ "$MACOS_SELECTED" == true ]]; then
+            test "$MACOS_ADHOC_RESULT" = success
+          else
+            test "$MACOS_ADHOC_RESULT" = skipped
+          fi
+
   reproducibility:
     name: Verify independent byte-for-byte rebuilds
     needs:
       - resolve-target
       - select-targets
       - build
+      - macos-adhoc-gate
     runs-on: ubuntu-22.04
     env:
       TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
@@ -486,6 +780,7 @@ jobs:
       RELEASE_CANDIDATE: ${{ needs.resolve-target.outputs.release_candidate }}
       PRERELEASE_CHANNEL: ${{ needs.resolve-target.outputs.prerelease_channel }}
       ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
+      MACOS_SELECTED: ${{ needs.select-targets.outputs.macos_selected }}
     steps:
       - name: Checkout immutable verification code
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
@@ -556,6 +851,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           mkdir -p canary-assets
+          test -z "$(find artifacts -mindepth 1 -maxdepth 1 -type d -name 'raw-release-*' -print -quit)"
           primaries=(artifacts/release-"$PACKAGE_LABEL"-*-primary-"$TARGET_SHA")
           test "${#primaries[@]}" -gt 0
           for primary in "${primaries[@]}"; do
@@ -579,24 +875,34 @@ jobs:
             echo "source_commit=$TARGET_SHA"
             echo "workflow_run_id=$GITHUB_RUN_ID"
             echo 'signed=false'
+            echo 'developer_id_signed=false'
+            echo "macos_adhoc_signed=$MACOS_SELECTED"
             echo 'notarized=false'
             echo 'published=false'
             echo
             echo "These exact-SHA $PRERELEASE_CHANNEL artifacts are for controlled canary testing only."
-            echo 'They are not signed, notarized, tagged, or published as a production release.'
+            echo 'They are not release-signed, Developer-ID signed, notarized, tagged, or published as a production release.'
+            if [[ "$MACOS_SELECTED" == true ]]; then
+              echo 'The macOS app bundles have deterministic ad-hoc launch signatures only; they carry no developer identity and are not notarized.'
+            fi
             echo 'Verify the unsigned SHA256 manifest before testing.'
           } > "$marker"
 
           manifest="canary-assets/$ASSET_PREFIX-MANIFEST-UNSIGNED.json"
-          python3 ci/release/generate_canary_manifest.py \
-            --artifacts canary-assets \
-            --package-label "$PACKAGE_LABEL" \
-            --source-version "$VERSION" \
-            --configured-version "$CONFIGURED_VERSION" \
-            --source-sha "$TARGET_SHA" \
-            --release-candidate "$RELEASE_CANDIDATE" \
-            --workflow-run-id "$GITHUB_RUN_ID" \
+          manifest_args=(
+            --artifacts canary-assets
+            --package-label "$PACKAGE_LABEL"
+            --source-version "$VERSION"
+            --configured-version "$CONFIGURED_VERSION"
+            --source-sha "$TARGET_SHA"
+            --release-candidate "$RELEASE_CANDIDATE"
+            --workflow-run-id "$GITHUB_RUN_ID"
             --output "$manifest"
+          )
+          if [[ "$MACOS_SELECTED" == true ]]; then
+            manifest_args+=(--macos-adhoc-signed)
+          fi
+          python3 ci/release/generate_canary_manifest.py "${manifest_args[@]}"
 
           sums="canary-assets/$ASSET_PREFIX-SHA256SUMS-UNSIGNED.txt"
           sums_name=$(basename "$sums")

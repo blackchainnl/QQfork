@@ -1290,7 +1290,10 @@ class ReleaseToolTests(unittest.TestCase):
                 "configured_version=30.1.1rc1\n"
                 f"source_commit={SOURCE_SHA}\n"
                 "workflow_run_id=12345\n"
-                "signed=false\nnotarized=false\npublished=false\n",
+                "signed=false\n"
+                "developer_id_signed=false\n"
+                "macos_adhoc_signed=false\n"
+                "notarized=false\npublished=false\n",
                 encoding="utf-8",
             )
             output = artifacts / f"{prefix}MANIFEST-UNSIGNED.json"
@@ -1311,6 +1314,8 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertEqual(manifest["prerelease_channel"], "alpha")
             self.assertEqual(manifest["source"]["commit"], SOURCE_SHA)
             self.assertFalse(manifest["release"]["signed"])
+            self.assertFalse(manifest["release"]["developer_id_signed"])
+            self.assertFalse(manifest["release"]["macos_adhoc_signed"])
             self.assertFalse(manifest["release"]["published"])
             self.assertTrue(output.is_file())
             self.assertTrue(
@@ -1339,7 +1344,10 @@ class ReleaseToolTests(unittest.TestCase):
                 "configured_version=30.1.1rc1\n"
                 f"source_commit={SOURCE_SHA}\n"
                 "workflow_run_id=12345\n"
-                "signed=false\nnotarized=false\npublished=false\n",
+                "signed=false\n"
+                "developer_id_signed=false\n"
+                "macos_adhoc_signed=false\n"
+                "notarized=false\npublished=false\n",
                 encoding="utf-8",
             )
             output = artifacts / f"{prefix}MANIFEST-UNSIGNED.json"
@@ -1379,7 +1387,10 @@ class ReleaseToolTests(unittest.TestCase):
                 "configured_version=30.1.1rc1\n"
                 f"source_commit={SOURCE_SHA}\n"
                 "workflow_run_id=12345\n"
-                "signed=false\nnotarized=false\npublished=false\n",
+                "signed=false\n"
+                "developer_id_signed=false\n"
+                "macos_adhoc_signed=true\n"
+                "notarized=false\npublished=false\n",
                 encoding="utf-8",
             )
             output = artifacts / f"{prefix}MANIFEST-UNSIGNED.json"
@@ -1393,11 +1404,14 @@ class ReleaseToolTests(unittest.TestCase):
                 release_candidate="1",
                 workflow_run_id="12345",
                 output=output,
+                macos_adhoc_signed=True,
             )
 
             self.assertEqual(manifest["package_label"], package_label)
             self.assertEqual(manifest["prerelease_channel"], "beta")
             self.assertEqual(manifest["source"]["commit"], SOURCE_SHA)
+            self.assertFalse(manifest["release"]["developer_id_signed"])
+            self.assertTrue(manifest["release"]["macos_adhoc_signed"])
             self.assertFalse(manifest["release"]["published"])
 
     def test_prerelease_workflow_keeps_the_signed_production_gate_separate(self):
@@ -1421,6 +1435,11 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertNotIn("- 'v30.1.1-alpha", workflow)
         self.assertNotIn("- 'v30.1.1-beta", workflow)
         self.assertIn("UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE", workflow)
+        self.assertIn("raw-release-${{ needs.resolve-target.outputs.package_label }}", workflow)
+        self.assertIn("macos-15-intel", workflow)
+        self.assertIn("codesign --force --deep --sign - --timestamp=none", workflow)
+        self.assertIn("macos_adhoc_signed=$MACOS_SELECTED", workflow)
+        self.assertIn("Developer-ID sign and notarize macOS artifacts", workflow)
 
     def test_reproducibility_requires_identical_bytes(self):
         verifier = load_module("verify_reproducible")
