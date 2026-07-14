@@ -21,12 +21,24 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
 
     @staticmethod
     def assert_public_inventory(inventory):
+        WalletQuantumKeySafetyTest.assert_no_private_fields(inventory)
         assert_equal(inventory["total"], len(inventory["keys"]))
         for key in inventory["keys"]:
             assert "private_key" not in key
             assert key["stored_in_wallet"]
             assert key["public_key"]
             assert key["address"]
+
+    @staticmethod
+    def assert_no_private_fields(value):
+        """Normal quantum RPC results must contain public metadata only."""
+        if isinstance(value, dict):
+            for field, child in value.items():
+                assert "private" not in field.lower()
+                WalletQuantumKeySafetyTest.assert_no_private_fields(child)
+        elif isinstance(value, list):
+            for child in value:
+                WalletQuantumKeySafetyTest.assert_no_private_fields(child)
 
     def run_test(self):
         node = self.nodes[0]
@@ -35,6 +47,7 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
 
         self.log.info("Raw private-key RPCs are disabled by default")
         first = wallet.getnewquantumaddress("first")
+        self.assert_no_private_fields(first)
         assert first["stored_in_wallet"]
         assert not first["backup_verified"]
         assert_raises_rpc_error(-2, "disabled by default", node.createquantumkey)
@@ -45,6 +58,28 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert_equal(inventory["total"], 1)
         assert_equal(inventory["backup_verified"], 0)
         assert not inventory["all_backed_up"]
+
+        self.log.info("The PoW miner selects only a durably stored wallet payout key")
+        pow_wallet_name = "quantum_pow_payout_safety"
+        node.createwallet(
+            wallet_name=pow_wallet_name,
+            descriptors=self.options.descriptors,
+            load_on_startup=True,
+        )
+        pow_wallet = node.get_wallet_rpc(pow_wallet_name)
+        pow_result = pow_wallet.setpowmining(True, 1, 1)
+        self.assert_no_private_fields(pow_result)
+        assert pow_result["enabled"]
+        assert pow_result["warning"]
+        pow_payout = pow_result["payout_address"]
+        assert pow_payout
+        pow_wallet.setpowmining(False)
+
+        pow_inventory = pow_wallet.getquantumkeyinventory()
+        self.assert_public_inventory(pow_inventory)
+        assert_equal(pow_inventory["total"], 1)
+        assert pow_inventory["all_durably_stored"]
+        assert_equal(pow_inventory["keys"][0]["address"], pow_payout)
 
         self.log.info("A directory backup is reopened, challenged, and marked complete")
         first_backup_dir = node.datadir_path / "quantum-first-backup"
@@ -60,6 +95,7 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
 
         self.log.info("A key created later is not covered by the earlier backup")
         second = wallet.getnewquantumaddress("second")
+        self.assert_no_private_fields(second)
         inventory = wallet.getquantumkeyinventory()
         self.assert_public_inventory(inventory)
         assert_equal(inventory["total"], 2)
@@ -97,18 +133,26 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         known_good = current_backup.read_bytes()
         assert_raises_rpc_error(-4, "Unlock this wallet", wallet.backupwallet, current_backup)
         assert_equal(current_backup.read_bytes(), known_good)
+        locked_key_count = wallet.getquantumkeyinventory()["total"]
+        assert_raises_rpc_error(-4, "requires an unlocked wallet", wallet.setpowmining, True, 1, 1)
+        assert_equal(wallet.getquantumkeyinventory()["total"], locked_key_count)
 
         self.log.info("The explicit unsafe gate still requires a normal, non-staking-only unlock")
-        self.restart_node(0, ["-allowunsafequantumkeyrpc=1"])
+        self.restart_node(0, ["-allowunsafequantumkeyrpc=1", "-debug=rpc"])
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(wallet_name)
+        private_material = []
         raw = node.createquantumkey()
         assert not raw["stored_in_wallet"]
         assert raw["private_key"]
+        private_material.append(raw["private_key"])
 
         wallet.walletpassphrase(passphrase, 100, True)
         assert_raises_rpc_error(-13, "staking only", wallet.dumpquantumkey, first["address"])
         assert_raises_rpc_error(-13, "staking only", wallet.getnewquantumaddress, "blocked")
+        staking_only_key_count = wallet.getquantumkeyinventory()["total"]
+        assert_raises_rpc_error(-4, "normal wallet unlock", wallet.setpowmining, True, 1, 1)
+        assert_equal(wallet.getquantumkeyinventory()["total"], staking_only_key_count)
 
         # Verification is internal and does not disclose or create a key, so a
         # staking-only unlock may still produce a complete checked backup.
@@ -117,6 +161,7 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         dumped = wallet.dumpquantumkey(first["address"])
         assert_equal(dumped["address"], first["address"])
         assert dumped["private_key"]
+        private_material.append(dumped["private_key"])
 
         imported = wallet.importquantumkey(
             raw["public_key"],
@@ -127,21 +172,26 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert_equal(imported["address"], raw["address"])
         assert imported["stored_in_wallet"]
         assert not imported["backup_verified"]
+        self.assert_no_private_fields(imported)
         imported_inventory = wallet.getquantumkeyinventory()
         assert_equal(imported_inventory["total"], 3)
         assert_equal(imported_inventory["backup_unverified"], 1)
 
         third = wallet.getnewquantumaddress("third")
+        self.assert_no_private_fields(third)
         inventory = wallet.getquantumkeyinventory()
         assert_equal(inventory["total"], 4)
         assert_equal(inventory["backup_unverified"], 2)
         assert not inventory["all_backed_up"]
         wallet.backupwallet(current_backup)
         assert wallet.getquantumkeyinventory()["all_backed_up"]
-        assert third["address"] in {entry["address"] for entry in wallet.listquantumaddresses()}
+        listed_addresses = wallet.listquantumaddresses()
+        self.assert_no_private_fields(listed_addresses)
+        assert third["address"] in {entry["address"] for entry in listed_addresses}
 
         self.log.info("A key returned to RPC survives an immediate ungraceful process stop")
         crash_key = wallet.getnewquantumaddress("crash-after-return")
+        self.assert_no_private_fields(crash_key)
         node.process.kill()
         node.process.wait(timeout=node.rpc_timeout)
         node.stdout.close()
@@ -151,7 +201,7 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         node.rpc_connected = False
         node.rpc = None
 
-        self.start_node(0, ["-allowunsafequantumkeyrpc=1"])
+        self.start_node(0, ["-allowunsafequantumkeyrpc=1", "-debug=rpc"])
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(wallet_name)
         crash_inventory = wallet.getquantumkeyinventory()
@@ -159,9 +209,31 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert_equal(crash_inventory["backup_unverified"], 1)
         assert crash_key["address"] in {entry["address"] for entry in crash_inventory["keys"]}
         wallet.walletpassphrase(passphrase, 100, False)
-        assert_equal(wallet.dumpquantumkey(crash_key["address"])["address"], crash_key["address"])
+        crash_dump = wallet.dumpquantumkey(crash_key["address"])
+        assert_equal(crash_dump["address"], crash_key["address"])
+        private_material.append(crash_dump["private_key"])
         wallet.backupwallet(current_backup)
         assert wallet.getquantumkeyinventory()["all_backed_up"]
+
+        self.log.info("The PoW payout survives a crash and is reused only with its durable key")
+        if pow_wallet_name not in node.listwallets():
+            node.loadwallet(pow_wallet_name)
+        pow_wallet = node.get_wallet_rpc(pow_wallet_name)
+        pow_inventory = pow_wallet.getquantumkeyinventory()
+        self.assert_public_inventory(pow_inventory)
+        assert_equal(pow_inventory["total"], 1)
+        assert pow_inventory["all_durably_stored"]
+        assert_equal(pow_inventory["keys"][0]["address"], pow_payout)
+        pow_result = pow_wallet.setpowmining(True, 1, 1)
+        self.assert_no_private_fields(pow_result)
+        assert_equal(pow_result["payout_address"], pow_payout)
+        assert "warning" not in pow_result
+        pow_wallet.setpowmining(False)
+
+        self.log.info("Private key material is absent from the daemon log, including RPC debug logging")
+        debug_log = node.debug_log_path.read_text(encoding="utf8", errors="replace")
+        if any(secret in debug_log for secret in private_material):
+            raise AssertionError("Private quantum key material was written to debug.log")
 
 
 if __name__ == "__main__":
