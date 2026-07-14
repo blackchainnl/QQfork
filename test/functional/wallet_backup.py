@@ -265,7 +265,12 @@ class WalletBackupTest(BitcoinTestFramework):
             os.path.join(self.nodes[0].wallets_path)]
 
         for sourcePath in sourcePaths:
-            assert_raises_rpc_error(-4, "backup failed", self.nodes[0].backupwallet, sourcePath)
+            assert_raises_rpc_error(
+                -4,
+                "Cannot back up a wallet onto its active database file",
+                self.nodes[0].backupwallet,
+                sourcePath,
+            )
 
 
 if __name__ == '__main__':
