@@ -224,39 +224,47 @@ class FullBlockTest(BitcoinTestFramework):
         #     genesis -> b1 (0) -> b2 (1) -> b5 (2) -> b6 (3)
         #                                                    \-> b9 (4)
         #                      \-> b3 (1) -> b4 (2)
-        self.log.info("Reject a block where the miner creates too much coinbase reward")
+        self.log.info("Reject a Gold Rush block claiming one satoshi above the legacy two-fee allowance")
         self.move_tip(6)
-        # Before quantum-spend activation, Blackcoin consensus preserves the
-        # legacy client's second fee allowance. next_block() already claims
-        # the first fee, so add the fee plus one satoshi to exceed the actual
-        # consensus limit by exactly one satoshi.
-        b9 = self.next_block(9, spend=out[4], additional_coinbase_value=out[4].vout[0].nValue)
-        self.send_blocks([b9], success=False, reject_reason='bad-cb-amount', reconnect=True)
+        b9 = self.next_block(
+            9,
+            spend=out[4],
+            additional_coinbase_value=self.gold_rush_fee_allowance(out[4]) + 1,
+        )
+        self.send_blocks([b9], success=False, reject_reason='bad-cb-amount', reconnect=True, timeout=10)
 
         # Create a fork that ends in a block with too much fee (the one that causes the reorg)
         #     genesis -> b1 (0) -> b2 (1) -> b5 (2) -> b6  (3)
         #                                          \-> b10 (3) -> b11 (4)
         #                      \-> b3 (1) -> b4 (2)
-        self.log.info("Reject a chain where the miner creates too much coinbase reward, even if the chain is longer")
+        self.log.info("Reject a longer Gold Rush chain claiming above the legacy two-fee allowance")
         self.move_tip(5)
         b10 = self.next_block(10, spend=out[3])
         self.send_blocks([b10], False)
 
-        b11 = self.next_block(11, spend=out[4], additional_coinbase_value=out[4].vout[0].nValue)
-        self.send_blocks([b11], success=False, reject_reason='bad-cb-amount', reconnect=True)
+        b11 = self.next_block(
+            11,
+            spend=out[4],
+            additional_coinbase_value=self.gold_rush_fee_allowance(out[4]) + 1,
+        )
+        self.send_blocks([b11], success=False, reject_reason='bad-cb-amount', reconnect=True, timeout=10)
 
         # Try again, but with a valid fork first
         #     genesis -> b1 (0) -> b2 (1) -> b5 (2) -> b6  (3)
         #                                          \-> b12 (3) -> b13 (4) -> b14 (5)
         #                      \-> b3 (1) -> b4 (2)
-        self.log.info("Reject a chain where the miner creates too much coinbase reward, even if the chain is longer (on a forked chain)")
+        self.log.info("Reject a longer fork claiming above the Gold Rush legacy two-fee allowance")
         self.move_tip(5)
         b12 = self.next_block(12, spend=out[3])
         self.save_spendable_output()
         b13 = self.next_block(13, spend=out[4])
         self.save_spendable_output()
-        b14 = self.next_block(14, spend=out[5], additional_coinbase_value=out[5].vout[0].nValue)
-        self.send_blocks([b12, b13, b14], success=False, reject_reason='bad-cb-amount', reconnect=True)
+        b14 = self.next_block(
+            14,
+            spend=out[5],
+            additional_coinbase_value=self.gold_rush_fee_allowance(out[5]) + 1,
+        )
+        self.send_blocks([b12, b13, b14], success=False, reject_reason='bad-cb-amount', reconnect=True, timeout=10)
 
         # New tip should be b13.
         assert_equal(node.getbestblockhash(), b13.hash)
@@ -974,19 +982,21 @@ class FullBlockTest(BitcoinTestFramework):
         # -> b64 (18) -> b65 (19) -> b69 (20)
         #                        \-> b68 (20)
         #
-        # b68 - coinbase claims one satoshi more than the legacy double-fee
-        #       allowance. This fails because the coinbase is trying to claim
-        #       1 satoshi too much in fees.
+        # During Gold Rush, legacy compatibility preserves the designated
+        # client's effective two-fee allowance for ordinary transactions.
         #
-        # b69 - coinbase claims exactly the legacy double-fee allowance.
-        #       This succeeds.
+        # b68 - coinbase claims one satoshi more than twice the transaction fee.
+        #       this fails because the coinbase exceeds the compatibility ceiling
+        #
+        # b69 - coinbase claims exactly twice the transaction fee.
+        #       this succeeds
         #
         self.log.info("Reject a block trying to claim too much subsidy in the coinbase transaction")
         self.move_tip(65)
         self.next_block(68, additional_coinbase_value=2 * MIN_BLOCK_TX_FEE + 1)
         tx = self.create_and_sign_transaction(out[20], out[20].vout[0].nValue - MIN_BLOCK_TX_FEE)
         b68 = self.update_block(68, [tx])
-        self.send_blocks([b68], success=False, reject_reason='bad-cb-amount', reconnect=True)
+        self.send_blocks([b68], success=False, reject_reason='bad-cb-amount', reconnect=True, timeout=10)
 
         self.log.info("Accept a block claiming the correct subsidy in the coinbase transaction")
         self.move_tip(65)
@@ -1369,6 +1379,17 @@ class FullBlockTest(BitcoinTestFramework):
         if vsize <= 100:
             return MIN_TX_FEE
         return (TX_FEE_PER_KB * vsize + 999) // 1000
+
+    @staticmethod
+    def gold_rush_fee_allowance(spend):
+        """Return the extra ordinary fee allowed by the legacy Gold Rush rule.
+
+        next_block() already credits the transaction's fee to the coinbase once.
+        Before quantum-spend activation, the designated legacy implementation
+        credits the same ordinary fee a second time. Adding this amount reaches
+        that compatibility ceiling; adding one satoshi must be rejected.
+        """
+        return spend.vout[0].nValue - 1
 
     def submit_blocks_rpc(self, blocks, expected_tip):
         best_time = self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"]
