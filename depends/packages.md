@@ -38,6 +38,10 @@ These variables are optional:
     stored locally. This can be used to avoid storing file-names with strange
     characters.
 
+    $(package)_fallback_download_path:
+    Alternative location of the upstream source, tried before the global
+    FALLBACK_DOWNLOAD_PATH.
+
     $(package)_dependencies:
     Names of any other packages that this one depends on.
 
