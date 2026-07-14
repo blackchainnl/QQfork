@@ -5,6 +5,7 @@
 #include <addresstype.h>
 #include <coins.h>
 #include <consensus/amount.h>
+#include <consensus/consensus.h>
 #include <crypto/common.h>
 #include <chain.h>
 #include <consensus/params.h>
@@ -102,6 +103,15 @@ COutPoint PoolOutpointForTest()
 {
     CHashWriter ss;
     ss << std::string("Quantum Quasar Shadow Pool") << std::vector<unsigned char>{};
+    return COutPoint{ss.GetHash(), 0};
+}
+
+COutPoint ClaimOutpointForTest(int height, const uint256& block_hash,
+                               uint32_t marker_index)
+{
+    CHashWriter ss;
+    ss << std::string("Quantum Quasar Shadow Claim") << height << block_hash
+       << marker_index;
     return COutPoint{ss.GetHash(), 0};
 }
 
@@ -333,6 +343,39 @@ bool UndoShadowAndRewind(CCoinsViewCache& view, const CBlock& block,
 #define ApplyShadowBlock ApplyShadowAndCheckpoint
 #define UndoShadowBlock UndoShadowAndRewind
 
+BOOST_AUTO_TEST_CASE(synthetic_claim_limit_preserves_history_and_tightens_at_activation)
+{
+    const Consensus::Params& mainnet = Params().GetConsensus();
+    BOOST_REQUIRE_EQUAL(mainnet.nShadowCompetingClaimsActivationHeight,
+                        MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT);
+    BOOST_CHECK_EQUAL(GetShadowSyntheticClaimLimit(
+                          mainnet,
+                          MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT - 1,
+                          687),
+                      (V4_MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT) + 2);
+    BOOST_CHECK_EQUAL(GetShadowSyntheticClaimLimit(
+                          mainnet,
+                          MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT,
+                          687),
+                      751U);
+
+    Consensus::Params consensus = mainnet;
+    consensus.nShadowCompetingClaimsActivationHeight = 100;
+    static constexpr uint32_t legacy_limit =
+        (V4_MAX_BLOCK_WEIGHT / MIN_TRANSACTION_WEIGHT) + 2;
+
+    BOOST_CHECK_EQUAL(GetShadowSyntheticClaimLimit(consensus, 99, 687),
+                      legacy_limit);
+    BOOST_CHECK_EQUAL(GetShadowSyntheticClaimLimit(consensus, 100, 687),
+                      751U);
+    BOOST_CHECK_EQUAL(GetShadowSyntheticClaimLimit(consensus, 100, 0),
+                      MAX_SHADOW_POW_EVALS_PER_BLOCK);
+    BOOST_CHECK_EQUAL(GetShadowSyntheticClaimLimit(
+                          consensus, 100,
+                          std::numeric_limits<uint32_t>::max()),
+                      legacy_limit);
+}
+
 BOOST_AUTO_TEST_CASE(legacy_whitelist_uses_aggregate_script_balance)
 {
     CCoinsView base;
@@ -403,6 +446,76 @@ BOOST_AUTO_TEST_CASE(whitelist_snapshot_markers_have_exact_authenticatable_prove
     }
     // One member cache, one manifest, one manifest shard, and one ready marker.
     BOOST_CHECK_EQUAL(authenticated_markers, 4U);
+}
+
+BOOST_AUTO_TEST_CASE(user_marker_lookalikes_are_never_authenticated_or_purged)
+{
+    CCoinsView base;
+    CCoinsViewCache view{&base, true};
+
+    uint256 tip_hash;
+    CBlockIndex tip;
+    InitIndex(tip, SHADOW_REWARD_START_HEIGHT, nullptr, tip_hash);
+
+    const std::vector<std::vector<unsigned char>> marker_tags{
+        {'Q', 'Q', 'W', 'L'},
+        {'Q', 'Q', 'W', 'L', 'R', 'E', 'A', 'D', 'Y'},
+        {'Q', 'Q', 'W', 'L', 'M', 'A', 'N'},
+        {'Q', 'Q', 'W', 'L', 'S', 'H'},
+        {'Q', 'Q', 'P', 'O', 'O', 'L'},
+        {'Q', 'Q', 'P', 'U', 'N', 'D'},
+        {'Q', 'Q', 'D', 'C', 'L', 'A', 'I', 'M'},
+        {'Q', 'Q', 'G', 'R', 'P', 'A', 'Y'},
+        {'Q', 'Q', 'G', 'R', 'S', 'P', 'E', 'N', 'T'},
+        {'Q', 'Q', 'G', 'R', 'I', 'N', 'V'},
+        {'Q', 'Q', 'S', 'O', 'L', 'V', 'E'},
+        {'Q', 'Q', 'A', 'S', 'I', 'G'},
+        {'Q', 'Q', 'A', 'S', 'E', 'T'},
+        {'Q', 'Q', 'A', 'S', 'H', 'D'},
+        {'Q', 'Q', 'A', 'U', 'N', 'D'},
+        {'Q', 'Q', 'A', 'U', 'S', 'H'},
+        {'Q', 'Q', 'R', 'E', 'P', 'L', 'A', 'Y'},
+    };
+    std::vector<COutPoint> lookalikes;
+    for (const auto& tag : marker_tags) {
+        for (uint32_t i = 0; i < 64; ++i) {
+            CHashWriter key;
+            key << std::string("ordinary user marker lookalike") << tag << i;
+            const COutPoint outpoint{key.GetHash(), 0};
+            Coin coin;
+            coin.out.nValue = 0;
+            coin.out.scriptPubKey = CScript{} << OP_FALSE << OP_RETURN << tag
+                                             << std::vector<unsigned char>{
+                                                    static_cast<unsigned char>(i)};
+            coin.fCoinBase = false;
+            coin.fCoinStake = false;
+            coin.nHeight = tip.nHeight;
+            coin.nTime = tip.GetBlockTime();
+            BOOST_REQUIRE(IsShadowMarkerScript(coin.out.scriptPubKey));
+            BOOST_CHECK(!IsAuthenticatedShadowMarkerOutpoint(outpoint, coin,
+                                                               &tip));
+            view.AddCoin(outpoint, std::move(coin), false);
+            lookalikes.push_back(outpoint);
+        }
+    }
+
+    const ShadowBlockReader empty_block_reader =
+        [](const CBlockIndex&, CBlock& block) {
+            block = CBlock{};
+            return true;
+        };
+    std::set<COutPoint> authenticated;
+    BOOST_REQUIRE(CollectAuthenticatedShadowStateOutpoints(
+        view, &tip, empty_block_reader, authenticated));
+    BOOST_CHECK(authenticated.empty());
+
+    uint64_t removed{0};
+    BOOST_REQUIRE(PurgeAuthenticatedShadowState(
+        view, &tip, empty_block_reader, removed));
+    BOOST_CHECK_EQUAL(removed, 0U);
+    for (const COutPoint& outpoint : lookalikes) {
+        BOOST_CHECK(view.HaveCoin(outpoint));
+    }
 }
 
 BOOST_AUTO_TEST_CASE(legacy_whitelist_canonicalizes_p2pk_stake_outputs)
@@ -648,6 +761,24 @@ BOOST_AUTO_TEST_CASE(pos_shadow_signal_v2_records_fee_paying_quantum_ledger_cred
     BOOST_REQUIRE_EQUAL(synthetic_payouts[0]->vout.size(), 1U);
     BOOST_CHECK_EQUAL(synthetic_payouts[0]->vout[0].nValue, 580 * COIN);
     BOOST_CHECK(synthetic_payouts[0]->vout[0].scriptPubKey == quantum_payout);
+
+    // A claim-shaped coin at the next deterministic index is not authority
+    // to extend the block's synthetic claim set. Enumeration is anchored to
+    // the authenticated QQPUND count and claims hash.
+    Coin authentic_claim;
+    BOOST_REQUIRE(view.GetCoin(ClaimOutpointForTest(
+        reward_index.nHeight, reward_index.GetBlockHash(), 0),
+        authentic_claim));
+    const COutPoint fake_next_claim = ClaimOutpointForTest(
+        reward_index.nHeight, reward_index.GetBlockHash(), 1);
+    view.AddCoin(fake_next_claim, Coin{authentic_claim}, true);
+    const std::vector<ShadowSyntheticPayoutTransaction> bounded_payouts =
+        GetAppliedShadowClaimPayoutTransactionRecords(
+            view, reward_index.nHeight, reward_index.GetBlockHash(),
+            reward_index.GetBlockTime());
+    BOOST_REQUIRE_EQUAL(bounded_payouts.size(), 1U);
+    BOOST_REQUIRE(view.SpendCoin(fake_next_claim));
+
     Coin synthetic_coin;
     BOOST_CHECK(view.GetCoin(COutPoint{synthetic_payouts[0]->GetHash(), 0}, synthetic_coin));
     BOOST_CHECK_EQUAL(synthetic_coin.out.nValue, 580 * COIN);
