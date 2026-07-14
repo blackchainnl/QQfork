@@ -6655,6 +6655,16 @@ bool CWallet::BackupWallet(const std::string& strDest, bilingual_str* error_out,
     fs::path backup_path = fs::PathFromString(strDest);
     try {
         if (fs::is_directory(backup_path)) {
+            // A backup placed directly in the configured wallet directory is
+            // discoverable as another live wallet. Apart from preserving the
+            // established backupwallet contract, refusing that destination
+            // prevents the verified copy from being opened and modified as a
+            // second wallet instance.
+            if (fs::equivalent(backup_path, GetWalletDir())) {
+                local_error = _("Cannot back up a wallet onto its active database file");
+                if (error_out) *error_out = local_error;
+                return false;
+            }
             backup_path /= fs::PathFromString(GetDatabase().Filename()).filename();
         }
         for (const fs::path& source_path : GetDatabase().Files()) {
