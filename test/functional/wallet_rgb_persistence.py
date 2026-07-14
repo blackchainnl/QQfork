@@ -2,9 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Exercise wallet persistence for imported RGB and EUTXO state metadata."""
-
-from decimal import Decimal
+"""Exercise wallet persistence for RGB metadata and EUTXO fail-closed policy."""
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
@@ -22,31 +20,7 @@ class WalletRGBPersistenceTest(BitcoinTestFramework):
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
 
-    def _funded_eutxo_commitment(self, node, datum, validator):
-        mining_address = node.getnewaddress("", "legacy")
-        block_hashes = self.generatetoaddress(node, 101, mining_address, sync_fun=self.no_op)
-        coinbase_txid = node.getblock(block_hashes[0])["tx"][0]
-        coinbase = node.getrawtransaction(coinbase_txid, True, block_hashes[0])
-        coinbase_value = Decimal(str(coinbase["vout"][0]["value"]))
-        amount = coinbase_value - Decimal("0.001")
-
-        raw = node.createrawtransaction(
-            [{"txid": coinbase_txid, "vout": 0}],
-            [{"eutxo": {"amount": amount, "datum": datum, "validator": validator}}],
-        )
-        signed = node.signrawtransactionwithwallet(
-            raw,
-            [{"txid": coinbase_txid, "vout": 0, "scriptPubKey": coinbase["vout"][0]["scriptPubKey"]["hex"], "amount": coinbase_value}],
-        )
-        assert_equal(signed["complete"], True)
-        accepted = node.testmempoolaccept([signed["hex"]])[0]
-        if not accepted["allowed"]:
-            raise AssertionError(f"EUTXO funding transaction rejected: {accepted}")
-        txid = node.sendrawtransaction(signed["hex"])
-        self.generatetoaddress(node, 1, mining_address, sync_fun=self.no_op)
-        return txid, amount
-
-    def _assert_wallet_state(self, node, contract_id, assignment_txid, eutxo_txid, eutxo_amount):
+    def _assert_wallet_state(self, node, contract_id, assignment_txid):
         assets = node.listrgbassets()
         assert_equal(len(assets), 1)
         assert_equal(assets[0]["contract_id"], contract_id)
@@ -62,25 +36,7 @@ class WalletRGBPersistenceTest(BitcoinTestFramework):
         assert_equal(assets[0]["assignments"][0]["amount"], 1000)
         assert_equal(assets[0]["assignments"][0]["spent"], False)
 
-        states = node.listeutxostates()
-        assert_equal(len(states), 1)
-        assert_equal(states[0]["txid"], eutxo_txid)
-        assert_equal(states[0]["vout"], 0)
-        assert_equal(Decimal(str(states[0]["amount"])), eutxo_amount)
-        assert_equal(states[0]["datum"], "01")
-        assert_equal(states[0]["validator"], "52885187")
-        assert_equal(states[0]["spent"], False)
-
-    def _assert_spent_eutxo_state(self, node, eutxo_txid, eutxo_amount):
         assert_equal(node.listeutxostates(), [])
-        states = node.listeutxostates(True)
-        assert_equal(len(states), 1)
-        assert_equal(states[0]["txid"], eutxo_txid)
-        assert_equal(states[0]["vout"], 0)
-        assert_equal(Decimal(str(states[0]["amount"])), eutxo_amount)
-        assert_equal(states[0]["datum"], "01")
-        assert_equal(states[0]["validator"], "52885187")
-        assert_equal(states[0]["spent"], True)
 
     def run_test(self):
         node = self.nodes[0]
@@ -137,52 +93,20 @@ class WalletRGBPersistenceTest(BitcoinTestFramework):
             },
         )
 
-        self.log.info("Importing live EUTXO state metadata")
-        eutxo_txid, eutxo_amount = self._funded_eutxo_commitment(node, datum="01", validator="52885187")
+        self.log.info("Rejecting EUTXO v15 construction without quantum ownership authorization")
         assert_raises_rpc_error(
-            -26,
-            "Live UTXO does not match supplied EUTXO state metadata",
-            node.importeutxostate,
-            {
-                "txid": eutxo_txid,
-                "vout": 0,
-                "amount": eutxo_amount,
-                "datum": "02",
-                "validator": "52885187",
-            },
+            -8,
+            "EUTXO v15 is disabled in v30.1.1 because it has no quantum ownership authorization",
+            node.createrawtransaction,
+            [],
+            [{"eutxo": {"amount": 1, "datum": "01", "validator": "52885187"}}],
         )
-        imported_state = node.importeutxostate({
-            "txid": eutxo_txid,
-            "vout": 0,
-            "amount": eutxo_amount,
-            "datum": "01",
-            "validator": "52885187",
-            "timestamp": 125,
-        })
-        assert_equal(imported_state["txid"], eutxo_txid)
-        self._assert_wallet_state(node, contract_id, assignment_txid, eutxo_txid, eutxo_amount)
+        self._assert_wallet_state(node, contract_id, assignment_txid)
 
-        self.log.info("Restarting node and verifying wallet metadata reload")
+        self.log.info("Restarting node and verifying RGB wallet metadata reload")
         self.restart_node(0, extra_args=self.extra_args[0])
         node = self.nodes[0]
-        self._assert_wallet_state(node, contract_id, assignment_txid, eutxo_txid, eutxo_amount)
-
-        self.log.info("Spending imported EUTXO state and verifying list reconciliation")
-        node.setmocktime(node.getblockheader(node.getbestblockhash())["time"] + 1)
-        spend_amount = eutxo_amount - Decimal("0.001")
-        spend = node.createeutxospend(
-            {"txid": eutxo_txid, "vout": 0, "datum": "01", "validator": "52885187", "redeemer": "02"},
-            [{node.getnewaddress(): spend_amount}],
-        )
-        accepted = node.testmempoolaccept([spend["hex"]])[0]
-        if not accepted["allowed"]:
-            raise AssertionError(f"EUTXO state spend rejected: {accepted}")
-        node.sendrawtransaction(spend["hex"])
-        self.generatetoaddress(node, 1, node.getnewaddress(), sync_fun=self.no_op)
-        self._assert_spent_eutxo_state(node, eutxo_txid, eutxo_amount)
-
-        self.restart_node(0, extra_args=self.extra_args[0])
-        self._assert_spent_eutxo_state(self.nodes[0], eutxo_txid, eutxo_amount)
+        self._assert_wallet_state(node, contract_id, assignment_txid)
 
 
 if __name__ == "__main__":
