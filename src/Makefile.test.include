@@ -178,6 +178,7 @@ BITCOIN_TESTS =\
   test/validation_flush_tests.cpp \
   test/validation_tests.cpp \
   test/validationinterface_tests.cpp \
+  test/v2_block_time_tests.cpp \
   test/versionbits_tests.cpp \
   test/xoroshiro128plusplus_tests.cpp
 
