@@ -78,6 +78,10 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     updateStakeWeight(true),
     worker(0)
 {
+    // Establish the GUI-thread cache before any view is attached. Later
+    // keystore notifications update it in updateStatus(). Timer-driven views
+    // read this cache instead of entering cs_wallet themselves.
+    cachedEncryptionStatus.store(getEncryptionStatus(), std::memory_order_release);
     fHaveWatchOnly = m_wallet->haveWatchOnly();
     addressTableModel = new AddressTableModel(this);
     transactionTableModel = new TransactionTableModel(platformStyle, this);
@@ -121,9 +125,27 @@ void WalletModel::setClientModel(ClientModel* client_model)
 
 void WalletModel::updateStatus()
 {
-    EncryptionStatus newEncryptionStatus = getEncryptionStatus();
+    interfaces::WalletEncryptionStatus status;
+    if (!m_wallet->tryGetEncryptionStatus(status)) {
+        // Keystore notifications can race with QQSIGNAL signing. Never wait
+        // for cs_wallet on the Qt thread; coalesce retries until the signer
+        // releases it instead.
+        if (!m_status_update_retry_scheduled) {
+            m_status_update_retry_scheduled = true;
+            QTimer::singleShot(50, this, [this] {
+                m_status_update_retry_scheduled = false;
+                updateStatus();
+            });
+        }
+        return;
+    }
 
-    if(cachedEncryptionStatus != newEncryptionStatus) {
+    const EncryptionStatus newEncryptionStatus = !status.encrypted
+        ? (status.private_keys_disabled ? NoKeys : Unencrypted)
+        : (status.locked ? Locked : Unlocked);
+
+    if (cachedEncryptionStatus.load(std::memory_order_acquire) != newEncryptionStatus) {
+        cachedEncryptionStatus.store(newEncryptionStatus, std::memory_order_release);
         Q_EMIT encryptionStatusChanged();
     }
 }

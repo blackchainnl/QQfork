@@ -85,6 +85,14 @@ public:
     RecentRequestsTableModel* getRecentRequestsTableModel() const;
 
     EncryptionStatus getEncryptionStatus() const;
+    /**
+     * Return the last encryption state published to the GUI thread.
+     *
+     * Unlike getEncryptionStatus(), this never enters cs_wallet. Views that
+     * refresh on a timer must use the cached value so a staking/signing pass
+     * cannot park the Qt event loop while it owns the wallet mutex.
+     */
+    EncryptionStatus getCachedEncryptionStatus() const { return cachedEncryptionStatus.load(std::memory_order_acquire); }
 
     // Check address for validity
     bool validateAddress(const QString& address) const;
@@ -195,7 +203,8 @@ private:
 
     // Cache some values to be able to detect changes
     interfaces::WalletBalances m_cached_balances;
-    EncryptionStatus cachedEncryptionStatus{Unencrypted};
+    std::atomic<EncryptionStatus> cachedEncryptionStatus{Unencrypted};
+    bool m_status_update_retry_scheduled{false};
     QTimer* timer;
 
     // Block hash denoting when the last balance update was done.

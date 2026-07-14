@@ -1807,6 +1807,15 @@ public:
     bool lock() override { return m_wallet->Lock(); }
     bool unlock(const SecureString& wallet_passphrase) override { return m_wallet->Unlock(wallet_passphrase); }
     bool isLocked() override { return m_wallet->IsLocked(); }
+    bool tryGetEncryptionStatus(interfaces::WalletEncryptionStatus& status) override
+    {
+        TRY_LOCK(m_wallet->cs_wallet, wallet_lock);
+        if (!wallet_lock) return false;
+        status.encrypted = m_wallet->IsCrypted();
+        status.locked = status.encrypted && m_wallet->IsLocked();
+        status.private_keys_disabled = m_wallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
+        return true;
+    }
     bool changeWalletPassphrase(const SecureString& old_wallet_passphrase,
         const SecureString& new_wallet_passphrase) override
     {

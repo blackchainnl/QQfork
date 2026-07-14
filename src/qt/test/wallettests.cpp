@@ -38,7 +38,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <memory>
+#include <thread>
 
 #include <QAbstractButton>
 #include <QAction>
@@ -680,6 +682,66 @@ void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, co
     QVERIFY(pow_status->text().contains(QString("Load a wallet")));
 }
 
+void TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(interfaces::Node& node, const PlatformStyle* platformStyle)
+{
+    auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-staking-heartbeat", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+
+    MiniGUI mini_gui(node, platformStyle);
+    mini_gui.initModelForWallet(node, wallet, platformStyle);
+    WalletModel& wallet_model = *mini_gui.walletModel;
+
+    // The cache is initialized before the first view heartbeat, then refreshed
+    // by every encrypt, unlock, and lock notification.
+    QCOMPARE(wallet_model.getCachedEncryptionStatus(), WalletModel::Unencrypted);
+    QVERIFY(wallet->EncryptWallet("qt-heartbeat-passphrase"));
+    QTRY_COMPARE_WITH_TIMEOUT(wallet_model.getCachedEncryptionStatus(), WalletModel::Locked, 1000);
+    QVERIFY(wallet->Unlock("qt-heartbeat-passphrase"));
+    QTRY_COMPARE_WITH_TIMEOUT(wallet_model.getCachedEncryptionStatus(), WalletModel::Unlocked, 1000);
+
+    // Cached state is display-only. Before the queued lock notification is
+    // delivered, the backend must still reject a sensitive operation by
+    // consulting the live wallet lock.
+    QVERIFY(wallet->Lock());
+    QCOMPARE(wallet_model.getCachedEncryptionStatus(), WalletModel::Unlocked);
+    std::string mining_error;
+    QVERIFY(!wallet_model.wallet().setPowMining(true, 1, 1, mining_error));
+    QVERIFY(mining_error.find("unlocked wallet") != std::string::npos);
+    QTRY_COMPARE_WITH_TIMEOUT(wallet_model.getCachedEncryptionStatus(), WalletModel::Locked, 1000);
+
+    StakingMiningPage page(platformStyle);
+    page.setClientModel(mini_gui.clientModel.get());
+    page.setWalletModel(&wallet_model);
+    page.show();
+    qApp->processEvents();
+
+    std::promise<void> mutex_held;
+    std::future<void> mutex_held_future = mutex_held.get_future();
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        mutex_held.set_value();
+        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+    });
+    mutex_held_future.wait();
+
+    QElapsedTimer status_timer;
+    status_timer.start();
+    wallet_model.updateStatus();
+    const qint64 status_elapsed_ms = status_timer.elapsed();
+
+    QElapsedTimer heartbeat_timer;
+    heartbeat_timer.start();
+    const bool invoked = QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection);
+    const qint64 heartbeat_elapsed_ms = heartbeat_timer.elapsed();
+    holder.join();
+
+    QVERIFY(invoked);
+    QVERIFY2(status_elapsed_ms < 100,
+             qPrintable(QStringLiteral("Wallet status callback waited %1 ms for cs_wallet").arg(status_elapsed_ms)));
+    QVERIFY2(heartbeat_elapsed_ms < 100,
+             qPrintable(QStringLiteral("Staking page heartbeat waited %1 ms for cs_wallet").arg(heartbeat_elapsed_ms)));
+}
+
 void TestWalletPagesScale(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
 {
     TransactionView& transaction_view = mini_gui.transactionView;
@@ -739,6 +801,7 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
     TestStakingMiningPageControls(mini_gui, platformStyle.get());
     TestWalletPagesScale(mini_gui, platformStyle.get());
     TestStakingMiningPageSurvivesWalletModelDeletion(node, wallet, platformStyle.get());
+    TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(node, platformStyle.get());
 
     // Update walletModel cached balance which will trigger an update for the 'labelBalance' QLabel.
     walletModel.pollBalanceChanged();

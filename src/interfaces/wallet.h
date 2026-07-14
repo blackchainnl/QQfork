@@ -76,6 +76,14 @@ struct WalletQuantumActionTx;
 using WalletOrderForm = std::vector<std::pair<std::string, std::string>>;
 using WalletValueMap = std::map<std::string, std::string>;
 
+/** Nonblocking wallet encryption snapshot for timer-driven user interfaces. */
+struct WalletEncryptionStatus
+{
+    bool encrypted{false};
+    bool locked{false};
+    bool private_keys_disabled{false};
+};
+
 //! Interface for accessing a wallet.
 class Wallet
 {
@@ -99,6 +107,9 @@ public:
 
     //! Return whether wallet is locked.
     virtual bool isLocked() = 0;
+
+    //! Try to read encryption state without waiting for the wallet mutex.
+    virtual bool tryGetEncryptionStatus(WalletEncryptionStatus& status) = 0;
 
     //! Change wallet passphrase.
     virtual bool changeWalletPassphrase(const SecureString& old_wallet_passphrase,

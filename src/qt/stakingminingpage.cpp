@@ -46,6 +46,7 @@
 #include <QMessageBox>
 #include <QPalette>
 #include <QPushButton>
+#include <QScopedValueRollback>
 #include <QSettings>
 #include <QScrollArea>
 #include <QSize>
@@ -2323,7 +2324,7 @@ void StakingMiningPage::updateStatus()
         resetStatusForNoWallet();
         return;
     }
-    m_updating = true;
+    QScopedValueRollback<bool> updating_guard(m_updating, true);
     // Only the Refresh button and wallet-changing actions (which set
     // m_force_full_refresh) trigger the expensive detail sweep. The periodic
     // timer and tab switches fall through with full_refresh=false and update
@@ -2348,7 +2349,10 @@ void StakingMiningPage::updateStatus()
 
     // Staking
     const bool staking = w.getEnabledStaking();
-    const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getEncryptionStatus();
+    // Never enter cs_wallet from this timer-driven GUI callback. QQSIGNAL
+    // construction and signing may legitimately own the wallet mutex for a
+    // bounded interval; waiting here would stop the entire Qt event loop.
+    const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getCachedEncryptionStatus();
     const bool normal_unlocked = encryption_status == WalletModel::Unlocked &&
                                  !w.getWalletUnlockStakingOnly();
     const bool normal_signing_available = encryption_status == WalletModel::Unencrypted || normal_unlocked;
@@ -2371,7 +2375,6 @@ void StakingMiningPage::updateStatus()
     // full-refresh cadence (and on show), never on every 5-second tick.
     if (!full_refresh) {
         refreshControlsEnabled();
-        m_updating = false;
         return;
     }
 
@@ -3009,7 +3012,6 @@ void StakingMiningPage::updateStatus()
         refreshControlsEnabled();
     }
     if (m_refresh_hint) m_refresh_hint->setText(tr("Detail panels updated. Press Refresh to reload."));
-    m_updating = false;
 }
 
 void StakingMiningPage::resetStatusForNoWallet()
@@ -3119,7 +3121,7 @@ void StakingMiningPage::refreshControlsEnabled()
     // Config is always editable; the backend only mines during the Gold Rush epoch.
     const bool has_wallet = m_wallet_model != nullptr;
     const WalletModel::EncryptionStatus encryption_status = has_wallet
-        ? m_wallet_model->getEncryptionStatus()
+        ? m_wallet_model->getCachedEncryptionStatus()
         : WalletModel::NoKeys;
     const bool tune = has_wallet && m_pow_enable->isChecked();
     m_staking_enable->setEnabled(has_wallet);
