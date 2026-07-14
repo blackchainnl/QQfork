@@ -169,6 +169,39 @@ class QuantumLifecycleTest(BitcoinTestFramework):
             raise AssertionError(f"missing Gold Rush companion marker for {payout_utxo['txid']}:{payout_utxo['vout']}")
         assert_equal(marker["value"], 0)
 
+    def _assert_output_lifecycle(self, wallet, utxo, state, *, synthetic,
+                                 merkle_included, mature, spendable,
+                                 permanently_locked=False):
+        matches = [
+            output for output in wallet.listunspent(
+                0, 9999999, [], True, {"include_immature_coinbase": True})
+            if output["txid"] == utxo["txid"] and output["vout"] == utxo["vout"]
+        ]
+        assert_equal(len(matches), 1)
+        output = matches[0]
+        assert_equal(output["spendability_state"], state)
+        assert_equal(output["synthetic"], synthetic)
+        assert_equal(output["merkle_included"], merkle_included)
+        assert_equal(output["mature"], mature)
+        assert_equal(output["ordinary_spendable"], spendable)
+        assert_equal(output["spendable"], spendable and output["wallet_signable"])
+        assert_equal(output["permanently_locked"], permanently_locked)
+        assert_equal(Decimal(output["nominal_amount"]), Decimal(output["amount"]))
+        assert_equal(
+            Decimal(output["effective_amount"]) + Decimal(output["burned_amount"]),
+            Decimal(output["nominal_amount"]),
+        )
+        return output
+
+    def _assert_wallet_lifecycle_consistent(self, wallet, category, minimum_count):
+        balances = wallet.getbalances()
+        wallet_info = wallet.getwalletinfo()
+        assert_equal(balances["mine"]["trusted"], balances["mine"]["lifecycle"]["ordinary_available"])
+        assert_equal(wallet_info["balance"], wallet_info["lifecycle"]["ordinary_available"])
+        assert_equal(wallet_info["balance"], balances["mine"]["trusted"])
+        assert balances["mine"]["lifecycle"]["categories"][category]["count"] >= minimum_count
+        assert wallet_info["lifecycle"]["categories"][category]["count"] >= minimum_count
+
     def _assert_phase_status(self, wallet, phase, *, quantum_spends_active, deadline_passed):
         node = self.nodes[0]
         info = node.getquantumquasarinfo()
@@ -235,6 +268,12 @@ class QuantumLifecycleTest(BitcoinTestFramework):
         self._mine_pos_block_with_claim(wallet, claim_a["txid"])
         payout_utxo_a = self._wait_for_quantum_utxo(wallet, payout_address_a)
         self._assert_goldrush_marker_exists(payout_utxo_a)
+        immature_a = self._assert_output_lifecycle(
+            wallet, payout_utxo_a, "gold_rush_synthetic_immature",
+            synthetic=True, merkle_included=False, mature=False, spendable=False,
+        )
+        assert immature_a["earliest_spend_height"] > node.getblockcount()
+        self._assert_wallet_lifecycle_consistent(wallet, "gold_rush_synthetic_immature", 1)
 
         payout_address_b = wallet.getnewquantumaddress()["address"]
         wallet.lockunspent(True, [{"txid": claim_b_funding_utxo["txid"], "vout": claim_b_funding_utxo["vout"]}])
@@ -250,6 +289,18 @@ class QuantumLifecycleTest(BitcoinTestFramework):
         payout_utxo_b = self._wait_for_quantum_utxo(wallet, payout_address_b, min_conf=COINBASE_MATURITY + 1)
         self._assert_phase_status(wallet, "gold_rush", quantum_spends_active=False, deadline_passed=False)
         assert_equal(wallet.getmigrationstatus()["goldrush_reward_outputs_needing_move"], 2)
+        mature_locked_a = self._assert_output_lifecycle(
+            wallet, payout_utxo_a, "gold_rush_synthetic_mature_locked",
+            synthetic=True, merkle_included=False, mature=True, spendable=False,
+        )
+        assert mature_locked_a["earliest_spend_height"] > node.getblockcount()
+        self._assert_output_lifecycle(
+            wallet, payout_utxo_b, "gold_rush_synthetic_mature_locked",
+            synthetic=True, merkle_included=False, mature=True, spendable=False,
+        )
+        self._assert_wallet_lifecycle_consistent(wallet, "gold_rush_synthetic_mature_locked", 2)
+        migration_status = wallet.getmigrationstatus()
+        assert_equal(migration_status["categories"]["gold_rush_synthetic_mature_locked"]["count"], 2)
 
         self.log.info("Gold Rush payout spends stay disabled during the legacy-compatible Gold Rush")
         migration_destination_a = wallet.getnewquantumaddress()["address"]
@@ -266,6 +317,16 @@ class QuantumLifecycleTest(BitcoinTestFramework):
         self._assert_phase_status(wallet, "migration", quantum_spends_active=True, deadline_passed=False)
 
         self.log.info("Gold Rush payouts are ordinary quantum UTXOs during migration")
+        migration_payout_a = self._assert_output_lifecycle(
+            wallet, payout_utxo_a, "migration_spendable_direct_quantum",
+            synthetic=True, merkle_included=False, mature=True, spendable=True,
+        )
+        assert_equal(migration_payout_a["earliest_spend_height"], node.getblockcount() + 1)
+        self._assert_output_lifecycle(
+            wallet, payout_utxo_b, "migration_spendable_direct_quantum",
+            synthetic=True, merkle_included=False, mature=True, spendable=True,
+        )
+        self._assert_wallet_lifecycle_consistent(wallet, "migration_spendable_direct_quantum", 2)
         valid_raw, valid_signed = self._build_quantum_spend(wallet, payout_utxo_a, migration_destination_a)
         assert_equal(valid_signed["complete"], True)
         valid_accept = node.testmempoolaccept([valid_signed["hex"]])[0]
@@ -277,6 +338,11 @@ class QuantumLifecycleTest(BitcoinTestFramework):
         assert node.gettxout(payout_utxo_a["txid"], payout_utxo_a["vout"], False) is None
         assert node.gettxout(payout_utxo_b["txid"], payout_utxo_b["vout"], False) is not None
         assert_equal(wallet.getmigrationstatus()["goldrush_reward_outputs_needing_move"], 0)
+        assert_equal([
+            output for output in wallet.listunspent(
+                0, 9999999, [], True, {"include_immature_coinbase": True})
+            if output["txid"] == payout_utxo_a["txid"] and output["vout"] == payout_utxo_a["vout"]
+        ], [])
 
         self.log.info("Same-address payout spends are valid; no remigration covenant exists")
         _, same_signed = self._build_quantum_spend(wallet, payout_utxo_b, payout_address_b)
@@ -290,10 +356,21 @@ class QuantumLifecycleTest(BitcoinTestFramework):
         self._mine_until_phase("final_lockout", MIGRATION_DEADLINE_TIME + 16, final_mining_address)
         final_tip = node.getbestblockhash()
         self._assert_phase_status(wallet, "final_lockout", quantum_spends_active=True, deadline_passed=True)
+        wallet.lockunspent(True, [{"txid": legacy_lockout_utxo["txid"], "vout": legacy_lockout_utxo["vout"]}])
+        self._assert_output_lifecycle(
+            wallet, legacy_lockout_utxo, "final_locked_legacy",
+            synthetic=False, merkle_included=True, mature=True, spendable=False,
+            permanently_locked=True,
+        )
+        self._assert_wallet_lifecycle_consistent(wallet, "final_locked_legacy", 1)
 
         self.log.info("Reorging below the deadline preserves ordinary payout spendability")
         node.invalidateblock(final_tip)
         self._assert_phase_status(wallet, "migration", quantum_spends_active=True, deadline_passed=False)
+        self._assert_output_lifecycle(
+            wallet, legacy_lockout_utxo, "spendable_legacy",
+            synthetic=False, merkle_included=True, mature=True, spendable=True,
+        )
         reorg_migration_destination = wallet.getnewquantumaddress()["address"]
         _, reorg_migration_signed = self._build_quantum_spend(wallet, payout_utxo_b, reorg_migration_destination)
         assert_equal(reorg_migration_signed["complete"], True)
@@ -302,6 +379,29 @@ class QuantumLifecycleTest(BitcoinTestFramework):
             raise AssertionError(f"ordinary payout spend rejected after deadline reorg: {reorg_migration_accept}")
         self._reconsider_tip(final_tip)
         self._assert_phase_status(wallet, "final_lockout", quantum_spends_active=True, deadline_passed=True)
+        self._assert_output_lifecycle(
+            wallet, legacy_lockout_utxo, "final_locked_legacy",
+            synthetic=False, merkle_included=True, mature=True, spendable=False,
+            permanently_locked=True,
+        )
+
+        self.log.info("Lifecycle classification survives wallet restart")
+        restart_time = MIGRATION_DEADLINE_TIME + 32
+        self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={restart_time}", "-staking=0"])
+        node = self.nodes[0]
+        node.loadwallet("quantum_lifecycle")
+        wallet = node.get_wallet_rpc("quantum_lifecycle")
+        self._set_mocktime(restart_time)
+        self._assert_phase_status(wallet, "final_lockout", quantum_spends_active=True, deadline_passed=True)
+        self._assert_output_lifecycle(
+            wallet, legacy_lockout_utxo, "final_locked_legacy",
+            synthetic=False, merkle_included=True, mature=True, spendable=False,
+            permanently_locked=True,
+        )
+        self._assert_output_lifecycle(
+            wallet, payout_utxo_b, "migration_spendable_direct_quantum",
+            synthetic=True, merkle_included=False, mature=True, spendable=True,
+        )
 
         self.log.info("Legacy inputs are rejected after final lockout")
         legacy_destination = wallet.getnewquantumaddress()["address"]

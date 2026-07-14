@@ -58,6 +58,8 @@ private:
     QLabel* m_label_legacy_balance{nullptr};
     QLabel* m_label_quantum_balance_text{nullptr};
     QLabel* m_label_quantum_balance{nullptr};
+    QLabel* m_label_lifecycle_locked_text{nullptr};
+    QLabel* m_label_lifecycle_locked{nullptr};
 
     const PlatformStyle* m_platform_style;
 

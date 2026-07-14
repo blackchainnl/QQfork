@@ -9,14 +9,52 @@
 
 #include <consensus/amount.h>
 #include <policy/fees.h> // for FeeCalculation
+#include <shadow.h>
 #include <util/result.h>
 #include <wallet/coinselection.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
+#include <array>
 #include <optional>
 
 namespace wallet {
+struct Balance;
+struct WalletLifecycleAmounts {
+    static constexpr size_t CATEGORY_COUNT{static_cast<size_t>(ValueLifecycleCategory::COUNT)};
+    std::array<uint64_t, CATEGORY_COUNT> outputs{};
+    std::array<CAmount, CATEGORY_COUNT> nominal{};
+    std::array<CAmount, CATEGORY_COUNT> effective{};
+    std::array<CAmount, CATEGORY_COUNT> burned{};
+    CAmount ordinary_available{0};
+    CAmount spendable_legacy{0};
+    CAmount spendable_quantum{0};
+};
+
+struct WalletLifecycleSummary {
+    int evaluation_height{0};
+    int64_t evaluation_mtp{0};
+    WalletLifecycleAmounts mine;
+    WalletLifecycleAmounts watchonly;
+};
+
+/** Classify one wallet output against the candidate next block using the
+ * active-chain coin and authenticated Gold Rush provenance. */
+bool GetWalletOutputLifecycle(const CWallet& wallet, const COutPoint& outpoint,
+                              const CTxOut& txout,
+                              ValueLifecycleClassification& classification,
+                              std::string& error)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+/** Return the ordinary-spendable wallet balance and a mutually exclusive
+ * lifecycle inventory. Locked synthetic, contract, Final, and fully decayed
+ * outputs never enter the trusted available balance. */
+bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
+                                 bool avoid_reuse, Balance& balance,
+                                 WalletLifecycleSummary& summary,
+                                 std::string& error)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
 /** Whether this wallet can satisfy a legacy input with a scriptSig-committed
  * ECDSA/ForkID signature, giving the transaction a txid that cannot be shared
  * with the legacy fork. Native and wrapped witness-only scripts return false. */

@@ -506,6 +506,13 @@ struct WalletBalances
     CAmount balance = 0;
     CAmount legacy_balance = 0;
     CAmount quantum_balance = 0;
+    CAmount synthetic_immature_balance = 0;
+    CAmount synthetic_mature_locked_balance = 0;
+    CAmount direct_quantum_phase_locked_balance = 0;
+    CAmount quantum_contract_restricted_balance = 0;
+    CAmount final_locked_legacy_balance = 0;
+    CAmount demurrage_locked_balance = 0;
+    CAmount demurrage_burned_balance = 0;
     CAmount unconfirmed_balance = 0;
     CAmount immature_balance = 0;
     CAmount stake = 0;
@@ -518,6 +525,13 @@ struct WalletBalances
     bool balanceChanged(const WalletBalances& prev) const
     {
         return balance != prev.balance || legacy_balance != prev.legacy_balance || quantum_balance != prev.quantum_balance ||
+               synthetic_immature_balance != prev.synthetic_immature_balance ||
+               synthetic_mature_locked_balance != prev.synthetic_mature_locked_balance ||
+               direct_quantum_phase_locked_balance != prev.direct_quantum_phase_locked_balance ||
+               quantum_contract_restricted_balance != prev.quantum_contract_restricted_balance ||
+               final_locked_legacy_balance != prev.final_locked_legacy_balance ||
+               demurrage_locked_balance != prev.demurrage_locked_balance ||
+               demurrage_burned_balance != prev.demurrage_burned_balance ||
                unconfirmed_balance != prev.unconfirmed_balance ||
                immature_balance != prev.immature_balance || stake != prev.stake || watch_only_balance != prev.watch_only_balance ||
                unconfirmed_watch_only_balance != prev.unconfirmed_watch_only_balance ||

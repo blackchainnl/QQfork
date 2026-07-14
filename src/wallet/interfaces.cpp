@@ -2069,23 +2069,37 @@ public:
     WalletBalances getBalances() override
     {
         LOCK2(::cs_main, m_wallet->cs_wallet);
-        const auto bal = GetBalance(*m_wallet);
         WalletBalances result;
+        Balance bal;
+        WalletLifecycleSummary lifecycle;
+        std::string lifecycle_error;
+        if (!GetLifecycleAdjustedBalance(*m_wallet, 0, /*avoid_reuse=*/true,
+                                         bal, lifecycle, lifecycle_error)) {
+            m_wallet->WalletLogPrintf("Unable to calculate lifecycle-adjusted GUI balance: %s\n",
+                                      lifecycle_error);
+            result.have_watch_only = haveWatchOnly();
+            return result;
+        }
         result.balance = bal.m_mine_trusted;
-        // Classify the legacy/quantum breakdown in one AvailableCoins pass
-        // instead of two family-filtered wallet scans; this call is polled on
-        // every new block, and each scan is expensive on large wallets. The
-        // per-script classification matches MatchesCoinControlInputFamily:
-        // quantum = migration or cold-stake script; legacy = everything else
-        // except EUTXO state outputs.
-        CCoinControl breakdown_control;
-        for (const COutput& out : AvailableCoinsListUnspent(*m_wallet, &breakdown_control).All()) {
-            const CScript& spk = out.txout.scriptPubKey;
-            if (IsQuantumMigrationScript(spk) || IsQuantumColdStakeScript(spk)) {
-                result.quantum_balance += out.txout.nValue;
-            } else if (!IsEUTXOScript(spk)) {
-                result.legacy_balance += out.txout.nValue;
-            }
+        result.legacy_balance = lifecycle.mine.spendable_legacy;
+        result.quantum_balance = lifecycle.mine.spendable_quantum;
+        auto category_nominal = [&](ValueLifecycleCategory category) {
+            return lifecycle.mine.nominal.at(static_cast<size_t>(category));
+        };
+        result.synthetic_immature_balance = category_nominal(
+            ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_IMMATURE);
+        result.synthetic_mature_locked_balance = category_nominal(
+            ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_MATURE_LOCKED);
+        result.direct_quantum_phase_locked_balance = category_nominal(
+            ValueLifecycleCategory::DIRECT_QUANTUM_PHASE_LOCKED);
+        result.quantum_contract_restricted_balance = category_nominal(
+            ValueLifecycleCategory::QUANTUM_CONTRACT_RESTRICTED);
+        result.final_locked_legacy_balance = category_nominal(
+            ValueLifecycleCategory::FINAL_LOCKED_LEGACY);
+        result.demurrage_locked_balance = category_nominal(
+            ValueLifecycleCategory::DEMURRAGE_LOCKED);
+        for (const CAmount burned : lifecycle.mine.burned) {
+            result.demurrage_burned_balance += burned;
         }
         result.unconfirmed_balance = bal.m_mine_untrusted_pending;
         result.immature_balance = bal.m_mine_immature;
@@ -2113,7 +2127,19 @@ public:
         balances = getBalances();
         return true;
     }
-    CAmount getBalance() override { return GetBalance(*m_wallet).m_mine_trusted; }
+    CAmount getBalance() override
+    {
+        LOCK2(::cs_main, m_wallet->cs_wallet);
+        Balance balance;
+        WalletLifecycleSummary lifecycle;
+        std::string error;
+        if (!GetLifecycleAdjustedBalance(*m_wallet, 0, /*avoid_reuse=*/true,
+                                         balance, lifecycle, error)) {
+            m_wallet->WalletLogPrintf("Unable to calculate lifecycle-adjusted balance: %s\n", error);
+            return 0;
+        }
+        return balance.m_mine_trusted;
+    }
     CAmount getAvailableBalance(const CCoinControl& coin_control) override
     {
         LOCK2(::cs_main, m_wallet->cs_wallet);

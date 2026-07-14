@@ -3718,6 +3718,15 @@ RPCHelpMan getmigrationstatus()
             {RPCResult::Type::STR_AMOUNT, "goldrush_reward_amount_needing_move", "compatibility field: Gold Rush reward value still phase-locked"},
             {RPCResult::Type::BOOL, "goldrush_remigration_active", "whether optional Gold Rush reward consolidation is available"},
             {RPCResult::Type::BOOL, "quantum_spends_active", "whether ML-DSA spends are enforceable at the tip"},
+            {RPCResult::Type::NUM, "lifecycle_evaluation_height", "candidate next-block height used for classification"},
+            {RPCResult::Type::OBJ_DYN, "categories", "mutually exclusive wallet lifecycle categories", {
+                {RPCResult::Type::OBJ, "category", "one lifecycle category", {
+                    {RPCResult::Type::NUM, "count", "wallet UTXO count"},
+                    {RPCResult::Type::STR_AMOUNT, "nominal_amount", "nominal value"},
+                    {RPCResult::Type::STR_AMOUNT, "effective_amount", "demurrage-adjusted value"},
+                    {RPCResult::Type::STR_AMOUNT, "burned_amount", "value removed by demurrage"},
+                }},
+            }},
             {RPCResult::Type::STR, "advice", "human-readable next step"},
         }},
         RPCExamples{HelpExampleCli("getmigrationstatus", "") + HelpExampleRpc("getmigrationstatus", "")},
@@ -3725,6 +3734,10 @@ RPCHelpMan getmigrationstatus()
     {
         const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
         if (!pwallet) return UniValue::VNULL;
+        // Keep wallet spend state and the active UTXO snapshot on the same tip.
+        // Without this barrier an RPC can race a just-connected staking block
+        // and briefly classify an already-consumed wallet output as corrupt.
+        pwallet->BlockUntilSyncedToCurrentChain();
         LOCK2(cs_main, pwallet->cs_wallet);
 
         const Consensus::Params& c = Params().GetConsensus();
@@ -3746,33 +3759,70 @@ RPCHelpMan getmigrationstatus()
 
         CAmount legacy_amt = 0, quantum_amt = 0, direct_quantum_amt = 0, staked_quantum_amt = 0, goldrush_reward_amt = 0;
         unsigned int legacy_n = 0, quantum_n = 0, direct_quantum_n = 0, staked_quantum_n = 0, goldrush_reward_n = 0;
-        ChainstateManager& chainman = pwallet->chain().chainman();
-        const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
-        for (const COutput& out : AvailableCoinsListUnspent(*pwallet).All()) {
+        std::array<uint64_t, WalletLifecycleAmounts::CATEGORY_COUNT> category_count{};
+        std::array<CAmount, WalletLifecycleAmounts::CATEGORY_COUNT> category_nominal{};
+        std::array<CAmount, WalletLifecycleAmounts::CATEGORY_COUNT> category_effective{};
+        std::array<CAmount, WalletLifecycleAmounts::CATEGORY_COUNT> category_burned{};
+        auto add_amount = [&](CAmount& total, CAmount amount) {
+            if (!MoneyRange(total) || !MoneyRange(amount) || amount > MAX_MONEY - total) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Wallet lifecycle amount is out of range");
+            }
+            total += amount;
+        };
+        auto add_count = [&](auto& count) {
+            if (count == std::numeric_limits<std::decay_t<decltype(count)>>::max()) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Wallet lifecycle output count is out of range");
+            }
+            ++count;
+        };
+
+        CoinFilterParams filter;
+        filter.min_amount = 0;
+        filter.include_immature_coinbase = true;
+        filter.skip_locked = false;
+        for (const COutput& out : AvailableCoinsListUnspent(*pwallet, nullptr, filter).All()) {
             const CScript& spk = out.txout.scriptPubKey;
+            ValueLifecycleClassification lifecycle;
+            std::string lifecycle_error;
+            if (!GetWalletOutputLifecycle(*pwallet, out.outpoint, out.txout,
+                                          lifecycle, lifecycle_error)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, lifecycle_error);
+            }
+            const size_t category = static_cast<size_t>(lifecycle.category);
+            if (category >= WalletLifecycleAmounts::CATEGORY_COUNT) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Unknown wallet lifecycle category");
+            }
+            add_count(category_count[category]);
+            add_amount(category_nominal[category], lifecycle.nominal_amount);
+            add_amount(category_effective[category], lifecycle.effective_amount);
+            add_amount(category_burned[category], lifecycle.burned_amount);
+
             if (IsQuantumMigrationScript(spk)) {
                 CTxDestination d;
                 const bool wallet_owned = ExtractDestination(spk, d) && pwallet->GetQuantumKeyInfo(d).has_value();
-                CScript marker_script;
-                if (IsLockedGoldRushPayoutOutput(view, out.outpoint, c,
-                        mtp, next_height, &marker_script) && marker_script == spk) {
-                    goldrush_reward_amt += out.txout.nValue;
-                    ++goldrush_reward_n;
-                } else if (wallet_owned) {
-                    quantum_amt += out.txout.nValue;
-                    ++quantum_n;
-                    if (IsDirectQuantumMigrationScript(spk)) {
-                        direct_quantum_amt += out.txout.nValue;
-                        ++direct_quantum_n;
-                    } else {
-                        staked_quantum_amt += out.txout.nValue;
-                        ++staked_quantum_n;
-                    }
+                if (!wallet_owned) continue;
+                add_amount(quantum_amt, lifecycle.nominal_amount);
+                add_count(quantum_n);
+                if (lifecycle.synthetic && !lifecycle.ordinary_spendable) {
+                    add_amount(goldrush_reward_amt, lifecycle.nominal_amount);
+                    add_count(goldrush_reward_n);
+                }
+                if (IsDirectQuantumMigrationScript(spk) && lifecycle.ordinary_spendable) {
+                    add_amount(direct_quantum_amt, lifecycle.effective_amount);
+                    add_count(direct_quantum_n);
+                } else if (!IsDirectQuantumMigrationScript(spk)) {
+                    add_amount(staked_quantum_amt, lifecycle.nominal_amount);
+                    add_count(staked_quantum_n);
                 }
             } else if (IsQuantumColdStakeScript(spk)) {
-                continue;
-            } else if (!IsEUTXOScript(spk) && out.spendable) {
-                legacy_amt += out.txout.nValue; ++legacy_n;
+                add_amount(staked_quantum_amt, lifecycle.nominal_amount);
+                add_count(staked_quantum_n);
+                add_amount(quantum_amt, lifecycle.nominal_amount);
+                add_count(quantum_n);
+            } else if (lifecycle.category == ValueLifecycleCategory::SPENDABLE_LEGACY &&
+                       out.spendable) {
+                add_amount(legacy_amt, lifecycle.effective_amount);
+                add_count(legacy_n);
             }
         }
 
@@ -3801,6 +3851,18 @@ RPCHelpMan getmigrationstatus()
         const bool goldrush_move_active = quantum_active;
         r.pushKV("goldrush_remigration_active", goldrush_move_active);
         r.pushKV("quantum_spends_active", quantum_active);
+        r.pushKV("lifecycle_evaluation_height", next_height);
+        UniValue categories(UniValue::VOBJ);
+        for (size_t i = 0; i < WalletLifecycleAmounts::CATEGORY_COUNT; ++i) {
+            UniValue category(UniValue::VOBJ);
+            category.pushKV("count", category_count[i]);
+            category.pushKV("nominal_amount", ValueFromAmount(category_nominal[i]));
+            category.pushKV("effective_amount", ValueFromAmount(category_effective[i]));
+            category.pushKV("burned_amount", ValueFromAmount(category_burned[i]));
+            categories.pushKV(ValueLifecycleCategoryName(static_cast<ValueLifecycleCategory>(i)),
+                              std::move(category));
+        }
+        r.pushKV("categories", std::move(categories));
         std::string advice;
         if (passed)              advice = "Deadline passed. Remaining legacy coins are permanently unspendable.";
         else if (goldrush_reward_n > 0) advice = "Gold Rush reward outputs remain locked until the Gold Rush ends; they then become ordinary quantum funds after normal maturity.";

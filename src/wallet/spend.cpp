@@ -67,6 +67,208 @@ static QuantumFundingPhase GetQuantumFundingPhase(const CWallet& wallet) EXCLUSI
     return phase;
 }
 
+bool GetWalletOutputLifecycle(const CWallet& wallet, const COutPoint& outpoint,
+                              const CTxOut& txout,
+                              ValueLifecycleClassification& classification,
+                              std::string& error)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    error.clear();
+
+    const CBlockIndex* tip = wallet.chain().getTip();
+    if (!tip) {
+        error = "Unable to classify wallet output without an active chain tip";
+        return false;
+    }
+    const int evaluation_height = tip->nHeight + 1;
+    const int64_t evaluation_mtp = tip->GetMedianTimePast();
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const CCoinsViewCache& view = wallet.chain().getCoinsTip();
+
+    Coin coin;
+    bool confirmed_coin = view.GetCoin(outpoint, coin) && !coin.IsSpent();
+    if (confirmed_coin) {
+        if (coin.out != txout) {
+            error = strprintf("Wallet output %s does not match the active UTXO set", outpoint.ToString());
+            return false;
+        }
+    } else {
+        const CWalletTx* wtx = wallet.GetWalletTx(outpoint.hash);
+        if (!wtx || outpoint.n >= wtx->tx->vout.size() ||
+            wallet.GetTxDepthInMainChain(*wtx) != 0 || !wtx->InMempool()) {
+            error = strprintf("Wallet output %s is absent from the active UTXO set", outpoint.ToString());
+            return false;
+        }
+        coin = Coin(txout, evaluation_height, /*coinbase=*/false,
+                    /*coinstake=*/false, wtx->GetTxTime());
+    }
+
+    bool synthetic{false};
+    if (confirmed_coin) {
+        const GoldRushPayoutStatus status = GetGoldRushPayoutStatus(
+            view, outpoint, consensus, nullptr, tip);
+        if (status == GoldRushPayoutStatus::CORRUPT) {
+            error = strprintf("Wallet output %s has missing or corrupt Gold Rush provenance", outpoint.ToString());
+            return false;
+        }
+        synthetic = status == GoldRushPayoutStatus::AUTHENTICATED;
+    }
+
+    std::optional<Consensus::DemurrageAttestationState> attestation;
+    if (consensus.IsDemurrageActive(evaluation_height, evaluation_mtp)) {
+        attestation = Consensus::LatestDemurrageAttestationStateForScript(view, txout.scriptPubKey);
+    }
+    const ValueLifecycleResult result = ClassifyValueLifecycle(
+        coin, synthetic, consensus, evaluation_height, evaluation_mtp,
+        attestation ? std::optional<int>{attestation->height} : std::nullopt,
+        attestation ? std::optional<int>{static_cast<int>(attestation->coverage_start_height)} : std::nullopt,
+        classification);
+    if (result != ValueLifecycleResult::OK) {
+        error = strprintf("Unable to classify wallet output %s (lifecycle error %u)",
+                          outpoint.ToString(), static_cast<unsigned>(result));
+        return false;
+    }
+    return true;
+}
+
+namespace {
+bool AddLifecycleValue(CAmount& total, CAmount value)
+{
+    if (!MoneyRange(total) || !MoneyRange(value) || value > MAX_MONEY - total) return false;
+    total += value;
+    return true;
+}
+
+bool AddLifecycleOutput(WalletLifecycleAmounts& amounts,
+                        const ValueLifecycleClassification& classification)
+{
+    const size_t category = static_cast<size_t>(classification.category);
+    if (category >= WalletLifecycleAmounts::CATEGORY_COUNT ||
+        amounts.outputs[category] == std::numeric_limits<uint64_t>::max()) return false;
+    ++amounts.outputs[category];
+    if (!AddLifecycleValue(amounts.nominal[category], classification.nominal_amount) ||
+        !AddLifecycleValue(amounts.effective[category], classification.effective_amount) ||
+        !AddLifecycleValue(amounts.burned[category], classification.burned_amount)) return false;
+    if (classification.ordinary_spendable) {
+        if (!AddLifecycleValue(amounts.ordinary_available, classification.effective_amount)) return false;
+        if (classification.category == ValueLifecycleCategory::SPENDABLE_LEGACY) {
+            if (!AddLifecycleValue(amounts.spendable_legacy, classification.effective_amount)) return false;
+        } else if (classification.category == ValueLifecycleCategory::MIGRATION_SPENDABLE_DIRECT_QUANTUM) {
+            if (!AddLifecycleValue(amounts.spendable_quantum, classification.effective_amount)) return false;
+        }
+    }
+    return true;
+}
+
+bool ReplaceLifecycleCredit(CAmount& balance, CAmount baseline, CAmount desired)
+{
+    if (!MoneyRange(balance) || !MoneyRange(baseline) || !MoneyRange(desired) ||
+        baseline > balance) return false;
+    balance -= baseline;
+    return AddLifecycleValue(balance, desired);
+}
+
+bool RemoveLifecycleCredit(CAmount& balance, CAmount amount)
+{
+    if (!MoneyRange(balance) || !MoneyRange(amount) || amount > balance) return false;
+    balance -= amount;
+    return true;
+}
+} // namespace
+
+bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
+                                 bool avoid_reuse, Balance& balance,
+                                 WalletLifecycleSummary& summary,
+                                 std::string& error)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+    error.clear();
+    balance = GetBalance(wallet, min_depth, avoid_reuse);
+    summary = {};
+
+    const CBlockIndex* tip = wallet.chain().getTip();
+    if (!tip) {
+        error = "Unable to calculate wallet lifecycle balance without an active chain tip";
+        return false;
+    }
+    summary.evaluation_height = tip->nHeight + 1;
+    summary.evaluation_mtp = tip->GetMedianTimePast();
+    const bool exclude_reused = avoid_reuse &&
+        wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
+
+    std::set<uint256> trusted_parents;
+    for (const auto& [wtxid, wtx] : wallet.mapWallet) {
+        const int depth = wallet.GetTxDepthInMainChain(wtx);
+        if (depth < 0 || (depth == 0 && !wtx.InMempool())) continue;
+        const bool trusted = CachedTxIsTrusted(wallet, wtx, trusted_parents);
+        if (!trusted || depth < min_depth) continue;
+
+        const bool wallet_immature = wallet.IsTxImmature(wtx);
+        for (uint32_t n = 0; n < wtx.tx->vout.size(); ++n) {
+            const COutPoint outpoint{wtxid, n};
+            const CTxOut& txout = wtx.tx->vout[n];
+            if (wallet.IsSpent(outpoint) ||
+                (exclude_reused && wallet.IsSpentKey(txout.scriptPubKey))) continue;
+
+            const isminetype mine = wallet.IsMine(txout);
+            const bool mine_spendable = (mine & ISMINE_SPENDABLE) != ISMINE_NO;
+            const bool watchonly = (mine & ISMINE_WATCH_ONLY) != ISMINE_NO;
+            if (!mine_spendable && !watchonly) continue;
+
+            ValueLifecycleClassification classification;
+            if (!GetWalletOutputLifecycle(wallet, outpoint, txout, classification, error)) return false;
+            if (mine_spendable && !AddLifecycleOutput(summary.mine, classification)) {
+                error = "Wallet lifecycle mine balance is out of range";
+                return false;
+            }
+            if (watchonly && !AddLifecycleOutput(summary.watchonly, classification)) {
+                error = "Wallet lifecycle watch-only balance is out of range";
+                return false;
+            }
+
+            const CAmount baseline = wallet_immature ? 0 : txout.nValue;
+            const CAmount desired = classification.ordinary_spendable
+                ? classification.effective_amount : 0;
+            if (mine_spendable &&
+                !ReplaceLifecycleCredit(balance.m_mine_trusted, baseline, desired)) {
+                error = "Wallet lifecycle-adjusted trusted balance is out of range";
+                return false;
+            }
+            if (watchonly &&
+                !ReplaceLifecycleCredit(balance.m_watchonly_trusted, baseline, desired)) {
+                error = "Wallet lifecycle-adjusted watch-only balance is out of range";
+                return false;
+            }
+
+            if (wallet_immature &&
+                (classification.mature || classification.permanently_locked)) {
+                if (wtx.IsCoinBase()) {
+                    if (mine_spendable && !RemoveLifecycleCredit(balance.m_mine_immature, txout.nValue)) {
+                        error = "Wallet lifecycle-adjusted immature balance is out of range";
+                        return false;
+                    }
+                    if (watchonly && !RemoveLifecycleCredit(balance.m_watchonly_immature, txout.nValue)) {
+                        error = "Wallet lifecycle-adjusted watch-only immature balance is out of range";
+                        return false;
+                    }
+                } else if (wtx.IsCoinStake()) {
+                    if (mine_spendable && !RemoveLifecycleCredit(balance.m_mine_stake, txout.nValue)) {
+                        error = "Wallet lifecycle-adjusted stake balance is out of range";
+                        return false;
+                    }
+                    if (watchonly && !RemoveLifecycleCredit(balance.m_watchonly_stake, txout.nValue)) {
+                        error = "Wallet lifecycle-adjusted watch-only stake balance is out of range";
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    return true;
+}
+
 static int64_t QuantumMigrationInputWeight()
 {
     const int64_t non_witness = 32 + 4 + GetSizeOfCompactSize(0) + 4;

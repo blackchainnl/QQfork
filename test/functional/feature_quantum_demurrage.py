@@ -458,6 +458,21 @@ class QuantumDemurrageTest(BitcoinTestFramework):
         assert_greater_than(1_000_000, output["remaining_ppm"])
         assert_greater_than(Decimal(output["burned_if_spent_amount"]), Decimal("0"))
         self._assert_output_recomputes(output)
+        listed_decaying = self._one_output(wallet, quantum_address)
+        assert_equal(listed_decaying["spendability_state"], "migration_spendable_direct_quantum")
+        assert_equal(listed_decaying["ordinary_spendable"], True)
+        assert_equal(listed_decaying["spendable"], True)
+        assert_equal(Decimal(listed_decaying["nominal_amount"]), Decimal(output["nominal_amount"]))
+        assert_equal(Decimal(listed_decaying["effective_amount"]), Decimal(output["effective_amount"]))
+        assert_equal(Decimal(listed_decaying["burned_amount"]), Decimal(output["burned_if_spent_amount"]))
+        lifecycle_balances = wallet.getbalances()
+        lifecycle_wallet_info = wallet.getwalletinfo()
+        assert_equal(lifecycle_balances["mine"]["trusted"], lifecycle_balances["mine"]["lifecycle"]["ordinary_available"])
+        assert_equal(lifecycle_wallet_info["balance"], lifecycle_wallet_info["lifecycle"]["ordinary_available"])
+        assert_greater_than(
+            Decimal(lifecycle_balances["mine"]["lifecycle"]["categories"]["migration_spendable_direct_quantum"]["burned_amount"]),
+            Decimal("0"),
+        )
 
         _, attested_output = self._wallet_output(wallet, attest_address)
         assert_equal(attested_output["exemption"], "attested")
@@ -578,6 +593,21 @@ class QuantumDemurrageTest(BitcoinTestFramework):
         assert_raises_rpc_error(-6, "No spendable wallet-owned quantum outputs are currently decaying", wallet.sweepdemurragedecay, {"source_address": lock_address})
 
         locked_utxo = self._one_output(wallet, lock_address)
+        assert_equal(locked_utxo["spendability_state"], "demurrage_locked")
+        assert_equal(locked_utxo["wallet_signable"], True)
+        assert_equal(locked_utxo["consensus_spendable"], False)
+        assert_equal(locked_utxo["ordinary_spendable"], False)
+        assert_equal(locked_utxo["spendable"], False)
+        assert_equal(locked_utxo["permanently_locked"], True)
+        assert_equal(Decimal(locked_utxo["effective_amount"]), Decimal("0E-8"))
+        assert_equal(Decimal(locked_utxo["burned_amount"]), Decimal(locked_utxo["nominal_amount"]))
+        locked_balances = wallet.getbalances()
+        locked_wallet_info = wallet.getwalletinfo()
+        locked_category = locked_balances["mine"]["lifecycle"]["categories"]["demurrage_locked"]
+        assert_greater_than(locked_category["count"], 0)
+        assert_greater_than(Decimal(locked_category["nominal_amount"]), Decimal("0"))
+        assert_equal(locked_balances["mine"]["trusted"], locked_balances["mine"]["lifecycle"]["ordinary_available"])
+        assert_equal(locked_wallet_info["balance"], locked_wallet_info["lifecycle"]["ordinary_available"])
         locked_spend = self._signed_quantum_spend(wallet, locked_utxo, wallet.getnewquantumaddress()["address"])
         assert_raises_rpc_error(-26, "bad-txns-spends-locked-coin", node.sendrawtransaction, locked_spend)
 

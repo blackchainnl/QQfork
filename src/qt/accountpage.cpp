@@ -491,20 +491,32 @@ void AccountPage::refresh()
         metadata.coldstake_addresses[QString::fromStdString(info.address)] = detail;
     }
 
-    m_total_card->setText(tr("<b>Total wallet balance</b><br>Available: %1<br>Pending: %2<br>Immature: %3")
+    const CAmount lifecycle_locked = balances.synthetic_mature_locked_balance +
+        balances.direct_quantum_phase_locked_balance +
+        balances.quantum_contract_restricted_balance +
+        balances.final_locked_legacy_balance + balances.demurrage_locked_balance;
+    m_total_card->setText(tr("<b>Wallet lifecycle totals</b><br>Ordinary available: %1<br>Pending: %2<br>Immature: %3<br>Locked/restricted: %4")
         .arg(formatBLK(balances.balance))
         .arg(formatBLK(balances.unconfirmed_balance))
-        .arg(formatBLK(balances.immature_balance)));
-    m_legacy_card->setText(tr("<b>Legacy spend path</b><br>%1<br>Use for current-chain fees, legacy sends, and legacy staking.")
-        .arg(formatBLK(balances.legacy_balance)));
-    m_quantum_card->setText(tr("<b>Quantum-controlled balance</b><br>%1<br>Includes wallet-owned quantum outputs; bonded or delegated outputs follow their contract rules, and Gold Rush rewards remain phase-locked until Gold Rush ends.")
-        .arg(formatBLK(balances.quantum_balance)));
+        .arg(formatBLK(balances.immature_balance))
+        .arg(formatBLK(lifecycle_locked)));
+    m_legacy_card->setText(tr("<b>Legacy lifecycle</b><br>Spendable now: %1<br>Final-locked: %2<br>Spendable legacy value must migrate before Final activation.")
+        .arg(formatBLK(balances.legacy_balance))
+        .arg(formatBLK(balances.final_locked_legacy_balance)));
+    m_quantum_card->setText(tr("<b>Quantum lifecycle</b><br>Direct spendable: %1<br>Gold Rush immature: %2<br>Gold Rush mature/phase-locked: %3<br>Other phase/contract restricted: %4")
+        .arg(formatBLK(balances.quantum_balance))
+        .arg(formatBLK(balances.synthetic_immature_balance))
+        .arg(formatBLK(balances.synthetic_mature_locked_balance))
+        .arg(formatBLK(balances.direct_quantum_phase_locked_balance +
+                       balances.quantum_contract_restricted_balance)));
     QString attention;
     if (migration.available) {
-        attention = tr("<b>Attention</b><br>Legacy to migrate: %1<br>Gold Rush rewards locked: %2<br>Staked/delegated quantum: %3")
+        attention = tr("<b>Attention</b><br>Legacy to migrate: %1<br>Gold Rush rewards phase-locked: %2<br>Staked/delegated quantum: %3<br>Demurrage locked: %4<br>Demurrage burned: %5")
             .arg(formatBLK(migration.eligible_legacy_amount))
             .arg(formatBLK(migration.goldrush_reward_amount_needing_move))
-            .arg(formatBLK(migration.staked_quantum_amount));
+            .arg(formatBLK(migration.staked_quantum_amount))
+            .arg(formatBLK(balances.demurrage_locked_balance))
+            .arg(formatBLK(balances.demurrage_burned_balance));
     } else {
         attention = tr("<b>Attention</b><br>Migration status is busy; refresh shortly.");
     }
