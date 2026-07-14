@@ -1371,7 +1371,8 @@ class SegWitTest(BitcoinTestFramework):
 
         self.sync_blocks()
         temp_utxo = []
-        tx = CTransaction()
+        version_transactions = []
+        version_utxos = {}
         witness_script = CScript([OP_TRUE])
         witness_hash = sha256(witness_script)
         assert_equal(len(self.nodes[1].getrawmempool()), 0)
@@ -1384,42 +1385,77 @@ class SegWitTest(BitcoinTestFramework):
                 script_pubkey = CScript([CScriptOp(version), witness_hash + b'\x00'])
             else:
                 script_pubkey = CScript([CScriptOp(version), witness_hash])
-            tx.vin = [CTxIn(COutPoint(self.utxo[0].sha256, self.utxo[0].n), b"")]
-            tx.vout = [CTxOut(self.utxo[0].nValue - 1000, script_pubkey)]
-            set_tx_fee(tx, self.utxo[0].nValue)
-            self.nodes[1].setmocktime(self.nodes[1].getblockheader(self.nodes[1].getbestblockhash())["time"] + 1)
-            assert_equal(self.nodes[1].testmempoolaccept([tx.serialize_with_witness().hex()])[0]["allowed"], False)
-            test_transaction_acceptance(self.nodes[0], self.test_node, tx, with_witness=True, accepted=True)
-            self.utxo.pop(0)
-            temp_utxo.append(UTXO(tx.sha256, 0, tx.vout[0].nValue))
+            version_tx = CTransaction()
+            version_tx.vin = [CTxIn(COutPoint(self.utxo[0].sha256, self.utxo[0].n), b"")]
+            version_tx.vout = [CTxOut(self.utxo[0].nValue - 1000, script_pubkey)]
+            set_tx_fee(version_tx, self.utxo[0].nValue)
 
-        self.generate(self.nodes[0], 1)  # Mine all the transactions
+            self.nodes[1].setmocktime(self.nodes[1].getblockheader(self.nodes[1].getbestblockhash())["time"] + 1)
+            standard_result = self.nodes[1].testmempoolaccept([version_tx.serialize_with_witness().hex()])[0]
+            if version not in (OP_0, OP_1):
+                # During Gold Rush every future witness output above v1 is a
+                # block-valid legacy unknown-witness program, but node policy
+                # must keep it out of both standard and nonstandard mempools.
+                assert_equal(standard_result["allowed"], False)
+                assert_equal(standard_result["reject-reason"], "quantum-output-premature")
+                self.nodes[0].setmocktime(self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"] + 1)
+                nonstandard_result = self.nodes[0].testmempoolaccept([version_tx.serialize_with_witness().hex()])[0]
+                assert_equal(nonstandard_result["allowed"], False)
+                assert_equal(nonstandard_result["reject-reason"], "quantum-output-premature")
+            else:
+                # OP_0 and OP_1 are not quantum outputs. The standard node
+                # rejects only because this fixture spends an OP_TRUE input;
+                # the nonstandard node must continue to accept both versions.
+                assert_equal(standard_result["allowed"], False)
+                assert_equal(standard_result["reject-reason"], "bad-txns-nonstandard-inputs")
+                test_transaction_acceptance(self.nodes[0], self.test_node, version_tx, with_witness=True, accepted=True)
+
+            self.utxo.pop(0)
+            version_utxo = UTXO(version_tx.sha256, 0, version_tx.vout[0].nValue)
+            temp_utxo.append(version_utxo)
+            version_utxos[version] = version_utxo
+            version_transactions.append(version_tx)
+
+        # Direct-block consensus must preserve legacy unknown-witness output
+        # acceptance throughout Gold Rush, including the transactions that
+        # mempool policy rejected above.
+        block = self.build_next_block()
+        self.update_witness_block_with_transactions(block, version_transactions)
+        test_witness_block(self.nodes[0], self.test_node, block, accepted=True)
+        self.sync_blocks()
         assert len(self.nodes[0].getrawmempool()) == 0
 
-        # Finally, verify that version 0 -> version 2 transactions
-        # are standard
-        script_pubkey = CScript([CScriptOp(OP_2), witness_hash])
+        # Verify that spending the version-0 output is standard. Pay into a
+        # standard legacy P2SH(OP_TRUE) destination so Gold Rush output policy
+        # does not mask the witness-input behavior under test.
+        legacy_redeem_script = CScript([OP_TRUE])
+        legacy_script_pubkey = script_to_p2sh_script(legacy_redeem_script)
+        v0_utxo = version_utxos[OP_0]
         tx2 = CTransaction()
-        tx2.vin = [CTxIn(COutPoint(tx.sha256, 0), b"")]
-        tx2.vout = [CTxOut(tx.vout[0].nValue - 1000, script_pubkey)]
+        tx2.vin = [CTxIn(COutPoint(v0_utxo.sha256, v0_utxo.n), b"")]
+        tx2.vout = [CTxOut(v0_utxo.nValue - 1000, legacy_script_pubkey)]
         tx2.wit.vtxinwit.append(CTxInWitness())
         tx2.wit.vtxinwit[0].scriptWitness.stack = [witness_script]
-        set_tx_fee(tx2, tx.vout[0].nValue)
+        set_tx_fee(tx2, v0_utxo.nValue)
         # Gets accepted to both policy-enforcing nodes and others.
         test_transaction_acceptance(self.nodes[0], self.test_node, tx2, with_witness=True, accepted=True)
         test_transaction_acceptance(self.nodes[1], self.std_node, tx2, with_witness=True, accepted=True)
-        temp_utxo.pop()  # last entry in temp_utxo was the output we just spent
+        temp_utxo.remove(v0_utxo)
         temp_utxo.append(UTXO(tx2.sha256, 0, tx2.vout[0].nValue))
 
-        # Spend everything in temp_utxo into an segwit v1 output.
+        # Spend everything in temp_utxo into another legacy destination. This
+        # isolates the policy assertions below to the future-witness inputs.
         tx3 = CTransaction()
         total_value = 0
         for i in temp_utxo:
             tx3.vin.append(CTxIn(COutPoint(i.sha256, i.n), b""))
             tx3.wit.vtxinwit.append(CTxInWitness())
             total_value += i.nValue
-        tx3.wit.vtxinwit[-1].scriptWitness.stack = [witness_script]
-        tx3.vout.append(CTxOut(total_value - 1000, script_pubkey))
+        # Supply witness data for an unknown witness input and the redeem
+        # script for the final P2SH(OP_TRUE) input.
+        tx3.wit.vtxinwit[0].scriptWitness.stack = [witness_script]
+        tx3.vin[-1].scriptSig = CScript([legacy_redeem_script])
+        tx3.vout.append(CTxOut(total_value - 1000, legacy_script_pubkey))
         set_tx_fee(tx3, total_value)
 
         # First we test this transaction against standard policy.
@@ -1432,14 +1468,22 @@ class SegWitTest(BitcoinTestFramework):
         # even with the node that accepts non-standard txs.
         test_transaction_acceptance(self.nodes[0], self.test_node, tx3, with_witness=True, accepted=False, reason="reserved for soft-fork upgrades")
 
-        # Building a block with the transaction must be valid, however.
+        # Convert the standard P2SH(OP_TRUE) result back to the direct OP_TRUE
+        # fixture shape expected by subsequent subtests.
+        cleanup_tx = CTransaction()
+        cleanup_tx.vin = [CTxIn(COutPoint(tx3.sha256, 0), CScript([legacy_redeem_script]))]
+        cleanup_tx.vout = [CTxOut(tx3.vout[0].nValue - 1000, CScript([OP_TRUE]))]
+        set_tx_fee(cleanup_tx, tx3.vout[0].nValue)
+
+        # Building a block with the policy-rejected transaction and its
+        # cleanup child must be valid, however.
         block = self.build_next_block()
-        self.update_witness_block_with_transactions(block, [tx2, tx3])
+        self.update_witness_block_with_transactions(block, [tx2, tx3, cleanup_tx])
         test_witness_block(self.nodes[0], self.test_node, block, accepted=True)
         self.sync_blocks()
 
         # Add utxo to our list
-        self.utxo.append(UTXO(tx3.sha256, 0, tx3.vout[0].nValue))
+        self.utxo.append(UTXO(cleanup_tx.sha256, 0, cleanup_tx.vout[0].nValue))
 
     @subtest
     def test_premature_coinbase_witness_spend(self):
