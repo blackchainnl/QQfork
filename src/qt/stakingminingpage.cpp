@@ -14,13 +14,17 @@
 #include <qt/walletmodel.h>
 
 #include <addresstype.h>
+#include <common/args.h>
 #include <crypto/sha256.h>
+#include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
 #include <primitives/transaction.h>
 #include <uint256.h>
 #include <util/strencodings.h>
 #include <wallet/wallet.h>
+
+#include <univalue.h>
 
 #include <algorithm>
 #include <array>
@@ -310,6 +314,24 @@ StakingMiningPage::StakingMiningPage(const PlatformStyle* platformStyle, QWidget
     connect(m_coldstake_withdraw, &QPushButton::clicked, this, &StakingMiningPage::onWithdrawColdStakeAddress);
     connect(m_coldstake_redelegate, &QPushButton::clicked, this, &StakingMiningPage::onRedelegateColdStake);
     connect(m_optimize_button, &QPushButton::clicked, this, &StakingMiningPage::onOptimizeUTXOSet);
+    connect(m_autostart_staking, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_autostart_staking, "autostartstaking", enabled);
+    });
+    connect(m_autostart_pow, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_autostart_pow, "powmining", enabled);
+    });
+    connect(m_auto_qqsignal, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_auto_qqsignal, "qqautoshadowsignal", enabled);
+    });
+    connect(m_auto_demurrage_attest, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_auto_demurrage_attest, "qqautodemurrageattest", enabled);
+    });
+    connect(m_auto_redelegate, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_auto_redelegate, "qqautoredelegate", enabled);
+    });
+    connect(m_allow_auto_key_creation, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_allow_auto_key_creation, "qqallowautokeycreation", enabled);
+    });
     connect(m_refresh_button, &QPushButton::clicked, this, [this]() {
         m_force_full_refresh = true;
         updateStatus();
@@ -485,10 +507,9 @@ void StakingMiningPage::setupUi()
     // ---- Staking section ----
     auto* stakingBox = new QGroupBox(tr("Staking"), this);
     auto* sgrid = new QGridLayout(stakingBox);
-    m_staking_enable = new QCheckBox(tr("Enable staking (Proof-of-Stake + Gold Rush)"), stakingBox);
+    m_staking_enable = new QCheckBox(tr("Enable legacy Proof-of-Stake"), stakingBox);
     m_staking_enable->setObjectName(QStringLiteral("stakingEnable"));
-    m_staking_enable->setToolTip(tr("Starts legacy PoS staking. If this wallet is whitelisted, Gold Rush "
-                                    "signalling and payouts are added to your coinstakes automatically during the epoch."));
+    m_staking_enable->setToolTip(tr("Starts legacy PoS staking for this loaded wallet. Gold Rush QQSIGNAL submission is a separate optional automation choice below and remains off unless you enable it."));
     m_unlock_staking_only = new QCheckBox(tr("Unlock wallet for LEGACY staking only"), stakingBox);
     m_unlock_staking_only->setObjectName(QStringLiteral("unlockStakingOnly"));
     m_unlock_staking_only->setToolTip(tr("Unlocks an encrypted wallet only for legacy staking. Spending, Gold Rush signals, "
@@ -521,12 +542,12 @@ void StakingMiningPage::setupUi()
            "<ul>"
            "<li>The wallet must have at least 10,000 BLK aggregate balance at the whitelist snapshot height.</li>"
            "<li>The wallet must solve a PoS block during the rolling activity window.</li>"
-           "<li>The wallet must be normally unlocked so it can publish a QQSIGNAL transaction. Staking-only unlock is not enough for this part.</li>"
+           "<li>The wallet must be normally unlocked and you must explicitly enable automatic QQSIGNAL submission below (or submit it through RPC). Staking-only unlock is not enough for this part.</li>"
            "</ul>"
            "<h3>How payouts work</h3>"
            "<p>Qualified active signalers share the PoS Gold Rush pool. The wallet displays these reward credits as <b>PoS - Quantum Stake</b> and shows the quantum payout address in the transaction list.</p>"
            "<h3>Example</h3>"
-           "<p>If your wallet was whitelisted and solves a PoS block, keep staking enabled and unlock with <b>Quantum and Legacy Staking</b>. The wallet publishes the signal and remains in the active signaler set until the activity window expires.</p>"),
+           "<p>If your wallet was whitelisted and solves a PoS block, keep staking enabled, unlock with <b>Quantum and Legacy Staking</b>, and explicitly enable automatic QQSIGNAL if you want the wallet to publish fee-paying signals. The runtime staking switch alone never grants that consent.</p>"),
         stakingBox);
     auto* unlockHelp = makeHelpButton(
         tr("Unlock"),
@@ -589,6 +610,37 @@ void StakingMiningPage::setupUi()
     sgrid->addWidget(m_optimize_button, 13, 2);
     sgrid->addWidget(m_optimize_status, 14, 0, 1, 3);
     miningLayout->addWidget(stakingBox);
+
+    // ---- Explicit optional automation ----
+    auto* automationBox = new QGroupBox(tr("Optional automation (explicit opt-in)"), this);
+    auto* automationLayout = new QVBoxLayout(automationBox);
+    auto* automationIntro = new QLabel(tr(
+        "These settings persist across restarts. Each is off by default. Runtime staking and mining controls above remain available without enabling automatic restart behavior."), automationBox);
+    automationIntro->setWordWrap(true);
+    m_autostart_staking = new QCheckBox(tr("Start staking after every wallet load"), automationBox);
+    m_autostart_staking->setObjectName(QStringLiteral("automationAutostartStaking"));
+    m_autostart_pow = new QCheckBox(tr("Start Gold Rush PoW after wallet startup"), automationBox);
+    m_autostart_pow->setObjectName(QStringLiteral("automationAutostartPow"));
+    m_auto_qqsignal = new QCheckBox(tr("Automatically submit eligible fee-paying QQSIGNAL transactions"), automationBox);
+    m_auto_qqsignal->setObjectName(QStringLiteral("automationQqSignal"));
+    m_auto_demurrage_attest = new QCheckBox(tr("Automatically submit fee-paying demurrage liveness attestations"), automationBox);
+    m_auto_demurrage_attest->setObjectName(QStringLiteral("automationDemurrageAttest"));
+    m_auto_redelegate = new QCheckBox(tr("Automatically redelegate eligible quantum cold stake"), automationBox);
+    m_auto_redelegate->setObjectName(QStringLiteral("automationRedelegate"));
+    m_allow_auto_key_creation = new QCheckBox(tr("Allow background creation of new non-HD quantum keys"), automationBox);
+    m_allow_auto_key_creation->setObjectName(QStringLiteral("automationAllowNewKeys"));
+    m_automation_status = new QLabel(automationBox);
+    m_automation_status->setObjectName(QStringLiteral("automationStatus"));
+    configureInfoPanel(m_automation_status);
+    automationLayout->addWidget(automationIntro);
+    automationLayout->addWidget(m_autostart_staking);
+    automationLayout->addWidget(m_autostart_pow);
+    automationLayout->addWidget(m_auto_qqsignal);
+    automationLayout->addWidget(m_auto_demurrage_attest);
+    automationLayout->addWidget(m_auto_redelegate);
+    automationLayout->addWidget(m_allow_auto_key_creation);
+    automationLayout->addWidget(m_automation_status);
+    miningLayout->addWidget(automationBox);
 
     // ---- Gold Rush Proof-of-Work section ----
     auto* powBox = new QGroupBox(tr("Gold Rush Proof-of-Work mining"), this);
@@ -1198,6 +1250,103 @@ void StakingMiningPage::setupUi()
 void StakingMiningPage::setClientModel(ClientModel* clientModel)
 {
     m_client_model = clientModel;
+    refreshAutomationControls();
+}
+
+void StakingMiningPage::onAutomationToggled(QCheckBox* control, const std::string& setting, bool enabled)
+{
+    if (m_updating || !m_client_model || !control) return;
+
+    if (m_client_model->node().isSettingIgnored(setting)) {
+        QMessageBox::warning(this, tr("Setting controlled at startup"),
+            tr("This choice is controlled by the command-line option -%1. No setting was changed. Remove or change that option and restart Blackcoin before using this control.")
+                .arg(QString::fromStdString(setting)));
+        refreshAutomationControls();
+        return;
+    }
+
+    const bool auto_keys = gArgs.GetBoolArg("-qqallowautokeycreation", wallet::DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION);
+    const bool auto_redelegate = gArgs.GetBoolArg("-qqautoredelegate", wallet::DEFAULT_AUTO_REDELEGATE);
+    if (setting == "qqautoredelegate" && enabled && !auto_keys) {
+        QMessageBox::warning(this, tr("Additional consent required"),
+            tr("Automatic redelegation creates a new non-HD quantum owner key and therefore requires 'Allow background creation of new non-HD quantum keys'. No setting was changed. Enable and acknowledge key creation first, then back up the wallet after every generated key."));
+        refreshAutomationControls();
+        return;
+    }
+    if (setting == "qqallowautokeycreation" && !enabled && auto_redelegate) {
+        QMessageBox::warning(this, tr("Disable redelegation first"),
+            tr("Automatic redelegation currently depends on background quantum-key creation. No setting was changed. Disable automatic redelegation first, then disable background key creation."));
+        refreshAutomationControls();
+        return;
+    }
+
+    QString consequence;
+    if (setting == "autostartstaking") {
+        consequence = tr("Blackcoin will start staking each time this wallet loads. This affects future wallet loads; it does not unlock an encrypted wallet.");
+    } else if (setting == "powmining") {
+        consequence = tr("Blackcoin will try to start the built-in Gold Rush PoW miner after wallet startup using %1 core(s) at %2% CPU per core. Each successful claim spends a legacy fee UTXO. Startup fails safely if the wallet is locked or no existing payout key is available.")
+            .arg(m_pow_cores ? m_pow_cores->value() : 1)
+            .arg(m_pow_percent ? m_pow_percent->value() : 1);
+    } else if (setting == "qqautoshadowsignal") {
+        consequence = tr("When this wallet is eligible and normally unlocked, Blackcoin may automatically create and broadcast fee-paying QQSIGNAL transactions. This does not activate consensus rules or unlock the wallet.");
+    } else if (setting == "qqautodemurrageattest") {
+        consequence = tr("After Final activation, this wallet may automatically create and broadcast fee-paying liveness attestations. Mandatory consensus demurrage and burn are automatic and remain active whether this optional wallet automation is on or off.");
+    } else if (setting == "qqautoredelegate") {
+        consequence = tr("Blackcoin may spend eligible delegated outputs and a transaction fee to create a replacement delegation after the configured no-win threshold. Each redelegation creates a new non-HD owner key that requires an immediate wallet backup.");
+    } else if (setting == "qqallowautokeycreation") {
+        consequence = tr("Background wallet tasks may create new non-HD ML-DSA keys. These keys are not recoverable from the wallet seed. You must back up the wallet after every generated key; an older backup cannot recover it.");
+    }
+
+    if (enabled && QMessageBox::question(this, tr("Confirm optional automation"),
+            consequence + tr("\n\nEnable this persistent setting?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+        refreshAutomationControls();
+        return;
+    }
+
+    m_client_model->node().updateRwSetting(setting, enabled);
+    if (setting == "powmining" && enabled) {
+        m_client_model->node().updateRwSetting("powminingthreads", m_pow_cores ? m_pow_cores->value() : 1);
+        m_client_model->node().updateRwSetting("powminingcpu", m_pow_percent ? m_pow_percent->value() : 1);
+    }
+    refreshAutomationControls();
+}
+
+void StakingMiningPage::refreshAutomationControls()
+{
+    if (!m_autostart_staking) return;
+
+    const struct {
+        QCheckBox* control;
+        const char* setting;
+        bool value;
+    } controls[] = {
+        {m_autostart_staking, "autostartstaking", gArgs.GetBoolArg("-autostartstaking", wallet::DEFAULT_AUTOSTART_STAKING)},
+        {m_autostart_pow, "powmining", gArgs.GetBoolArg("-powmining", false)},
+        {m_auto_qqsignal, "qqautoshadowsignal", gArgs.GetBoolArg("-qqautoshadowsignal", wallet::DEFAULT_AUTO_SHADOW_SIGNAL)},
+        {m_auto_demurrage_attest, "qqautodemurrageattest", gArgs.GetBoolArg("-qqautodemurrageattest", wallet::DEFAULT_AUTO_DEMURRAGE_ATTEST)},
+        {m_auto_redelegate, "qqautoredelegate", gArgs.GetBoolArg("-qqautoredelegate", wallet::DEFAULT_AUTO_REDELEGATE)},
+        {m_allow_auto_key_creation, "qqallowautokeycreation", gArgs.GetBoolArg("-qqallowautokeycreation", wallet::DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)},
+    };
+
+    int enabled_count{0};
+    QStringList startup_overrides;
+    for (const auto& item : controls) {
+        QSignalBlocker blocker(item.control);
+        item.control->setChecked(item.value);
+        const bool overridden = m_client_model && m_client_model->node().isSettingIgnored(item.setting);
+        item.control->setEnabled(m_client_model && !overridden);
+        if (item.value) ++enabled_count;
+        if (overridden) startup_overrides.push_back(QStringLiteral("-") + QString::fromLatin1(item.setting));
+    }
+
+    QString status = tr("<b>%1 of 6 optional automations enabled.</b> Runtime controls above never imply persistent consent. Consensus Final demurrage/burn is mandatory and independent of the optional attestation setting.")
+        .arg(enabled_count);
+    if (!startup_overrides.isEmpty()) {
+        status += tr("<br>Controlled by startup options (restart required to change here): %1")
+            .arg(startup_overrides.join(QStringLiteral(", ")));
+    }
+    m_automation_status->setText(status);
 }
 
 void StakingMiningPage::setWalletModel(WalletModel* walletModel)
@@ -1432,7 +1581,8 @@ void StakingMiningPage::onApplyPow()
         const QString body = tr("This will start the built-in Gold Rush PoW miner with %1 CPU core(s) at %2% target duty cycle.\n\n"
                                 "The wallet must be normally unlocked so it can sign QQSPROOF claim transactions. "
                                 "The miner also needs a confirmed, spendable legacy BLK UTXO to authenticate and pay the fee for each claim. "
-                                "A wallet-backed quantum payout key may be created automatically; back up this wallet after enabling mining.\n\n"
+                                "If no existing payout key is available, approving this dialog is one-time consent to create one new non-HD quantum key. "
+                                "That key is not recoverable from the wallet seed; back up this wallet immediately if one is created.\n\n"
                                 "Start mining now?")
                                  .arg(cores)
                                  .arg(percent);
@@ -1457,7 +1607,12 @@ void StakingMiningPage::onApplyPow()
     refreshControlsEnabled();
 
     std::string error;
-    const bool ok = m_wallet_model->wallet().setPowMining(enabled, cores, percent, error);
+    // The immediately preceding confirmation explicitly covers creation of a
+    // new non-HD payout key. Reconfiguration of an already-running miner does
+    // not grant any additional key-creation consent.
+    const bool ok = m_wallet_model->wallet().setPowMining(
+        enabled, cores, percent, error,
+        /*allow_new_payout_key=*/enabled && !current_info.enabled);
     m_pow_apply_pending = false;
     if (!ok) {
         m_pow_enable->setChecked(false);
@@ -2350,6 +2505,7 @@ void StakingMiningPage::updateStatus()
     if (!isVisible() || window()->isMinimized()) {
         return;
     }
+    refreshAutomationControls();
     if (!m_wallet_model) {
         resetStatusForNoWallet();
         return;
@@ -2505,6 +2661,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     const bool normal_unlocked = encryption_status == WalletModel::Unlocked &&
                                  !w.getWalletUnlockStakingOnly();
     const bool normal_signing_available = encryption_status == WalletModel::Unencrypted || normal_unlocked;
+    const bool auto_qqsignal = gArgs.GetBoolArg("-qqautoshadowsignal", wallet::DEFAULT_AUTO_SHADOW_SIGNAL);
 
     // UI mutations happen only here, after the worker-owned immutable result
     // has returned to this object's Qt event thread.
@@ -2517,6 +2674,8 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
             eligibility = tr("This wallet has no spendable script in the Gold Rush whitelist.");
         } else if (info.wallet_active_signal) {
             eligibility = tr("This wallet is whitelisted and actively signaled.");
+        } else if (info.wallet_recent_solve_qualified && !auto_qqsignal) {
+            eligibility = tr("This wallet is whitelisted and has a recent solve; automatic QQSIGNAL is off until you explicitly enable it.");
         } else if (info.wallet_recent_solve_qualified) {
             eligibility = tr("This wallet is whitelisted and has a recent solve; unlock normally to signal.");
         } else {
@@ -2575,7 +2734,9 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
               .arg(last_pos_payout)
         : tr("PoS Gold Rush jackpot: %1 accrued; Gold Rush is not active.")
               .arg(formatBLK(info.pos_accrued_jackpot));
-    if (info.epoch_active && !normal_signing_available) {
+    if (info.epoch_active && !auto_qqsignal) {
+        pos_goldrush_text += tr("   |   Automatic QQSIGNAL is off (explicit opt-in below).");
+    } else if (info.epoch_active && !normal_signing_available) {
         pos_goldrush_text += tr("   |   Unlock Quantum and Legacy Staking to broadcast QQSIGNAL.");
     }
     pos_goldrush_text += tr("   |   This wallet: %1.").arg(wallet_signal_text);
@@ -2677,6 +2838,8 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
         recommended_action = tr("Unlock this wallet normally. Gold Rush PoW claims cannot be signed while the wallet is locked or unlocked for staking only.");
     } else if (info.state == interfaces::WalletPowMiningState::RUNTIME_ERROR) {
         recommended_action = tr("The Gold Rush PoW worker stopped after an error. Review debug.log, correct the reported problem, and restart the miner.");
+    } else if (info.epoch_active && info.wallet_recent_solve_qualified && !info.wallet_active_signal && !auto_qqsignal) {
+        recommended_action = tr("This wallet has a recent PoS solve. Enable <b>Automatically submit eligible fee-paying QQSIGNAL transactions</b> below if you consent to signal automatically, or use the sendshadowsignal RPC manually.");
     } else if (info.epoch_active && info.wallet_whitelisted_scripts > 0 && !normal_signing_available) {
         recommended_action = tr("Unlock with <b>Quantum and Legacy Staking</b> if you want this wallet to broadcast Gold Rush PoS signals. Legacy staking-only unlock will not create quantum signal transactions.");
     } else if (info.epoch_active && info.wallet_recent_solve_qualified && !info.wallet_active_signal) {

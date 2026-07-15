@@ -142,15 +142,40 @@ The wallet exposes helper RPCs for both paths, including `getgoldrushstate`,
 `getgoldrushinfo`, `sendshadowsignal`, `getshadowpowwork`,
 `sendshadowpowclaim`, `setpowmining`, and `getpowmininginfo`.
 
-### Fleet-safe quantum payout bindings
+### Explicit wallet automation and fleet-safe quantum payout bindings
 
-The default interactive-wallet behavior may create a new ML-DSA key when an
-automatic Gold Rush payout or later automatic demurrage-attestation change
-first needs one. Every such non-HD key requires a new wallet backup. Fleet
-operators can prohibit all background key creation and bind the automatic
-paths to an existing key instead:
+v30.1.1 starts every optional local automation in the fail-closed state.
+Automatic staking restart, PoW restart, QQSIGNAL submission, demurrage
+attestations, cold-stake redelegation, and background ML-DSA key creation must
+each be enabled explicitly. The GUI provides separate persistent controls and
+consequence-specific confirmations. Headless operators can inspect the same
+effective state with `getstakinginfo` and `getpowmininginfo`.
+
+For a one-session headless start, control the loaded wallet explicitly:
+
+```bash
+blackcoin-cli -rpcwallet="Wallet Name" staking true
+blackcoin-cli -rpcwallet="Wallet Name" setpowmining true 1 1 false
+blackcoin-cli -rpcwallet="Wallet Name" getstakinginfo
+blackcoin-cli -rpcwallet="Wallet Name" getpowmininginfo
+```
+
+The final `false` refuses new payout-key creation. For persistent daemon
+behavior, add only the automations you actually authorize to the startup
+command or configuration, for example `autostartstaking=1`,
+`qqautoshadowsignal=1`, and a backed-up
+`qqpospayoutaddress=blk1...`. Persistent PoW additionally uses `powmining=1`,
+`powminingthreads=1`, `powminingcpu=1`, and a backed-up
+`qqpowpayoutaddress=blk1...`. The GUI exposes the same runtime controls and
+persistent choices in Staking & Mining.
+
+Background key creation is off by default. Prefer binding every automatic path
+to an existing backed-up key:
 
 ```ini
+autostartstaking=0
+powmining=0
+qqautoshadowsignal=0
 qqallowautokeycreation=0
 qqpowpayoutaddress=blk1...
 qqpospayoutaddress=blk1...
@@ -169,21 +194,29 @@ actionable wallet error. Keep one independently configured wallet per fleet
 process; a loaded wallet that does not own the process-level binding cannot use
 that automatic path.
 
-`qqallowautokeycreation=0` also requires an explicit
-`qqautoredelegate=0`. Autonomous cold-stake redelegation currently creates a
-new owner key, so startup rejects the hard fleet mode unless that automation is
-disabled. The hard mode does not disable a user's explicit
+Enabling `qqautoredelegate=1` also requires explicit
+`qqallowautokeycreation=1`. Autonomous cold-stake redelegation currently
+creates a new non-HD owner key, so startup rejects that automation unless key
+creation has separately been authorized. The default-off key gate does not disable a user's explicit
 `getnewquantumaddress` request. Keep the bindings in the node configuration so
 they survive restart, and verify that the referenced key is present in every
 wallet backup before enabling staking or mining.
 
-During Gold Rush and Migration, fleet operators may keep
-`qqautodemurrageattest=0`. This emergency switch returns before the automatic
+During Gold Rush and Migration, keep `qqautodemurrageattest=0` unless the
+operator expressly wants fee-paying attestation transactions. This switch returns before the automatic
 attestation scheduler scans the wallet or constructs a transaction. Before
 enabling it at Final activation, keep `qqdemurragechangeaddress` bound to an
 existing backed-up key, restart with `qqautodemurrageattest=1`, and verify that
 the wallet's quantum-key inventory has not changed. Manual attestation RPCs are
-not disabled by this background-automation switch.
+not disabled by this background-automation switch. Mandatory consensus
+demurrage and permanent burn begin automatically at Final height 6,922,000 and
+are not controlled by the optional wallet-attestation setting.
+
+`setpowmining true 1 1 false` starts only when a configured or previously
+stored payout key exists. If no payout exists, the call fails without creating
+a key. `setpowmining true 1 1 true` is a separate one-call consent to create one
+new non-HD payout key; if the result reports `created_payout_key=true`, back up
+the wallet immediately.
 
 ## Quantum Addresses And Migration
 
@@ -284,6 +317,9 @@ That process exits automatically at the durable `COMMIT_READY` transition.
 Start once normally without either reindex option. The second process verifies
 the recorded tip and complete Coin commitment, retires the preserved source,
 then restores the operator's automation settings before loading wallets. Do
+not treat the temporary source backup as expendable before that verification:
+it is retired only after verification succeeds, while failure or interruption
+preserves the backup and journal for recovery. Do
 not persist `reindex-chainstate=1` or `reindex=1` in configuration or settings;
 v30.1.1 rejects both loop-forming configurations.
 
@@ -386,17 +422,20 @@ On first run, if no explicit `-datadir` or `-conf` is supplied, `blackcoind` and
 `blackcoin-qt` inspect the default data-directory locations for older Blackcoin
 data.
 
-If a legacy `~/.blackmore` directory exists and `.blackcoin` does not, the node
-copies `.blackmore` to `.blackcoin`, converts `blackmore.conf` to
-`blackcoin.conf`, removes copied lock files, leaves the original `.blackmore`
-directory intact, and writes a durable migration marker.
+No source is selected automatically. Whether one or both locations contain
+data, `blackcoin-qt` shows the detected source and destination paths, explains
+copy/backup and rollback behavior, and offers the applicable source or an
+exit/manual choice. Exiting does not start a new migration, backup, or
+retirement operation.
 
-If both `.blackcoin` and `.blackmore` contain data, `blackcoin-qt` prompts the
-user to keep `.blackcoin` or import `.blackmore`. Headless `blackcoind` safely
-keeps `.blackcoin` by default and preserves `.blackmore` under
-`.blackcoin.backup`. Operators can explicitly choose with
-`-migratewallet=blackmore`, `-migratewallet=blackcoin`, or
-`-migratewallet=none`.
+Headless `blackcoind` fails closed before starting a backup or import and prints
+the exact applicable one-shot command. Use `-migratewallet=blackmore` to copy
+the detected `.blackmore` tree into `.blackcoin` after verified recovery
+backups, `-migratewallet=blackcoin` to keep a populated `.blackcoin` source
+after verified backup, or `-migratewallet=none` to preserve verified backups
+without importing or replacing wallet data. Pass the option on the command
+line only and remove it after the successful first run; do not persist it in
+`blackcoin.conf`.
 
 Migration is copy-first and backup-preserving. If migration cannot complete
 safely, startup aborts rather than creating or loading an empty or wrong wallet.

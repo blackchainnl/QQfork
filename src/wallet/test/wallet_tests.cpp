@@ -869,8 +869,20 @@ BOOST_AUTO_TEST_CASE(shadow_solve_index_is_bounded_ordered_and_disconnect_safe)
 
 BOOST_AUTO_TEST_CASE(goldrush_pow_miner_lifecycle_creates_quantum_payout)
 {
+    ScopedArgsSettings args_guard;
+    args_guard.Force("-qqallowautokeycreation", "0");
     bilingual_str error;
-    BOOST_REQUIRE(m_wallet.SetPowMining(/*enabled=*/true, /*threads=*/1, /*cpu_percent=*/10, error));
+    BOOST_CHECK(!m_wallet.SetPowMining(/*enabled=*/true, /*threads=*/1,
+                                      /*cpu_percent=*/10, error));
+    BOOST_CHECK(error.original.find("allow_new_payout_key=true") != std::string::npos);
+    BOOST_CHECK(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.m_pow_payout_quantum.empty()));
+
+    error.clear();
+    bool created_payout_key{false};
+    BOOST_REQUIRE(m_wallet.SetPowMining(
+        /*enabled=*/true, /*threads=*/1, /*cpu_percent=*/10, error,
+        &created_payout_key, /*allow_new_payout_key=*/true));
+    BOOST_CHECK(created_payout_key);
     BOOST_CHECK(m_wallet.m_pow_mining_enabled.load());
     std::string original_payout;
     {

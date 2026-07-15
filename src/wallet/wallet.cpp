@@ -6837,10 +6837,19 @@ void CWallet::postInitProcess()
     // Update wallet transactions with current mempool transactions.
     chain().requestMempoolTransactions(*this);
 
-    // Start mining proof-of-stake blocks in the background unless the caller
-    // wants explicit staking control.
-    if (gArgs.GetBoolArg("-autostartstaking", true)) {
+    // Staking and PoW autostart are independent consent decisions. Starting
+    // runtime staking must never implicitly start a fee-paying PoW miner, and
+    // disabling staking autostart must not suppress an explicit -powmining=1.
+    if (gArgs.GetBoolArg("-autostartstaking", DEFAULT_AUTOSTART_STAKING)) {
         StartStake();
+    }
+    if (gArgs.GetBoolArg("-powmining", false)) {
+        bilingual_str pow_error;
+        const int pow_threads = static_cast<int>(gArgs.GetIntArg("-powminingthreads", 1));
+        const int pow_cpu = static_cast<int>(gArgs.GetIntArg("-powminingcpu", 1));
+        if (!SetPowMining(/*enabled=*/true, pow_threads, pow_cpu, pow_error)) {
+            WalletLogPrintf("Gold Rush PoW mining not auto-started: %s\n", pow_error.original);
+        }
     }
 }
 
@@ -8537,7 +8546,8 @@ ShadowPowClaimInputSelectionResult CWallet::SelectShadowPowClaimInput(
     return ShadowPowClaimInputSelectionResult::NO_ELIGIBLE_INPUT;
 }
 
-bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error, bool* created_payout)
+bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
+                           bool* created_payout, bool allow_new_payout_key)
 {
     if (created_payout) *created_payout = false;
     if (enabled) {
@@ -8578,7 +8588,7 @@ bool CWallet::SetPowMining(bool enabled, int threads, int cpu_percent, bilingual
         }
     }
 
-    if (!EnsurePowPayoutAddress(error, created_payout)) return false;
+    if (!EnsurePowPayoutAddress(error, created_payout, allow_new_payout_key)) return false;
 
     m_pow_threads = threads;
     m_pow_cpu_percent = cpu_percent;
@@ -8697,7 +8707,7 @@ QuantumAddressBindingResult CWallet::ResolveConfiguredQuantumAddress(
     return QuantumAddressBindingResult::RESOLVED;
 }
 
-bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created)
+bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created, bool allow_new_key)
 {
     if (created) *created = false;
     static constexpr const char* POW_PAYOUT_LABEL{"PoW - Quantum Claim Address"};
@@ -8726,11 +8736,6 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created)
         return false;
     case QuantumAddressBindingResult::UNSET:
         break;
-    }
-
-    if (!gArgs.GetBoolArg("-qqallowautokeycreation", true)) {
-        error = _("Gold Rush PoW payout is not configured. Set -qqpowpayoutaddress=<existing wallet-owned quantum address>, or explicitly allow automatic key creation with -qqallowautokeycreation=1.");
-        return false;
     }
 
     std::string restored_payout;
@@ -8767,6 +8772,12 @@ bool CWallet::EnsurePowPayoutAddress(bilingual_str& error, bool* created)
         }
         WalletLogPrintf("Gold Rush PoW miner restored payout address %s.\n", restored_payout);
         return true;
+    }
+
+    if (!allow_new_key &&
+        !gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)) {
+        error = _("Gold Rush PoW has no existing payout key. Bind one with -qqpowpayoutaddress=<existing wallet-owned quantum address>, restart with explicit -qqallowautokeycreation=1 consent, or call setpowmining with allow_new_payout_key=true and back up the wallet immediately.");
+        return false;
     }
 
     auto dest = GetNewQuantumDestination(POW_PAYOUT_LABEL);
@@ -8822,11 +8833,6 @@ bool CWallet::EnsureShadowSignalPayoutAddress(
         break;
     }
 
-    if (!gArgs.GetBoolArg("-qqallowautokeycreation", true)) {
-        error = _("Gold Rush PoS payout is not configured. Set -qqpospayoutaddress=<existing wallet-owned quantum address>, or explicitly allow automatic key creation with -qqallowautokeycreation=1.");
-        return false;
-    }
-
     std::optional<CTxDestination> reused_dest;
     bool relabel_reused_dest{false};
     {
@@ -8857,6 +8863,11 @@ bool CWallet::EnsureShadowSignalPayoutAddress(
         return true;
     }
 
+    if (!gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)) {
+        error = _("Gold Rush PoS has no existing payout key. Bind one with -qqpospayoutaddress=<existing wallet-owned quantum address>, or restart with explicit -qqallowautokeycreation=1 consent and back up the wallet immediately after any key is created.");
+        return false;
+    }
+
     auto dest = GetNewQuantumDestination(SHADOW_SIGNAL_PAYOUT_LABEL);
     if (!dest) {
         error = util::ErrorString(dest);
@@ -8883,7 +8894,7 @@ bool CWallet::PrepareAutomaticDemurrageChangeAddress(CCoinControl& coin_control,
         break;
     }
 
-    if (!gArgs.GetBoolArg("-qqallowautokeycreation", true)) {
+    if (!gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)) {
         error = _("Automatic demurrage-attestation change is not configured. Set -qqdemurragechangeaddress=<existing wallet-owned quantum address>, or explicitly allow automatic key creation with -qqallowautokeycreation=1.");
         return false;
     }

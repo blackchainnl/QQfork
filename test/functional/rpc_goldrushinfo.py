@@ -83,6 +83,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
         try:
             started = cli_wallet.setpowmining(True, 1, 100)
             assert_equal(started["enabled"], True)
+            assert_equal(started["created_payout_key"], False)
             assert_equal(started["threads"], 1)
             assert_equal(started["cpu_percent"], 100)
             payout = started["payout_address"]
@@ -153,6 +154,21 @@ class GoldRushInfoTest(BitcoinTestFramework):
         wallet_name = "goldrush_pow"
         node.createwallet(wallet_name=wallet_name)
         wallet = node.get_wallet_rpc(wallet_name)
+
+        self.log.info("Optional wallet automation is visible and fail-closed by default")
+        staking_info = wallet.getstakinginfo()
+        assert_equal(staking_info["autostart_staking"], False)
+        assert_equal(staking_info["automatic_qqsignal"], False)
+        assert_equal(staking_info["automatic_demurrage_attestation"], False)
+        assert_equal(staking_info["automatic_redelegation"], False)
+        assert_equal(staking_info["allow_automatic_quantum_key_creation"], False)
+        assert_equal(staking_info["consensus_demurrage_automatic"], True)
+        pow_info = wallet.getpowmininginfo()
+        assert_equal(pow_info["autostart"], False)
+        assert_equal(pow_info["allow_automatic_quantum_key_creation"], False)
+        pow_help = wallet.help("setpowmining")
+        assert "allow_new_payout_key" in pow_help
+        assert "Back up the wallet immediately" in pow_help
 
         rpc_target = wallet.getnewaddress()
         cli_target = wallet.getnewaddress()

@@ -97,7 +97,9 @@ blackcoind -datadir=/path/to/data -networkactive=0 -staking=0 \
 The rebuilding process exits automatically after it durably reaches
 `COMMIT_READY`. Start once normally, without `-reindex-chainstate` or
 `-reindex`; that process authenticates the replacement and retires the retained
-source before wallets load. Never put either reindex option in
+source before wallets load. The temporary source backup is retired only after
+that separate verification succeeds. A verification failure, shutdown, or
+interruption preserves the backup and journal for recovery. Never put either reindex option in
 `blackcoin.conf` or `settings.json`; v30.1.1 rejects a persistent true value to
 prevent a rebuild loop.
 
@@ -218,8 +220,12 @@ sanitizer or changing CRC32C results.
   Migration ends at 6,921,999, and Final Lockout plus permanent-burn demurrage
   begin automatically at 6,922,000. Readiness signalling does not vote these
   transitions into effect.
-- Legacy data-directory migration remains in place so existing Blackcoin users
-  can move to Blackcoin without manually relocating wallet or chain data.
+- Legacy data-directory migration remains copy-first and backup-preserving, but
+  never auto-selects wallet data. The GUI presents source, destination,
+  preservation, rollback, and exit/manual choices. Headless startup fails
+  closed before backup or import until a one-shot command-line choice is given:
+  `-migratewallet=blackmore`, `-migratewallet=blackcoin`, or
+  `-migratewallet=none`. Remove the option after the successful first run.
 - Version-2 transactions omit their legacy transaction-time field from the
   wire format. Mempool admission, block assembly, UTXO provenance, and block
   validation now use the serialized block context consistently so a locally
@@ -228,6 +234,21 @@ sanitizer or changing CRC32C results.
 
 ### Wallet and RPC
 
+- Optional local wallet automation is fail-closed in v30.1.1. Automatic staking
+  restart, PoW restart, fee-paying QQSIGNAL submission, fee-paying demurrage
+  attestations, cold-stake redelegation, and background non-HD quantum-key
+  creation are off until the operator enables each behavior explicitly. The
+  GUI exposes separate persistent controls and consequence-specific
+  confirmations; `getstakinginfo` and `getpowmininginfo` report effective
+  automation state for CLI and daemon operators.
+- Mandatory consensus demurrage and permanent burn still begin automatically
+  at Final height 6,922,000. The optional wallet attestation switch neither
+  activates nor disables that consensus rule.
+- `setpowmining` reuses a configured or previously stored wallet-owned payout
+  key by default. If none exists, the RPC fails without creating a key unless
+  its fourth `allow_new_payout_key` argument is `true` (or the operator already
+  supplied `-qqallowautokeycreation=1`). A successful creation reports
+  `created_payout_key=true` and requires an immediate wallet backup.
 - Quantum address, Gold Rush, PoW miner, cold-staking, and RGB RPC surfaces are
   present for validation. EUTXO decode/verify and persisted-metadata RPCs remain
   available for inspection, while EUTXO creation, funding, and spending RPCs

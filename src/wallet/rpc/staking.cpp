@@ -5,6 +5,7 @@
 #include <addresstype.h>
 #include <chain.h>
 #include <coins.h>
+#include <common/args.h>
 #include <consensus/demurrage.h>
 #include <consensus/tx_verify.h>
 #include <core_io.h>
@@ -403,6 +404,12 @@ static RPCHelpMan getstakinginfo()
                     {
                         {RPCResult::Type::BOOL, "enabled", "'true' if staking is enabled"},
                         {RPCResult::Type::BOOL, "staking", "'true' if wallet is currently staking"},
+                        {RPCResult::Type::BOOL, "autostart_staking", "Whether explicit persistent consent was given to start staking after each wallet load."},
+                        {RPCResult::Type::BOOL, "automatic_qqsignal", "Whether optional fee-paying Gold Rush PoS QQSIGNAL automation is enabled."},
+                        {RPCResult::Type::BOOL, "automatic_demurrage_attestation", "Whether optional fee-paying wallet demurrage-attestation automation is enabled."},
+                        {RPCResult::Type::BOOL, "automatic_redelegation", "Whether optional fee-paying quantum cold-stake redelegation automation is enabled."},
+                        {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether background wallet automation may create new non-HD ML-DSA keys."},
+                        {RPCResult::Type::BOOL, "consensus_demurrage_automatic", "Always true: mandatory consensus demurrage/burn is independent of optional wallet attestations."},
                         {RPCResult::Type::NUM, "blocks", "Current active-chain height"},
                         {RPCResult::Type::NUM, "currentblockweight", /*optional=*/true, "Weight of the last assembled block template"},
                         {RPCResult::Type::NUM, "currentblocktx", /*optional=*/true, "Transaction count of the last assembled block template"},
@@ -483,6 +490,12 @@ static RPCHelpMan getstakinginfo()
 
     obj.pushKV("enabled", pwallet->m_enabled_staking.load());
     obj.pushKV("staking", staking);
+    obj.pushKV("autostart_staking", gArgs.GetBoolArg("-autostartstaking", DEFAULT_AUTOSTART_STAKING));
+    obj.pushKV("automatic_qqsignal", gArgs.GetBoolArg("-qqautoshadowsignal", DEFAULT_AUTO_SHADOW_SIGNAL));
+    obj.pushKV("automatic_demurrage_attestation", gArgs.GetBoolArg("-qqautodemurrageattest", DEFAULT_AUTO_DEMURRAGE_ATTEST));
+    obj.pushKV("automatic_redelegation", gArgs.GetBoolArg("-qqautoredelegate", DEFAULT_AUTO_REDELEGATE));
+    obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));
+    obj.pushKV("consensus_demurrage_automatic", true);
 
     obj.pushKV("blocks", blocks);
     if (current_block_weight) obj.pushKV("currentblockweight", *current_block_weight);
@@ -512,8 +525,9 @@ static RPCHelpMan staking()
             "Gets or sets the current staking configuration.\n"
             "When called without an argument, returns the current status of staking.\n"
             "When called with an argument, enables or disables staking.\n"
-            "For fleet mode with -qqallowautokeycreation=0, configure -qqpospayoutaddress with an existing wallet-owned ordinary direct (non-tiered, non-cold-stake) quantum address before an automatic Gold Rush PoS signal becomes eligible.\n"
-            "The independent -qqautodemurrageattest=0 switch disables background demurrage-attestation scans without disabling staking or manual attestation RPCs.\n",
+            "This changes the current loaded-wallet staking state only. Use -autostartstaking=1 for explicit persistent consent to restart staking after every wallet load.\n"
+            "Automatic QQSIGNAL is independently opt-in with -qqautoshadowsignal=1. Configure -qqpospayoutaddress with an existing backed-up wallet-owned ordinary direct quantum address, or separately consent to non-HD key creation with -qqallowautokeycreation=1.\n"
+            "Optional wallet demurrage attestations are independently opt-in with -qqautodemurrageattest=1. Mandatory consensus demurrage and burn are automatic after Final activation and cannot be disabled here.\n",
             {
                 {"generate", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED, "To enable or disable staking."},
 
@@ -2007,23 +2021,26 @@ static RPCHelpMan setpowmining()
         "\nStart, stop, or reconfigure the built-in (in-process) Gold Rush Proof-of-Work miner.\n"
         "No external miner is required. Mining only produces claims during the Gold Rush reward window,\n"
         "requires an unlocked wallet with private keys, and credits valid claims to a wallet-owned quantum address in the upgraded shadow ledger.\n"
-        "Set -qqpowpayoutaddress to bind an existing wallet-owned ordinary direct (non-tiered, non-cold-stake) quantum address. With -qqallowautokeycreation=0, that explicit binding is required and no payout key is generated.\n"
+        "By default the miner reuses -qqpowpayoutaddress or a previously stored wallet payout and creates no key. If neither exists, the call fails without changing the wallet unless allow_new_payout_key=true gives one-call consent, or startup already supplied -qqallowautokeycreation=1. Every newly created payout key is non-HD and requires an immediate wallet backup.\n"
         "Claim submission is not whitelist-gated, but it does require a spendable non-dust legacy UTXO to authenticate the QQSPROOF transaction and pay the minimal network fee.\n",
         {
             {"enabled", RPCArg::Type::BOOL, RPCArg::Optional::NO, "true to start mining, false to stop."},
             {"threads", RPCArg::Type::NUM, RPCArg::Default{1}, "Worker threads (CPU cores) to use, 1..256."},
             {"cpu_percent", RPCArg::Type::NUM, RPCArg::Default{1}, "Per-core CPU duty-cycle target, 1..100."},
+            {"allow_new_payout_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicit consent to create one new non-HD ML-DSA payout key if no configured or previously stored payout exists. Back up the wallet immediately if the result reports created_payout_key=true."},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is now enabled."},
             {RPCResult::Type::NUM, "threads", "Configured worker threads."},
             {RPCResult::Type::NUM, "cpu_percent", "Configured per-core CPU duty cycle."},
             {RPCResult::Type::STR, "payout_address", "The configured, restored, or newly created wallet-owned quantum payout address."},
+            {RPCResult::Type::BOOL, "created_payout_key", "Whether this call created a new non-HD ML-DSA payout key."},
             {RPCResult::Type::STR, "warning", /*optional=*/true, "Backup reminder when a wallet-backed quantum payout key was created."},
         }},
         RPCExamples{
-            HelpExampleCli("setpowmining", "true 2 50")
-          + HelpExampleRpc("setpowmining", "true, 2, 50")
+            HelpExampleCli("setpowmining", "true 2 50 false")
+          + HelpExampleCli("setpowmining", "true 2 50 true")
+          + HelpExampleRpc("setpowmining", "true, 2, 50, false")
         },
     [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -2033,9 +2050,12 @@ static RPCHelpMan setpowmining()
     const bool enabled = request.params[0].get_bool();
     const int threads = request.params[1].isNull() ? 1 : request.params[1].getInt<int>();
     const int cpu_percent = request.params[2].isNull() ? 1 : request.params[2].getInt<int>();
+    const bool allow_new_payout_key = !request.params[3].isNull() && request.params[3].get_bool();
     bilingual_str error;
     bool created_payout_key{false};
-    const bool ok = pwallet->SetPowMining(enabled, threads, cpu_percent, error, &created_payout_key);
+    const bool ok = pwallet->SetPowMining(
+        enabled, threads, cpu_percent, error, &created_payout_key,
+        allow_new_payout_key);
     if (!ok) {
         throw JSONRPCError(RPC_WALLET_ERROR, error.original);
     }
@@ -2048,6 +2068,7 @@ static RPCHelpMan setpowmining()
         LOCK(pwallet->cs_wallet);
         result.pushKV("payout_address", pwallet->m_pow_payout_quantum);
     }
+    result.pushKV("created_payout_key", created_payout_key);
     if (created_payout_key) {
         result.pushKV("warning", "A new wallet-backed ML-DSA quantum payout address was created for PoW rewards. Back up this wallet before relying on mined rewards.");
     }
@@ -2063,6 +2084,8 @@ static RPCHelpMan getpowmininginfo()
         {},
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is enabled."},
+            {RPCResult::Type::BOOL, "autostart", "Whether explicit persistent consent was given to start PoW mining at wallet startup."},
+            {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether background wallet automation may create a new non-HD payout key."},
             {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, epoch_inactive, claim_in_flight, claim_quarantined, ready, hashing, or error."},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
             {RPCResult::Type::NUM, "cpu_percent", "Per-core CPU duty-cycle target."},
@@ -2086,6 +2109,8 @@ static RPCHelpMan getpowmininginfo()
 
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("enabled", pwallet->m_pow_mining_enabled.load());
+    obj.pushKV("autostart", gArgs.GetBoolArg("-powmining", false));
+    obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));
     obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pwallet->m_pow_state.load())));
     obj.pushKV("threads", pwallet->m_pow_threads.load());
     obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());

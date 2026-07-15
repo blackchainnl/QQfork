@@ -2329,10 +2329,13 @@ public:
     {
         return m_wallet->m_enabled_staking;
     }
-    bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error) override
+    bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
+                      bool allow_new_payout_key) override
     {
         bilingual_str werror;
-        const bool ok = m_wallet->SetPowMining(enabled, threads, cpu_percent, werror);
+        const bool ok = m_wallet->SetPowMining(
+            enabled, threads, cpu_percent, werror, /*created_payout=*/nullptr,
+            allow_new_payout_key);
         if (!ok) {
             error = werror.original;
             m_wallet->WalletLogPrintf("Gold Rush PoW miner configuration failed: %s\n", werror.original);

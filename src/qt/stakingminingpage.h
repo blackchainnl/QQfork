@@ -8,6 +8,7 @@
 #include <qt/walletmodel.h>
 
 #include <cstdint>
+#include <string>
 #include <QPointer>
 #include <QSize>
 #include <QString>
@@ -32,12 +33,12 @@ QT_END_NAMESPACE
 /**
  * "Staking & Mining" tab.
  *
- * Top section  - Staking: one master toggle that enables legacy PoS staking and, automatically,
- *                Gold Rush PoS signalling/claims when the wallet is whitelisted during the epoch.
+ * Top section  - Staking: one master toggle that enables legacy PoS staking. Fee-paying
+ *                Gold Rush PoS signalling remains a separate explicit automation choice.
  *                Wired to the existing interfaces::Wallet staking enable.
  * Bottom section - Gold Rush Proof-of-Work: a separate opt-in for the in-process (fully integrated,
  *                no external miner) Argon2id solver, with CPU-core and CPU-% throttle controls,
- *                an auto-created quantum payout address, live status, and the Gold Rush
+ *                an explicitly confirmed quantum payout address, live status, and the Gold Rush
  *                phase-lock warning. Wired to interfaces::Wallet PoW-mining methods.
  */
 class StakingMiningPage : public QWidget
@@ -153,6 +154,16 @@ private:
     QPushButton* m_optimize_button{nullptr};
     QLabel* m_optimize_status{nullptr};
 
+    // Optional persistent automation. Every item is off by default and has a
+    // separate confirmation because the consequences are different.
+    QCheckBox* m_autostart_staking{nullptr};
+    QCheckBox* m_autostart_pow{nullptr};
+    QCheckBox* m_auto_qqsignal{nullptr};
+    QCheckBox* m_auto_demurrage_attest{nullptr};
+    QCheckBox* m_auto_redelegate{nullptr};
+    QCheckBox* m_allow_auto_key_creation{nullptr};
+    QLabel* m_automation_status{nullptr};
+
     // Proof-of-Work section
     QCheckBox* m_pow_enable{nullptr};
     QCheckBox* m_pow_unlock_wallet{nullptr};
@@ -240,6 +251,8 @@ private:
     void applyDonationPercentage(unsigned int percentage);
     void applyDonationDefaults(bool wallet_migration_complete);
     void refreshDonationControls();
+    void onAutomationToggled(QCheckBox* control, const std::string& setting, bool enabled);
+    void refreshAutomationControls();
     bool requestStakingOnlyUnlock();
     bool requestNormalUnlock();
     void showHelpDialog(const QString& title, const QString& html);

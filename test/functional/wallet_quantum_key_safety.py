@@ -69,9 +69,19 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
             load_on_startup=True,
         )
         pow_wallet = node.get_wallet_rpc(pow_wallet_name)
-        pow_result = pow_wallet.setpowmining(True, 1, 1)
+        assert_raises_rpc_error(
+            -4,
+            "allow_new_payout_key=true",
+            pow_wallet.setpowmining,
+            True,
+            1,
+            1,
+        )
+        assert_equal(pow_wallet.getquantumkeyinventory()["total"], 0)
+        pow_result = pow_wallet.setpowmining(True, 1, 1, True)
         self.assert_no_private_fields(pow_result)
         assert pow_result["enabled"]
+        assert pow_result["created_payout_key"]
         assert pow_result["warning"]
         pow_payout = pow_result["payout_address"]
         assert pow_payout
@@ -248,6 +258,7 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         pow_result = pow_wallet.setpowmining(True, 1, 1)
         self.assert_no_private_fields(pow_result)
         assert_equal(pow_result["payout_address"], pow_payout)
+        assert_equal(pow_result["created_payout_key"], False)
         assert "warning" not in pow_result
         pow_wallet.setpowmining(False)
 

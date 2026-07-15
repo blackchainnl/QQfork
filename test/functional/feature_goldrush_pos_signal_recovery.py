@@ -30,6 +30,7 @@ class GoldRushPosSignalRecoveryTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.extra_args = [[
             "-staketimio=25",
+            "-qqautoshadowsignal=1",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=300",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",

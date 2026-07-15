@@ -62,6 +62,8 @@ class QuantumDemurrageTest(BitcoinTestFramework):
             "-txindex=1",
             "-staketimio=50",
             "-donatetodevfund=0",
+            "-qqautodemurrageattest=1",
+            "-qqallowautokeycreation=1",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=10",
             f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",

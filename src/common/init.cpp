@@ -1237,20 +1237,37 @@ MigrationChoice ParseMigrationChoice(const ArgsManager& args)
 
 MigrationChoice ResolveAutoMigrationChoice(bool has_blackcoin, const fs::path& blackcoin_path, const std::optional<LegacySource>& blackmore_source, const common::LegacyMigrationPromptFn& legacy_migration_prompt_fn, bool explicit_choice)
 {
-    if (blackmore_source && !has_blackcoin) return MigrationChoice::BLACKMORE;
-    if (has_blackcoin && !blackmore_source) return MigrationChoice::BLACKCOIN;
-    if (!has_blackcoin && !blackmore_source) return MigrationChoice::NONE;
-
     if (!explicit_choice && legacy_migration_prompt_fn) {
         const MigrationChoice prompted = ParseMigrationChoiceValue(
-            legacy_migration_prompt_fn(fs::PathToString(blackcoin_path), fs::PathToString(blackmore_source->path)));
+            legacy_migration_prompt_fn(
+                has_blackcoin ? fs::PathToString(blackcoin_path) : std::string{},
+                blackmore_source ? fs::PathToString(blackmore_source->path) : std::string{}));
         if (prompted == MigrationChoice::BLACKMORE || prompted == MigrationChoice::BLACKCOIN || prompted == MigrationChoice::NONE || prompted == MigrationChoice::ABORT) {
             return prompted;
         }
     }
+    // AUTO deliberately never chooses wallet data. A GUI callback may turn it
+    // into a concrete one-shot choice; blackcoind must fail closed below and
+    // print the exact command required. This prevents a first start from
+    // copying, retiring, or selecting wallet data without informed consent.
+    return MigrationChoice::AUTO;
+}
 
-    LogPrintf("Blackcoin: both .blackcoin and .blackmore legacy datadirs were found; keeping the populated .blackcoin datadir by default. The .blackmore datadir will be backed up and preserved. Restart with -migratewallet=blackmore to import it explicitly.\n");
-    return MigrationChoice::BLACKCOIN;
+std::string LegacyMigrationConsentRequiredMessage(bool has_blackcoin, const fs::path& blackcoin_path, const std::optional<LegacySource>& blackmore_source)
+{
+    std::string choices;
+    if (blackmore_source) {
+        choices += strprintf(" Restart with -migratewallet=blackmore to copy %s into %s after creating verified recovery backups.",
+                             fs::quoted(fs::PathToString(blackmore_source->path)),
+                             fs::quoted(fs::PathToString(blackcoin_path)));
+    }
+    if (has_blackcoin) {
+        choices += strprintf(" Restart with -migratewallet=blackcoin to keep %s active after creating a verified recovery backup.",
+                             fs::quoted(fs::PathToString(blackcoin_path)));
+    }
+    choices += " Restart with -migratewallet=none to preserve verified backups without importing or replacing wallet data.";
+    return "an explicit one-shot legacy wallet-data choice is required; no new migration, backup, or retirement operation was started." + choices +
+           " Do not put migratewallet in blackcoin.conf; remove the command-line option after this successful first run.";
 }
 
 std::optional<std::string> CommitMigrationMarker(const fs::path& destination, const std::string& status)
@@ -1357,6 +1374,9 @@ MigrationOutcome MaybeMigrateLegacyDataDir(ArgsManager& args, const common::Lega
     const bool explicit_choice = args.IsArgSet("-migratewallet");
     if (choice == MigrationChoice::AUTO) {
         choice = ResolveAutoMigrationChoice(has_blackcoin, base_path, blackmore_source, legacy_migration_prompt_fn, explicit_choice);
+    }
+    if (choice == MigrationChoice::AUTO) {
+        return {.aborted = false, .error = LegacyMigrationConsentRequiredMessage(has_blackcoin, base_path, blackmore_source)};
     }
     if (choice == MigrationChoice::ABORT) {
         // The user chose to exit instead of deciding. Nothing has been copied,

@@ -60,7 +60,7 @@ QString PosGuide()
 <li>At the whitelist snapshot height, the wallet's controlled addresses are checked for aggregate balance.</li>
 <li>If the aggregate balance is at least 10,000 BLK, that wallet target can qualify for PoS Gold Rush participation.</li>
 <li>During Gold Rush, the wallet still has to actively stake and solve PoS blocks.</li>
-<li>When it has a recent qualifying solve, the wallet must be normally unlocked so it can publish the signal transaction.</li>
+<li>When it has a recent qualifying solve, the wallet must be normally unlocked and the user must explicitly enable automatic QQSIGNAL submission (or submit the signal manually through RPC).</li>
 </ol>
 <p><b>Example A:</b> a wallet held 6,000 BLK at one address and 4,500 BLK at another controlled address at the snapshot. The aggregate is 10,500 BLK, so it can qualify.</p>
 <p><b>Example B:</b> a wallet held 9,999.999 BLK at the snapshot. It is below the threshold and must not receive PoS Gold Rush rewards from that snapshot.</p>
@@ -78,6 +78,7 @@ QString PosGuide()
 <li>Confirm the wallet had at least 10,000 BLK aggregate balance at the whitelist snapshot height.</li>
 <li>Confirm the wallet solved a PoS block inside the rolling activity window.</li>
 <li>Confirm the wallet was normally unlocked, not only legacy staking-only unlocked, when the signal needed to be created.</li>
+<li>Confirm automatic QQSIGNAL was explicitly enabled, or submit the signal manually with the wallet RPC. Enabling ordinary staking alone does not grant this transaction consent.</li>
 <li>Check the Transactions and Account tabs for the quantum payout address and credit.</li>
 </ul>
 )HTML");
@@ -89,7 +90,7 @@ QString PowGuide()
 <h2>Detailed PoW Gold Rush example</h2>
 <p>Gold Rush PoW is not a separate block chain. It creates claim transactions that are included in ordinary PoS blocks. This gives smaller holders a way to compete for part of the Gold Rush reward schedule without needing 10,000 BLK at the PoS whitelist snapshot.</p>
 <ol>
-<li>The wallet creates or reuses a wallet-backed quantum payout address.</li>
+<li>The wallet reuses an existing wallet-backed quantum payout address. If none exists, the GUI asks before creating one; RPC callers must pass explicit one-call key-creation consent.</li>
 <li>The built-in miner searches for an Argon2id proof that meets the current target.</li>
 <li>When it finds a proof, the wallet creates a QQSPROOF transaction.</li>
 <li>The QQSPROOF transaction pays a normal small legacy-chain fee.</li>
@@ -101,6 +102,7 @@ QString PowGuide()
 
 <h3>Why the payout must be a quantum address</h3>
 <p>PoW Gold Rush is intended to pull users onto quantum-resistant keys. Paying the reward to a legacy address would defeat the transition goal. The wallet therefore uses a quantum payout address and asks users to back up the wallet after that address exists.</p>
+<p>Quantum payout keys are non-HD. The miner never creates one silently: reject the prompt or omit the RPC consent flag and mining fails without creating a key. If a new payout key is created, back up the wallet immediately.</p>
 
 <h3>When PoW rewards become spendable</h3>
 <p>A Gold Rush reward remains locked until Gold Rush ends and must satisfy normal maturity. It then becomes an ordinary direct quantum output at the original payout address. Moving it to a fresh address is optional consolidation or key rotation, not a prerequisite for sends, cold-stake delegation, or node bonding.</p>
@@ -182,6 +184,7 @@ QString DemurrageGuide()
 <h2>Demurrage and liveness attestations</h2>
 <p>Demurrage is an inactivity rule for eligible direct, tiered, and cold-stake quantum outputs. It is inactive throughout Gold Rush and Migration, then activates automatically with Final Lockout at height 6,922,000.</p>
 <p>A liveness attestation is a small fee-paying transaction that proves the controlling quantum key is still actively managed. The wallet can create attestations only for eligible wallet-backed direct or tiered v16 addresses. A cold-stake output cannot be attested.</p>
+<p>Automatic wallet attestations are optional and off by default. Enabling or disabling that local automation does not enable, delay, or disable consensus demurrage or the permanent burn.</p>
 <p><b>Example:</b> a user has an eligible direct quantum output that has not moved for many months. Before it begins to lose effective value, the wallet can send an attestation for that key. Automatic attempts require staking to be enabled, a normally unlocked private-key wallet, a safe spendable fee input, and available attestation capacity. Construction or broadcast failure can defer an attempt. Merely leaving the wallet online does not guarantee an attestation.</p>
 <p>Cold-stake delegation alone is not exempt; a successful coinstake spends and recreates the output and refreshes its activity. The Account tab shows whether outputs are decaying, locked, or protected by a recent qualifying attestation. Mainnet configures no exempt scripts. Any nominal-minus-effective principal realized by a spend is permanently burned and is never paid to a miner, staker, treasury, reward pool, or claim participant.</p>
 )HTML");

@@ -205,27 +205,40 @@ static bool ErrorSettingsRead(const bilingual_str& error, const std::vector<std:
 
 static std::string PromptLegacyMigrationChoice(const std::string& blackcoin_datadir, const std::string& blackmore_datadir)
 {
+    const bool has_blackcoin = !blackcoin_datadir.empty();
+    const bool has_blackmore = !blackmore_datadir.empty();
     QMessageBox messagebox(
         QMessageBox::Question,
         PACKAGE_NAME,
         QObject::tr("Choose Blackcoin wallet data"),
         QMessageBox::NoButton);
     messagebox.setText(QObject::tr(
-        "Blackcoin found both an existing Blackcoin data directory and a legacy Blackmore data directory. "
-        "Choose which wallet data to load. Both sources will be backed up before startup continues. "
-        "Choosing Exit closes Blackcoin without changing anything; you will be asked again next time."));
-    messagebox.setInformativeText(QObject::tr("Blackcoin: %1\nBlackmore: %2")
-        .arg(QString::fromStdString(blackcoin_datadir), QString::fromStdString(blackmore_datadir)));
-    QPushButton* keep_blackcoin = messagebox.addButton(QObject::tr("Use existing Blackcoin wallet"), QMessageBox::AcceptRole);
-    QPushButton* import_blackmore = messagebox.addButton(QObject::tr("Import Blackmore wallet"), QMessageBox::ActionRole);
-    QPushButton* exit_app = messagebox.addButton(QObject::tr("Exit"), QMessageBox::RejectRole);
-    messagebox.setDefaultButton(keep_blackcoin);
+        "Blackcoin found legacy wallet data. Choose the source to use before any new migration, backup, or retirement operation starts. "
+        "An import is copy-only: the source is retained, verified recovery backups are created, and the selected data becomes active only after verification. "
+        "Choosing Exit closes Blackcoin without selecting or importing wallet data; use the displayed one-shot command for a manual/headless start."));
+
+    QString details;
+    if (has_blackcoin) details += QObject::tr("Existing Blackcoin source/destination: %1\n").arg(QString::fromStdString(blackcoin_datadir));
+    if (has_blackmore) details += QObject::tr("Legacy Blackmore source: %1\n").arg(QString::fromStdString(blackmore_datadir));
+    if (has_blackmore) details += QObject::tr("Import command: blackcoind -migratewallet=blackmore\n");
+    if (has_blackcoin) details += QObject::tr("Keep command: blackcoind -migratewallet=blackcoin\n");
+    details += QObject::tr("Backup-only command: blackcoind -migratewallet=none\n\nRemove the option after the successful first run; it is not a persistent setting.");
+    messagebox.setInformativeText(details);
+
+    QPushButton* keep_blackcoin = has_blackcoin
+        ? messagebox.addButton(QObject::tr("Use existing Blackcoin wallet"), QMessageBox::AcceptRole)
+        : nullptr;
+    QPushButton* import_blackmore = has_blackmore
+        ? messagebox.addButton(QObject::tr("Import Blackmore wallet"), QMessageBox::ActionRole)
+        : nullptr;
+    QPushButton* exit_app = messagebox.addButton(QObject::tr("Exit / decide manually"), QMessageBox::RejectRole);
+    messagebox.setDefaultButton(keep_blackcoin ? keep_blackcoin : import_blackmore);
     // Esc and the window close button also mean "exit without deciding".
     messagebox.setEscapeButton(exit_app);
     messagebox.exec();
 
-    if (messagebox.clickedButton() == import_blackmore) return "blackmore";
-    if (messagebox.clickedButton() == keep_blackcoin) return "blackcoin";
+    if (import_blackmore && messagebox.clickedButton() == import_blackmore) return "blackmore";
+    if (keep_blackcoin && messagebox.clickedButton() == keep_blackcoin) return "blackcoin";
     return "abort";
 }
 

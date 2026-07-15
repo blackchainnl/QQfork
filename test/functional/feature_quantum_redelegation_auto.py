@@ -33,6 +33,7 @@ class QuantumRedelegationAutoTest(BitcoinTestFramework):
             f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
             f"-qqstaketierheight={GOLD_RUSH_END_HEIGHT + 1}",
             "-qqautoredelegate=1",
+            "-qqallowautokeycreation=1",
             "-qqredelegationtriggermultiplier=1",
             "-qqredelegationmaxpatienceblocks=1",
             "-qqredelegationmintriggerblocks=10",

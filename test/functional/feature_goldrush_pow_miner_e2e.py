@@ -268,7 +268,7 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         )
 
         existing_claims = set(self._pow_claim_txids())
-        started = miner_wallet.setpowmining(True, 1, 100)
+        started = miner_wallet.setpowmining(True, 1, 100, True)
         assert_equal(started["enabled"], True)
         assert_equal(started["threads"], 1)
         assert_equal(started["cpu_percent"], 100)
@@ -291,7 +291,7 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
 
     def _start_miner_until_claim(self, miner_wallet):
         node = self.nodes[0]
-        started = miner_wallet.setpowmining(True, 1, 100)
+        started = miner_wallet.setpowmining(True, 1, 100, True)
         assert_equal(started["enabled"], True)
         assert_equal(started["threads"], 1)
         assert_equal(started["cpu_percent"], 100)

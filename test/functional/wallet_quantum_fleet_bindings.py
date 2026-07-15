@@ -47,14 +47,14 @@ class WalletQuantumFleetBindingsTest(BitcoinTestFramework):
             "-qqautodemurrageattest=0",
         ]
 
-        self.log.info("Hard fleet mode requires explicit auto-redelegation shutdown")
+        self.log.info("Automatic redelegation requires separate background-key consent")
         self.stop_node(0)
         node.assert_start_raises_init_error(
-            extra_args=["-qqallowautokeycreation=0"],
+            extra_args=["-qqautoredelegate=1"],
             expected_msg=(
-                "Error: -qqallowautokeycreation=0 requires explicit "
-                "-qqautoredelegate=0 because automatic redelegation otherwise "
-                "generates a new quantum owner key."
+                "Error: -qqautoredelegate=1 requires explicit "
+                "-qqallowautokeycreation=1 because each automatic redelegation "
+                "generates a new non-HD quantum owner key that must be backed up."
             ),
         )
 
@@ -117,6 +117,7 @@ class WalletQuantumFleetBindingsTest(BitcoinTestFramework):
             started = wallet.setpowmining(True, 1, 1)
         assert started["enabled"]
         assert_equal(started["payout_address"], bound)
+        assert_equal(started["created_payout_key"], False)
         assert "warning" not in started
         # Give the worker time to perform its first hot-loop re-resolution.
         # Before the edge-triggered log guard this produced a second identical
@@ -143,6 +144,7 @@ class WalletQuantumFleetBindingsTest(BitcoinTestFramework):
         assert_equal(self.key_set(wallet), expected_keys)
         started = wallet.setpowmining(True, 1, 1)
         assert_equal(started["payout_address"], bound)
+        assert_equal(started["created_payout_key"], False)
         assert "warning" not in started
         wallet.setpowmining(False)
         node.mockscheduler(61)

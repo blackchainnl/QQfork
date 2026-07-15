@@ -171,7 +171,9 @@ Choice PromptForRebuild(QWidget* parent)
     box.setInformativeText(QObject::tr(
         "Wallet files and available block files are preserved. Automatic mode "
         "restarts Blackcoin once to rebuild, then once normally to verify the "
-        "replacement before wallet automation is allowed."));
+        "replacement before wallet automation is allowed. The temporary source "
+        "chainstate backup is retired only after that separate verification "
+        "succeeds; a failure or interruption preserves it for recovery."));
     QPushButton* automatic = box.addButton(QObject::tr("Rebuild automatically"), QMessageBox::AcceptRole);
     QPushButton* manual = box.addButton(QObject::tr("Exit and rebuild manually"), QMessageBox::RejectRole);
     box.setDefaultButton(automatic);
@@ -194,7 +196,9 @@ void ShowManualRebuildInstructions(QWidget* parent, const QString& executable,
         "After confirming your wallet backup, run this one-time command. The "
         "process exits automatically at the protected commit point; then reopen "
         "Blackcoin normally without either reindex option to verify the rebuilt "
-        "state. Do not add reindex-chainstate to the configuration file."));
+        "state. The temporary source chainstate backup is retired only after "
+        "successful verification; a failure or interruption preserves it. Do "
+        "not add reindex-chainstate to the configuration file."));
     box.setDetailedText(command);
     box.exec();
 }

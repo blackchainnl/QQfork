@@ -212,6 +212,13 @@ static constexpr size_t DUMMY_NESTED_P2WPKH_INPUT_SIZE = 91;
 static const CAmount DEFAULT_MIN_STAKING_AMOUNT = 0.1 * COIN;
 //! -reservebalance default
 static const CAmount DEFAULT_RESERVE_BALANCE = 0;
+//! Optional wallet automation is opt-in. Consensus lifecycle and demurrage
+//! rules are independent and remain mandatory at their configured heights.
+static constexpr bool DEFAULT_AUTOSTART_STAKING{false};
+static constexpr bool DEFAULT_AUTO_SHADOW_SIGNAL{false};
+static constexpr bool DEFAULT_AUTO_DEMURRAGE_ATTEST{false};
+static constexpr bool DEFAULT_AUTO_REDELEGATE{false};
+static constexpr bool DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION{false};
 //! -donatetodevfund default
 static const unsigned int DEFAULT_DONATION_PERCENTAGE = 0;
 static const unsigned int DEFAULT_DONATION_SUGGESTED_PERCENTAGE = 1;
@@ -1130,7 +1137,7 @@ public:
     // but only one caller per wallet may select an input, sign, and commit a
     // QQSPROOF transaction at a time.
     std::atomic<bool> m_shadow_pow_claim_submission_inflight{false};
-    std::string m_pow_payout_quantum GUARDED_BY(cs_wallet); // auto-created ML-DSA payout address
+    std::string m_pow_payout_quantum GUARDED_BY(cs_wallet); // configured, reused, or explicitly consented ML-DSA payout
     // Runtime cache used to emit the configured QQSIGNAL binding once per
     // wallet process instead of once per retry attempt.
     std::string m_shadow_signal_payout_quantum GUARDED_BY(cs_wallet);
@@ -1550,7 +1557,8 @@ public:
     std::unique_ptr<std::vector<std::thread>> threadStakeMinerGroup GUARDED_BY(m_staking_thread_mutex);
 
     /* Built-in Gold Rush PoW miner */
-    bool SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error, bool* created_payout = nullptr);
+    bool SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
+                      bool* created_payout = nullptr, bool allow_new_payout_key = false);
     void StopPowMining();
     bool IsPowMiningClosing() const;
     void ThreadShadowPoWMiner(int worker_id);
@@ -1559,7 +1567,8 @@ public:
         const std::string& purpose,
         CTxDestination& destination,
         bilingual_str& error) const;
-    bool EnsurePowPayoutAddress(bilingual_str& error, bool* created = nullptr);
+    bool EnsurePowPayoutAddress(bilingual_str& error, bool* created = nullptr,
+                                bool allow_new_key = false);
     bool EnsureShadowSignalPayoutAddress(
         CScript& payout_script,
         std::string& payout_address,

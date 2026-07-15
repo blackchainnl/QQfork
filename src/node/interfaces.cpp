@@ -864,17 +864,6 @@ public:
         if (node::CanStake()) {
             StartStake(wallet);
         }
-        // Headless auto-start of the built-in Gold Rush PoW miner (-powmining). Logs and continues
-        // if it cannot start yet (e.g. the wallet is locked); the user can start it later via the
-        // setpowmining RPC or the GUI once conditions allow.
-        if (gArgs.GetBoolArg("-powmining", false)) {
-            bilingual_str pow_error;
-            const int pow_threads = (int)gArgs.GetIntArg("-powminingthreads", 1);
-            const int pow_cpu = (int)gArgs.GetIntArg("-powminingcpu", 1);
-            if (!wallet.SetPowMining(true, pow_threads, pow_cpu, pow_error)) {
-                wallet.WalletLogPrintf("Gold Rush PoW mining not auto-started: %s\n", pow_error.original);
-            }
-        }
     }
     void stopStake(wallet::CWallet& wallet) override
     {

@@ -1332,7 +1332,7 @@ bool CreateQuantumColdStakeRedelegationTransaction(
 
 int MaybeAutoDemurrageAttest(CWallet& wallet)
 {
-    if (!gArgs.GetBoolArg("-qqautodemurrageattest", true)) return 0;
+    if (!gArgs.GetBoolArg("-qqautodemurrageattest", DEFAULT_AUTO_DEMURRAGE_ATTEST)) return 0;
 
     {
         LOCK(wallet.cs_wallet);
@@ -1515,7 +1515,7 @@ int MaybeAutoDemurrageAttest(CWallet& wallet)
 int MaybeAutoShadowSignal(CWallet& wallet)
 {
     ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
-    if (!gArgs.GetBoolArg("-qqautoshadowsignal", true)) return 0;
+    if (!gArgs.GetBoolArg("-qqautoshadowsignal", DEFAULT_AUTO_SHADOW_SIGNAL)) return 0;
     if (!wallet.m_enabled_staking.load() || wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
         return 0;
     }
@@ -1666,9 +1666,9 @@ int MaybeAutoShadowSignal(CWallet& wallet)
 
 int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
 {
-    if (!gArgs.GetBoolArg("-qqautoredelegate", true)) return 0;
-    if (!gArgs.GetBoolArg("-qqallowautokeycreation", true)) {
-        wallet.WalletLogPrintf("Automatic Quantum cold-stake redelegation is disabled because -qqallowautokeycreation=0 forbids its new owner-key generation path. Keep -qqautoredelegate=0 in fleet configuration.\n");
+    if (!gArgs.GetBoolArg("-qqautoredelegate", DEFAULT_AUTO_REDELEGATE)) return 0;
+    if (!gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)) {
+        wallet.WalletLogPrintf("Automatic Quantum cold-stake redelegation is disabled because explicit -qqallowautokeycreation=1 consent is absent. Disable -qqautoredelegate or restart with both options enabled and back up every new non-HD key.\n");
         return 0;
     }
     if (wallet.IsLocked() || wallet.m_wallet_unlock_staking_only || wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {

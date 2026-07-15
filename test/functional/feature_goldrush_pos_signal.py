@@ -38,6 +38,7 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
             "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
+            "-qqautoshadowsignal=1",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=500",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",

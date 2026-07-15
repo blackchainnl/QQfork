@@ -265,7 +265,8 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self.log.info("The built-in miner waits for a new tip after its exact input becomes unavailable")
         builtin_race_before = self._claim_txids(builtin_race)
         with node.wait_for_debug_log([b"Gold Rush PoW claim submission test barrier reached"], timeout=180):
-            builtin_race.setpowmining(True, 1, 100)
+            started = builtin_race.setpowmining(True, 1, 100, True)
+            assert started["created_payout_key"]
         with node.wait_for_debug_log([b"is no longer spendable; retry after the next tip"], timeout=20):
             assert_equal(builtin_race.lockunspent(False, [builtin_race_inputs[LIVE_FEE_VALUES[0]]]), True)
         try:
@@ -356,8 +357,9 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
         self.log.info("The built-in miner uses the same guard and exception cleanup")
         before_builtin_fault = self._quarantined_claim_txids(builtin)
-        started = builtin.setpowmining(True, 1, 100)
-        assert started["payout_address"]
+        started = builtin.setpowmining(True, 1, 100, True)
+        assert started["created_payout_key"]
+        builtin_payout = started["payout_address"]
         try:
             builtin_fault_txid = self._wait_for_new_quarantined_claim(builtin, before_builtin_fault)
         finally:

@@ -142,13 +142,15 @@ remain stable after a clean restart and a second offline chainstate rebuild.
 
 ## First run and data migration
 
-On first run without `-datadir` or `-conf`, `blackcoind` and `blackcoin-qt` look for a legacy
-`~/.blackmore` data directory. If it is the only legacy data directory, the node **copies**
-it to `~/.blackcoin`, converts `blackmore.conf` to `blackcoin.conf`, leaves the original
-intact, and writes a migration marker. If both `.blackcoin` and `.blackmore` exist, the GUI
-prompts and headless startup safely keeps `.blackcoin` unless `-migratewallet=blackmore` is
-supplied. Migration failures abort startup rather than loading the wrong wallet. Ensure there
-is enough free disk for a full copy of the selected legacy directory and its backup.
+On first run without `-datadir` or `-conf`, `blackcoind` and `blackcoin-qt` inspect the
+default `.blackcoin` and legacy `~/.blackmore` locations but never select wallet data
+automatically. The GUI shows source, destination, backup/rollback behavior, and applicable
+migrate or exit/manual choices. Headless startup fails closed before backup or import and
+prints the exact one-shot `-migratewallet=blackmore`, `-migratewallet=blackcoin`, or
+`-migratewallet=none` command. Remove that command-line option after the successful first
+run. Blackmore import remains copy-first, converts `blackmore.conf` to `blackcoin.conf`, and
+leaves the original intact. Migration failures abort startup rather than loading the wrong
+wallet. Ensure there is enough free disk for the selected directory and verified backups.
 
 > **Important:** ML-DSA quantum keys are **not** derived from your HD seed. **Back up your
 > wallet again after creating any quantum address** (migration, staking, operator, or cold-stake), or a

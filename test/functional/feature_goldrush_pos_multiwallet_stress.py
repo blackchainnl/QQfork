@@ -44,6 +44,7 @@ class GoldRushPosMultiwalletStressTest(BitcoinTestFramework):
         self.base_args = [
             "-allowunsafequantumkeyrpc=1",
             "-autostartstaking=0",
+            "-qqautoshadowsignal=1",
             "-txindex=1",
             "-staketimio=25",
             "-shadowwhitelistheight=5",

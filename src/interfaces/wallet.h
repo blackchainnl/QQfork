@@ -323,7 +323,8 @@ public:
     //! @param threads  worker threads / CPU cores (>=1)
     //! @param cpu_percent  per-core CPU duty-cycle target, 1..100
     //! Returns false (and fills `error`) if PoW mining cannot be configured (e.g. wallet locked).
-    virtual bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error) = 0;
+    virtual bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
+                              bool allow_new_payout_key = false) = 0;
 
     //! Read the built-in Gold Rush PoW miner status (config, hashrate, epoch, payout).
     virtual WalletPowMiningInfo getPowMiningInfo() = 0;
