@@ -1419,6 +1419,7 @@ static RPCHelpMan sendshadowpowclaim()
                 "PoW claims are NOT whitelist-gated. A valid mined claim credits the upgraded shadow ledger to quantum_address without changing the legacy block subsidy.\n"
                 "If proof is omitted, grinding is memory-hard (Argon2id, ~1 MiB per try) and synchronous; tune max_tries accordingly.\n"
                 "If proof is supplied, it must be the hex QQSPROOF payload for the current tip, target address, and quantum payout address.\n"
+                "The active proof format is reported by getshadowpowwork. QQP2/QQP3 do not bind an exact fee input; QQP4 does so only after its separately scheduled activation. Never reuse one externally supplied proof for multiple claim transactions.\n"
                 "Only valid during the Gold Rush reward window. An unconfirmed QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it; this wallet will not create another fee-input claim until it resolves on chain.\n" +
                 HELP_REQUIRING_PASSPHRASE,
                 {
@@ -1585,7 +1586,11 @@ static RPCHelpMan sendshadowpowclaim()
             throw JSONRPCError(RPC_INVALID_PARAMETER, "proof encodes an unknown mode; fee-paying QQSPROOF claims require PoW mode byte 0");
         }
         if (!ValidateShadowPowProofForWork(pow_work, *supplied_proof)) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof does not match the current tip, exact fee input, target address, quantum payout address, and PoW channel");
+            throw JSONRPCError(
+                RPC_INVALID_PARAMETER,
+                pow_work.input_bound
+                    ? "proof does not match the current tip, exact fee input, target address, quantum payout address, and PoW channel"
+                    : "proof does not match the current tip, target address, quantum payout address, and PoW channel");
         }
     }
 

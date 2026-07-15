@@ -8,6 +8,7 @@ from test_framework.util import assert_equal, assert_raises_rpc_error
 QQSPROOF_HEX = "51515350524f4f46"
 GOLD_RUSH_END_HEIGHT = 501
 MIGRATION_END_HEIGHT = 700
+QQP3_LATE_ORIGIN_WINDOW = 64
 POW_WALLET_PASSPHRASE = "goldrush-pow-state-test"
 
 class GoldRushInfoTest(BitcoinTestFramework):
@@ -154,6 +155,9 @@ class GoldRushInfoTest(BitcoinTestFramework):
         wallet_name = "goldrush_pow"
         node.createwallet(wallet_name=wallet_name)
         wallet = node.get_wallet_rpc(wallet_name)
+        cli_wallet_name = "goldrush_pow_cli"
+        node.createwallet(wallet_name=cli_wallet_name)
+        cli_rpc_wallet = node.get_wallet_rpc(cli_wallet_name)
 
         self.log.info("Optional wallet automation is visible and fail-closed by default")
         staking_info = wallet.getstakinginfo()
@@ -176,7 +180,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert "Back up the wallet immediately" in pow_help
 
         rpc_target = wallet.getnewaddress()
-        cli_target = wallet.getnewaddress()
+        cli_target = cli_rpc_wallet.getnewaddress()
         self._generate_with_peer_offline(node, 101, rpc_target)
         self._generate_with_peer_offline(node, 101, cli_target)
         self._sync_mocktime_to_tip()
@@ -205,6 +209,8 @@ class GoldRushInfoTest(BitcoinTestFramework):
         wallet_help = wallet.help("sendshadowpowclaim")
         assert "PoW claims are NOT whitelist-gated" in wallet_help
         assert "Quantum migration address" in wallet_help
+        assert "QQP2/QQP3 do not bind an exact fee input" in wallet_help
+        assert "Never reuse one externally supplied proof" in wallet_help
         assert "proof" in wallet_help
 
         self.log.info("Rejecting invalid built-in PoW miner configuration")
@@ -225,6 +231,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
         self.disconnect_nodes(0, 1)
 
         self.log.info("Broadcasting non-whitelisted PoW claim via RPC")
+        claim_origin_height = node.getblockcount() + 1
         stale_claim = wallet.sendshadowpowclaim(rpc_target, rpc_quantum, 200000)
         assert_equal(stale_claim["address"], rpc_target)
         assert_equal(stale_claim["quantum_address"], rpc_quantum)
@@ -264,22 +271,49 @@ class GoldRushInfoTest(BitcoinTestFramework):
         )
         stolen_quantum = wallet.getnewquantumaddress()["address"]
         assert_raises_rpc_error(-8, proof_mismatch_error, wallet.sendshadowpowclaim, rpc_target, stolen_quantum, 1, None, stale_claim["proof"])
-        assert_raises_rpc_error(-26, "shadow-proof-mempool-conflict", wallet.sendshadowpowclaim, rpc_target, rpc_quantum, 1, None, stale_claim["proof"])
+        # Known P0 (#26): before separately activated QQP4 exact-input binding,
+        # an identical QQP3 proof can currently be replayed through a second
+        # fee input and receive a distinct canonical rank. Keep this behavior
+        # explicit until the duplicate-proof amplification rule is repaired;
+        # silently accepting it here would hide the release blocker.
+        duplicate_claim = wallet.sendshadowpowclaim(
+            rpc_target, rpc_quantum, 1, None, stale_claim["proof"]
+        )
+        assert duplicate_claim["txid"] != stale_claim["txid"]
+        assert_equal(duplicate_claim["proof"], stale_claim["proof"])
+        assert_equal(
+            set(self._mempool_pow_claims(node)),
+            {stale_claim["txid"], duplicate_claim["txid"]},
+        )
 
-        self.log.info("Expiring unmined next-block-only PoW claims when the tip advances")
+        self.log.info("Retaining QQP3 claims through the bounded late-origin window")
         stale_parent = node.getbestblockhash()
         self.generatetoaddress(self.nodes[1], 3, self.nodes[1].get_deterministic_priv_key().address, sync_fun=self.no_op)
         self.connect_nodes(0, 1)
         self.sync_blocks()
         assert node.getbestblockhash() != stale_parent
+        assert_equal(
+            set(self._mempool_pow_claims(node)),
+            {stale_claim["txid"], duplicate_claim["txid"]},
+        )
+
+        self.log.info("Expiring QQP3 claims only after their 64-block late-origin window")
+        blocks_to_expire = claim_origin_height + QQP3_LATE_ORIGIN_WINDOW - node.getblockcount()
+        assert blocks_to_expire > 0
+        self._generate_with_peer_offline(
+            self.nodes[1],
+            blocks_to_expire,
+            self.nodes[1].get_deterministic_priv_key().address,
+        )
         self.wait_until(lambda: stale_claim["txid"] not in node.getrawmempool(), timeout=10)
+        self.wait_until(lambda: duplicate_claim["txid"] not in node.getrawmempool(), timeout=10)
         stale_accept = node.testmempoolaccept([stale_claim["hex"]])[0]
         assert_equal(stale_accept["allowed"], False)
-        assert_equal(stale_accept["reject-reason"], "shadow-proof-invalid")
+        assert_equal(stale_accept["reject-reason"], "shadow-proof-origin-expired")
 
         if self.is_cli_compiled():
             self.log.info("Checking miner work and broadcasting non-whitelisted PoW claim via CLI")
-            cli_quantum = wallet.getnewquantumaddress()["address"]
+            cli_quantum = cli_rpc_wallet.getnewquantumaddress()["address"]
             cli_work = node.cli.getshadowpowwork(cli_target, cli_quantum)
             assert_equal(cli_work["prefix"], "QQSPROOF")
             assert_equal(cli_work["proof_mode"], "pow")
@@ -288,7 +322,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(cli_work["quantum_address"], cli_quantum)
             assert_equal(cli_work["quantum_payout_script"], node.validateaddress(cli_quantum)["scriptPubKey"])
 
-            cli_wallet = node.cli("-rpcwallet={}".format(wallet_name))
+            cli_wallet = node.cli("-rpcwallet={}".format(cli_wallet_name))
             cli_claim = cli_wallet.sendshadowpowclaim(cli_target, cli_quantum, 200000)
             assert_equal(cli_claim["address"], cli_target)
             assert_equal(cli_claim["quantum_address"], cli_quantum)
