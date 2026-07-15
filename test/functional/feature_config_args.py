@@ -66,9 +66,9 @@ class ConfArgsTest(BitcoinTestFramework):
         with open(inc_conf_file_path, 'w', encoding='utf-8') as conf:
             conf.write('reindex=1\n')
 
-        with self.nodes[0].assert_debug_log(expected_msgs=['Warning: reindex=1 is set in the configuration file, which will significantly slow down startup. Consider removing or commenting out this option for better performance, unless there is currently a condition which makes rebuilding the indexes necessary']):
-            self.start_node(0)
-        self.stop_node(0)
+        self.nodes[0].assert_start_raises_init_error(
+            expected_msg='Error: reindex=1 is set persistently. Remove it from blackcoin.conf or settings.json and pass -reindex only once on the command line.'
+        )
 
         with open(inc_conf_file_path, 'w', encoding='utf-8') as conf:
             conf.write('-dash=1\n')
@@ -146,7 +146,7 @@ class ConfArgsTest(BitcoinTestFramework):
         # Check that correct configuration file path is actually logged
         # (conf_path, not node.bitcoinconf)
         with self.nodes[0].assert_debug_log(expected_msgs=[f"Config file: {conf_path}"]):
-            self.start_node(0, ["-allowignoredconf"], env=env)
+            self.start_node(0, ["-allowignoredconf", "-migratewallet=none"], env=env)
             self.stop_node(0)
 
         # Restore node arguments after the test
@@ -368,7 +368,7 @@ class ConfArgsTest(BitcoinTestFramework):
         # config file.
         node_args = node.args
         node.args = [arg for arg in node.args if not arg.startswith("-datadir=")]
-        node.assert_start_raises_init_error([], re.escape(
+        node.assert_start_raises_init_error(["-migratewallet=none"], re.escape(
             f'Error: Data directory "{node.datadir_path}" contains a "blackcoin.conf" file which is ignored, because a '
             f'different configuration file "{default_datadir}/blackcoin.conf" from data directory "{default_datadir}" '
             f'is being used instead.') + r"[\s\S]*", env=env, match=ErrorMatch.FULL_REGEX)
