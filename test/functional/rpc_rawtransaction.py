@@ -576,6 +576,10 @@ class RawTransactionsTest(BitcoinTestFramework):
         txId = self.nodes[0].sendtoaddress(mSigObj, 2.2)
         decTx = self.nodes[0].gettransaction(txId)
         rawTx2 = self.nodes[0].decoderawtransaction(decTx['hex'])
+        # Match the earlier multisig fixtures: this test covers raw-transaction
+        # RPCs, not randomized fee-filter relay at the wallet's default rate.
+        for node in self.nodes[1:]:
+            assert_equal(node.sendrawtransaction(decTx["hex"]), txId)
         self.sync_all()
         self.generate(self.nodes[0], 1)
 

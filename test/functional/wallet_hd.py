@@ -159,8 +159,11 @@ class WalletHDTest(BitcoinTestFramework):
 
         # send a tx and make sure its using the internal chain for the changeoutput
         txid = self.nodes[1].sendtoaddress(self.nodes[0].getnewaddress(), 1)
-        # The next legacy-only phase mines on node 0. Explicitly synchronize
-        # the fixture first so that phase does not depend on relay timing.
+        # This test covers wallet derivation, not fee-filtered P2P relay. Submit
+        # the fixture directly because a peer may advertise a randomized fee
+        # filter just above the wallet's default feerate.
+        if txid not in self.nodes[0].getrawmempool():
+            self.nodes[0].sendrawtransaction(self.nodes[1].gettransaction(txid)['hex'])
         self.sync_mempools()
         outs = self.nodes[1].gettransaction(txid=txid, verbose=True)['decoded']['vout']
         keypath = ""

@@ -76,7 +76,10 @@ class QuantumFinalLockoutSighashTest(BitcoinTestFramework):
 
         self.log.info("Cross the migration deadline into final lockout")
         quantum_address = node.createquantumkey()["address"]
-        self._mine_until_phase("final_lockout", quantum_address)
+        # Future-witness coinbase outputs are intentionally unavailable during
+        # Gold Rush. Mine the transition blocks to the existing legacy payout
+        # address, then exercise the quantum destination after final lockout.
+        self._mine_until_phase("final_lockout", funding_key.address)
         info = node.getquantumquasarinfo()
         assert_equal(info["phase"], "final_lockout")
         assert_equal(info["replay_protection_active"], True)

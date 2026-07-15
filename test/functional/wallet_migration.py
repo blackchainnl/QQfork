@@ -56,6 +56,15 @@ class WalletMigrationTest(BitcoinTestFramework):
             assert_equal(file_magic, b'SQLite format 3\x00')
         assert_equal(self.nodes[0].get_wallet_rpc(wallet_name).getwalletinfo()["format"], "sqlite")
 
+    def assert_is_bdb(self, wallet_name):
+        wallet_file_path = self.nodes[0].wallets_path / wallet_name / self.wallet_data_filename
+        with open(wallet_file_path, "rb") as f:
+            data = f.read(16)
+        assert_equal(len(data), 16)
+        _, _, magic = struct.unpack("QII", data)
+        assert_equal(magic, BTREE_MAGIC)
+        assert_equal(self.nodes[0].get_wallet_rpc(wallet_name).getwalletinfo()["format"], "bdb")
+
     def create_legacy_wallet(self, wallet_name, disable_private_keys=False):
         self.nodes[0].createwallet(wallet_name=wallet_name, descriptors=False, disable_private_keys=disable_private_keys)
         wallet = self.nodes[0].get_wallet_rpc(wallet_name)
