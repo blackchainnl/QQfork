@@ -31,6 +31,7 @@
 #include <node/context.h>
 #include <node/interface_ui.h>
 #include <node/mini_miner.h>
+#include <node/shadow_resource_monitor.h>
 #include <node/transaction.h>
 #include <policy/feerate.h>
 #include <policy/fees.h>
@@ -102,6 +103,29 @@ public:
     ChainstateRebuildStatus getChainstateRebuildStatus() override
     {
         return Assert(m_context)->chainstate_rebuild_status.load();
+    }
+    ShadowResourceStatus getShadowResourceStatus() override
+    {
+        return node::GetShadowResourceStatus(chainman());
+    }
+    ShadowSupplyScanProgress getShadowSupplyScanProgress() override
+    {
+        return node::GetShadowSupplyScanProgress();
+    }
+    bool abortCirculatingSupplyScan() override
+    {
+        return node::RequestShadowSupplyScanAbort();
+    }
+    UniValue runCirculatingSupplyScan(
+        bool allow_unqualified_resource_scan) override
+    {
+        // Keep the consensus-sensitive accounting implementation single-source
+        // while exposing a typed model operation to Qt. The GUI never builds a
+        // command string and the one-call authorization value is passed only in
+        // this ephemeral request.
+        UniValue params{UniValue::VARR};
+        params.push_back(allow_unqualified_resource_scan);
+        return executeRpc("getcirculatingsupply", params, {});
     }
     uint32_t getLogCategories() override { return LogInstance().GetCategoryMask(); }
     bool baseInitialize() override

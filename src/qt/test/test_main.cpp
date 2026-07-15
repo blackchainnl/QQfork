@@ -13,6 +13,7 @@
 #include <qt/test/chainstaterebuildassistanttests.h>
 #include <qt/test/optiontests.h>
 #include <qt/test/rpcnestedtests.h>
+#include <qt/test/shadowresourcedialogtests.h>
 #include <qt/test/uritests.h>
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
@@ -105,6 +106,9 @@ int main(int argc, char* argv[])
 
     RPCNestedTests test3(app.node());
     num_test_failures += QTest::qExec(&test3);
+
+    ShadowResourceDialogTests shadow_resource_dialog_tests;
+    num_test_failures += QTest::qExec(&shadow_resource_dialog_tests);
 
 #ifdef ENABLE_WALLET
     WalletTests test5(app.node());

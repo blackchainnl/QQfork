@@ -39,6 +39,8 @@ struct bilingual_str;
 namespace node {
 enum class ChainstateRebuildStatus;
 struct NodeContext;
+struct ShadowResourceStatus;
+struct ShadowSupplyScanProgress;
 } // namespace node
 namespace wallet {
 class CCoinControl;
@@ -98,6 +100,25 @@ public:
 
     //! Get mandatory chainstate-upgrade state for the GUI startup assistant.
     virtual node::ChainstateRebuildStatus getChainstateRebuildStatus() = 0;
+
+    //! Get the current scoped shadow-resource operating status.
+    virtual node::ShadowResourceStatus getShadowResourceStatus() = 0;
+
+    //! Get the current or most recent full-supply scan progress.
+    virtual node::ShadowSupplyScanProgress getShadowSupplyScanProgress() = 0;
+
+    //! Request cooperative cancellation of the active full-supply scan.
+    virtual bool abortCirculatingSupplyScan() = 0;
+
+    /**
+     * Run one full circulating-supply scan.
+     *
+     * The boolean is authorization for this call only when the snapshot is
+     * outside the reviewed diagnostic height or chainstate-size envelope. It
+     * is never persisted and cannot bypass hard integrity or absolute work
+     * limits.
+     */
+    virtual UniValue runCirculatingSupplyScan(bool allow_unqualified_resource_scan) = 0;
 
     // Get log flags.
     virtual uint32_t getLogCategories() = 0;

@@ -17,6 +17,7 @@
 #include <qt/optionsmodel.h>
 #include <qt/platformstyle.h>
 #include <qt/rpcconsole.h>
+#include <qt/shadowresourcedialog.h>
 #include <qt/utilitydialog.h>
 
 #ifdef ENABLE_WALLET
@@ -105,6 +106,7 @@ BitcoinGUI::BitcoinGUI(interfaces::Node& node, const PlatformStyle *_platformSty
     updateWindowTitle();
 
     rpcConsole = new RPCConsole(node, _platformStyle, nullptr);
+    shadowResourceDialog = new ShadowResourceDialog(node, nullptr);
     helpMessageDialog = new HelpMessageDialog(this, false);
 #ifdef ENABLE_WALLET
     if(enableWallet)
@@ -258,6 +260,7 @@ BitcoinGUI::~BitcoinGUI()
 #endif
 
     delete rpcConsole;
+    delete shadowResourceDialog;
 }
 
 void BitcoinGUI::createActions()
@@ -367,6 +370,12 @@ void BitcoinGUI::createActions()
     openRPCConsoleAction->setEnabled(false);
     openRPCConsoleAction->setObjectName("openRPCConsoleAction");
 
+    openShadowResourceAction = new QAction(tr("Quantum resource monitor"), this);
+    openShadowResourceAction->setStatusTip(tr(
+        "Inspect the scoped resource envelope and control the optional full supply scan"));
+    openShadowResourceAction->setEnabled(false);
+    openShadowResourceAction->setObjectName("openShadowResourceAction");
+
     usedSendingAddressesAction = new QAction(tr("&Sending addresses"), this);
     usedSendingAddressesAction->setStatusTip(tr("Show the list of used sending addresses and labels"));
     usedReceivingAddressesAction = new QAction(tr("&Receiving addresses"), this);
@@ -415,8 +424,12 @@ void BitcoinGUI::createActions()
     connect(optionsAction, &QAction::triggered, this, &BitcoinGUI::optionsClicked);
     connect(showHelpMessageAction, &QAction::triggered, this, &BitcoinGUI::showHelpMessageClicked);
     connect(openRPCConsoleAction, &QAction::triggered, this, &BitcoinGUI::showDebugWindow);
+    connect(openShadowResourceAction, &QAction::triggered,
+            this, &BitcoinGUI::showShadowResourceDialog);
     // prevents an open debug window from becoming stuck/unusable on client shutdown
     connect(quitAction, &QAction::triggered, rpcConsole, &QWidget::hide);
+    connect(quitAction, &QAction::triggered,
+            shadowResourceDialog, &QWidget::hide);
 
 #ifdef ENABLE_WALLET
     if(walletFrame)
@@ -591,6 +604,7 @@ void BitcoinGUI::createMenuBar()
     }
 
     window_menu->addSeparator();
+    window_menu->addAction(openShadowResourceAction);
     for (RPCConsole::TabTypes tab_type : rpcConsole->tabs()) {
         QAction* tab_action = window_menu->addAction(rpcConsole->tabTitle(tab_type));
         tab_action->setShortcut(rpcConsole->tabShortcut(tab_type));
@@ -698,6 +712,10 @@ void BitcoinGUI::setClientModel(ClientModel *_clientModel, interfaces::BlockAndH
         m_mask_values_action->setChecked(_clientModel->getOptionsModel()->getOption(OptionsModel::OptionID::MaskValues).toBool());
     } else {
         // Shutdown requested, disable menus
+        // Node shutdown has already been requested by BitcoinApplication at
+        // this point. Join the resource worker before core begins chainstate
+        // teardown so no status or supply-scan read can overlap it.
+        shadowResourceDialog->join();
         if (trayIconMenu)
         {
             // Disable context menu on tray icon
@@ -978,6 +996,11 @@ void BitcoinGUI::showDebugWindowActivateConsole()
 {
     rpcConsole->setTabFocus(RPCConsole::TabTypes::CONSOLE);
     showDebugWindow();
+}
+
+void BitcoinGUI::showShadowResourceDialog()
+{
+    GUIUtil::bringToFront(shadowResourceDialog);
 }
 
 void BitcoinGUI::showHelpMessageClicked()
@@ -1391,6 +1414,7 @@ void BitcoinGUI::showEvent(QShowEvent *event)
 
     // enable the debug window when the main window shows up
     openRPCConsoleAction->setEnabled(true);
+    openShadowResourceAction->setEnabled(true);
     aboutAction->setEnabled(true);
     optionsAction->setEnabled(true);
 
@@ -1786,6 +1810,10 @@ void BitcoinGUI::unsubscribeFromCoreSignals()
 
 void BitcoinGUI::join()
 {
+    // Stop accepting new resource work and begin cooperative cancellation.
+    // BitcoinApplication requests global node shutdown immediately after this
+    // method, then setClientModel(nullptr) performs the bounded worker join.
+    shadowResourceDialog->requestShutdown();
 #ifdef ENABLE_WALLET
     if (timerStakingIcon) timerStakingIcon->stop();
     if (m_wallet_controller) {
