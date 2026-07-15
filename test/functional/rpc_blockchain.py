@@ -93,7 +93,6 @@ class BlockchainTest(BitcoinTestFramework):
         self._test_getblock()
         self._test_getdeploymentinfo()
         self._test_y2106()
-        assert self.nodes[0].verifychain(4, 0)
 
     def mine_chain(self):
         self.log.info(f"Generate {HEIGHT} blocks after the genesis block in ten-minute steps")
@@ -276,6 +275,16 @@ class BlockchainTest(BitcoinTestFramework):
         header = self.nodes[0].getblockheader(last)
         assert_equal(header["time"], time_2106)
         assert header["mediantime"] <= time_2106
+
+        # This is a version-2 coinbase: its UTXO time comes from the unsigned
+        # 32-bit block header, not a serialized transaction nTime. Level 4
+        # verification disconnects and reconnects it, covering the full
+        # chainstate round trip at the year-2106 boundary.
+        block = self.nodes[0].getblock(last, 2)
+        assert_equal(block["tx"][0]["version"], 2)
+        # Exercise only the max-uint32 tip before the broader chain check.
+        assert self.nodes[0].verifychain(4, 1)
+        assert self.nodes[0].verifychain(4, 0)
 
     def _test_getchaintxstats(self):
         self.log.info("Test getchaintxstats")

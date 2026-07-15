@@ -19,6 +19,7 @@ enum class WalletPowMiningState : uint8_t {
     NO_SPENDABLE_LEGACY_FEE_UTXO,
     EPOCH_INACTIVE,
     CLAIM_IN_FLIGHT,
+    CLAIM_QUARANTINED,
     READY,
     HASHING,
     RUNTIME_ERROR,
@@ -34,6 +35,7 @@ constexpr std::string_view WalletPowMiningStateName(WalletPowMiningState state) 
     case WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO: return "no_spendable_legacy_fee_utxo";
     case WalletPowMiningState::EPOCH_INACTIVE: return "epoch_inactive";
     case WalletPowMiningState::CLAIM_IN_FLIGHT: return "claim_in_flight";
+    case WalletPowMiningState::CLAIM_QUARANTINED: return "claim_quarantined";
     case WalletPowMiningState::READY: return "ready";
     case WalletPowMiningState::HASHING: return "hashing";
     case WalletPowMiningState::RUNTIME_ERROR: return "error";

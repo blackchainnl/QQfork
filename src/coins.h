@@ -51,8 +51,8 @@ public:
     unsigned int nTime;
 
     //! construct a Coin from a CTxOut and height/coinbase information.
-    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn, int nTimeIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn), nHeight(nHeightIn), nTime(nTimeIn) {}
-    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn, int nTimeIn) : out(outIn), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn), nHeight(nHeightIn), nTime(nTimeIn) {}
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn, uint32_t nTimeIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn), nHeight(nHeightIn), nTime(nTimeIn) {}
+    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn, uint32_t nTimeIn) : out(outIn), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn), nHeight(nHeightIn), nTime(nTimeIn) {}
 
     void Clear() {
         out.SetNull();
@@ -384,7 +384,13 @@ private:
 //! an overwrite.
 // TODO: pass in a boolean to limit these possible overwrites to known
 // (pre-BIP34) cases.
-void AddCoins(CCoinsViewCache& cache, const CTransaction& tx, int nHeight, bool check = false, int nBlockTime = 0);
+/** Return the canonical UTXO timestamp for a transaction in a block.
+ * Version-2 transactions do not serialize nTime, so their UTXOs carry the
+ * containing block time. Keep the input wide enough for the full uint32_t
+ * header range; callers must supply a valid block-header timestamp. */
+uint32_t GetCoinTime(const CTransaction& tx, int64_t nBlockTime = 0);
+
+void AddCoins(CCoinsViewCache& cache, const CTransaction& tx, int nHeight, bool check = false, int64_t nBlockTime = 0);
 
 //! Utility function to find any unspent output with a given txid.
 //! This function can be quite expensive because in the event of a transaction

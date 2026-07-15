@@ -52,6 +52,7 @@
 #endif
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <thread>
 #include <utility>
@@ -72,6 +73,11 @@ static bool IsShadowProofTx(const CTransaction& tx)
 static bool IsShadowControlTx(const CTransaction& tx)
 {
     return TransactionHasShadowProof(tx) || TransactionHasShadowSignal(tx);
+}
+
+static bool IsRepresentableHeaderTime(int64_t nTime)
+{
+    return nTime >= 0 && nTime <= std::numeric_limits<uint32_t>::max();
 }
 
 static bool IsPreMigrationQuantumSpendScript(const CScript& script_pub_key)
@@ -116,21 +122,31 @@ static bool IsPackageTxAllowedAfterFinalLockout(const CTransaction& tx, CCoinsVi
     return CheckTieredStakePrincipalCovenant(tx, inputs, flags, spend_height, reject_reason, &consensus_params, spend_time);
 }
 
-int64_t UpdateTime(CBlock* pblock, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev)
+std::optional<uint32_t> UpdateTime(CBlock* pblock, Chainstate& active_chainstate,
+                                   const Consensus::Params& consensus_params,
+                                   const CBlockIndex* pindex_prev,
+                                   int64_t adjusted_time)
 {
-    int64_t nOldTime = pblock->nTime;
-    int64_t nNewTime{std::max<int64_t>(pindexPrev->GetMedianTimePast() + 1, GetAdjustedTimeSeconds())};
-
-    if (nOldTime < nNewTime) {
-        pblock->nTime = nNewTime;
+    const std::optional<int64_t> next_header_time =
+        GetNextBlockHeaderTime(active_chainstate, pindex_prev, adjusted_time);
+    if (!next_header_time || !IsRepresentableHeaderTime(*next_header_time)) {
+        LogPrintf("UpdateTime: no legal representable next-block header time at adjusted time %d\n",
+                  adjusted_time);
+        return std::nullopt;
     }
+
+    // This is intentionally a canonical assignment rather than an
+    // increment-only mutation. A cached template can be stale in either
+    // direction after adjusted time moves; callers must rebuild its package
+    // when the result differs from the template's selected-header time.
+    pblock->nTime = static_cast<uint32_t>(*next_header_time);
 
     // Updating time can change work required on testnet:
-    if (consensusParams.fPowAllowMinDifficultyBlocks) {
-        pblock->nBits = GetNextTargetRequired(pindexPrev, consensusParams, pblock->IsProofOfStake());
+    if (consensus_params.fPowAllowMinDifficultyBlocks) {
+        pblock->nBits = GetNextTargetRequired(pindex_prev, consensus_params, pblock->IsProofOfStake());
     }
 
-    return nNewTime - nOldTime;
+    return pblock->nTime;
 }
 
 int64_t GetMaxTransactionTime(CBlock* pblock)
@@ -227,7 +243,12 @@ void BlockAssembler::resetBlock()
     m_next_block_fees.clear();
 }
 
-std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn, CWallet* pwallet, bool* pfPoSCancel, int64_t* pFees, CTxDestination destination)
+std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn,
+                                                                 CWallet* pwallet,
+                                                                 bool* pfPoSCancel,
+                                                                 int64_t* pFees,
+                                                                 CTxDestination destination,
+                                                                 std::optional<COutPoint> forced_kernel)
 {
     const auto time_start{SteadyClock::now()};
 
@@ -258,14 +279,30 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         pblock->nVersion = gArgs.GetIntArg("-blockversion", pblock->nVersion);
     }
 
-    pblock->nTime = GetAdjustedTimeSeconds();
+    const int64_t adjusted_time = GetAdjustedTimeSeconds();
     if (pwallet) {
-        pblock->nTime &= ~chainparams.GetConsensus().nStakeTimestampMask;
+        const std::optional<int64_t> pos_time = GetNextBlockPoSTime(
+            m_chainstate, pindexPrev, chainparams.GetConsensus(), adjusted_time);
+        if (!pos_time) {
+            if (pfPoSCancel) *pfPoSCancel = true;
+            return nullptr;
+        }
+        pblock->nTime = static_cast<uint32_t>(*pos_time);
     } else {
-        // Package checks must use the same mineable PoW timestamp retained by
-        // the final header. In particular, an accelerated chain can have MTP
-        // ahead of adjusted time while version-2 transactions carry no nTime.
-        pblock->nTime = std::max<int64_t>(pblock->nTime, pindexPrev->GetMedianTimePast() + 1);
+        // Package checks must use the same generic next-header timestamp
+        // retained by the final template. In particular, an accelerated chain
+        // can have MTP ahead of adjusted time while version-2 transactions
+        // carry no nTime. Do not use this non-wallet path to characterize
+        // current-mainnet block production: mainnet block assembly is
+        // proof-of-stake gated.
+        const std::optional<uint32_t> header_time = UpdateTime(
+            pblock, m_chainstate, chainparams.GetConsensus(), pindexPrev,
+            adjusted_time);
+        if (!header_time) {
+            LogPrintf("CreateNewBlock: no legal generic next-block header time at adjusted time %d\n",
+                      adjusted_time);
+            return nullptr;
+        }
     }
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
 
@@ -348,11 +385,25 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
             for (size_t i = 1; i < pblock->vtx.size(); ++i) {
                 selected_txs.push_back(pblock->vtx[i]);
             }
-            if (wallet::CreateCoinStake(*pwallet, pblock->nBits, 1, txCoinStake, nFees, destination, selected_txs)) {
+            if (wallet::CreateCoinStake(*pwallet, pblock->nBits, 1, txCoinStake,
+                                         nFees, destination, selected_txs,
+                                         forced_kernel)) {
                 if (txCoinStake.nTime >= pindexPrev->GetMedianTimePast()+1) {
+                    // Packages were checked against the preselected aligned
+                    // header time. Do not let a wallet-side kernel search
+                    // advance that header after package selection: a v2
+                    // parent would then gain a newer UTXO timestamp than a
+                    // selected legacy descendant. A retry will build and
+                    // recheck a fresh template at the new time instead.
+                    if (txCoinStake.nVersion < 2 && txCoinStake.nTime != pblock->nTime) {
+                        pwallet->WalletLogPrintf(
+                            "CreateNewBlock: refusing coinstake time %u that differs from selected header time %u\n",
+                            txCoinStake.nTime, pblock->nTime);
+                        return nullptr;
+                    }
                     // Make the coinbase tx empty in case of proof of stake
                     coinbaseTx.vout[0].SetEmpty();
-                    pblock->nTime = coinbaseTx.nTime = txCoinStake.nTime;
+                    coinbaseTx.nTime = pblock->nTime;
                     pblock->vtx.insert(pblock->vtx.begin() + 1, MakeTransactionRef(CTransaction(txCoinStake)));
                     *pfPoSCancel = false;
                 }
@@ -383,14 +434,34 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
     if (pblock->IsProofOfStake()) {
         // Only v1 carries an authoritative transaction timestamp. A v2
-        // coinstake's hidden local nTime disappears on the wire.
+        // coinstake's hidden local nTime disappears on the wire. The wallet
+        // must have used the header time selected before package checks.
         if (pblock->vtx[1]->nVersion < 2 && pblock->vtx[1]->nTime) {
-            pblock->nTime = pblock->vtx[1]->nTime;
+            const int64_t coinstake_time = pblock->vtx[1]->nTime;
+            if (!IsRepresentableHeaderTime(coinstake_time)) {
+                LogPrintf("CreateNewBlock: refusing unrepresentable PoS header time %d\n",
+                          coinstake_time);
+                return nullptr;
+            }
+            if (coinstake_time != pblock->nTime) {
+                LogPrintf("CreateNewBlock: coinstake time %d differs from selected PoS header time %d\n",
+                          coinstake_time, pblock->nTime);
+                return nullptr;
+            }
         }
     } else {
-        pblock->nTime = std::max<int64_t>(pblock->nTime,
-            std::max<int64_t>(pindexPrev->GetMedianTimePast() + 1, GetMaxTransactionTime(pblock)));
-        UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+        // `addPackageTxs()` checked every package at the preselected generic
+        // header time. Mutating that time after selection can make a v2 parent
+        // acquire a later UTXO timestamp than a selected legacy child. Keep
+        // the selected header immutable; this is an invariant check only.
+        const int64_t required_header_time = std::max<int64_t>(
+            pindexPrev->GetMedianTimePast() + 1, GetMaxTransactionTime(pblock));
+        if (!IsRepresentableHeaderTime(required_header_time) ||
+            required_header_time > pblock->nTime) {
+            LogPrintf("CreateNewBlock: selected package requires header time %d, but candidate is %d\n",
+                      required_header_time, pblock->nTime);
+            return nullptr;
+        }
     }
     pblock->nNonce         = 0;
     pblocktemplate->vTxSigOpsCost[0] = WITNESS_SCALE_FACTOR * GetLegacySigOpCount(*pblock->vtx[0]);
@@ -461,6 +532,28 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
                                        SCRIPT_VERIFY_QUANTUM_COLDSTAKE;
     if (IsQuantumStakeTiersActive(chainparams.GetConsensus(), next_block_mtp, next_height)) {
         final_lockout_flags |= SCRIPT_VERIFY_QUANTUM_STAKE_TIERS;
+    }
+
+    // CCoinsViewMemPool intentionally gives a version-2 mempool output a
+    // non-authoritative zero timestamp: it has not yet been assigned a block
+    // header time. A template, however, is evaluating a concrete candidate
+    // header. Overlay every v2 output in its ancestor closure at that exact
+    // candidate time before checking any input. Prepopulating both already
+    // selected transactions and this candidate package keeps the result
+    // independent of the container's iteration order and avoids changing the
+    // global CCoinsViewMemPool semantics.
+    const auto overlay_v2_outputs = [&](const CTransaction& candidate_tx) {
+        if (candidate_tx.nVersion >= 2 &&
+            !candidate_tx.IsCoinBase() && !candidate_tx.IsCoinStake()) {
+            AddCoins(package_view, candidate_tx, next_height,
+                     /*check=*/true, nTime);
+        }
+    };
+    for (CTxMemPool::txiter selected : inBlock) {
+        overlay_v2_outputs(selected->GetTx());
+    }
+    for (CTxMemPool::txiter candidate : package) {
+        overlay_v2_outputs(candidate->GetTx());
     }
 
     for (CTxMemPool::txiter selected : inBlock) {

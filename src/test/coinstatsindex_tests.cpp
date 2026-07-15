@@ -50,8 +50,11 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
     static constexpr uint8_t SCHEMA_KEY{'V'};
     static constexpr uint32_t PRERELEASE_COINSTATS_SCHEMA{2};
     static constexpr uint32_t CURRENT_COINSTATS_SCHEMA{3};
-    static constexpr uint32_t PRERELEASE_SHADOW_SCHEMA{4};
-    static constexpr uint32_t CURRENT_SHADOW_SCHEMA{8};
+    // Schema 10 adds QQP4 version/input provenance. A schema-9 database has
+    // valid QQP3 data but cannot safely be reinterpreted as exact-input data,
+    // so it must be discarded and rebuilt from the chain.
+    static constexpr uint32_t PRE_QQP4_SHADOW_SCHEMA{9};
+    static constexpr uint32_t CURRENT_SHADOW_SCHEMA{10};
     const std::string sentinel{"prerelease-claim-allocation"};
 
     const auto build_index = [](BaseIndex& index) {
@@ -110,7 +113,7 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
     }
     {
         CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
-        BOOST_REQUIRE(db.Write(SCHEMA_KEY, PRERELEASE_SHADOW_SCHEMA));
+        BOOST_REQUIRE(db.Write(SCHEMA_KEY, PRE_QQP4_SHADOW_SCHEMA));
         BOOST_REQUIRE(db.Write(sentinel, true));
     }
     {

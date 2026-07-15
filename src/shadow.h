@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <map>
 #include <optional>
 #include <set>
@@ -198,11 +199,14 @@ struct ShadowPowClaimAccounting {
     CAmount base_fee{0};
     CAmount credited_amount{0};
     bool base_fee_known{false};
+    uint8_t proof_version{0};
     bool origin_bound{false};
     uint32_t origin_height{0};
     uint256 origin_previous_block_hash;
     uint32_t inclusion_height{0};
     uint32_t origin_age{0};
+    bool input_bound{false};
+    COutPoint claim_outpoint;
     ShadowPowClaimDisposition disposition{ShadowPowClaimDisposition::INVALID_PROOF};
 };
 
@@ -245,7 +249,22 @@ struct ShadowPowAccountingContext {
     CAmount credited_pow_pool{0};
     unsigned int target_bits{0};
     std::vector<ShadowPowOriginContext> late_origins;
+    /**
+     * Snapshot the two independent consensus boundaries with the accounting
+     * input.  The evaluator deliberately does not consult global chain
+     * parameters: reindex and unit callers can supply an explicit historical
+     * schedule, and a future QQP4 activation must not reinterpret QQP3 rows.
+     *
+     * A manually constructed canonical (QQP3) test context defaults to the
+     * already-active QQP3 rule.  QQP4 remains disabled unless its height is
+     * explicitly set.
+     */
+    int competing_claims_activation_height{0};
+    int qqp4_activation_height{std::numeric_limits<int>::max()};
     bool canonical_rule_active{false};
+    /** True only after the separately scheduled QQP4 hard fork. The existing
+     * canonical_rule_active field remains the v30.1.0 QQP3 boundary. */
+    bool qqp4_rule_active{false};
     bool valid{false};
 };
 
@@ -326,7 +345,7 @@ static constexpr CAmount SHADOW_WHITELIST_MIN_BALANCE = 10000 * COIN;
 static constexpr int SHADOW_SOLVER_ACTIVITY_SECONDS = 14 * 24 * 60 * 60;
 static constexpr int SHADOW_SOLVER_ACTIVITY_WINDOW = SHADOW_SOLVER_ACTIVITY_SECONDS / 64;
 static constexpr unsigned int MAX_SHADOW_POW_EVALS_PER_BLOCK = 64;
-/** A QQP3 proof remains relayable and fee-reimbursable through this many
+/** A QQP4 proof remains relayable and fee-reimbursable through this many
  *  blocks after its committed origin height. */
 static constexpr uint32_t SHADOW_POW_LATE_ORIGIN_WINDOW = 64;
 /** A serialized CTxOut consumes at least 9 non-witness bytes (36 weight).
@@ -358,6 +377,9 @@ uint32_t GetShadowSyntheticClaimLimit(const Consensus::Params& consensus,
 
 /** Get the magic OP_RETURN prefix used for Quantum Quasar shadow proofs. */
 const std::vector<unsigned char>& GetShadowPrefix();
+/** Exact prefixed QQSPROOF byte size produced for a given target height. */
+size_t GetShadowPowProofPayloadSize(int height, size_t target_script_size,
+                                    size_t payout_script_size);
 
 /** Build the height-5,945,000 whitelist from aggregate balances in the currently connected UTXO view. */
 std::set<CScript> BuildLegacyWhitelist(CCoinsView& view);
@@ -430,7 +452,9 @@ bool BuildShadowSignalData(const CScript& target, const CScript& quantum_payout_
 /** Build a mined OP_RETURN data push containing the QQSPROOF prefix and payload. */
 bool MineShadowProofData(const CScript& target, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool proof_of_stake, uint64_t max_tries, std::vector<unsigned char>& data_out);
 bool MineShadowProofData(const CScript& target, const CScript& quantum_payout_script, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, uint64_t max_tries, std::vector<unsigned char>& data_out);
+bool MineShadowProofData(const CScript& target, const CScript& quantum_payout_script, const COutPoint& claim_outpoint, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, uint64_t max_tries, std::vector<unsigned char>& data_out);
 bool MineShadowProofDataRange(const CScript& target, const CScript& quantum_payout_script, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, uint64_t start_nonce, uint64_t nonce_step, uint64_t max_tries, std::vector<unsigned char>& data_out, uint64_t* tries_done = nullptr);
+bool MineShadowProofDataRange(const CScript& target, const CScript& quantum_payout_script, const COutPoint& claim_outpoint, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, uint64_t start_nonce, uint64_t nonce_step, uint64_t max_tries, std::vector<unsigned char>& data_out, uint64_t* tries_done = nullptr);
 
 /** Immutable Gold Rush PoW work parameters snapshotted for one tip. Produced under the chain
  *  lock by PrepareShadowPowWork(); GrindShadowPowWork() then grinds Argon2id over a nonce range
@@ -444,6 +468,8 @@ struct ShadowPowWork {
     uint256 prev_hash;
     unsigned int bits{0};
     bool origin_bound{false};
+    bool input_bound{false};
+    COutPoint claim_outpoint;
 };
 
 /** Typed validation result used wherever Argon2id evaluation can fail locally.
@@ -466,6 +492,7 @@ enum class ShadowPowGrindResult {
 /** Snapshot PoW work for the block after pindexPrev. Reads the shadow pool from `view`, so the
  *  caller must hold the chain state stable (cs_main). Cheap; does no Argon2id work. */
 ShadowPowWork PrepareShadowPowWork(const CScript& target, const CScript& quantum_payout_script, const CBlockIndex* pindexPrev, const CCoinsViewCache& view);
+ShadowPowWork PrepareShadowPowWork(const CScript& target, const CScript& quantum_payout_script, const COutPoint& claim_outpoint, const CBlockIndex* pindexPrev, const CCoinsViewCache& view);
 /** Pure Argon2id grind over a nonce range. No chain/view access; safe to call with NO lock held. */
 ShadowPowGrindResult GrindShadowPowWorkDetailed(const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step, uint64_t max_tries, std::vector<unsigned char>& data_out, uint64_t* tries_done = nullptr);
 bool GrindShadowPowWork(const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step, uint64_t max_tries, std::vector<unsigned char>& data_out, uint64_t* tries_done = nullptr);
@@ -474,6 +501,12 @@ bool GrindShadowPowWork(const ShadowPowWork& work, uint64_t start_nonce, uint64_
  *  quantum payout script, before the wallet broadcasts a claim transaction. */
 ShadowProofValidationResult ValidateShadowPowProofForWorkDetailed(const ShadowPowWork& work, const std::vector<unsigned char>& prefixed_proof);
 bool ValidateShadowPowProofForWork(const ShadowPowWork& work, const std::vector<unsigned char>& prefixed_proof);
+
+/** Decode the exact fee input committed by a QQP4 payload. Returns false for
+ * legacy/unbound proof versions and malformed bytes. */
+bool GetShadowPowProofBoundOutpoint(const std::vector<unsigned char>& prefixed_proof,
+                                    COutPoint& outpoint_out);
+std::optional<COutPoint> GetShadowPowProofBoundOutpoint(const CTransaction& tx);
 
 /** Test-only, process-local fault injection for one or more Argon2id calls.
  *  No configuration, RPC, or network path can arm this hook. */
@@ -541,9 +574,14 @@ ShadowPowAccountingResult EvaluateShadowPowClaimAccounting(
 
 /** Mempool policy helpers for next-block-only QQSPROOF claims. */
 ShadowProofPayloadMode ClassifyShadowProofPayload(const std::vector<unsigned char>& prefixed_proof);
+ShadowProofPayloadMode ClassifyShadowProofPayload(
+    const std::vector<unsigned char>& prefixed_proof, bool qqp4_active);
 std::vector<ShadowProofObservation> GetShadowProofObservations(const CBlock& block);
 std::vector<ShadowProofObservation> GetShadowProofObservations(
     const CBlock& block, ShadowProofObservationSummary& summary);
+std::vector<ShadowProofObservation> GetShadowProofObservations(
+    const CBlock& block, const Consensus::Params& consensus, int block_height,
+    ShadowProofObservationSummary& summary);
 bool TransactionHasShadowProof(const CTransaction& tx);
 bool TransactionHasShadowSignal(const CTransaction& tx);
 ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransaction& tx, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, bool gold_rush_active, std::string& reject_reason);

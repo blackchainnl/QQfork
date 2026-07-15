@@ -155,6 +155,54 @@ int64_t FutureDrift(Chainstate& active_chainstate, int64_t nTime)
     return Params().GetConsensus().IsProtocolV2(nTime) ? nTime + 15 : nTime + 10 * 60;
 }
 
+static std::optional<int64_t> GetMaxNextBlockHeaderTime(Chainstate& active_chainstate,
+                                                         int64_t adjusted_time)
+{
+    constexpr int64_t MAX_HEADER_TIME{std::numeric_limits<uint32_t>::max()};
+    if (adjusted_time < 0 || adjusted_time > MAX_HEADER_TIME) return std::nullopt;
+    const int64_t max_header_time = std::min<int64_t>(
+        FutureDrift(active_chainstate, adjusted_time), MAX_HEADER_TIME);
+    if (max_header_time < adjusted_time) return std::nullopt;
+    return max_header_time;
+}
+
+std::optional<int64_t> GetNextBlockHeaderTime(Chainstate& active_chainstate,
+                                              const CBlockIndex* pindex_prev,
+                                              int64_t adjusted_time)
+{
+    const std::optional<int64_t> max_header_time =
+        GetMaxNextBlockHeaderTime(active_chainstate, adjusted_time);
+    if (!max_header_time ||
+        (pindex_prev && pindex_prev->GetMedianTimePast() == std::numeric_limits<int64_t>::max())) {
+        return std::nullopt;
+    }
+    const int64_t minimum_time = pindex_prev
+        ? std::max<int64_t>(adjusted_time, pindex_prev->GetMedianTimePast() + 1)
+        : adjusted_time;
+    if (minimum_time > *max_header_time) return std::nullopt;
+    return minimum_time;
+}
+
+std::optional<int64_t> GetNextBlockPoSTime(Chainstate& active_chainstate,
+                                           const CBlockIndex* pindex_prev,
+                                           const Consensus::Params& consensus_params,
+                                           int64_t adjusted_time)
+{
+    const std::optional<int64_t> minimum_time =
+        GetNextBlockHeaderTime(active_chainstate, pindex_prev, adjusted_time);
+    const std::optional<int64_t> max_header_time =
+        GetMaxNextBlockHeaderTime(active_chainstate, adjusted_time);
+    if (!minimum_time || !max_header_time) return std::nullopt;
+    const int64_t mask = consensus_params.nStakeTimestampMask;
+    if (mask <= 0) {
+        return minimum_time;
+    }
+    if (*minimum_time > std::numeric_limits<int64_t>::max() - mask) return std::nullopt;
+    const int64_t candidate_time = (*minimum_time + mask) & ~mask;
+    if (candidate_time > *max_header_time) return std::nullopt;
+    return candidate_time;
+}
+
 bool CheckFinalTxAtTip(const CBlockIndex& active_chain_tip, const CTransaction& tx)
 {
     AssertLockHeld(cs_main);
@@ -307,10 +355,12 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     AssertLockHeld(m_mempool->cs);
 
     // Revalidate every proof against the restored branch. Legacy QQP2 proofs
-    // remain next-block-only; post-boundary QQP3 proofs can remain relayable
+    // remain next-block-only; post-boundary exact-input-bound QQP4 proofs can
+    // remain relayable
     // when their authenticated origin is on this branch and no more than the
     // fixed late-origin window behind its next block.
     std::vector<CTransactionRef> stale_shadow_claims;
+    bool shadow_local_integrity_failure{false};
     const CBlockIndex* restored_tip = m_chain.Tip();
     const bool gold_rush_active = restored_tip &&
         IsShadowGoldRushRewardActive(Params().GetConsensus(),
@@ -320,10 +370,14 @@ void Chainstate::MaybeUpdateMempoolForReorg(
         const CTransactionRef tx = entry.get().GetSharedTx();
         if (!TransactionHasShadowProof(*tx)) continue;
         std::string reject_reason;
-        if (CheckShadowPowClaimForMempoolDetailed(
+        const ShadowProofValidationResult status =
+            CheckShadowPowClaimForMempoolDetailed(
                 *tx, restored_tip, CoinsTip(), gold_rush_active,
-                reject_reason) == ShadowProofValidationResult::INVALID) {
+                reject_reason);
+        if (status != ShadowProofValidationResult::VALID) {
             stale_shadow_claims.push_back(tx);
+            shadow_local_integrity_failure |=
+                status == ShadowProofValidationResult::LOCAL_INTERNAL_ERROR;
         }
     }
     for (const CTransactionRef& tx : stale_shadow_claims) {
@@ -332,6 +386,10 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     if (!stale_shadow_claims.empty()) {
         LogPrint(BCLog::MEMPOOL, "Removed %u ineligible Quantum Quasar shadow PoW claim transaction(s) after chain reorganization\n",
                  static_cast<unsigned int>(stale_shadow_claims.size()));
+    }
+    if (shadow_local_integrity_failure) {
+        m_chainman.GetNotifications().fatalError(
+            "Unable to authenticate Gold Rush PoW origin state while revalidating the mempool after reorganization; shutting down");
     }
 
     std::vector<uint256> vHashUpdate;
@@ -369,9 +427,10 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     const CBlockIndex* next_block_tip = m_chain.Tip();
     const int next_block_height = next_block_tip ? next_block_tip->nHeight + 1 : 0;
     const int64_t next_block_mtp = next_block_tip ? next_block_tip->GetMedianTimePast() : GetAdjustedTimeSeconds();
-    const int64_t next_block_spend_time = next_block_tip
-        ? std::max<int64_t>(GetAdjustedTimeSeconds(), next_block_tip->GetBlockTime() + 1)
-        : GetAdjustedTimeSeconds();
+    const int64_t adjusted_time = GetAdjustedTimeSeconds();
+    const std::optional<int64_t> next_block_header_time = GetNextBlockHeaderTime(
+        *this, next_block_tip, adjusted_time);
+    const int64_t next_block_spend_time = next_block_header_time.value_or(adjusted_time);
     const unsigned int next_block_script_flags = GetNextBlockScriptFlags(next_block_tip, m_chainman);
 
     // A transaction accepted before a lifecycle boundary may be invalid for
@@ -440,13 +499,25 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     // If true, the tx would be invalid in the next block; remove this entry and all of its descendants.
     const auto filter_final_and_mature = [this, &invalid_lifecycle_transactions,
                                           next_block_height, next_block_mtp,
-                                          next_block_spend_time, next_block_script_flags](CTxMemPool::txiter it)
+                                          next_block_header_time, next_block_spend_time,
+                                          next_block_script_flags](CTxMemPool::txiter it)
         EXCLUSIVE_LOCKS_REQUIRED(m_mempool->cs, ::cs_main) {
         AssertLockHeld(m_mempool->cs);
         AssertLockHeld(::cs_main);
         const CTransaction& tx = it->GetTx();
 
         if (invalid_lifecycle_transactions.count(tx.GetHash())) return true;
+        // Version-2 transactions have no serialized nTime. If a local clock
+        // anomaly leaves no representable next-block header inside the
+        // future-drift window, using adjusted time here would falsely evict
+        // an otherwise valid v2 relay transaction. The maximum representable
+        // timestamp is only a reorg-check sentinel: it is never used for a
+        // candidate header, whose time remains governed by
+        // GetNextBlockHeaderTime during template assembly.
+        const int64_t reorg_input_check_time =
+            !next_block_header_time && tx.nVersion >= 2
+                ? std::numeric_limits<uint32_t>::max()
+                : next_block_spend_time;
 
         // The transaction must be final.
         if (!CheckFinalTxAtTip(*Assert(m_chain.Tip()), tx)) return true;
@@ -489,7 +560,7 @@ void Chainstate::MaybeUpdateMempoolForReorg(
         TxValidationState tx_state;
         CAmount next_block_fee{0};
         if (!Consensus::CheckTxInputs(tx, tx_state, next_block_view,
-                                      next_block_height, next_block_spend_time,
+                                      next_block_height, reorg_input_check_time,
                                       next_block_mtp, next_block_fee)) {
             return true;
         }
@@ -887,9 +958,13 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
     const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
     const int next_height = tip ? tip->nHeight + 1 : 0;
     const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : nTimeTx;
-    const int64_t next_block_spend_time = tip
-        ? std::max<int64_t>(adjusted_time, next_block_mtp + 1)
-        : adjusted_time;
+    const std::optional<int64_t> next_block_header_time = GetNextBlockHeaderTime(
+        m_active_chainstate, tip, adjusted_time);
+    if (!next_block_header_time && tx.nVersion >= 2) {
+        return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND,
+                             "next-block-time-unavailable");
+    }
+    const int64_t next_block_spend_time = next_block_header_time.value_or(adjusted_time);
     // Quantum witness spends become consensus-active at Migration even when
     // the independent BIP9 SegWit deployment is not active on this chain.
     const bool witnessEnabled =
@@ -1000,8 +1075,11 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
         size_t shadow_proof_count{0};
         for (const CTxMemPoolEntryRef& entry : m_pool.entryAll()) {
             const CTransactionRef pool_tx = entry.get().GetSharedTx();
-            if (pool_tx->GetHash() != tx.GetHash() &&
-                TransactionHasShadowProof(*pool_tx)) ++shadow_proof_count;
+            if (pool_tx->GetHash() == tx.GetHash() ||
+                !TransactionHasShadowProof(*pool_tx)) {
+                continue;
+            }
+            ++shadow_proof_count;
         }
         if (shadow_proof_count >= shadow_proof_limit) {
             return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
@@ -1585,6 +1663,52 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
         const Consensus::Params& consensus = m_active_chainstate.m_chainman.GetConsensus();
         const int next_height = tip ? tip->nHeight + 1 : 0;
         const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : args.m_accept_time;
+
+        // PreChecks observes only the already-committed mempool. Package
+        // members live in m_viewmempool until the complete package passes, so
+        // enforce the competing-claim capacity and proof/nullifier uniqueness
+        // across both sets before any member is finalized.
+        const size_t shadow_proof_limit =
+            consensus.IsShadowCompetingClaimsActive(next_height)
+                ? MAX_SHADOW_POW_EVALS_PER_BLOCK : 1;
+        size_t existing_shadow_proofs{0};
+        std::set<COutPoint> bound_claim_outpoints;
+        for (const CTxMemPoolEntryRef& entry : m_pool.entryAll()) {
+            const CTransactionRef pool_tx = entry.get().GetSharedTx();
+            if (!TransactionHasShadowProof(*pool_tx)) continue;
+            ++existing_shadow_proofs;
+            if (const auto outpoint =
+                    GetShadowPowProofBoundOutpoint(*pool_tx)) {
+                bound_claim_outpoints.insert(*outpoint);
+            }
+        }
+        size_t package_shadow_proofs{0};
+        for (Workspace& ws : workspaces) {
+            if (!TransactionHasShadowProof(*ws.m_ptx)) continue;
+            ++package_shadow_proofs;
+            bool duplicate{false};
+            if (const auto outpoint =
+                    GetShadowPowProofBoundOutpoint(*ws.m_ptx)) {
+                duplicate = !bound_claim_outpoints.insert(*outpoint).second ||
+                            duplicate;
+            }
+            if (duplicate ||
+                existing_shadow_proofs + package_shadow_proofs >
+                    shadow_proof_limit) {
+                const std::string reason = duplicate
+                    ? "shadow-proof-package-duplicate"
+                    : "shadow-proof-mempool-limit";
+                ws.m_state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                   reason);
+                package_state.Invalid(PackageValidationResult::PCKG_TX,
+                                      "transaction failed");
+                results.emplace(ws.m_ptx->GetWitnessHash(),
+                                MempoolAcceptResult::Failure(ws.m_state));
+                return PackageMempoolAcceptResult(package_state,
+                                                   std::move(results));
+            }
+        }
+
         if (consensus.IsDemurrageActive(next_height, next_block_mtp)) {
             std::set<uint256> attested_keys;
             size_t ignored_mempool_attestation_count{0};
@@ -2172,7 +2296,7 @@ void Chainstate::InvalidBlockFound(CBlockIndex* pindex, const BlockValidationSta
     }
 }
 
-void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight, int nBlockTime)
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight, int64_t nBlockTime)
 {
     // mark inputs spent
     if (!tx.IsCoinBase()) {
@@ -3405,9 +3529,7 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
         uint256 hash = tx.GetHash();
         bool is_coinbase = tx.IsCoinBase();
         bool is_coinstake = tx.IsCoinStake();
-        const unsigned int coin_time = tx.nVersion < 2
-            ? tx.nTime
-            : static_cast<unsigned int>(pindex->GetBlockTime());
+        const uint32_t coin_time = GetCoinTime(tx, pindex->GetBlockTime());
 
         // Check that all outputs are available and match the outputs in the block itself
         // exactly.
@@ -4602,6 +4724,7 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         m_mempool->removeForBlock(blockConnecting.vtx, pindexNew->nHeight);
         disconnectpool.removeForBlock(blockConnecting.vtx);
         std::vector<CTransactionRef> expired_shadow_claims;
+        bool shadow_local_integrity_failure{false};
         const bool next_gold_rush_active = IsShadowGoldRushRewardActive(
             Params().GetConsensus(), pindexNew->GetMedianTimePast(),
             pindexNew->nHeight + 1);
@@ -4609,10 +4732,14 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
             const CTransactionRef tx = entry.get().GetSharedTx();
             if (!TransactionHasShadowProof(*tx)) continue;
             std::string reject_reason;
-            if (CheckShadowPowClaimForMempoolDetailed(
+            const ShadowProofValidationResult status =
+                CheckShadowPowClaimForMempoolDetailed(
                     *tx, pindexNew, CoinsTip(), next_gold_rush_active,
-                    reject_reason) == ShadowProofValidationResult::INVALID) {
+                    reject_reason);
+            if (status != ShadowProofValidationResult::VALID) {
                 expired_shadow_claims.push_back(tx);
+                shadow_local_integrity_failure |=
+                    status == ShadowProofValidationResult::LOCAL_INTERNAL_ERROR;
             }
         }
         for (const CTransactionRef& tx : expired_shadow_claims) {
@@ -4621,6 +4748,10 @@ bool Chainstate::ConnectTip(BlockValidationState& state, CBlockIndex* pindexNew,
         if (!expired_shadow_claims.empty()) {
             LogPrint(BCLog::MEMPOOL, "Expired %u stale Quantum Quasar shadow PoW claim transaction(s)\n",
                      static_cast<unsigned int>(expired_shadow_claims.size()));
+        }
+        if (shadow_local_integrity_failure) {
+            m_chainman.GetNotifications().fatalError(
+                "Unable to authenticate Gold Rush PoW origin state while revalidating the mempool after block connection; shutting down");
         }
     }
     // Update m_chain & related variables.
@@ -4816,10 +4947,14 @@ bool Chainstate::ActivateBestChainStep(BlockValidationState& state, CBlockIndex*
     }
     if (m_mempool) {
         const CBlockIndex* tip = this->m_chain.Tip();
-        const int64_t next_block_spend_time = tip ? std::max<int64_t>(GetAdjustedTimeSeconds(), tip->GetBlockTime() + 1) : GetAdjustedTimeSeconds();
-        const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : next_block_spend_time;
-        m_mempool->check(this->CoinsTip(), this->m_chain.Height() + 1,
-                         next_block_spend_time, next_block_mtp);
+        const int64_t adjusted_time = GetAdjustedTimeSeconds();
+        const std::optional<int64_t> next_block_header_time = GetNextBlockHeaderTime(
+            *this, tip, adjusted_time);
+        if (next_block_header_time) {
+            const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : *next_block_header_time;
+            m_mempool->check(this->CoinsTip(), this->m_chain.Height() + 1,
+                             *next_block_header_time, next_block_mtp);
+        }
     }
 
     CheckForkWarningConditions();
@@ -6230,10 +6365,14 @@ MempoolAcceptResult ChainstateManager::ProcessTransaction(const CTransactionRef&
     }
     auto result = AcceptToMemoryPool(active_chainstate, tx, GetTime(), /*bypass_limits=*/ false, test_accept);
     const CBlockIndex* tip = active_chainstate.m_chain.Tip();
-    const int64_t next_block_spend_time = tip ? std::max<int64_t>(GetAdjustedTimeSeconds(), tip->GetBlockTime() + 1) : GetAdjustedTimeSeconds();
-    const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : next_block_spend_time;
-    active_chainstate.GetMempool()->check(active_chainstate.CoinsTip(), active_chainstate.m_chain.Height() + 1,
-                                          next_block_spend_time, next_block_mtp);
+    const int64_t adjusted_time = GetAdjustedTimeSeconds();
+    const std::optional<int64_t> next_block_header_time = GetNextBlockHeaderTime(
+        active_chainstate, tip, adjusted_time);
+    if (next_block_header_time) {
+        const int64_t next_block_mtp = tip ? tip->GetMedianTimePast() : *next_block_header_time;
+        active_chainstate.GetMempool()->check(active_chainstate.CoinsTip(), active_chainstate.m_chain.Height() + 1,
+                                              *next_block_header_time, next_block_mtp);
+    }
     return result;
 }
 
@@ -6728,7 +6867,7 @@ Chainstate::ReplayResult Chainstate::ReplayShadowBlocks()
     const ShadowBlockReader replay_block_reader = [&](const CBlockIndex& index, CBlock& block) {
         return m_blockman.ReadBlockFromDisk(block, index);
     };
-    // The schema-11 replay marker commits the exact tip, schedule, pool, signal,
+    // The schema-12 replay marker commits the exact tip, schedule, pool, signal,
     // whitelist, Gold Rush inventory, and demurrage inventory. Check it before
     // any historical obligation calculation so every normal restart, including
     // Final, is bounded and performs no reward-height walk, block read, or UTXO
@@ -6740,12 +6879,12 @@ Chainstate::ReplayResult Chainstate::ReplayShadowBlocks()
     }
 
     // At/after the whitelist boundary there is no safe in-place repair path:
-    // the exact schema-11 checkpoint must authenticate or chainstate must be rebuilt.
+    // the exact schema-12 checkpoint must authenticate or chainstate must be rebuilt.
     // Return before the historical reward-obligation walk so a corrupt or old
     // checkpoint also fails in bounded time rather than delaying the recovery
     // instruction by up to the entire Gold Rush window.
     if (pindexTip->nHeight >= SHADOW_WHITELIST_HEIGHT) {
-        error("ReplayShadowBlocks(): Quantum Quasar v30.1.1 schema-11 auxiliary checkpoint is missing or inconsistent at height %d",
+        error("ReplayShadowBlocks(): Quantum Quasar v30.1.1 schema-12 auxiliary checkpoint is missing or inconsistent at height %d",
               pindexTip->nHeight);
         return ReplayResult::CHAINSTATE_REBUILD_REQUIRED;
     }

@@ -113,12 +113,13 @@ public:
 
         return true;
     }
-    bool appInitMain(interfaces::BlockAndHeaderTipInfo* tip_info) override
+    interfaces::AppInitResult appInitMain(interfaces::BlockAndHeaderTipInfo* tip_info) override
     {
-        if (AppInitMain(*m_context, tip_info)) return true;
+        const interfaces::AppInitResult result = AppInitMain(*m_context, tip_info);
+        if (result != interfaces::AppInitResult::FAILURE) return result;
         // Error during initialization, set exit status before continue
         m_context->exit_status.store(EXIT_FAILURE);
-        return false;
+        return result;
     }
     void appShutdown() override
     {

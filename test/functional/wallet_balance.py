@@ -23,6 +23,40 @@ REGTEST_BLOCK_REWARD = Decimal("10000")
 WATCHONLY_IMMATURE_REWARD = REGTEST_BLOCK_REWARD * COINBASE_MATURITY
 
 
+def assert_balance_result(node, actual, expected):
+    expected_top_level = set(expected) | {
+        "lastprocessedblock",
+        "lifecycle_evaluation_height",
+        "lifecycle_evaluation_mtp",
+    }
+    assert_equal(set(actual), expected_top_level)
+    assert_equal(actual["lifecycle_evaluation_height"], node.getblockcount() + 1)
+    assert_equal(
+        actual["lifecycle_evaluation_mtp"],
+        node.getblockheader(node.getbestblockhash())["mediantime"],
+    )
+
+    for ownership, expected_amounts in expected.items():
+        amounts = actual[ownership]
+        assert_equal(set(amounts), set(expected_amounts) | {"lifecycle"})
+        for name, value in expected_amounts.items():
+            assert_equal(amounts[name], value)
+
+        lifecycle = amounts["lifecycle"]
+        assert_equal(lifecycle["ordinary_available"], expected_amounts["trusted"])
+        assert_equal(lifecycle["spendable_legacy"], expected_amounts["trusted"])
+        assert_equal(lifecycle["spendable_quantum"], 0)
+        assert_equal(
+            lifecycle["ordinary_available"],
+            lifecycle["spendable_legacy"] + lifecycle["spendable_quantum"],
+        )
+        for category in lifecycle["categories"].values():
+            assert category["count"] >= 0
+            assert 0 <= category["effective_amount"] <= category["nominal_amount"]
+            assert 0 <= category["burned_amount"] <= category["nominal_amount"]
+            assert category["effective_amount"] + category["burned_amount"] <= category["nominal_amount"]
+
+
 def create_transactions(node, address, amt, fees):
     # Create and sign raw transactions from node to address for amt.
     # Creates a transaction for each fee and returns an array
@@ -205,11 +239,8 @@ class WalletTest(BitcoinTestFramework):
                 del expected_balances_0["watchonly"]
             balances_0 = self.nodes[0].getbalances()
             balances_1 = self.nodes[1].getbalances()
-            # remove lastprocessedblock keys (they will be tested later)
-            del balances_0['lastprocessedblock']
-            del balances_1['lastprocessedblock']
-            assert_equal(balances_0, expected_balances_0)
-            assert_equal(balances_1, expected_balances_1)
+            assert_balance_result(self.nodes[0], balances_0, expected_balances_0)
+            assert_balance_result(self.nodes[1], balances_1, expected_balances_1)
             # getbalance without any arguments includes unconfirmed transactions, but not untrusted transactions
             assert_equal(self.nodes[0].getbalance(), node0_change)  # change from node 0's send
             assert_equal(self.nodes[1].getbalance(), Decimal('0'))  # node 1's send had an unsafe input

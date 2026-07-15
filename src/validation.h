@@ -124,6 +124,29 @@ unsigned int GetNextBlockScriptFlags(const CBlockIndex* active_tip, const Chains
 /** Exact next-block mempool/tooling flags, including deployment gating and
  * Quantum Quasar lifecycle flags. */
 unsigned int GetNextBlockPolicyScriptFlags(const CBlockIndex* active_tip, const ChainstateManager& chainman);
+/**
+ * Return the earliest representable next-block header time at adjusted_time.
+ * The result respects the previous block's MTP and the active chainstate's
+ * future-drift limit. nullopt means no legal next-block header can be made
+ * yet. This is a generic PoW/PoS policy helper; it does not change consensus
+ * validation of a received block.
+ */
+std::optional<int64_t> GetNextBlockHeaderTime(Chainstate& active_chainstate,
+                                              const CBlockIndex* pindex_prev,
+                                              int64_t adjusted_time);
+/**
+ * Return the earliest timestamp that a proof-of-stake block built on
+ * pindex_prev can use at adjusted_time without exceeding the active
+ * chainstate's header future-drift limit. The result respects the previous
+ * block's MTP and is rounded up, never down, to the configured stake-time
+ * granularity. nullopt means that no legal PoS header time exists yet. This
+ * is a candidate-time policy/template helper; it does not change consensus
+ * validation of a received block.
+ */
+std::optional<int64_t> GetNextBlockPoSTime(Chainstate& active_chainstate,
+                                           const CBlockIndex* pindex_prev,
+                                           const Consensus::Params& consensus_params,
+                                           int64_t adjusted_time);
 /** Output-only lifecycle rules, usable by offline signing/PSBT workflows that
  * do not have authoritative input provenance. */
 bool CheckQuantumQuasarOutputs(const CTransaction& tx, unsigned int flags,
@@ -1024,13 +1047,23 @@ public:
     //! Latches an interrupted staged rebuild so resetting the process signal
     //! cannot authorize a later commit in the same ChainstateManager.
     std::atomic<bool> m_chainstate_rebuild_interrupted{false};
+    //! Set only after the BUILDING journal transition is durable. The
+    //! rebuilding process must complete in isolation before normal services
+    //! can start.
+    std::atomic<bool> m_chainstate_rebuild_staged_this_process{false};
     //! Prevents a second finalizer call in the building process from treating
     //! COMMIT_READY as proof that a separate process reopened the replacement.
     std::atomic<bool> m_chainstate_rebuild_committed_this_process{false};
+    //! Set only after recovery has validated the COMMIT_READY journal and its
+    //! preserved-source topology in this process.
+    std::atomic<bool> m_chainstate_rebuild_reopened_committed_this_process{false};
     //! Set only after VerifyLoadedChainstate completes successfully for the
     //! current load. A COMMIT_READY replacement may not retire preserved
     //! backups without this explicit same-process verification proof.
     std::atomic<bool> m_chainstate_rebuild_verified_this_process{false};
+    //! Set only after the committed replacement and its preserved backups have
+    //! been durably retired in this process.
+    std::atomic<bool> m_chainstate_rebuild_cleanup_completed_this_process{false};
     const Options m_options;
     std::thread m_thread_load;
     //! A single BlockManager instance is shared across each constructed

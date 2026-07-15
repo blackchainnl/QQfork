@@ -125,6 +125,7 @@ UniValue ShadowCreditJSON(const ShadowIndexRecord& record)
             ? UniValue(ValueFromAmount(record.pow_claim_source.base_fee)) : UniValue{});
         source.pushKV("base_fee_atomic", record.pow_claim_source.base_fee_known
             ? UniValue(strprintf("%d", record.pow_claim_source.base_fee)) : UniValue{});
+        source.pushKV("proof_version", record.pow_claim_source.proof_version);
         source.pushKV("origin_bound", record.pow_claim_source.origin_bound);
         source.pushKV("origin_height", record.pow_claim_source.origin_height);
         source.pushKV("origin_previous_block_hash",
@@ -133,6 +134,16 @@ UniValue ShadowCreditJSON(const ShadowIndexRecord& record)
                           : UniValue(record.pow_claim_source.origin_previous_block_hash.GetHex()));
         source.pushKV("inclusion_height", record.pow_claim_source.inclusion_height);
         source.pushKV("origin_age", record.pow_claim_source.origin_age);
+        source.pushKV("input_bound", record.pow_claim_source.input_bound);
+        if (record.pow_claim_source.input_bound) {
+            UniValue outpoint(UniValue::VOBJ);
+            outpoint.pushKV("txid",
+                             record.pow_claim_source.claim_outpoint.hash.GetHex());
+            outpoint.pushKV("vout", record.pow_claim_source.claim_outpoint.n);
+            source.pushKV("claim_outpoint", std::move(outpoint));
+        } else {
+            source.pushKV("claim_outpoint", UniValue{});
+        }
     }
     credit.pushKV("pow_claim_source", std::move(source));
     return credit;

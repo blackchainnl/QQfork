@@ -12,6 +12,30 @@ from test_framework.util import assert_equal
 
 REGTEST_BLOCK_REWARD = 10000
 
+
+def assert_lifecycle_metadata(node, balances):
+    assert_equal(balances["lifecycle_evaluation_height"], node.getblockcount() + 1)
+    assert_equal(
+        balances["lifecycle_evaluation_mtp"],
+        node.getblockheader(node.getbestblockhash())["mediantime"],
+    )
+
+
+def assert_mine_balances(balances, expected):
+    mine = balances["mine"]
+    assert_equal(set(mine), set(expected) | {"lifecycle"})
+    for name, value in expected.items():
+        assert_equal(mine[name], value)
+    lifecycle = mine["lifecycle"]
+    assert_equal(lifecycle["ordinary_available"], expected["trusted"])
+    assert_equal(lifecycle["spendable_legacy"], expected["trusted"])
+    assert_equal(lifecycle["spendable_quantum"], 0)
+
+
+def comparable_balance_sections(balances):
+    return {name: balances[name] for name in ("mine", "watchonly") if name in balances}
+
+
 class OrphanedBlockRewardTest(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser)
@@ -57,6 +81,7 @@ class OrphanedBlockRewardTest(BitcoinTestFramework):
         self.sync_mocktime_to_tip()
         assert_equal(self.nodes[1].getbalance(), 10 + REGTEST_BLOCK_REWARD)
         pre_reorg_conf_bals = self.nodes[1].getbalances()
+        assert_lifecycle_metadata(self.nodes[1], pre_reorg_conf_bals)
         txid = self.nodes[1].sendtoaddress(self.nodes[0].getnewaddress(), REGTEST_BLOCK_REWARD + 5)
         self.relay_wallet_tx(1, 0, txid)
         orig_chain_tip = self.nodes[0].getbestblockhash()
@@ -69,7 +94,9 @@ class OrphanedBlockRewardTest(BitcoinTestFramework):
         blocks = self.generate(self.nodes[0], 152)
         conflict_block = blocks[0]
         # We expect the descendants of orphaned rewards to no longer be considered
-        assert_equal(self.nodes[1].getbalances()["mine"], {
+        orphaned_balances = self.nodes[1].getbalances()
+        assert_lifecycle_metadata(self.nodes[1], orphaned_balances)
+        assert_mine_balances(orphaned_balances, {
           "trusted": 10,
           "untrusted_pending": 0,
           "immature": 0,
@@ -92,9 +119,11 @@ class OrphanedBlockRewardTest(BitcoinTestFramework):
         self.generate(self.nodes[0], 3)
 
         balances = self.nodes[1].getbalances()
-        del balances["lastprocessedblock"]
-        del pre_reorg_conf_bals["lastprocessedblock"]
-        assert_equal(balances, pre_reorg_conf_bals)
+        assert_lifecycle_metadata(self.nodes[1], balances)
+        assert_equal(
+            comparable_balance_sections(balances),
+            comparable_balance_sections(pre_reorg_conf_bals),
+        )
         assert_equal(self.nodes[1].gettransaction(txid)["details"][0]["abandoned"], True)
 
 

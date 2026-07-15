@@ -30,6 +30,7 @@
 #include <validationinterface.h>
 
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <optional>
 #include <string_view>
@@ -727,6 +728,26 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
     CCoinsViewCache mempoolDuplicate(const_cast<CCoinsViewCache*>(&active_coins_tip));
     const int64_t check_spend_time{spendtime > 0 ? spendtime : GetAdjustedTimeSeconds()};
     const int64_t check_demurrage_time{demurragetime > 0 ? demurragetime : check_spend_time};
+    const bool timestamp_replay_available{
+        check_spend_time >= 0 &&
+        check_spend_time <= std::numeric_limits<uint32_t>::max()};
+    // Keep the graph/ancestor structural audit below even when a caller asks
+    // to sample a hypothetical next-block time that cannot be represented in
+    // CBlockHeader::nTime. The timestamp-dependent replay is deliberately
+    // skipped in that case rather than narrowing the value or teaching
+    // GetCoinTime() a lossy fallback.
+    if (!timestamp_replay_available) {
+        LogPrint(BCLog::MEMPOOL,
+                 "Skipping timestamp-dependent mempool replay for unrepresentable next-block time %d\n",
+                 check_spend_time);
+    }
+    std::set<COutPoint> structural_mempool_outputs;
+    // A v2 parent receives its timestamp only when a concrete block header is
+    // chosen. A legacy child can therefore be valid when admitted (the
+    // parent is represented by the mempool view) yet be too old for this
+    // particular candidate header. Track that expected, time-local state so
+    // the diagnostic replay never turns it into a process-aborting invariant.
+    std::set<uint256> timestamp_unmineable_transactions;
 
     for (const auto& it : GetSortedDepthAndScore()) {
         checkTotal += it->GetTxSize();
@@ -735,18 +756,29 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
         const CTransaction& tx = it->GetTx();
         innerUsage += memusage::DynamicUsage(it->GetMemPoolParentsConst()) + memusage::DynamicUsage(it->GetMemPoolChildrenConst());
         CTxMemPoolEntry::Parents setParentCheck;
+        bool has_timestamp_unmineable_parent{false};
         for (const CTxIn &txin : tx.vin) {
             // Check that every mempool transaction's inputs refer to available coins, or other mempool tx's.
             indexed_transaction_set::const_iterator it2 = mapTx.find(txin.prevout.hash);
             if (it2 != mapTx.end()) {
                 const CTransaction& tx2 = it2->GetTx();
-                assert(tx2.vout.size() > txin.prevout.n && !tx2.vout[txin.prevout.n].IsNull());
+                assert(tx2.vout.size() > txin.prevout.n &&
+                       !tx2.vout[txin.prevout.n].IsNull() &&
+                       !tx2.vout[txin.prevout.n].scriptPubKey.IsUnspendable());
                 setParentCheck.insert(*it2);
+                has_timestamp_unmineable_parent |=
+                    timestamp_unmineable_transactions.count(txin.prevout.hash) != 0;
             }
             // We are iterating through the mempool entries sorted in order by ancestor count.
             // All parents must have been checked before their children and their coins added to
             // the mempoolDuplicate coins cache.
-            assert(mempoolDuplicate.HaveCoin(txin.prevout));
+            if (timestamp_replay_available) {
+                assert(mempoolDuplicate.HaveCoin(txin.prevout));
+            } else if (it2 != mapTx.end()) {
+                assert(structural_mempool_outputs.count(txin.prevout));
+            } else {
+                assert(active_coins_tip.HaveCoin(txin.prevout));
+            }
             // Check whether its inputs are marked in mapNextTx.
             auto it3 = mapNextTx.find(txin.prevout);
             assert(it3 != mapNextTx.end());
@@ -796,19 +828,52 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
         // just a sanity check, not definitive that this calc is correct...
         assert(it->GetSizeWithDescendants() >= child_sizes + it->GetTxSize());
 
-        TxValidationState dummy_state; // Not used. CheckTxInputs() should always pass
-        CAmount txfee = 0;
         assert(!tx.IsCoinBase());
-        // Blackcoin v2+ transactions serialize nTime as zero and are checked
-        // against the block time when mined. Recheck the mempool against the
-        // caller-supplied next-block spend time rather than the wall-clock
-        // entry time, which can be earlier than input coin times under
-        // mocktime or immediately after connecting a block.
-        assert(Consensus::CheckTxInputs(tx, dummy_state, mempoolDuplicate, spendheight,
-                                        check_spend_time, check_demurrage_time, txfee));
-        for (const auto& input: tx.vin) mempoolDuplicate.SpendCoin(input.prevout);
-        AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max(),
-                 /*check=*/false, check_spend_time);
+        if (timestamp_replay_available) {
+            TxValidationState dummy_state;
+            CAmount txfee = 0;
+            // Blackcoin v2+ transactions serialize nTime as zero and are checked
+            // against the block time when mined. Recheck the mempool against the
+            // caller-supplied next-block spend time rather than the wall-clock
+            // entry time, which can be earlier than input coin times under
+            // mocktime or immediately after connecting a block.
+            const bool inputs_valid = Consensus::CheckTxInputs(
+                tx, dummy_state, mempoolDuplicate, spendheight,
+                check_spend_time, check_demurrage_time, txfee);
+            const bool direct_timestamp_conflict =
+                !inputs_valid && dummy_state.GetRejectReason() == "bad-txns-time-earlier-than-input";
+            const bool timestamp_unmineable = has_timestamp_unmineable_parent ||
+                                               direct_timestamp_conflict;
+
+            // The replay evaluates one hypothetical header time, rather than
+            // the context-free mempool view used at admission. A v2 output is
+            // overlaid at that header time, so a legacy descendant can be
+            // temporarily unmineable solely because its serialized nTime is
+            // older. Preserve the normal assertion for every other standalone
+            // failure, but retain the graph and model its outputs for a known
+            // timestamp-local dependency so its descendants are also checked
+            // structurally rather than crashing a node. A descendant's own
+            // non-timestamp input failure remains an invariant violation even
+            // if an ancestor is temporarily unmineable at this header time.
+            assert(inputs_valid || direct_timestamp_conflict);
+            if (timestamp_unmineable) {
+                timestamp_unmineable_transactions.insert(tx.GetHash());
+                LogPrint(BCLog::MEMPOOL,
+                         "Mempool transaction %s is structurally valid but unmineable at candidate time %d%s%s\n",
+                         tx.GetHash().ToString(), check_spend_time,
+                         direct_timestamp_conflict ? ": bad-txns-time-earlier-than-input" : "",
+                         has_timestamp_unmineable_parent ? ": depends on timestamp-unmineable parent" : "");
+            }
+            for (const auto& input: tx.vin) mempoolDuplicate.SpendCoin(input.prevout);
+            AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max(),
+                     /*check=*/false, check_spend_time);
+        } else {
+            for (size_t output_index = 0; output_index < tx.vout.size(); ++output_index) {
+                if (!tx.vout[output_index].scriptPubKey.IsUnspendable()) {
+                    structural_mempool_outputs.emplace(tx.GetHash(), output_index);
+                }
+            }
+        }
     }
     for (auto it = mapNextTx.cbegin(); it != mapNextTx.cend(); it++) {
         uint256 hash = it->second->GetHash();

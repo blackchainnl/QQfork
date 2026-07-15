@@ -452,9 +452,12 @@ static std::vector<RPCResult> TransactionDescriptionString()
            {RPCResult::Type::NUM_TIME, "time", "The transaction time expressed in " + UNIX_EPOCH_TIME + "."},
            {RPCResult::Type::NUM_TIME, "timereceived", "The time received expressed in " + UNIX_EPOCH_TIME + "."},
            {RPCResult::Type::STR, "comment", /*optional=*/true, "If a comment is associated with the transaction, only present if not empty."},
-           {RPCResult::Type::STR, "qq_auto_shadow_stale", /*optional=*/true, "Set to \"1\" when a Gold Rush shadow proof is pending automatic tip validation or was automatically abandoned as stale."},
-           {RPCResult::Type::STR, "qq_manual_shadow_abandon", /*optional=*/true, "Set to \"1\" when the transaction was manually abandoned and must not be reopened automatically after a reorganization."},
+           {RPCResult::Type::STR, "qq_auto_shadow_stale", /*optional=*/true, "Set to \"1\" when an automatically managed Gold Rush record awaits tip validation or reorg-safe repair. Gold Rush PoW claims remain quarantined; generic abandonment does not release their fee input."},
+           {RPCResult::Type::STR, "qq_manual_shadow_abandon", /*optional=*/true, "Set to \"1\" when a non-PoW-claim transaction was manually abandoned and must not be reopened automatically after a reorganization. Gold Rush PoW claims cannot be abandoned with abandontransaction."},
            {RPCResult::Type::STR, "qq_reorg_shadow_resubmit", /*optional=*/true, "Set to \"1\" while an automatically restored Gold Rush proof is awaiting immediate resubmission after a reorganization."},
+           {RPCResult::Type::STR, "qq_shadow_pow_quarantine", /*optional=*/true, "Set to \"1\" when a peer-visible Gold Rush PoW claim remains reserved. The wallet does not automatically create a fee-paying conflicting self-spend."},
+           {RPCResult::Type::STR_HEX, "qq_shadow_pow_cleanup_for", /*optional=*/true, "Compatibility metadata for a legacy fee-paying Gold Rush PoW conflict-resolution transaction."},
+           {RPCResult::Type::STR, "qq_shadow_pow_legacy_cleanup_quarantine", /*optional=*/true, "Set to \"1\" when a legacy Gold Rush PoW cleanup is retained for its conflict reservation but will never be automatically rebroadcast."},
            {RPCResult::Type::STR, "qq_synthetic_goldrush_payout", /*optional=*/true, "Set to \"1\" for a wallet-recognized synthetic Gold Rush payout transaction."},
            {RPCResult::Type::STR, "qq_synthetic_goldrush_payout_stale", /*optional=*/true, "Set to \"1\" when the stored synthetic payout is not authenticated by its active block's current claim markers."},
            {RPCResult::Type::STR_HEX, "qq_synthetic_goldrush_payout_stale_block", /*optional=*/true, "Former active block attribution retained for an unauthenticated synthetic payout audit record."},
@@ -845,7 +848,10 @@ RPCHelpMan abandontransaction()
                 "This will mark this transaction and all its in-wallet descendants as abandoned which will allow\n"
                 "for their inputs to be respent.  It can be used to replace \"stuck\" or evicted transactions.\n"
                 "It only works on transactions which are not included in a block and are not currently in the mempool.\n"
-                "It has no effect on transactions which are already abandoned.\n",
+                "It has no effect on transactions which are already abandoned.\n"
+                "Gold Rush PoW QQSPROOF claims cannot be abandoned with this RPC. Their exact fee input\n"
+                "remains reserved because a peer may still confirm the claim; resolution requires the claim\n"
+                "or a conflicting cleanup transaction to confirm on chain.\n",
                 {
                     {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The transaction id"},
                 },

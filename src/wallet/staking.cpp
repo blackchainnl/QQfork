@@ -2159,7 +2159,11 @@ bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::se
 
 // peercoin: create coin stake transaction
 typedef std::vector<unsigned char> valtype;
-bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval, CMutableTransaction& txNew, CAmount& nFees, CTxDestination destination, const std::vector<CTransactionRef>& selected_txs)
+bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval,
+                     CMutableTransaction& txNew, CAmount& nFees,
+                     CTxDestination destination,
+                     const std::vector<CTransactionRef>& selected_txs,
+                     std::optional<COutPoint> forced_kernel)
 {
     arith_uint256 bnTargetPerCoinDay;
     bnTargetPerCoinDay.SetCompact(nBits);
@@ -2229,7 +2233,9 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
 
     for (const std::pair<const CWalletTx*, unsigned int> &pcoin : setCoins)
     {
-        if (selected_tx_reserved_outpoints.count(COutPoint(pcoin.first->GetHash(), pcoin.second))) continue;
+        const COutPoint prevoutStake{pcoin.first->GetHash(), pcoin.second};
+        if (forced_kernel && prevoutStake != *forced_kernel) continue;
+        if (selected_tx_reserved_outpoints.count(prevoutStake)) continue;
         if (final_quantum_lockout &&
             !IsQuantumMigrationScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey) &&
             !IsQuantumColdStakeScript(pcoin.first->tx->vout[pcoin.second].scriptPubKey)) {
@@ -2247,7 +2253,6 @@ bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterva
         {
             // Search backward in time from the given txNew timestamp
             // Search nSearchInterval seconds back up to nMaxStakeSearchInterval
-            COutPoint prevoutStake = COutPoint(pcoin.first->GetHash(), pcoin.second);
             const uint32_t kernel_time = txNew.nTime - n;
             if (CheckKernel(pindexPrev, nBits, kernel_time, prevoutStake, wallet.chain().getCoinsTip()))
             {

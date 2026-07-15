@@ -23,6 +23,10 @@ MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 40_000
 QQSPROOF_HEX = "51515350524f4f46"
 QUANTUM_SPEND_FEE = Decimal("0.01")
 MINER_FUNDING = Decimal("1.0")
+# QQP4 claims remain valid for a bounded late-inclusion window. A terminal
+# stale test must advance beyond this consensus window rather than treating a
+# single omitted block as an eviction.
+QQP4_LATE_ORIGIN_WINDOW = 64
 
 
 class GoldRushPowMinerE2ETest(BitcoinTestFramework):
@@ -38,6 +42,8 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
             "-staketimio=50",
             "-mempoolexpiry=1",
             "-shadowwhitelistheight=1",
+            "-shadowcompetingclaimsheight=2",
+            "-shadowqqp4height=2",
             "-shadowgoldrushblocks=500",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
             f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
@@ -164,6 +170,39 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         if name not in node.listwallets():
             node.loadwallet(name)
         return node.get_wallet_rpc(name)
+
+    def _claim_input(self, txid):
+        decoded = self.nodes[0].decoderawtransaction(
+            self.nodes[0].getrawtransaction(txid)
+        )
+        assert_equal(len(decoded["vin"]), 1)
+        return {"txid": decoded["vin"][0]["txid"], "vout": decoded["vin"][0]["vout"]}
+
+    def _assert_quarantined_claim(self, wallet, txid, address, claim_input):
+        """A stale QQSPROOF must not make its fee input reusable locally."""
+        node = self.nodes[0]
+        self.wait_until(lambda: txid not in node.getrawmempool(), timeout=20)
+        record = wallet.gettransaction(txid)
+        assert_equal(self._is_abandoned(wallet, txid), False)
+        assert_equal(record["qq_shadow_pow_quarantine"], "1")
+        assert "qq_auto_shadow_stale" not in record
+        assert_raises_rpc_error(
+            -5,
+            "Transaction not eligible for abandonment",
+            wallet.abandontransaction,
+            txid,
+        )
+        assert all(
+            {"txid": utxo["txid"], "vout": utxo["vout"]} != claim_input
+            for utxo in wallet.listunspent(1, 9999999, [address])
+        )
+
+    def _assert_no_automatic_claim_cleanup(self, wallet, claim_txid):
+        """Terminal claims stay quarantined; the wallet must not pay to race them."""
+        assert not any(
+            entry.get("qq_shadow_pow_cleanup_for") == claim_txid
+            for entry in wallet.listtransactions("*", 1000, 0, True)
+        )
 
     def _assert_confirmed_claim(self, wallet, txid, block_hash):
         record = wallet.gettransaction(txid)
@@ -321,16 +360,12 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         assert miner_entry, "miner fee UTXO must be visible in Gold Rush wallet status"
         assert_equal(miner_entry[0]["whitelisted"], False)
 
-        self.log.info("Expiring a built-in miner claim when the next block excludes it")
+        self.log.info("Quarantining a built-in miner claim only after its QQP4 late-inclusion window expires")
         stale_txid, _ = self._start_miner_until_claim(stale_miner)
         assert stale_txid in node.getrawmempool()
         stale_hex = node.getrawtransaction(stale_txid)
         stale_decoded = node.decoderawtransaction(stale_hex)
-        assert_equal(len(stale_decoded["vin"]), 1)
-        stale_input = {
-            "txid": stale_decoded["vin"][0]["txid"],
-            "vout": stale_decoded["vin"][0]["vout"],
-        }
+        stale_input = self._claim_input(stale_txid)
         stale_change = next(vout for vout in stale_decoded["vout"] if Decimal(str(vout["value"])) > 0)
         child_address = stale_miner.getnewaddress("stale-child", "legacy")
         child_amount = Decimal(str(stale_change["value"])) - Decimal("0.01")
@@ -345,59 +380,38 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         self._assert_legacy_stake_weight(stale_miner, 0)
         empty_block = self.generateblock(node, output=staker_address, transactions=[])["hash"]
         assert stale_txid not in node.getblock(empty_block)["tx"]
-        self.wait_until(lambda: stale_txid not in node.getrawmempool(), timeout=10)
-        self.wait_until(lambda: self._is_abandoned(stale_miner, stale_txid), timeout=10)
-        self.wait_until(lambda: self._is_abandoned(stale_miner, child_txid), timeout=10)
-        assert_equal(stale_miner.gettransaction(stale_txid)["qq_auto_shadow_stale"], "1")
+        self.wait_until(lambda: stale_txid in node.getrawmempool(), timeout=20)
+        for _ in range(QQP4_LATE_ORIGIN_WINDOW):
+            if stale_txid not in node.getrawmempool():
+                break
+            self.generateblock(node, output=staker_address, transactions=[])
+        self._assert_quarantined_claim(stale_miner, stale_txid, stale_address, stale_input)
+        assert_equal(self._is_abandoned(stale_miner, child_txid), False)
+        # An ordinary child may be abandoned, but that must not cascade into
+        # release of the terminal QQSPROOF root input while a peer could still
+        # confirm the original claim.
         stale_miner.abandontransaction(child_txid)
-        assert_equal(stale_miner.gettransaction(child_txid)["qq_manual_shadow_abandon"], "1")
+        assert_equal(self._is_abandoned(stale_miner, child_txid), True)
+        self._assert_quarantined_claim(
+            stale_miner, stale_txid, stale_address, stale_input
+        )
         stale_accept = node.testmempoolaccept([stale_hex])[0]
         assert_equal(stale_accept["allowed"], False)
-        assert_equal(stale_accept["reject-reason"], "shadow-proof-invalid")
-        released = stale_miner.listunspent(1, 9999999, [stale_address])
-        assert_equal(len(released), 1)
-        assert_equal(
-            {"txid": released[0]["txid"], "vout": released[0]["vout"]},
-            stale_input,
-        )
         assert_equal(stale_miner.listunspent(0, 9999999, [child_address]), [])
-        assert_equal(Decimal(str(stale_miner.getbalances()["mine"]["trusted"])), MINER_FUNDING)
-        self._assert_legacy_stake_weight(stale_miner, int(MINER_FUNDING * 100_000_000))
+
+        self.log.info("Restarting preserves a terminal quarantine without creating a fee-paying cleanup")
+        self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={self.mock_time}"])
+        node = self.nodes[0]
+        node.setmocktime(self.mock_time)
+        staker = self._load_wallet("goldrush_pow_staker")
+        stale_miner = self._load_wallet("goldrush_pow_stale")
+        age_miner = self._load_wallet("goldrush_pow_age")
+        repair_miner = self._load_wallet("goldrush_pow_repair")
+        self._assert_quarantined_claim(stale_miner, stale_txid, stale_address, stale_input)
+        self._assert_no_automatic_claim_cleanup(stale_miner, stale_txid)
+        assert_equal(len(stale_miner.listunspent(1, 9999999, [stale_address])), 0)
+        assert_equal(stale_miner.listunspent(0, 9999999, [child_address]), [])
         self._sync_mocktime_to_tip()
-
-        self.log.info("Restoring a claim package when a reorg restores its bound parent")
-        node.invalidateblock(empty_block)
-        self.wait_until(lambda: not self._is_abandoned(stale_miner, stale_txid), timeout=10)
-        assert_equal(self._is_abandoned(stale_miner, child_txid), True)
-        self.wait_until(lambda: stale_txid in node.getrawmempool(), timeout=20)
-        recovered = stale_miner.gettransaction(stale_txid)
-        assert "qq_auto_shadow_stale" not in recovered
-        assert "qq_reorg_shadow_resubmit" not in recovered
-        assert child_txid not in node.getrawmempool()
-
-        # Exclude the recovered package from the replacement tip so it becomes
-        # stale again and releases the same input for the next mining attempt.
-        replacement_empty = self.generateblock(node, output=staker_address, transactions=[])["hash"]
-        assert stale_txid not in node.getblock(replacement_empty)["tx"]
-        self.wait_until(lambda: self._is_abandoned(stale_miner, stale_txid), timeout=10)
-        assert_equal(self._is_abandoned(stale_miner, child_txid), True)
-        self._sync_mocktime_to_tip()
-
-        self.log.info("Reusing the released input and confirming that block inclusion is never abandoned")
-        reused_txid, reused_payout_address = self._start_miner_until_claim(stale_miner)
-        reused_decoded = node.decoderawtransaction(node.getrawtransaction(reused_txid))
-        assert_equal(len(reused_decoded["vin"]), 1)
-        assert_equal(
-            {
-                "txid": reused_decoded["vin"][0]["txid"],
-                "vout": reused_decoded["vin"][0]["vout"],
-            },
-            stale_input,
-        )
-        reused_block_hash = self._mine_pos_block_with_claim(staker, reused_txid)
-        assert reused_txid in node.getblock(reused_block_hash)["tx"]
-        self._assert_confirmed_claim(stale_miner, reused_txid, reused_block_hash)
-        reused_payout = self._wait_for_quantum_utxo(stale_miner, reused_payout_address)
 
         self.log.info("Ordinary mempool age expiry must not abandon a still tip-valid claim")
         age_txid, _ = self._start_miner_until_claim(age_miner)
@@ -416,9 +430,15 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         self.log.info("Repairing an already-stale v30.1.0-style claim when its wallet is loaded")
         repair_txid, _ = self._start_miner_until_claim(repair_miner)
         assert repair_txid in node.getrawmempool()
+        repair_input = self._claim_input(repair_txid)
         repair_miner.unloadwallet()
         repair_block = self.generateblock(node, output=staker_address, transactions=[])["hash"]
         assert repair_txid not in node.getblock(repair_block)["tx"]
+        self.wait_until(lambda: repair_txid in node.getrawmempool(), timeout=20)
+        for _ in range(QQP4_LATE_ORIGIN_WINDOW):
+            if repair_txid not in node.getrawmempool():
+                break
+            self.generateblock(node, output=staker_address, transactions=[])
         self.wait_until(lambda: repair_txid not in node.getrawmempool(), timeout=10)
 
         self.log.info("Restarting before wallet load exercises persisted stale-claim repair")
@@ -429,16 +449,12 @@ class GoldRushPowMinerE2ETest(BitcoinTestFramework):
         miner = self._load_wallet("goldrush_pow_miner")
         stale_miner = self._load_wallet("goldrush_pow_stale")
         age_miner = self._load_wallet("goldrush_pow_age")
-        self._assert_confirmed_claim(stale_miner, reused_txid, reused_block_hash)
         self._assert_confirmed_claim(age_miner, age_txid, age_block_hash)
-        restarted_reused_payout = self._wait_for_quantum_utxo(stale_miner, reused_payout_address)
-        for field in ("txid", "vout", "amount"):
-            assert_equal(restarted_reused_payout[field], reused_payout[field])
 
         repair_miner = self._load_wallet("goldrush_pow_repair")
-        self.wait_until(lambda: self._is_abandoned(repair_miner, repair_txid), timeout=10)
-        assert_equal(len(repair_miner.listunspent(1, 9999999, [repair_address])), 1)
-        assert_equal(Decimal(str(repair_miner.getbalances()["mine"]["trusted"])), MINER_FUNDING)
+        self._assert_quarantined_claim(repair_miner, repair_txid, repair_address, repair_input)
+        self._assert_no_automatic_claim_cleanup(repair_miner, repair_txid)
+        assert_equal(len(repair_miner.listunspent(1, 9999999, [repair_address])), 0)
         self._sync_mocktime_to_tip()
 
         self.log.info("Submitting a fresh built-in miner claim and mining it in a PoS block")

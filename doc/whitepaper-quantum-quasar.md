@@ -309,12 +309,21 @@ transactions carried in OP_RETURN outputs:
   retargeted every 64 blocks within a [10-bit, 18-bit] band, and submits it in a claim
   transaction that is validated before mempool acceptance. Already-mined blocks through
   5,993,199 retain the v30.1.0 first-valid-claim allocation. At the first scheduled
-  halving, height 5,993,200, v30.1.1 begins canonically ranking competing candidates
-  independently of transaction order and evaluates at most 64 Argon2 proofs. The
-  lowest-ranked valid claim receives the fixed PoW pool after each other evaluated valid
-  claimant is reimbursed its actual base fee, capped at 0.01 BLK. At most 0.63 BLK can
-  be reimbursed in one block. Invalid, malformed, and excess claims receive nothing, and
-  all credits still sum exactly to the pre-existing pool.
+  halving, height 5,993,200, v30.1.1 begins the QQP3 canonical rank-v1 rule,
+  ranking competing candidates independently of transaction order and evaluating at most
+  64 Argon2 proofs. QQP3 binds each new proof to its intended height and parent and
+  permits fee-only reimbursement for 64 later blocks on the same branch. The
+  lowest-ranked valid current-origin claim receives
+  the fixed PoW pool after every current loser and eligible late claimant is reimbursed its
+  actual base fee, capped at 0.01 BLK. A late-only block leaves the unreimbursed pool
+  accumulated. At most 0.63 BLK can be reimbursed alongside a winner. Invalid, malformed,
+  expired, off-branch, and excess claims receive nothing.
+
+  QQP4 additionally binds the exact single legacy fee-input outpoint. It has a
+  separate consensus activation and is disabled on mainnet in the v30.1.1
+  alpha/beta channel. Readiness or version-bit signalling cannot activate QQP4.
+  Any future QQP4 release must publish an explicit activation height and a tested
+  transition for QQP3 claims that are still inside their late-inclusion window.
 
 The wallet can automate both when the corresponding staking/mining mode and signing
 prerequisites are satisfied. See §9 for the exact RPCs (`sendshadowsignal`,
@@ -884,6 +893,7 @@ the competing-claim boundary shown below.
 | `SHADOW_WHITELIST_MIN_BALANCE` | 10,000 BLK | Whitelist eligibility threshold | `shadow.h` |
 | `SHADOW_REWARD_START_HEIGHT` | 5,950,000 | Gold Rush rewards begin | `shadow_schedule.cpp` |
 | `MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT` | 5,993,200 | Canonical competing-claim allocation begins | `shadow.h` |
+| `Consensus::Params::nShadowQQP4ActivationHeight` | `INT_MAX` (disabled in alpha/beta) | Separately scheduled exact-input QQP4 activation; not a readiness-bit activation | `consensus/params.h` |
 | `SHADOW_GOLD_RUSH_BLOCKS` | 243,000 (180 days) | Gold Rush length | `shadow_schedule.cpp` |
 | `SHADOW_REWARD_END_HEIGHT` | 6,192,999 | Gold Rush rewards end | `shadow_schedule.cpp` |
 | `MAINNET_QUANTUM_MIGRATION_END_HEIGHT` | 6,921,999 | Last height-authoritative Migration block | `shadow.h` |

@@ -67,11 +67,20 @@ address. If a staker includes a valid claim, the upgraded rules credit the
 claim's reward to that quantum address. Claim transactions pay ordinary network
 fees. Through height 5,993,199, replay preserves the v30.1.0 allocation rule so
 already-mined shadow history is not reassigned. From the first scheduled Gold
-Rush halving at height 5,993,200, if a custom block contains multiple valid
-claims, v30.1.1 chooses the winner by a transaction-order-independent rank. Each
-evaluated valid loser receives its actual fee capped at 0.01 BLK, and the winner
-receives the fixed pool remainder. Malformed and over-limit claims receive
-nothing; the total credit never exceeds the existing pool.
+Rush halving at height 5,993,200, the existing QQP3 rule authenticates an
+origin height and parent hash and chooses a current-origin winner by the
+transaction-order-independent rank-v1 rule. Current losers and eligible claims
+included up to 64 blocks late receive their actual fee capped at 0.01 BLK. The
+winner receives the fixed pool remainder; late-only blocks leave the
+unreimbursed pool accumulated. Malformed, expired, origin-mismatched, and
+over-limit claims receive nothing; the total credit never exceeds the existing
+pool.
+
+QQP4 adds an exact legacy fee-input outpoint, but it has a separate consensus
+activation and is disabled on mainnet in this alpha/beta channel. Signalling
+does not activate QQP4. A future QQP4 release must declare its activation
+height and prove the Q3 late-claim transition through block, mempool, reorg,
+and replay coverage before scheduling it.
 
 This makes height 5,993,200 an upgrade deadline for every wallet, staking or
 mining node, explorer, and indexer that consumes shadow state. v30.1.0 and
@@ -206,7 +215,7 @@ inspection-only.
 ## Existing-node upgrade and chainstate rebuild
 
 v30.1.1 changes the persisted shadow and demurrage state to authenticated
-schema 11, recomputes the
+schema 12, recomputes the
 canonical competing-claim result from height 5,993,200, and preserves v30.1.0
 block-time provenance for transaction outputs across live validation and replay.
 Operators upgrading from
@@ -255,7 +264,7 @@ blackcoin-cli gettxoutsetinfo muhash
 blackcoin-cli getgoldrushstate
 ```
 
-In `getgoldrushstate`, require `replay_state.schema` to equal `11` and
+In `getgoldrushstate`, require `replay_state.schema` to equal `12` and
 `replay_state.present`, `marker_valid`, and `valid_for_tip` to all be `true` at
 or after the whitelist height. Record its 64-hex-character `commitment`, marker
 height, marker block hash, active height, and best-block hash. The UTXO MuHash

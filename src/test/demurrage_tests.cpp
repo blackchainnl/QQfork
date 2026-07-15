@@ -62,7 +62,7 @@ COutPoint PrereleaseInventoryOutpoint()
 }
 
 Coin TestMarkerCoin(CAmount value, const CScript& script, int height,
-                    int time, bool coinbase = true)
+                    uint32_t time, bool coinbase = true)
 {
     return Coin{CTxOut{value, script}, height, coinbase, false, time};
 }

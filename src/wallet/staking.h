@@ -25,7 +25,11 @@ void AvailableCoinsForStaking(const CWallet& wallet,
                            const CoinFilterParams& params = {}) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::set<std::pair<const CWalletTx *, unsigned int> > &setCoinsRet, CAmount& nValueRet)
     EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
-bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval, CMutableTransaction& tx, CAmount& nFees, CTxDestination destination, const std::vector<CTransactionRef>& selected_txs = {});
+bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval,
+                     CMutableTransaction& tx, CAmount& nFees,
+                     CTxDestination destination,
+                     const std::vector<CTransactionRef>& selected_txs = {},
+                     std::optional<COutPoint> forced_kernel = std::nullopt);
 
 struct DemurrageAttestationTxResult
 {

@@ -18,9 +18,9 @@ the new RPCs return an explicit error rather than silently returning partial
 history.
 
 Mainnet lifecycle boundaries are height-authoritative. Gold Rush is height
-5,950,000 through 6,192,999; the emission-neutral competing-claim rule begins
-at height 5,993,200; Migration is height 6,193,000 through 6,921,999; and Final
-Lockout plus automatic demurrage begin at height 6,922,000. Witness-v15 EUTXO
+5,950,000 through 6,192,999; the QQP3 emission-neutral competing-claim rule
+begins at height 5,993,200; Migration is height 6,193,000 through 6,921,999;
+and Final Lockout plus automatic demurrage begin at height 6,922,000. Witness-v15 EUTXO
 funding and spending remain frozen because v15 lacks quantum ownership
 authorization. Demurrage decay realized by a valid spend is permanently burned
 and is never paid to a miner, staker, treasury, shadow pool, or claim
@@ -40,11 +40,13 @@ support production-network pruning and rejects a nonzero `-prune` value on
 mainnet, testnet, and signet. Explorer operators must use `-prune=0`.
 `-reindex` wipes and deterministically rebuilds the index.
 
-v30.1.1 uses shadowindex schema 8. Schema 5 invalidated prerelease data built
+v30.1.1 uses shadowindex schema 10. Schema 5 invalidated prerelease data built
 with the superseded height-5,950,000 claim boundary, schema 6 added proof-mode
 classification, schema 7 added ordered spend anchors used by the bounded event
-transport, and schema 8 replaces unbounded per-note claim rows with top-64
-detail, fixed aggregates, and a deterministic commitment. Any recognized older
+transport, schema 8 replaced unbounded per-note claim rows with top-64 detail
+and fixed aggregates, schema 9 added origin/inclusion provenance and
+late-claim dispositions, and schema 10 adds proof-version and optional
+exact-fee-input-binding fields for a separately activated QQP4 rule. Any recognized older
 shadowindex schema is discarded and rebuilt automatically. Coinstatsindex
 schema 3 likewise invalidates its
 prerelease schema-2 synthetic-payout statistics. These auxiliary-index rebuilds
@@ -114,24 +116,30 @@ accepted, so an explorer detects a reorganization when a previously stored
 anchor hash is rejected or no longer matches `getblockhash(height)`.
 
 `pow_claim_accounting` reports `observed_count`, `evaluated_count`, winner,
-reimbursed-loser, total rejection counts, and a fixed breakdown for invalid
+current-loser reimbursement, late reimbursement, total rejection counts, and a fixed breakdown for invalid
 location, malformed transaction, invalid proof, wrong/unknown mode, input
-mismatch, invalid base fee, and evaluation-limit outcomes. It also reports
+mismatch, invalid base fee, origin mismatch, origin expiry, and evaluation-limit outcomes. It also reports
 exact winner, reimbursement, and combined credited totals plus the non-null
 `accounting_commitment`. `total_records` is the pageable detail count and is
 always equal to `evaluated_count` and at most 64; aggregate-only structural and
 over-budget outcomes do not have invented detail rows. Stable detailed
 dispositions are `invalid_proof`, `input_mismatch`, `invalid_base_fee`,
-`winner`, and `reimbursed_loser`. A positive winner or reimbursed-loser credit
-carries the exact synthetic transaction ID. Zero-fee valid losers remain
-visible as `reimbursed_loser` rows with zero credit and no synthetic output.
+`origin_mismatch`, `origin_expired`, `winner`, `reimbursed_loser`, and
+`reimbursed_late`. Every row exposes `proof_version`, `origin_bound`,
+`origin_height`, `origin_previous_block_hash`, `inclusion_height`,
+`origin_age`, `input_bound`, and `claim_outpoint`. The last is null for QQP3
+and becomes an object containing the exact base-chain `txid` and `vout` only
+after separately activated QQP4 binding is in force.
+A positive winner or reimbursement carries the exact synthetic transaction ID.
+Zero-fee valid reimbursements remain visible with zero credit and no synthetic
+output.
 
 `observed_pow_claim_txids` is retained as a compatibility sample in base-block
 order and is capped at 64 entries. It is not a complete inventory when
 `observed_count` exceeds the array length. Consumers must use the aggregate
 counts and commitment rather than treating the sample as exhaustive.
 
-On mainnet this canonical per-claim classification begins at height 5,993,200.
+On mainnet this QQP3 canonical per-claim classification begins at height 5,993,200.
 Earlier Gold Rush blocks intentionally reproduce the v30.1.0 first-valid-claim
 allocation and therefore do not expose a retroactively invented canonical
 winner or loser reimbursement. Their authenticated PoW synthetic payouts are
@@ -141,6 +149,17 @@ each payout's `pow_claim_source` is null. At and after height 5,993,200, every
 credited PoW payout must map to one canonical source record and the exact
 credited total; missing or inconsistent provenance stops the auxiliary index
 instead of publishing a partial result.
+
+QQP3 commits the intended height and parent hash. It may be included at that
+height or up to 64 blocks later while the origin remains on the active branch.
+Late claims receive only their capped actual fee. A late-only block therefore
+reports reimbursement payouts but no winner and does not consume the remaining
+PoW jackpot. QQP4 additionally commits the exact single legacy fee input, but
+its activation is separate and disabled on mainnet in this alpha/beta channel.
+No readiness or version-bit state activates QQP4. A future QQP4 schedule must
+publish its height and the tested treatment of already-eligible QQP3 late
+claims; explorers must not infer that a QQP4 boundary is the 5,993,200 QQP3
+boundary.
 
 Index construction authenticates the historical pool context while holding the
 chain/view lock, then releases that lock before the shared Argon2 evaluator is
@@ -304,11 +323,11 @@ test. It:
 9. forces an equal-tip ABA reorg while supply, script, and outpoint RPCs are in
    progress and requires an explicit retry instead of a mixed-branch result.
 
-`feature_shadowindex_claim_boundary.py` compresses the height-5,993,200
-boundary on regtest. It proves that a paid historical v30.1.0-style claim
-survives restart, disconnect/reconnect, and `-reindex` with explicit null source
-provenance, while the first post-activation payout requires and retains its
-exact canonical source and accounting totals through the same rebuild path.
+`feature_shadowindex_claim_boundary.py` must configure its QQP3 and QQP4
+activation heights independently on regtest. It proves that a paid historical
+v30.1.0-style claim survives restart, disconnect/reconnect, and `-reindex` with
+explicit null source provenance; QQP3 canonical provenance and any future QQP4
+exact-input provenance must then be exercised as separate transitions.
 
 `interface_zmq_shadow.py` is the executable event-ingestion test. Enable the
 transport with:

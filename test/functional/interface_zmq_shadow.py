@@ -81,6 +81,8 @@ class ShadowZMQTest(BitcoinTestFramework):
             "-shadowwhitelistheight=1",
             "-shadowgoldrushstartheight=20",
             "-shadowgoldrushblocks=10",
+            "-shadowcompetingclaimsheight=20",
+            "-shadowqqp4height=20",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
         ]
         self.shadow_args = self.common_args + [
@@ -259,8 +261,20 @@ class ShadowZMQTest(BitcoinTestFramework):
             assert_equal(credit["vout"], payout_utxo["vout"])
             assert_equal(credit["address"], payout_address)
             assert_equal(credit["mode"], "pow")
-            assert_equal(credit["pow_claim_source"]["txid"], claim["txid"])
-            assert_equal(credit["pow_claim_source"]["disposition"], "winner")
+            claim_source = credit["pow_claim_source"]
+            assert_equal(claim_source["txid"], claim["txid"])
+            assert_equal(claim_source["disposition"], "winner")
+            raw_claim = node.getrawtransaction(claim["txid"], True)
+            assert_equal(len(raw_claim["vin"]), 1)
+            assert_equal(claim_source["proof_version"], 4)
+            assert_equal(claim_source["input_bound"], True)
+            assert_equal(
+                claim_source["claim_outpoint"],
+                {
+                    "txid": raw_claim["vin"][0]["txid"],
+                    "vout": raw_claim["vin"][0]["vout"],
+                },
+            )
             expected_atomic = str(int(Decimal(str(payout_utxo["amount"])) * 100_000_000))
             assert_equal(credit["nominal_amount_atomic"], expected_atomic)
             assert payout_utxo["txid"] not in node.getblock(claim_blockhash)["tx"]

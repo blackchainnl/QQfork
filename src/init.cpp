@@ -245,9 +245,13 @@ static void ShutdownNotify(const ArgsManager& args)
 
 void Interrupt(NodeContext& node)
 {
+    if (node.rebuild_restart_required.load()) {
+        LogPrintf("Skipping -shutdownnotify for planned chainstate rebuild restart\n");
+    } else {
 #if HAVE_SYSTEM
-    ShutdownNotify(*node.args);
+        ShutdownNotify(*node.args);
 #endif
+    }
     InterruptHTTPServer();
     InterruptHTTPRPC();
     InterruptRPC();
@@ -945,6 +949,9 @@ bool AppInitParameterInteraction(const ArgsManager& args)
     if (args.IsArgSet("-shadowcompetingclaimsheight") && chain != ChainType::REGTEST) {
         return InitError(_("-shadowcompetingclaimsheight is only supported on regtest."));
     }
+    if (args.IsArgSet("-shadowqqp4height") && chain != ChainType::REGTEST) {
+        return InitError(_("-shadowqqp4height is only supported on regtest."));
+    }
 
     if (args.IsArgSet("-solostaking") && chain != ChainType::TESTNET && chain != ChainType::REGTEST) {
         return InitError(_("-solostaking is only supported on testnet/regtest in the test schedule branch."));
@@ -1196,8 +1203,12 @@ bool AppInitInterfaces(NodeContext& node)
     return true;
 }
 
-bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
+static bool AppInitMainImpl(NodeContext& node,
+                            interfaces::BlockAndHeaderTipInfo* tip_info,
+                            bool& rebuild_restart_required)
 {
+    node.rebuild_restart_required = false;
+    rebuild_restart_required = false;
     const ArgsManager& args = *Assert(node.args);
     const CChainParams& chainparams = Params();
 
@@ -1275,6 +1286,11 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     GetMainSignals().RegisterBackgroundSignalScheduler(*node.scheduler);
 
+    // All normal service setup is deliberately deferred until chainstate
+    // bootstrap has either completed or failed closed. This keeps a staged or
+    // committed rebuild out of wallet, RPC, ZMQ, and P2P initialization.
+    PeerManager::Options peerman_opts{};
+    auto initialize_normal_services = [&]() -> bool {
     // Create client interfaces for wallets that are supposed to be loaded
     // according to -wallet and -disablewallet options. This only constructs
     // the interfaces, it doesn't load wallet data. Wallets actually get loaded
@@ -1325,7 +1341,6 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     fListen = args.GetBoolArg("-listen", DEFAULT_LISTEN);
     fDiscover = args.GetBoolArg("-discover", true);
 
-    PeerManager::Options peerman_opts{};
     ApplyArgsManOptions(args, peerman_opts);
 
     {
@@ -1561,6 +1576,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         RegisterValidationInterface(g_zmq_notification_interface.get());
     }
 #endif
+        return true;
+    };
 
     // ********************************************************* Step 7: load block chain
 
@@ -1721,6 +1738,50 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     ChainstateManager& chainman = *Assert(node.chainman);
+    const bool staged_chainstate_rebuild =
+        chainman.m_chainstate_rebuild_staged_this_process.load();
+    const bool reopened_committed_rebuild =
+        chainman.m_chainstate_rebuild_reopened_committed_this_process.load();
+
+    if (staged_chainstate_rebuild && reopened_committed_rebuild) {
+        return InitError(_("Chainstate rebuild lifecycle is internally inconsistent. Normal services were not started."));
+    }
+    if (staged_chainstate_rebuild || reopened_committed_rebuild) {
+        // No PeerManager, index, wallet, RPC, ZMQ, or normal import path exists
+        // yet. Use a dedicated bootstrap thread so the protected lifecycle has
+        // the same threading boundary as regular block import, then join it
+        // before any service can observe or modify the rebuilt state.
+        uiInterface.InitMessage(
+            staged_chainstate_rebuild
+                ? _("Rebuilding protected chainstate…").translated
+                : _("Verifying rebuilt chainstate…").translated);
+        assert(!chainman.m_thread_load.joinable());
+        chainman.m_thread_load = std::thread(
+            &util::TraceThread, "rebuildbootstrap", [&chainman] {
+                ImportBlocks(chainman, {});
+            });
+        chainman.m_thread_load.join();
+
+        if (staged_chainstate_rebuild) {
+            if (!chainman.m_chainstate_rebuild_committed_this_process.load()) {
+                return InitError(_("The protected chainstate rebuild did not reach a durable commit. Normal services were not started; restart to recover the preserved databases."));
+            }
+            rebuild_restart_required = true;
+            uiInterface.InitMessage(
+                _("Chainstate rebuild completed. Restart Blackcoin to begin normal operation.").translated);
+            LogPrintf("Protected chainstate rebuild committed; a clean restart is required before normal services may start\n");
+            node.rebuild_restart_required = true;
+            StartShutdown();
+            return true;
+        }
+
+        if (!chainman.m_chainstate_rebuild_cleanup_completed_this_process.load()) {
+            return InitError(_("The committed chainstate rebuild did not complete protected verification and cleanup. Normal services were not started; preserve the datadir and retry."));
+        }
+        LogPrintf("Protected chainstate rebuild verification completed before normal service initialization\n");
+    }
+
+    if (!initialize_normal_services()) return false;
 
     assert(!node.peerman);
     node.peerman = PeerManager::make(*node.connman, *node.addrman,
@@ -2074,6 +2135,19 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 #endif
 
     return true;
+}
+
+interfaces::AppInitResult AppInitMain(
+    NodeContext& node,
+    interfaces::BlockAndHeaderTipInfo* tip_info)
+{
+    bool rebuild_restart_required{false};
+    if (!AppInitMainImpl(node, tip_info, rebuild_restart_required)) {
+        return interfaces::AppInitResult::FAILURE;
+    }
+    return rebuild_restart_required
+        ? interfaces::AppInitResult::REBUILD_RESTART_REQUIRED
+        : interfaces::AppInitResult::SUCCESS;
 }
 
 bool StartIndexBackgroundSync(NodeContext& node)

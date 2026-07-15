@@ -515,10 +515,10 @@ class WalletMigrationTest(BitcoinTestFramework):
 
     def clear_default_wallet(self, backup_file):
         # Test cleanup: Clear unnamed default wallet for subsequent tests
-        (self.old_node.wallets_path / "wallet.dat").unlink()
-        (self.master_node.wallets_path / "wallet.dat").unlink(missing_ok=True)
-        shutil.rmtree(self.master_node.wallets_path / "default_wallet_watchonly", ignore_errors=True)
-        shutil.rmtree(self.master_node.wallets_path / "default_wallet_solvables", ignore_errors=True)
+        node = self.nodes[0]
+        (node.wallets_path / "wallet.dat").unlink(missing_ok=True)
+        shutil.rmtree(node.wallets_path / "default_wallet_watchonly", ignore_errors=True)
+        shutil.rmtree(node.wallets_path / "default_wallet_solvables", ignore_errors=True)
         backup_file.unlink()
 
     def test_default_wallet(self):
@@ -541,7 +541,8 @@ class WalletMigrationTest(BitcoinTestFramework):
 
     def test_default_wallet_watch_only(self):
         self.log.info("Test unnamed (default) watch-only wallet migration")
-        master_wallet = self.master_node.get_wallet_rpc(self.default_wallet_name)
+        node = self.nodes[0]
+        master_wallet = node.get_wallet_rpc(self.default_wallet_name)
         wallet = self.create_legacy_wallet("")
         wallet.importaddress(master_wallet.getnewaddress(address_type="legacy"))
 
@@ -555,35 +556,36 @@ class WalletMigrationTest(BitcoinTestFramework):
         assert_equal(info["private_keys_enabled"], False)
         assert_equal(info["walletname"], "default_wallet_watchonly")
         # Check the default wallet is not available anymore
-        assert not (self.master_node.wallets_path / "wallet.dat").exists()
+        assert not (node.wallets_path / "wallet.dat").exists()
 
         wallet.unloadwallet()
         self.clear_default_wallet(backup_file=Path(res["backup_path"]))
 
     def test_default_wallet_failure(self):
         self.log.info("Test failure during unnamed (default) wallet migration")
-        master_wallet = self.master_node.get_wallet_rpc(self.default_wallet_name)
+        node = self.nodes[0]
+        master_wallet = node.get_wallet_rpc(self.default_wallet_name)
         wallet = self.create_legacy_wallet("")
         wallet.importaddress(master_wallet.getnewaddress(address_type="legacy"))
 
         # Create wallet directory with the watch-only name and a wallet file.
         # Because the wallet dir exists, this will cause migration to fail.
-        watch_only_dir = self.master_node.wallets_path / "default_wallet_watchonly"
+        watch_only_dir = node.wallets_path / "default_wallet_watchonly"
         os.mkdir(watch_only_dir)
-        shutil.copyfile(self.old_node.wallets_path / "wallet.dat", watch_only_dir / "wallet.dat")
+        shutil.copyfile(node.wallets_path / "wallet.dat", watch_only_dir / "wallet.dat")
 
         mocked_time = int(time.time())
-        self.master_node.setmocktime(mocked_time)
+        node.setmocktime(mocked_time)
         assert_raises_rpc_error(-4, "Failed to create database", wallet.migratewallet)
-        self.master_node.setmocktime(0)
+        node.setmocktime(0)
 
         # Verify the /wallets/ path exists
-        assert self.master_node.wallets_path.exists()
+        assert node.wallets_path.exists()
         # Check backup file exists. Because the wallet has no name, the backup is prefixed with 'default_wallet'
-        backup_path = self.master_node.wallets_path / f"default_wallet_{mocked_time}.legacy.bak"
+        backup_path = node.wallets_path / f"default_wallet_{mocked_time}.legacy.bak"
         assert backup_path.exists()
         # Verify the original unnamed wallet was restored
-        assert (self.master_node.wallets_path / "wallet.dat").exists()
+        assert (node.wallets_path / "wallet.dat").exists()
         # And verify it is still a BDB wallet
         self.assert_is_bdb("")
 

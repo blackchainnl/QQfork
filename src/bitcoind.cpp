@@ -246,7 +246,12 @@ static bool AppInit(NodeContext& node)
             // If locking the data directory failed, exit immediately
             return false;
         }
-        fRet = AppInitInterfaces(node) && AppInitMain(node);
+        if (!AppInitInterfaces(node)) {
+            fRet = false;
+        } else {
+            const interfaces::AppInitResult result = AppInitMain(node);
+            fRet = result != interfaces::AppInitResult::FAILURE;
+        }
     }
     catch (const std::exception& e) {
         PrintExceptionContinue(&e, "AppInit()");

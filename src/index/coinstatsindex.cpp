@@ -269,7 +269,7 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
             for (uint32_t j = 0; j < tx->vout.size(); ++j) {
                 const CTxOut& out{tx->vout[j]};
                 const unsigned int coin_time = (tx->nVersion < 2) ? tx->nTime : block.data->GetBlockTime();
-                Coin coin{out, block.height, tx->IsCoinBase(), tx->IsCoinStake(), static_cast<int>(coin_time)};
+                Coin coin{out, block.height, tx->IsCoinBase(), tx->IsCoinStake(), coin_time};
                 COutPoint outpoint{tx->GetHash(), j};
 
                 // Skip unspendable coins
@@ -296,7 +296,7 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
         {
             LOCK(cs_main);
             for (const ShadowSyntheticPayoutCoin& payout : GetAppliedShadowClaimPayoutCoins(m_chainstate->CoinsTip(), block.height, block.hash, block.data->GetBlockTime())) {
-                Coin coin{payout.txout, static_cast<int>(payout.height), /*fCoinBaseIn=*/true, /*fCoinStakeIn=*/false, static_cast<int>(payout.time)};
+                Coin coin{payout.txout, static_cast<int>(payout.height), /*fCoinBaseIn=*/true, /*fCoinStakeIn=*/false, static_cast<uint32_t>(payout.time)};
                 shadow_payouts.emplace_back(payout.outpoint, coin);
                 AddCreatedCoin(payout.outpoint, coin);
                 m_total_subsidy += coin.out.nValue;
@@ -546,7 +546,7 @@ bool CoinStatsIndex::ReverseBlock(const CBlock& block, const CBlockIndex* pindex
             const CTxOut& out{tx->vout[j]};
             COutPoint outpoint{tx->GetHash(), j};
             const unsigned int coin_time = (tx->nVersion < 2) ? tx->nTime : block.GetBlockTime();
-            Coin coin{out, pindex->nHeight, tx->IsCoinBase(), tx->IsCoinStake(), static_cast<int>(coin_time)};
+            Coin coin{out, pindex->nHeight, tx->IsCoinBase(), tx->IsCoinStake(), coin_time};
 
             // Skip unspendable coins
             if (coin.out.scriptPubKey.IsUnspendable()) {

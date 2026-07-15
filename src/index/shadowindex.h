@@ -35,19 +35,24 @@ struct ShadowIndexPowClaimSource {
     CAmount base_fee{0};
     bool base_fee_known{false};
     ShadowPowClaimDisposition disposition{ShadowPowClaimDisposition::INVALID_PROOF};
+    uint8_t proof_version{0};
     bool origin_bound{false};
     uint32_t origin_height{0};
     uint256 origin_previous_block_hash;
     uint32_t inclusion_height{0};
     uint32_t origin_age{0};
+    bool input_bound{false};
+    COutPoint claim_outpoint;
 
     SERIALIZE_METHODS(ShadowIndexPowClaimSource, obj)
     {
         uint8_t disposition{static_cast<uint8_t>(obj.disposition)};
         READWRITE(obj.txid, obj.vout, obj.canonical_rank, obj.base_fee,
-                  obj.base_fee_known, disposition, obj.origin_bound,
+                  obj.base_fee_known, disposition, obj.proof_version,
+                  obj.origin_bound,
                   obj.origin_height, obj.origin_previous_block_hash,
-                  obj.inclusion_height, obj.origin_age);
+                  obj.inclusion_height, obj.origin_age, obj.input_bound,
+                  obj.claim_outpoint);
         SER_READ(obj, {
             if (disposition > static_cast<uint8_t>(ShadowPowClaimDisposition::REIMBURSED_LATE)) {
                 throw std::ios_base::failure("Invalid shadow POW claim disposition");

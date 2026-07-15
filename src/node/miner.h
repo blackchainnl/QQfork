@@ -203,7 +203,12 @@ public:
     explicit BlockAssembler(Chainstate& chainstate, const CTxMemPool* mempool, const Options& options);
 
     /** Construct a new block template with coinbase to scriptPubKeyIn */
-    std::unique_ptr<CBlockTemplate> CreateNewBlock(const CScript& scriptPubKeyIn, CWallet* pwallet = nullptr, bool* pfPoSCancel = nullptr, int64_t* pFees = 0, CTxDestination destination = CNoDestination());
+    std::unique_ptr<CBlockTemplate> CreateNewBlock(const CScript& scriptPubKeyIn,
+                                                    CWallet* pwallet = nullptr,
+                                                    bool* pfPoSCancel = nullptr,
+                                                    int64_t* pFees = nullptr,
+                                                    CTxDestination destination = CNoDestination(),
+                                                    std::optional<COutPoint> forced_kernel = std::nullopt);
 
     inline static std::optional<int64_t> m_last_block_num_txs{};
     inline static std::optional<int64_t> m_last_block_weight{};
@@ -239,7 +244,19 @@ private:
     void SortForBlock(const CTxMemPool::setEntries& package, std::vector<CTxMemPool::txiter>& sortedEntries);
 };
 
-int64_t UpdateTime(CBlock* pblock, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev);
+/**
+ * Canonicalize a template header to the earliest representable next-block time
+ * for the supplied adjusted clock value. The engaged result is the resulting
+ * uint32_t header time (including an unchanged header); nullopt means no
+ * legal generic next-block header exists at that clock value.
+ *
+ * Callers that have already selected transactions against a different header
+ * time must rebuild and revalidate their package after a successful change.
+ */
+std::optional<uint32_t> UpdateTime(CBlock* pblock, Chainstate& active_chainstate,
+                                   const Consensus::Params& consensus_params,
+                                   const CBlockIndex* pindex_prev,
+                                   int64_t adjusted_time);
 
 /** Modify the extranonce in a block */
 void IncrementExtraNonce(CBlock* pblock, const CBlockIndex* pindexPrev, unsigned int& nExtraNonce);

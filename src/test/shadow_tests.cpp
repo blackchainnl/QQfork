@@ -23,6 +23,7 @@
 #include <util/strencodings.h>
 
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <array>
 #include <limits>
@@ -191,14 +192,52 @@ CTransactionRef MakeSignalTx(const CScript& target, const std::vector<unsigned c
     return MakeTransactionRef(std::move(mtx));
 }
 
-CTransactionRef MakePowClaimTx(const CScript& target, const std::vector<unsigned char>& proof, uint32_t input_n = 0)
+CTransactionRef MakePowClaimTx(const CScript& target,
+                               const std::vector<unsigned char>& proof,
+                               const COutPoint& input)
 {
     CMutableTransaction mtx;
-    mtx.vin.push_back(CTxIn{COutPoint{uint256{2}, input_n}});
+    mtx.vin.push_back(CTxIn{input});
     mtx.vout.push_back(CTxOut(1 * COIN, target));
     mtx.vout.push_back(CTxOut(0, CScript{} << OP_RETURN << proof));
     return MakeTransactionRef(std::move(mtx));
 }
+
+CTransactionRef MakePowClaimTx(const CScript& target,
+                               const std::vector<unsigned char>& proof,
+                               uint32_t input_n = 0)
+{
+    return MakePowClaimTx(target, proof, COutPoint{uint256{2}, input_n});
+}
+
+bool MineQQP4Proof(const CScript& target, const CScript& payout,
+                  uint32_t input_n, const CBlockIndex* parent,
+                  const CCoinsViewCache& view, uint64_t max_tries,
+                  std::vector<unsigned char>& proof_out)
+{
+    return MineShadowProofData(target, payout,
+                               COutPoint{uint256{2}, input_n}, parent, view,
+                               max_tries, proof_out);
+}
+
+/** A regtest fixture with an explicit, independently scheduled QQP4 fork.
+ * QQP3 remains active for two blocks first so boundary tests cannot accidentally
+ * couple the two wire formats again. */
+class QQP4ActivationTestingSetup : public TestChain100Setup
+{
+public:
+    QQP4ActivationTestingSetup()
+        : TestChain100Setup{ChainType::REGTEST, {
+              "-regtest",
+              "-shadowwhitelistheight=100",
+              "-shadowgoldrushstartheight=101",
+              "-shadowgoldrushblocks=96",
+              "-shadowcompetingclaimsheight=110",
+              "-shadowqqp4height=112",
+          }}
+    {
+    }
+};
 
 CTransactionRef MakePowClaimTxWithTwoProofs(const CScript& target,
                                             const std::vector<unsigned char>& first_proof,
@@ -234,6 +273,42 @@ std::vector<unsigned char> MakeInvalidPowProofData(uint64_t nonce, const CScript
     proof.insert(proof.end(), target.begin(), target.end());
     proof.push_back(static_cast<unsigned char>(payout_script.size() & 0xff));
     proof.push_back(static_cast<unsigned char>((payout_script.size() >> 8) & 0xff));
+    proof.insert(proof.end(), payout_script.begin(), payout_script.end());
+    return proof;
+}
+
+std::vector<unsigned char> MakeQQP1ProofData(uint64_t nonce,
+                                              const CScript& target)
+{
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '1', 0});
+    for (unsigned int i = 0; i < 8; ++i) {
+        proof.push_back(static_cast<unsigned char>((nonce >> (8 * i)) & 0xff));
+    }
+    proof.insert(proof.end(), target.begin(), target.end());
+    return proof;
+}
+
+std::vector<unsigned char> MakeQQP3ProofData(
+    uint64_t nonce, uint32_t origin_height, const uint256& origin_parent,
+    const CScript& target, const CScript& payout_script)
+{
+    std::vector<unsigned char> proof = GetShadowPrefix();
+    proof.insert(proof.end(), {'Q', 'Q', 'P', '3', 0});
+    for (unsigned int i = 0; i < 8; ++i) {
+        proof.push_back(static_cast<unsigned char>((nonce >> (8 * i)) & 0xff));
+    }
+    for (unsigned int i = 0; i < 4; ++i) {
+        proof.push_back(static_cast<unsigned char>(
+            (origin_height >> (8 * i)) & 0xff));
+    }
+    proof.insert(proof.end(), origin_parent.begin(), origin_parent.end());
+    proof.push_back(static_cast<unsigned char>(target.size() & 0xff));
+    proof.push_back(static_cast<unsigned char>((target.size() >> 8) & 0xff));
+    proof.insert(proof.end(), target.begin(), target.end());
+    proof.push_back(static_cast<unsigned char>(payout_script.size() & 0xff));
+    proof.push_back(static_cast<unsigned char>(
+        (payout_script.size() >> 8) & 0xff));
     proof.insert(proof.end(), payout_script.begin(), payout_script.end());
     return proof;
 }
@@ -439,16 +514,61 @@ BOOST_AUTO_TEST_CASE(shadow_index_record_validation_respects_claim_boundary)
     record.pow_claim_source.base_fee_known = true;
     record.pow_claim_source.base_fee = CENT;
     record.pow_claim_source.disposition = ShadowPowClaimDisposition::WINNER;
+    record.pow_claim_source.proof_version = 3;
     record.pow_claim_source.origin_bound = true;
     record.pow_claim_source.origin_height =
         MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
     record.pow_claim_source.origin_previous_block_hash = uint256S("07");
     record.pow_claim_source.inclusion_height =
         MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
+    record.pow_claim_source.input_bound = false;
+    record.pow_claim_source.claim_outpoint.SetNull();
     BOOST_CHECK(!IsValidShadowIndexRecord(record));
 
     record.origin_height = MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
     BOOST_CHECK(IsValidShadowIndexRecord(record));
+
+    // Current winners and current losers cannot be relabeled as a late
+    // provenance row by a corrupt auxiliary index.
+    record.pow_claim_source.origin_height = record.origin_height - 1;
+    record.pow_claim_source.origin_age = 1;
+    BOOST_CHECK(!IsValidShadowIndexRecord(record));
+    record.pow_claim_source.disposition =
+        ShadowPowClaimDisposition::REIMBURSED_LOSER;
+    BOOST_CHECK(!IsValidShadowIndexRecord(record));
+    record.pow_claim_source.disposition = ShadowPowClaimDisposition::WINNER;
+    record.pow_claim_source.origin_height = record.origin_height;
+    record.pow_claim_source.origin_age = 0;
+    BOOST_CHECK(IsValidShadowIndexRecord(record));
+
+    // QQP3 intentionally preserves valid QQP2 rows.  The canonical-accounting
+    // boundary is not an exact-input wire fork.
+    const ShadowIndexPowClaimSource valid_v3_source =
+        record.pow_claim_source;
+    record.pow_claim_source.proof_version = 2;
+    record.pow_claim_source.origin_bound = false;
+    record.pow_claim_source.input_bound = false;
+    record.pow_claim_source.claim_outpoint.SetNull();
+    BOOST_CHECK(IsValidShadowIndexRecord(record));
+    record.pow_claim_source.disposition =
+        ShadowPowClaimDisposition::REIMBURSED_LOSER;
+    BOOST_CHECK(IsValidShadowIndexRecord(record));
+    record.pow_claim_source.disposition = ShadowPowClaimDisposition::WINNER;
+    record.pow_claim_source = valid_v3_source;
+
+    record.pow_claim_source.disposition =
+        ShadowPowClaimDisposition::REIMBURSED_LOSER;
+    BOOST_CHECK(IsValidShadowIndexRecord(record));
+    record.pow_claim_source = valid_v3_source;
+
+    // QQP4 cannot be smuggled into the deployed QQP3 history.  Its own
+    // schedule is disabled on mainnet in this alpha/beta.
+    record.pow_claim_source.proof_version = 4;
+    record.pow_claim_source.input_bound = true;
+    record.pow_claim_source.claim_outpoint = COutPoint{uint256S("08"), 1};
+    BOOST_CHECK(!IsValidShadowIndexRecord(record));
+    record.pow_claim_source = valid_v3_source;
+
     record.pow_claim_source_present = false;
     BOOST_CHECK(!IsValidShadowIndexRecord(record));
 
@@ -474,6 +594,23 @@ BOOST_AUTO_TEST_CASE(shadow_index_record_validation_respects_claim_boundary)
                 record.pow_claim_source.origin_previous_block_hash);
     BOOST_CHECK_EQUAL(restored_source.inclusion_height, record.origin_height);
     BOOST_CHECK_EQUAL(restored_source.origin_age, 3U);
+    BOOST_CHECK_EQUAL(restored_source.proof_version, 3U);
+    BOOST_CHECK(!restored_source.input_bound);
+    BOOST_CHECK(restored_source.claim_outpoint.IsNull());
+
+    // QQP3 must not carry QQP4's input provenance fields.
+    record.pow_claim_source.input_bound = true;
+    BOOST_CHECK(!IsValidShadowIndexRecord(record));
+    record.pow_claim_source.input_bound = false;
+    record.pow_claim_source.claim_outpoint = COutPoint{uint256S("08"), 1};
+    BOOST_CHECK(!IsValidShadowIndexRecord(record));
+    record.pow_claim_source.claim_outpoint.SetNull();
+    record.pow_claim_source.inclusion_height = record.origin_height + 1;
+    record.pow_claim_source.origin_age = 4;
+    BOOST_CHECK(!IsValidShadowIndexRecord(record));
+    record.pow_claim_source.inclusion_height = record.origin_height;
+    record.pow_claim_source.origin_age = 3;
+    BOOST_CHECK(IsValidShadowIndexRecord(record));
 
     record.spent = true;
     record.spend_height = record.origin_height + 1;
@@ -484,6 +621,46 @@ BOOST_AUTO_TEST_CASE(shadow_index_record_validation_respects_claim_boundary)
     BOOST_CHECK(IsValidShadowIndexRecord(record));
 
     record.decayed_amount_at_spend = 2 * COIN;
+    BOOST_CHECK(!IsValidShadowIndexRecord(record));
+}
+
+// Registered below, after the file-wide BasicTestingSetup suite is closed.
+// TestChain100Setup owns global chain parameters and cannot be nested below
+// that fixture without invalidating both fixtures' lifecycle.
+static void CheckShadowIndexRecordQQP4ExactInputAfterSeparateActivation()
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int q4_height = consensus.nShadowQQP4ActivationHeight;
+    BOOST_REQUIRE_EQUAL(consensus.nShadowCompetingClaimsActivationHeight, 110);
+    BOOST_REQUIRE_EQUAL(q4_height, 112);
+    BOOST_REQUIRE(consensus.IsShadowQQP4Active(q4_height));
+
+    ShadowIndexRecord record;
+    record.outpoint = COutPoint{uint256::ONE, 0};
+    record.origin_height = q4_height;
+    record.origin_block_hash = uint256S("02");
+    record.origin_block_time = 1;
+    record.proof_of_work = true;
+    record.nominal_amount = 10 * COIN;
+    record.script_pub_key = QuantumScript(0x51);
+    record.pow_claim_source_present = true;
+    record.pow_claim_source.txid = uint256S("03");
+    record.pow_claim_source.canonical_rank = uint256S("04");
+    record.pow_claim_source.base_fee_known = true;
+    record.pow_claim_source.base_fee = CENT;
+    record.pow_claim_source.disposition = ShadowPowClaimDisposition::WINNER;
+    record.pow_claim_source.proof_version = 4;
+    record.pow_claim_source.origin_bound = true;
+    record.pow_claim_source.origin_height = q4_height;
+    record.pow_claim_source.origin_previous_block_hash = uint256S("07");
+    record.pow_claim_source.inclusion_height = q4_height;
+    record.pow_claim_source.input_bound = true;
+    record.pow_claim_source.claim_outpoint = COutPoint{uint256S("08"), 1};
+    BOOST_CHECK(IsValidShadowIndexRecord(record));
+
+    record.pow_claim_source.proof_version = 3;
+    record.pow_claim_source.input_bound = false;
+    record.pow_claim_source.claim_outpoint.SetNull();
     BOOST_CHECK(!IsValidShadowIndexRecord(record));
 }
 
@@ -1064,6 +1241,20 @@ BOOST_AUTO_TEST_CASE(active_signal_and_pool_state_are_atomic_and_fail_closed)
     BOOST_CHECK(replay.marker_block_hash == first_index.GetBlockHash());
     BOOST_CHECK_EQUAL(replay.commitment.size(), uint256::size());
 
+    // A separately scheduled QQP4 fork must not rewrite the deployed
+    // schema-12 checkpoint domain before it activates. This is the direct
+    // v30.1.0 chainstate/restart compatibility vector: the same marker remains
+    // current when a future QQP4 height is configured beyond this tip.
+    Consensus::Params future_qqp4 = Params().GetConsensus();
+    future_qqp4.nShadowQQP4ActivationHeight = first_index.nHeight + 1;
+    BOOST_REQUIRE(!future_qqp4.IsShadowQQP4Active(first_index.nHeight));
+    const ShadowReplayStateInfo future_qqp4_replay =
+        GetShadowReplayStateInfo(view, future_qqp4, &first_index);
+    BOOST_CHECK(future_qqp4_replay.present);
+    BOOST_CHECK(future_qqp4_replay.marker_valid);
+    BOOST_CHECK(future_qqp4_replay.valid_for_tip);
+    BOOST_CHECK(future_qqp4_replay.commitment == replay.commitment);
+
     const COutPoint replay_outpoint = ShadowReplayStateOutpointForTesting();
     Coin canonical_replay_coin;
     BOOST_REQUIRE(view.GetCoin(replay_outpoint, canonical_replay_coin));
@@ -1284,6 +1475,34 @@ BOOST_AUTO_TEST_CASE(shadow_undo_inactive_gold_rush_epoch_is_noop)
     BOOST_CHECK_EQUAL(after_undo.pow_amount, before.pow_amount);
     BOOST_CHECK_EQUAL(after_undo.pos_amount, before.pos_amount);
     BOOST_CHECK_EQUAL(after_undo.claimed_amount, before.claimed_amount);
+}
+
+BOOST_AUTO_TEST_CASE(shadow_undo_zero_input_noncoinbase_disconnect_is_safe)
+{
+    CCoinsView base;
+    CCoinsViewCache view{&base, true};
+
+    uint256 block_hash;
+    CBlockIndex index;
+    InitIndex(index, SHADOW_REWARD_START_HEIGHT, nullptr, block_hash);
+
+    CMutableTransaction zero_input;
+    zero_input.nVersion = 2;
+    zero_input.vout.emplace_back(1 * COIN, CScript{} << OP_TRUE);
+    const CTransactionRef zero_input_tx = MakeTransactionRef(std::move(zero_input));
+    BOOST_REQUIRE(!zero_input_tx->IsCoinBase());
+    BOOST_REQUIRE(zero_input_tx->vin.empty());
+
+    CBlock block;
+    block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_TRUE));
+    block.vtx.push_back(zero_input_tx);
+    CBlockUndo undo;
+    undo.vtxundo.resize(block.vtx.size() - 1);
+
+    // DisconnectBlock reaches this helper before restoring the base UTXO
+    // undo. A malformed zero-input non-coinbase transaction must not make
+    // the reverse-input loop underflow while unwinding the block.
+    BOOST_CHECK(UndoSpentGoldRushPayouts(view, block, undo, &index));
 }
 
 BOOST_AUTO_TEST_CASE(shadow_apply_active_epoch_ignores_blocks_outside_reward_height_window)
@@ -1746,10 +1965,14 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_claim_reimburses_valid_loser_without_i
 
     const CScript pow_target = CScript{} << OP_2;
     const CScript quantum_payout = QuantumScript(0x47);
-    std::vector<unsigned char> pow_proof;
+    std::vector<unsigned char> pow_proof_a;
+    std::vector<unsigned char> pow_proof_b;
     BOOST_REQUIRE(MineShadowProofData(pow_target, quantum_payout,
                                       &activation_parent, view, 50'000,
-                                      pow_proof));
+                                      pow_proof_a));
+    BOOST_REQUIRE(MineShadowProofData(pow_target, quantum_payout,
+                                      &activation_parent, view, 50'000,
+                                      pow_proof_b));
 
     uint256 claim_hash;
     CBlockIndex claim_index;
@@ -1761,8 +1984,8 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_claim_reimburses_valid_loser_without_i
     claim_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_4));
     claim_block.vtx.push_back(MakeCoinstakeTx(
         CScript{} << OP_5, {}, {CTxOut(expected_pow_pool, quantum_payout)}));
-    claim_block.vtx.push_back(MakePowClaimTx(pow_target, pow_proof, 0));
-    claim_block.vtx.push_back(MakePowClaimTx(pow_target, pow_proof, 1));
+    claim_block.vtx.push_back(MakePowClaimTx(pow_target, pow_proof_a, 0));
+    claim_block.vtx.push_back(MakePowClaimTx(pow_target, pow_proof_b, 1));
     CBlockUndo claim_undo = MakeUndoWithInputScripts(claim_block, {{1, CScript{} << OP_5}, {2, pow_target}, {3, pow_target}});
 
     std::map<CScript, CAmount> direct_payouts;
@@ -1820,6 +2043,7 @@ BOOST_AUTO_TEST_CASE(pow_shadow_qqp3_late_claims_are_bounded_and_emission_neutra
     ShadowPowWork late_work;
     late_work.valid = true;
     late_work.origin_bound = true;
+    late_work.input_bound = false;
     late_work.height = origin_height;
     late_work.prev_hash = origin_parent;
     late_work.bits = 10;
@@ -1986,7 +2210,7 @@ BOOST_AUTO_TEST_CASE(pow_shadow_qqp3_late_claims_are_bounded_and_emission_neutra
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-origin-mismatch");
 }
 
-BOOST_AUTO_TEST_CASE(pow_shadow_competing_claim_activation_preserves_history_then_switches_exactly)
+BOOST_AUTO_TEST_CASE(pow_shadow_qqp3_preserves_v30_1_0_qqp2_qqp3_and_rank_v1)
 {
     CCoinsView base;
     CCoinsViewCache view{&base, true};
@@ -2008,15 +2232,26 @@ BOOST_AUTO_TEST_CASE(pow_shadow_competing_claim_activation_preserves_history_the
     const CScript target_b = CScript{} << OP_3;
     const CScript payout_a = QuantumScript(0x84);
     const CScript payout_b = QuantumScript(0x85);
-    std::vector<unsigned char> proof_a;
-    std::vector<unsigned char> proof_b;
+    // The same intended claim height has both historical QQP2 and QQP3 wire
+    // candidates.  Q3 is explicitly constructed here because this unit test
+    // passes a compressed consensus schedule rather than mutating global
+    // mainnet parameters.
+    std::vector<unsigned char> qqp2_proof;
     BOOST_REQUIRE(MineShadowProofData(target_a, payout_a, &prev_index, view,
-                                      100'000, proof_a));
-    BOOST_REQUIRE(MineShadowProofData(target_b, payout_b, &prev_index, view,
-                                      100'000, proof_b));
+                                      100'000, qqp2_proof));
+    ShadowPowWork qqp3_work = PrepareShadowPowWork(
+        target_b, payout_b, &prev_index, view);
+    BOOST_REQUIRE(qqp3_work.valid);
+    qqp3_work.origin_bound = true;
+    qqp3_work.input_bound = false;
+    std::vector<unsigned char> qqp3_proof;
+    BOOST_REQUIRE(GrindShadowPowWork(qqp3_work, 0, 1, 100'000,
+                                     qqp3_proof));
+    BOOST_CHECK_EQUAL(qqp2_proof[GetShadowPrefix().size() + 3], '2');
+    BOOST_CHECK_EQUAL(qqp3_proof[GetShadowPrefix().size() + 3], '3');
 
-    const CTransactionRef tx_a = MakePowClaimTx(target_a, proof_a, 0);
-    const CTransactionRef tx_b = MakePowClaimTx(target_b, proof_b, 1);
+    const CTransactionRef tx_a = MakePowClaimTx(target_a, qqp2_proof, 0);
+    const CTransactionRef tx_b = MakePowClaimTx(target_b, qqp3_proof, 1);
     const CAmount actual_fee = CENT / 2;
 
     uint256 claim_hash;
@@ -2051,13 +2286,16 @@ BOOST_AUTO_TEST_CASE(pow_shadow_competing_claim_activation_preserves_history_the
     BOOST_REQUIRE(GetShadowPowDirectPayouts(
         view, block_ba, &claim_index, &undo_ba, historical,
         historical_ba, historical_ba_total));
+    // Before Q3, only the non-origin-bound QQP2 candidate is valid. The
+    // first-valid historical allocation therefore remains unchanged even if
+    // the QQP3-shaped transaction comes first in the block.
     BOOST_REQUIRE_EQUAL(historical_ab.size(), 1U);
     BOOST_REQUIRE_EQUAL(historical_ba.size(), 1U);
     BOOST_CHECK_EQUAL(historical_ab[payout_a], 580 * COIN);
-    BOOST_CHECK_EQUAL(historical_ba[payout_b], 580 * COIN);
+    BOOST_CHECK_EQUAL(historical_ba[payout_a], 580 * COIN);
     BOOST_CHECK_EQUAL(historical_ab_total, 580 * COIN);
     BOOST_CHECK_EQUAL(historical_ba_total, historical_ab_total);
-    BOOST_CHECK(historical_ab != historical_ba);
+    BOOST_CHECK(historical_ab == historical_ba);
 
     std::vector<ShadowPowClaimAccounting> preactivation_accounting;
     BOOST_REQUIRE(GetShadowPowClaimAccounting(
@@ -2077,20 +2315,27 @@ BOOST_AUTO_TEST_CASE(pow_shadow_competing_claim_activation_preserves_history_the
     BOOST_REQUIRE(GetShadowPowDirectPayouts(
         view, block_ba, &claim_index, &undo_ba, canonical,
         canonical_ba, canonical_ba_total));
+    // v30.1.0 Q3 accepts both wire formats.  It only adds canonical
+    // allocation, QQP3 origin/late semantics, and rank-v1; QQP4 remains
+    // disabled in this schedule.
+    BOOST_CHECK(!canonical.IsShadowQQP4Active(claim_index.nHeight));
     BOOST_CHECK(canonical_ab == canonical_ba);
     BOOST_REQUIRE_EQUAL(canonical_ab.size(), 2U);
     BOOST_CHECK_EQUAL(canonical_ab_total, 580 * COIN);
     BOOST_CHECK_EQUAL(canonical_ba_total, canonical_ab_total);
-    std::array<CAmount, 2> canonical_amounts{
-        canonical_ab[payout_a], canonical_ab[payout_b]};
-    std::sort(canonical_amounts.begin(), canonical_amounts.end());
-    BOOST_CHECK_EQUAL(canonical_amounts[0], actual_fee);
-    BOOST_CHECK_EQUAL(canonical_amounts[1], 580 * COIN - actual_fee);
 
+    ShadowPowAccountingContext q3_context;
+    BOOST_REQUIRE(PrepareShadowPowClaimAccounting(
+                      view, block_ab, &claim_index, canonical, q3_context) ==
+                  ShadowPowAccountingResult::OK);
+    BOOST_REQUIRE(q3_context.valid);
+    BOOST_CHECK(!q3_context.qqp4_rule_active);
     std::vector<ShadowPowClaimAccounting> activation_accounting;
+    ShadowPowClaimAggregate activation_aggregate;
     BOOST_REQUIRE(GetShadowPowClaimAccounting(
         view, block_ab, &claim_index, &undo_ab, canonical,
-        activation_accounting) == ShadowPowAccountingResult::OK);
+        activation_accounting, &activation_aggregate) ==
+                  ShadowPowAccountingResult::OK);
     BOOST_REQUIRE_EQUAL(activation_accounting.size(), 2U);
     BOOST_CHECK_EQUAL(std::count_if(
         activation_accounting.begin(), activation_accounting.end(),
@@ -2101,8 +2346,302 @@ BOOST_AUTO_TEST_CASE(pow_shadow_competing_claim_activation_preserves_history_the
         activation_accounting.begin(), activation_accounting.end(),
         [](const ShadowPowClaimAccounting& entry) {
             return entry.disposition ==
-                   ShadowPowClaimDisposition::REIMBURSED_LOSER;
+                ShadowPowClaimDisposition::REIMBURSED_LOSER;
         }), 1U);
+    for (const ShadowPowClaimAccounting& entry : activation_accounting) {
+        const std::vector<unsigned char>& proof =
+            entry.source_txid == tx_a->GetHash() ? qqp2_proof : qqp3_proof;
+        const std::vector<unsigned char> proof_payload(
+            proof.begin() + GetShadowPrefix().size(), proof.end());
+        CHashWriter rank;
+        rank << std::string{"Quantum Quasar Canonical POW Claim Rank v1"}
+             << claim_index.nHeight << prev_index.GetBlockHash()
+             << entry.source_txid << entry.source_vout << proof_payload;
+        BOOST_CHECK(entry.canonical_rank == rank.GetHash());
+        BOOST_CHECK(!entry.input_bound);
+    }
+
+    // Differential-vector check for the exact deployed QQP3 accounting
+    // stream.  In particular, proof_version/input_bound/outpoint are *not*
+    // serialized under the v2 domain before QQP4 activation.
+    CHashWriter observations;
+    observations << std::string{"Quantum Quasar POW Claim Observations v1"}
+                 << q3_context.height << q3_context.previous_block_hash
+                 << block_ab.GetHash();
+    for (const auto& [tx, proof] : std::array{
+             std::pair{tx_a, std::cref(qqp2_proof)},
+             std::pair{tx_b, std::cref(qqp3_proof)}}) {
+        const std::vector<unsigned char> payload(
+            proof.get().begin() + GetShadowPrefix().size(), proof.get().end());
+        observations << tx->GetHash() << uint32_t{1} << payload
+                     << true << uint32_t{1};
+    }
+    CHashWriter q3_commitment;
+    q3_commitment << std::string{"Quantum Quasar Bounded POW Claim Accounting v2"}
+                  << q3_context.height << q3_context.previous_block_hash
+                  << q3_context.credited_pow_pool << q3_context.target_bits
+                  << observations.GetHash()
+                  << activation_aggregate.observed_count
+                  << activation_aggregate.evaluated_count
+                  << activation_aggregate.invalid_location_count
+                  << activation_aggregate.malformed_transaction_count
+                  << activation_aggregate.invalid_proof_count
+                  << activation_aggregate.wrong_mode_count
+                  << activation_aggregate.unknown_mode_count
+                  << activation_aggregate.origin_mismatch_count
+                  << activation_aggregate.origin_expired_count
+                  << activation_aggregate.input_mismatch_count
+                  << activation_aggregate.invalid_base_fee_count
+                  << activation_aggregate.evaluation_limit_count
+                  << activation_aggregate.winner_count
+                  << activation_aggregate.reimbursed_loser_count
+                  << activation_aggregate.reimbursed_late_count;
+    for (const ShadowPowClaimAccounting& entry : activation_accounting) {
+        q3_commitment << entry.source_txid << entry.source_vout
+                      << entry.canonical_rank << entry.payout_script
+                      << entry.base_fee << entry.credited_amount
+                      << entry.base_fee_known << entry.origin_bound
+                      << entry.origin_height
+                      << entry.origin_previous_block_hash
+                      << entry.inclusion_height << entry.origin_age
+                      << static_cast<uint8_t>(entry.disposition);
+    }
+    BOOST_CHECK(activation_aggregate.accounting_commitment ==
+                q3_commitment.GetHash());
+
+    // QQP1 remains invalid, while Q3 continues to accept QQP2 and QQP3. This
+    // is the pre-QQP4 compatibility vector that protects replay behavior.
+    const std::vector<unsigned char> qqp1 =
+        MakeQQP1ProofData(/*nonce=*/11, target_a);
+    CBlock q3_formats_block;
+    q3_formats_block.vtx = {
+        MakeCoinbaseTx(CScript{} << OP_4), MakeCoinstakeTx(staker_target),
+        MakePowClaimTx(target_a, qqp1, 0),
+        MakePowClaimTx(target_a, qqp2_proof, 1),
+        MakePowClaimTx(target_b, qqp3_proof, 2),
+    };
+    CBlockUndo q3_formats_undo = MakeUndoWithInputScripts(
+        q3_formats_block,
+        {{1, staker_target}, {2, target_a}, {3, target_a}, {4, target_b}});
+    SetUndoInputValue(q3_formats_undo, 2, COIN + actual_fee);
+    SetUndoInputValue(q3_formats_undo, 3, COIN + actual_fee);
+    SetUndoInputValue(q3_formats_undo, 4, COIN + actual_fee);
+    std::vector<ShadowPowClaimAccounting> q3_accounting;
+    ShadowPowClaimAggregate q3_aggregate;
+    BOOST_REQUIRE(GetShadowPowClaimAccounting(
+                      view, q3_formats_block, &claim_index,
+                      &q3_formats_undo, canonical, q3_accounting,
+                      &q3_aggregate) == ShadowPowAccountingResult::OK);
+    BOOST_REQUIRE_EQUAL(q3_accounting.size(), 3U);
+    BOOST_CHECK_EQUAL(std::count_if(
+        q3_accounting.begin(), q3_accounting.end(),
+        [](const ShadowPowClaimAccounting& entry) {
+            return entry.disposition == ShadowPowClaimDisposition::INVALID_PROOF;
+        }), 1U);
+    BOOST_CHECK_EQUAL(q3_aggregate.winner_count, 1U);
+    BOOST_CHECK_EQUAL(q3_aggregate.reimbursed_loser_count, 1U);
+
+    // Preserve v30.1.0 invalid-proof precedence byte-for-byte. The first
+    // payload is syntactically valid QQP2 but deliberately fails work while
+    // its carrier has both a bad fee and a wrong input. Two deterministic
+    // QQP1 payloads then exercise invalid fee and input paths independently.
+    // The final carrier is a structurally valid QQP4 payload with a valid fee
+    // and matching input. Before QQP4, every one must stop at INVALID_PROOF:
+    // fee/input classification cannot alter the QQP3 aggregate or v2 hash.
+    const ShadowPowWork q2_work = PrepareShadowPowWork(
+        target_a, payout_a, &prev_index, view);
+    BOOST_REQUIRE(q2_work.valid);
+    BOOST_REQUIRE(ValidateShadowPowProofForWork(q2_work, qqp2_proof));
+    const size_t nonce_offset = GetShadowPrefix().size() + 5;
+    BOOST_REQUIRE_GT(qqp2_proof.size(), nonce_offset);
+    std::vector<unsigned char> bad_work_qqp2;
+    for (uint16_t delta = 1; delta <= 255; ++delta) {
+        bad_work_qqp2 = qqp2_proof;
+        bad_work_qqp2[nonce_offset] ^= static_cast<unsigned char>(delta);
+        if (!ValidateShadowPowProofForWork(q2_work, bad_work_qqp2)) break;
+    }
+    BOOST_REQUIRE(!bad_work_qqp2.empty());
+    BOOST_REQUIRE(!ValidateShadowPowProofForWork(q2_work, bad_work_qqp2));
+
+    ShadowPowWork malicious_qqp4_work = q2_work;
+    malicious_qqp4_work.target = target_b;
+    malicious_qqp4_work.quantum_payout_script = payout_b;
+    malicious_qqp4_work.origin_bound = true;
+    malicious_qqp4_work.input_bound = true;
+    malicious_qqp4_work.claim_outpoint = COutPoint{uint256{2}, 8};
+    std::vector<unsigned char> malicious_qqp4;
+    BOOST_REQUIRE(GrindShadowPowWork(malicious_qqp4_work,
+                                     /*start_nonce=*/0,
+                                     /*nonce_step=*/1,
+                                     /*max_tries=*/100'000,
+                                     malicious_qqp4));
+    BOOST_REQUIRE(ValidateShadowPowProofForWork(malicious_qqp4_work,
+                                                malicious_qqp4));
+    const std::vector<unsigned char> invalid_qqp1_low_fee =
+        MakeQQP1ProofData(/*nonce=*/100, target_a);
+    const std::vector<unsigned char> invalid_qqp1_wrong_input =
+        MakeQQP1ProofData(/*nonce=*/101, target_a);
+    const CTransactionRef bad_work_tx = MakePowClaimTx(
+        target_a, bad_work_qqp2, 7);
+    const CTransactionRef invalid_low_fee_tx = MakePowClaimTx(
+        target_a, invalid_qqp1_low_fee, 9);
+    const CTransactionRef invalid_wrong_input_tx = MakePowClaimTx(
+        target_a, invalid_qqp1_wrong_input, 10);
+    const CTransactionRef malicious_qqp4_tx = MakePowClaimTx(
+        target_b, malicious_qqp4, 8);
+    CBlock invalid_order_block;
+    invalid_order_block.vtx = {
+        MakeCoinbaseTx(CScript{} << OP_4), MakeCoinstakeTx(staker_target),
+        bad_work_tx, invalid_low_fee_tx, invalid_wrong_input_tx,
+        malicious_qqp4_tx,
+    };
+    const CScript wrong_input = CScript{} << OP_5;
+    CBlockUndo invalid_order_undo = MakeUndoWithInputScripts(
+        invalid_order_block,
+        {{1, staker_target}, {2, wrong_input}, {3, target_a},
+         {4, target_b}, {5, target_b}});
+    // The QQP2 and first QQP1 carrier spend less than they create. The second
+    // QQP1 carrier has a valid fee but its actual input script differs from
+    // its target. The QQP4 carrier has a valid fee and matching bound input.
+    SetUndoInputValue(invalid_order_undo, 2, COIN / 2);
+    SetUndoInputValue(invalid_order_undo, 3, COIN / 2);
+    SetUndoInputValue(invalid_order_undo, 4, COIN + actual_fee);
+    SetUndoInputValue(invalid_order_undo, 5, COIN + actual_fee);
+
+    ShadowPowAccountingContext invalid_order_context;
+    BOOST_REQUIRE(PrepareShadowPowClaimAccounting(
+                      view, invalid_order_block, &claim_index, canonical,
+                      invalid_order_context) == ShadowPowAccountingResult::OK);
+    BOOST_REQUIRE(invalid_order_context.valid);
+    BOOST_CHECK(!invalid_order_context.qqp4_rule_active);
+    std::vector<ShadowPowClaimAccounting> invalid_order_accounting;
+    ShadowPowClaimAggregate invalid_order_aggregate;
+    BOOST_REQUIRE(GetShadowPowClaimAccounting(
+                      view, invalid_order_block, &claim_index,
+                      &invalid_order_undo, canonical,
+                      invalid_order_accounting,
+                      &invalid_order_aggregate) ==
+                  ShadowPowAccountingResult::OK);
+    BOOST_REQUIRE_EQUAL(invalid_order_accounting.size(), 4U);
+    BOOST_CHECK_EQUAL(invalid_order_aggregate.observed_count, 4U);
+    BOOST_CHECK_EQUAL(invalid_order_aggregate.evaluated_count, 4U);
+    BOOST_CHECK_EQUAL(invalid_order_aggregate.invalid_proof_count, 4U);
+    BOOST_CHECK_EQUAL(invalid_order_aggregate.invalid_base_fee_count, 0U);
+    BOOST_CHECK_EQUAL(invalid_order_aggregate.input_mismatch_count, 0U);
+    BOOST_CHECK_EQUAL(invalid_order_aggregate.winner_count, 0U);
+    BOOST_CHECK_EQUAL(invalid_order_aggregate.reimbursed_loser_count, 0U);
+
+    const auto bad_work_row = std::find_if(
+        invalid_order_accounting.begin(), invalid_order_accounting.end(),
+        [&](const ShadowPowClaimAccounting& entry) {
+            return entry.source_txid == bad_work_tx->GetHash();
+        });
+    const auto malicious_qqp4_row = std::find_if(
+        invalid_order_accounting.begin(), invalid_order_accounting.end(),
+        [&](const ShadowPowClaimAccounting& entry) {
+            return entry.source_txid == malicious_qqp4_tx->GetHash();
+        });
+    const auto invalid_low_fee_row = std::find_if(
+        invalid_order_accounting.begin(), invalid_order_accounting.end(),
+        [&](const ShadowPowClaimAccounting& entry) {
+            return entry.source_txid == invalid_low_fee_tx->GetHash();
+        });
+    const auto invalid_wrong_input_row = std::find_if(
+        invalid_order_accounting.begin(), invalid_order_accounting.end(),
+        [&](const ShadowPowClaimAccounting& entry) {
+            return entry.source_txid == invalid_wrong_input_tx->GetHash();
+        });
+    BOOST_REQUIRE(bad_work_row != invalid_order_accounting.end());
+    BOOST_REQUIRE(malicious_qqp4_row != invalid_order_accounting.end());
+    BOOST_REQUIRE(invalid_low_fee_row != invalid_order_accounting.end());
+    BOOST_REQUIRE(invalid_wrong_input_row != invalid_order_accounting.end());
+    BOOST_CHECK_EQUAL(bad_work_row->proof_version, 2U);
+    BOOST_CHECK(!bad_work_row->base_fee_known);
+    BOOST_CHECK_EQUAL(invalid_low_fee_row->proof_version, 1U);
+    BOOST_CHECK(!invalid_low_fee_row->base_fee_known);
+    BOOST_CHECK_EQUAL(invalid_wrong_input_row->proof_version, 1U);
+    BOOST_CHECK(!invalid_wrong_input_row->base_fee_known);
+    BOOST_CHECK_EQUAL(malicious_qqp4_row->proof_version, 0U);
+    BOOST_CHECK(malicious_qqp4_row->payout_script.empty());
+    BOOST_CHECK(!malicious_qqp4_row->base_fee_known);
+
+    // Explorer-facing structural metadata receives the same activation
+    // context. A historical Q3 block must continue to expose future QQP4
+    // magic as malformed, rather than retroactively advertising it as PoW.
+    ShadowProofObservationSummary invalid_order_summary;
+    const std::vector<ShadowProofObservation> invalid_order_observations_out =
+        GetShadowProofObservations(invalid_order_block, canonical,
+                                   claim_index.nHeight,
+                                   invalid_order_summary);
+    const auto malicious_qqp4_observation = std::find_if(
+        invalid_order_observations_out.begin(),
+        invalid_order_observations_out.end(),
+        [&](const ShadowProofObservation& observation) {
+            return observation.source_txid == malicious_qqp4_tx->GetHash();
+        });
+    BOOST_REQUIRE(malicious_qqp4_observation !=
+                  invalid_order_observations_out.end());
+    BOOST_CHECK(malicious_qqp4_observation->mode ==
+                ShadowProofPayloadMode::MALFORMED);
+    BOOST_CHECK(ClassifyShadowProofPayload(malicious_qqp4) ==
+                ShadowProofPayloadMode::MALFORMED);
+    BOOST_CHECK(ClassifyShadowProofPayload(malicious_qqp4,
+                                           /*qqp4_active=*/true) ==
+                ShadowProofPayloadMode::POW);
+
+    CHashWriter invalid_order_observations;
+    invalid_order_observations
+        << std::string{"Quantum Quasar POW Claim Observations v1"}
+        << invalid_order_context.height
+        << invalid_order_context.previous_block_hash
+        << invalid_order_block.GetHash();
+    for (const auto& [tx, proof] : std::array{
+             std::pair{bad_work_tx, std::cref(bad_work_qqp2)},
+             std::pair{invalid_low_fee_tx, std::cref(invalid_qqp1_low_fee)},
+             std::pair{invalid_wrong_input_tx,
+                       std::cref(invalid_qqp1_wrong_input)},
+             std::pair{malicious_qqp4_tx, std::cref(malicious_qqp4)}}) {
+        const std::vector<unsigned char> payload(
+            proof.get().begin() + GetShadowPrefix().size(),
+            proof.get().end());
+        invalid_order_observations << tx->GetHash() << uint32_t{1} << payload
+                                   << true << uint32_t{1};
+    }
+    CHashWriter invalid_order_commitment;
+    invalid_order_commitment
+        << std::string{"Quantum Quasar Bounded POW Claim Accounting v2"}
+        << invalid_order_context.height
+        << invalid_order_context.previous_block_hash
+        << invalid_order_context.credited_pow_pool
+        << invalid_order_context.target_bits
+        << invalid_order_observations.GetHash()
+        << invalid_order_aggregate.observed_count
+        << invalid_order_aggregate.evaluated_count
+        << invalid_order_aggregate.invalid_location_count
+        << invalid_order_aggregate.malformed_transaction_count
+        << invalid_order_aggregate.invalid_proof_count
+        << invalid_order_aggregate.wrong_mode_count
+        << invalid_order_aggregate.unknown_mode_count
+        << invalid_order_aggregate.origin_mismatch_count
+        << invalid_order_aggregate.origin_expired_count
+        << invalid_order_aggregate.input_mismatch_count
+        << invalid_order_aggregate.invalid_base_fee_count
+        << invalid_order_aggregate.evaluation_limit_count
+        << invalid_order_aggregate.winner_count
+        << invalid_order_aggregate.reimbursed_loser_count
+        << invalid_order_aggregate.reimbursed_late_count;
+    for (const ShadowPowClaimAccounting& entry : invalid_order_accounting) {
+        invalid_order_commitment
+            << entry.source_txid << entry.source_vout
+            << entry.canonical_rank << entry.payout_script
+            << entry.base_fee << entry.credited_amount
+            << entry.base_fee_known << entry.origin_bound
+            << entry.origin_height << entry.origin_previous_block_hash
+            << entry.inclusion_height << entry.origin_age
+            << static_cast<uint8_t>(entry.disposition);
+    }
+    BOOST_CHECK(invalid_order_aggregate.accounting_commitment ==
+                invalid_order_commitment.GetHash());
 }
 
 BOOST_AUTO_TEST_CASE(pow_shadow_canonical_winner_is_order_independent_and_replay_safe)
@@ -2315,7 +2854,8 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_winner_is_order_independent_and_replay
     BOOST_CHECK_EQUAL(replayed_total, applied_total_a);
 }
 
-BOOST_AUTO_TEST_CASE(pow_shadow_payload_modes_are_strictly_bound_to_pow_accounting)
+// Registered below, after the file-wide BasicTestingSetup suite is closed.
+static void CheckQQP4PayloadModesAreStrictlyBoundToPowAccounting()
 {
     CCoinsView base;
     CCoinsViewCache seed_view{&base, true};
@@ -2349,29 +2889,46 @@ BOOST_AUTO_TEST_CASE(pow_shadow_payload_modes_are_strictly_bound_to_pow_accounti
                                   &reward_undo));
 
     const int activation_height =
-        Params().GetConsensus().nShadowCompetingClaimsActivationHeight;
+        Params().GetConsensus().nShadowQQP4ActivationHeight;
     BOOST_REQUIRE_GT(activation_height, reward_index.nHeight);
-    uint256 activation_parent_hash;
-    CBlockIndex activation_parent;
-    InitIndex(activation_parent, activation_height - 1, &reward_index,
-              activation_parent_hash);
-    BOOST_REQUIRE(AdvanceGoldRushInventoryTip(seed_view, &activation_parent));
+    // Apply every intervening Gold Rush block. The pool and active-signal
+    // markers are branch-authenticated at each height, so merely advancing the
+    // inventory tip would create a state combination that no connected chain
+    // can have and would test a false local failure instead of QQP4 behavior.
+    std::array<CBlockIndex, 10> activation_path;
+    std::array<uint256, 10> activation_path_hashes;
+    BOOST_REQUIRE_EQUAL(static_cast<int>(activation_path.size()),
+                        activation_height - reward_index.nHeight - 1);
+    CBlockIndex* activation_parent = &reward_index;
+    for (size_t i = 0; i < activation_path.size(); ++i) {
+        InitIndex(activation_path[i], activation_parent->nHeight + 1,
+                  activation_parent, activation_path_hashes[i]);
+        CBlock empty_block;
+        empty_block.vtx = {MakeCoinbaseTx(CScript{} << OP_TRUE),
+                           MakeCoinstakeTx(staker_target)};
+        CBlockUndo empty_undo = MakeUndoWithInputScripts(
+            empty_block, {{1, staker_target}});
+        BOOST_REQUIRE(ApplyShadowBlock(seed_view, empty_block,
+                                      &activation_path[i], &empty_undo));
+        activation_parent = &activation_path[i];
+    }
+    BOOST_REQUIRE_EQUAL(activation_parent->nHeight, activation_height - 1);
 
     std::vector<unsigned char> pow_proof;
-    BOOST_REQUIRE(MineShadowProofData(pow_target, quantum_payout,
-                                      &activation_parent, seed_view, 100'000,
-                                      pow_proof));
+    BOOST_REQUIRE(MineQQP4Proof(pow_target, quantum_payout, 3,
+                                activation_parent, seed_view, 100'000,
+                                pow_proof));
     const size_t mode_offset = GetShadowPrefix().size() + 4;
     BOOST_REQUIRE_GT(pow_proof.size(), mode_offset);
     std::vector<unsigned char> pos_proof = pow_proof;
     std::vector<unsigned char> unknown_proof = pow_proof;
     pos_proof[mode_offset] = 1;
     unknown_proof[mode_offset] = 0x7f;
-    BOOST_CHECK(ClassifyShadowProofPayload(pow_proof) ==
+    BOOST_CHECK(ClassifyShadowProofPayload(pow_proof, /*qqp4_active=*/true) ==
                 ShadowProofPayloadMode::POW);
-    BOOST_CHECK(ClassifyShadowProofPayload(pos_proof) ==
+    BOOST_CHECK(ClassifyShadowProofPayload(pos_proof, /*qqp4_active=*/true) ==
                 ShadowProofPayloadMode::POS);
-    BOOST_CHECK(ClassifyShadowProofPayload(unknown_proof) ==
+    BOOST_CHECK(ClassifyShadowProofPayload(unknown_proof, /*qqp4_active=*/true) ==
                 ShadowProofPayloadMode::UNKNOWN);
 
     const CTransactionRef pos_tx = MakePowClaimTx(pow_target, pos_proof, 0);
@@ -2380,22 +2937,41 @@ BOOST_AUTO_TEST_CASE(pow_shadow_payload_modes_are_strictly_bound_to_pow_accounti
     const CTransactionRef duplicate_tx = MakePowClaimTxWithTwoProofs(
         pow_target, pow_proof, pow_proof, 2);
     const CTransactionRef pow_tx = MakePowClaimTx(pow_target, pow_proof, 3);
+    const CTransactionRef qqp1_tx = MakePowClaimTx(
+        pow_target, MakeQQP1ProofData(/*nonce=*/1, pow_target), 0);
+    const CTransactionRef qqp2_tx = MakePowClaimTx(
+        pow_target, MakeInvalidPowProofData(/*nonce=*/2, pow_target,
+                                            quantum_payout), 1);
+    const CTransactionRef qqp3_tx = MakePowClaimTx(
+        pow_target, MakeQQP3ProofData(
+                        /*nonce=*/3,
+                        static_cast<uint32_t>(activation_height),
+                        activation_parent->GetBlockHash(), pow_target,
+                        quantum_payout),
+        2);
 
     std::string reject_reason;
     BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
-                    *pos_tx, &activation_parent, seed_view, true,
+                    *pos_tx, activation_parent, seed_view, true,
                     reject_reason) == ShadowProofValidationResult::INVALID);
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-wrong-mode-pos");
     reject_reason.clear();
     BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
-                    *unknown_tx, &activation_parent, seed_view, true,
+                    *unknown_tx, activation_parent, seed_view, true,
                     reject_reason) == ShadowProofValidationResult::INVALID);
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-unknown-mode");
     reject_reason.clear();
     BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
-                    *duplicate_tx, &activation_parent, seed_view, true,
+                    *duplicate_tx, activation_parent, seed_view, true,
                     reject_reason) == ShadowProofValidationResult::INVALID);
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-duplicate");
+    for (const CTransactionRef& retired_tx : {qqp1_tx, qqp2_tx, qqp3_tx}) {
+        reject_reason.clear();
+        BOOST_CHECK(CheckShadowPowClaimForMempoolDetailed(
+                        *retired_tx, activation_parent, seed_view, true,
+                        reject_reason) == ShadowProofValidationResult::INVALID);
+        BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-version");
+    }
 
     // Wrong, unknown, and duplicate payloads are rejected before Argon2. The
     // injected failure must remain armed until the canonical PoW proof runs.
@@ -2403,19 +2979,19 @@ BOOST_AUTO_TEST_CASE(pow_shadow_payload_modes_are_strictly_bound_to_pow_accounti
     reject_reason.clear();
     const ShadowProofValidationResult skipped_pos =
         CheckShadowPowClaimForMempoolDetailed(
-            *pos_tx, &activation_parent, seed_view, true, reject_reason);
+            *pos_tx, activation_parent, seed_view, true, reject_reason);
     reject_reason.clear();
     const ShadowProofValidationResult skipped_unknown =
         CheckShadowPowClaimForMempoolDetailed(
-            *unknown_tx, &activation_parent, seed_view, true, reject_reason);
+            *unknown_tx, activation_parent, seed_view, true, reject_reason);
     reject_reason.clear();
     const ShadowProofValidationResult skipped_duplicate =
         CheckShadowPowClaimForMempoolDetailed(
-            *duplicate_tx, &activation_parent, seed_view, true, reject_reason);
+            *duplicate_tx, activation_parent, seed_view, true, reject_reason);
     reject_reason.clear();
     const ShadowProofValidationResult pow_fault =
         CheckShadowPowClaimForMempoolDetailed(
-            *pow_tx, &activation_parent, seed_view, true, reject_reason);
+            *pow_tx, activation_parent, seed_view, true, reject_reason);
     ClearShadowArgon2FailuresForTesting();
     BOOST_CHECK(skipped_pos == ShadowProofValidationResult::INVALID);
     BOOST_CHECK(skipped_unknown == ShadowProofValidationResult::INVALID);
@@ -2425,7 +3001,7 @@ BOOST_AUTO_TEST_CASE(pow_shadow_payload_modes_are_strictly_bound_to_pow_accounti
 
     uint256 claim_hash;
     CBlockIndex claim_index;
-    InitIndex(claim_index, activation_height, &activation_parent, claim_hash);
+    InitIndex(claim_index, activation_height, activation_parent, claim_hash);
     CBlock mode_block;
     mode_block.vtx = {MakeCoinbaseTx(CScript{} << OP_3),
                       MakeCoinstakeTx(staker_target), pos_tx, unknown_tx,
@@ -2434,8 +3010,11 @@ BOOST_AUTO_TEST_CASE(pow_shadow_payload_modes_are_strictly_bound_to_pow_accounti
         mode_block, {{1, staker_target}, {2, pow_target}, {3, pow_target},
                      {4, pow_target}});
 
+    ShadowProofObservationSummary observation_summary;
     const std::vector<ShadowProofObservation> observations =
-        GetShadowProofObservations(mode_block);
+        GetShadowProofObservations(mode_block, Params().GetConsensus(),
+                                   claim_index.nHeight,
+                                   observation_summary);
     BOOST_REQUIRE_EQUAL(observations.size(), 4U);
     BOOST_CHECK_EQUAL(std::count_if(
         observations.begin(), observations.end(),
@@ -2502,11 +3081,11 @@ BOOST_AUTO_TEST_CASE(pow_shadow_payload_modes_are_strictly_bound_to_pow_accounti
                       0U);
 
     const ShadowGoldRushInfo parent_info = GetShadowGoldRushInfo(
-        seed_view, &activation_parent);
+        seed_view, activation_parent);
     BOOST_REQUIRE(UndoShadowBlock(mode_view, mode_block, &claim_index,
                                  &mode_undo));
     const ShadowGoldRushInfo undo_info = GetShadowGoldRushInfo(
-        mode_view, &activation_parent);
+        mode_view, activation_parent);
     BOOST_CHECK_EQUAL(undo_info.pow_amount, parent_info.pow_amount);
     BOOST_CHECK_EQUAL(undo_info.pos_amount, parent_info.pos_amount);
     BOOST_CHECK_EQUAL(undo_info.claimed_amount, parent_info.claimed_amount);
@@ -2631,8 +3210,8 @@ BOOST_AUTO_TEST_CASE(pow_shadow_malformed_multi_proof_transaction_is_never_reimb
     const CScript target = CScript{} << OP_2;
     const CScript payout = QuantumScript(0x77);
     std::vector<unsigned char> proof;
-    BOOST_REQUIRE(MineShadowProofData(target, payout, &activation_parent, view,
-                                      100'000, proof));
+    BOOST_REQUIRE(MineShadowProofData(target, payout, &activation_parent,
+                                      view, 100'000, proof));
 
     uint256 claim_hash;
     CBlockIndex claim_index;
@@ -2835,10 +3414,6 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_evaluation_cap_reimburses_only_63_lose
 
     const CScript pow_target = CScript{} << OP_2;
     const CScript quantum_payout = QuantumScript(0x4a);
-    std::vector<unsigned char> pow_proof;
-    BOOST_REQUIRE(MineShadowProofData(pow_target, quantum_payout,
-                                      &activation_parent, view, 50'000,
-                                      pow_proof));
 
     uint256 claim_hash;
     CBlockIndex claim_index;
@@ -2851,20 +3426,27 @@ BOOST_AUTO_TEST_CASE(pow_shadow_canonical_evaluation_cap_reimburses_only_63_lose
     claim_block.vtx.push_back(MakeCoinstakeTx(
         CScript{} << OP_5, {}, {CTxOut(expected_pow_pool, quantum_payout)}));
     std::map<size_t, CScript> input_scripts{{1, CScript{} << OP_5}};
+    std::vector<std::vector<unsigned char>> proofs;
+    proofs.reserve(65);
     for (uint32_t i = 0; i < 65; ++i) {
-        claim_block.vtx.push_back(MakePowClaimTx(pow_target, pow_proof, i));
+        std::vector<unsigned char> proof;
+        BOOST_REQUIRE(MineShadowProofData(pow_target, quantum_payout,
+                                          &activation_parent, view, 50'000,
+                                          proof));
+        claim_block.vtx.push_back(MakePowClaimTx(pow_target, proof, i));
+        proofs.push_back(std::move(proof));
         input_scripts.emplace(2 + i, pow_target);
     }
-    const std::vector<unsigned char> canonical_proof{
-        pow_proof.begin() + GetShadowPrefix().size(), pow_proof.end()};
     std::vector<uint256> expected_ranks;
     expected_ranks.reserve(65);
-    for (size_t tx_index = 2; tx_index < claim_block.vtx.size(); ++tx_index) {
+    for (const std::vector<unsigned char>& proof : proofs) {
+        const std::vector<unsigned char> canonical_proof{
+            proof.begin() + GetShadowPrefix().size(), proof.end()};
         CHashWriter rank_writer;
         rank_writer << std::string{"Quantum Quasar Canonical POW Claim Rank v1"}
                     << claim_index.nHeight
                     << activation_parent.GetBlockHash()
-                    << claim_block.vtx[tx_index]->GetHash()
+                    << claim_block.vtx[2 + expected_ranks.size()]->GetHash()
                     << uint32_t{1} << canonical_proof;
         expected_ranks.push_back(rank_writer.GetHash());
     }
@@ -3319,3 +3901,27 @@ BOOST_AUTO_TEST_CASE(shadow_max_block_direct_total_bounds_to_schedule)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// QQP4 tests need a real regtest schedule. Register them only after the
+// file-wide BasicTestingSetup suite has fully torn down; nesting a second
+// global chain fixture would reinitialize gArgs/chainparams mid-test.
+namespace shadow_tests {
+BOOST_FIXTURE_TEST_SUITE(qqp4_activation_tests, QQP4ActivationTestingSetup)
+
+BOOST_AUTO_TEST_CASE(
+    shadow_index_record_validation_enforces_qqp4_exact_input_after_separate_activation)
+{
+    CheckShadowIndexRecordQQP4ExactInputAfterSeparateActivation();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(qqp4_payload_tests, QQP4ActivationTestingSetup)
+
+BOOST_AUTO_TEST_CASE(pow_shadow_payload_modes_are_strictly_bound_to_pow_accounting)
+{
+    CheckQQP4PayloadModesAreStrictlyBoundToPowAccounting();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+} // namespace shadow_tests

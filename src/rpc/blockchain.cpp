@@ -1787,6 +1787,9 @@ static UniValue QuantumQuasarStatus(const CBlockIndex& tip, const ChainstateMana
     const bool final_lockout_active = consensus.IsQuantumFinalLockout(mtp, next_height);
     const bool shadow_reward_height_active = IsShadowGoldRushRewardHeight(next_height);
     const auto lifecycle = consensus.GetQuantumLifecycleState(mtp, next_height);
+    const bool qqp4_disabled =
+        consensus.nShadowQQP4ActivationHeight ==
+        std::numeric_limits<int>::max();
 
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("phase", QuantumQuasarPhaseName(phase));
@@ -1816,6 +1819,18 @@ static UniValue QuantumQuasarStatus(const CBlockIndex& tip, const ChainstateMana
     obj.pushKV("shadow_reward_next_height", next_height);
     obj.pushKV("shadow_reward_start_height", SHADOW_REWARD_START_HEIGHT);
     obj.pushKV("shadow_reward_end_height", SHADOW_REWARD_END_HEIGHT);
+    // Keep QQP3 canonical accounting and the future QQP4 exact-input fork
+    // visibly distinct. Versionbits readiness is deliberately not an
+    // activation mechanism for either field.
+    obj.pushKV("qqp4_activation_disabled", qqp4_disabled);
+    obj.pushKV("qqp4_activation_height", qqp4_disabled
+        ? 0 : consensus.nShadowQQP4ActivationHeight);
+    obj.pushKV("qqp4_active_at_tip",
+               consensus.IsShadowQQP4Active(tip.nHeight));
+    obj.pushKV("qqp4_active_next_block",
+               consensus.IsShadowQQP4Active(next_height));
+    obj.pushKV("qqp4_exact_input_required_next_block",
+               consensus.IsShadowQQP4Active(next_height));
     obj.pushKV("new_network_stake_only", new_network_stake_only);
     obj.pushKV("replay_protection_active", quantum_spend_active);
     obj.pushKV("sighash_forkid_active", quantum_spend_active);
@@ -1883,6 +1898,11 @@ static const std::vector<RPCResult> RPCHelpForQuantumQuasar{
     {RPCResult::Type::NUM, "shadow_reward_next_height", "height of the next block checked against the deterministic payout window"},
     {RPCResult::Type::NUM, "shadow_reward_start_height", "first deterministic Gold Rush payout height"},
     {RPCResult::Type::NUM, "shadow_reward_end_height", "last deterministic Gold Rush payout height"},
+    {RPCResult::Type::BOOL, "qqp4_activation_disabled", "whether QQP4 is disabled by the consensus schedule; readiness signalling cannot enable it"},
+    {RPCResult::Type::NUM, "qqp4_activation_height", "separately scheduled QQP4 activation height, or 0 when disabled"},
+    {RPCResult::Type::BOOL, "qqp4_active_at_tip", "whether the connected tip was validated after the separately scheduled QQP4 activation"},
+    {RPCResult::Type::BOOL, "qqp4_active_next_block", "whether the next block requires QQP4 rather than the established QQP2/QQP3 rules"},
+    {RPCResult::Type::BOOL, "qqp4_exact_input_required_next_block", "whether the next block requires an exact fee-input-bound QQP4 proof"},
     {RPCResult::Type::BOOL, "new_network_stake_only", "whether staking has crossed the final quantum-only lockout cutover"},
     {RPCResult::Type::BOOL, "replay_protection_active", "whether post-Gold-Rush signature replay protection is active"},
     {RPCResult::Type::BOOL, "sighash_forkid_active", "whether legacy ECDSA signatures must use the fork-protected digest"},
@@ -2317,6 +2337,10 @@ static RPCHelpMan getgoldrushstate()
                         {RPCResult::Type::BOOL, "competing_claim_rule_active", "Whether the active tip uses canonical competing-claim allocation"},
                         {RPCResult::Type::BOOL, "competing_claim_rule_active_next_block", "Whether the next block uses canonical competing-claim allocation"},
                         {RPCResult::Type::NUM, "blocks_until_competing_claim_rule", "Blocks from the active tip through the activation block; zero once active"},
+                        {RPCResult::Type::BOOL, "qqp4_activation_disabled", "Whether the separately scheduled QQP4 exact-input fork is disabled; readiness signalling cannot enable it"},
+                        {RPCResult::Type::NUM, "qqp4_activation_height", "Separately scheduled QQP4 activation height, or 0 when disabled"},
+                        {RPCResult::Type::BOOL, "qqp4_active", "Whether the active tip uses QQP4 exact-input proof rules"},
+                        {RPCResult::Type::BOOL, "qqp4_active_next_block", "Whether the next block requires QQP4 exact-input proof rules"},
                         {RPCResult::Type::OBJ, "replay_state", "Authenticated auxiliary-state rebuild commitment",
                             {
                                 {RPCResult::Type::NUM, "schema", "Required replay schema version"},
@@ -2368,6 +2392,14 @@ static RPCHelpMan getgoldrushstate()
                consensus.IsShadowCompetingClaimsActive(pindex->nHeight + 1));
     obj.pushKV("blocks_until_competing_claim_rule",
                std::max(0, competing_claim_height - pindex->nHeight));
+    const bool qqp4_disabled = consensus.nShadowQQP4ActivationHeight ==
+        std::numeric_limits<int>::max();
+    obj.pushKV("qqp4_activation_disabled", qqp4_disabled);
+    obj.pushKV("qqp4_activation_height", qqp4_disabled
+        ? 0 : consensus.nShadowQQP4ActivationHeight);
+    obj.pushKV("qqp4_active", consensus.IsShadowQQP4Active(pindex->nHeight));
+    obj.pushKV("qqp4_active_next_block",
+               consensus.IsShadowQQP4Active(pindex->nHeight + 1));
 
     const ShadowReplayStateInfo replay = GetShadowReplayStateInfo(
         active_chainstate.CoinsTip(), consensus, pindex);
@@ -2490,7 +2522,8 @@ static RPCHelpMan getgoldrushblock()
     UniValue observed_signals(UniValue::VARR);
     ShadowProofObservationSummary proof_summary;
     for (const ShadowProofObservation& observation :
-            GetShadowProofObservations(block, proof_summary)) {
+            GetShadowProofObservations(block, consensus, pindex->nHeight,
+                                       proof_summary)) {
         std::string mode;
         std::string non_credit_reason;
         switch (observation.mode) {

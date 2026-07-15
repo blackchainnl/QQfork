@@ -58,6 +58,15 @@ struct BlockAndHeaderTipInfo
     double verification_progress;
 };
 
+//! Outcome of node bootstrap. A staged chainstate rebuild can finish its
+//! isolated first pass successfully while requiring one clean restart before
+//! normal node services may begin.
+enum class AppInitResult {
+    SUCCESS,
+    REBUILD_RESTART_REQUIRED,
+    FAILURE,
+};
+
 //! External signer interface used by the GUI.
 class ExternalSigner
 {
@@ -93,7 +102,7 @@ public:
     virtual bool baseInitialize() = 0;
 
     //! Start node.
-    virtual bool appInitMain(interfaces::BlockAndHeaderTipInfo* tip_info = nullptr) = 0;
+    virtual AppInitResult appInitMain(interfaces::BlockAndHeaderTipInfo* tip_info = nullptr) = 0;
 
     //! Stop node.
     virtual void appShutdown() = 0;

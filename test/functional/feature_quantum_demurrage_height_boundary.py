@@ -136,7 +136,9 @@ class QuantumDemurrageHeightBoundaryTest(BitcoinTestFramework):
 
         self.log.info("Replay the active boundary from block files")
         self.stop_node(0)
-        self.start_node(0, extra_args=self.extra_args[0] + ["-reindex-chainstate"])
+        self.run_chainstate_rebuild_first_pass(
+            node, self.extra_args[0] + ["-reindex-chainstate"])
+        self.restart_after_chainstate_rebuild(0, extra_args=self.extra_args[0])
         node = self.nodes[0]
         assert_equal(node.getblockcount(), FIRST_FINAL_HEIGHT)
         replay_supply = node.getcirculatingsupply()
@@ -169,7 +171,9 @@ class QuantumDemurrageHeightBoundaryTest(BitcoinTestFramework):
         with node.assert_debug_log([failure]):
             node.assert_start_raises_init_error(extra_args=self.extra_args[0])
 
-        self.start_node(0, extra_args=self.extra_args[0] + ["-reindex-chainstate"])
+        self.run_chainstate_rebuild_first_pass(
+            node, self.extra_args[0] + ["-reindex-chainstate"])
+        self.restart_after_chainstate_rebuild(0, extra_args=self.extra_args[0])
         node = self.nodes[0]
         assert_equal(node.getblockcount(), 8)
         assert_equal(node.getcirculatingsupply()["demurrage_active"], True)

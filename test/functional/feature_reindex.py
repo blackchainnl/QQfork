@@ -26,30 +26,16 @@ class ReindexTest(BitcoinTestFramework):
         self.generatetoaddress(self.nodes[0], 3, self.nodes[0].get_deterministic_priv_key().address)
         blockcount = self.nodes[0].getblockcount()
         self.stop_nodes()
-        extra_args = [["-reindex-chainstate" if justchainstate else "-reindex"]]
-        self.start_nodes(extra_args)
-        assert_equal(self.nodes[0].getblockcount(), blockcount)  # start_node is blocking on reindex
         if justchainstate:
-            # A chainstate-only rebuild commits in the rebuilding process but
-            # retains its source backup until a separate process has reopened
-            # and verified the replacement.
             node = self.nodes[0]
             journal = node.chain_path / "chainstate-rebuild.journal"
             backup = node.chain_path / "chainstate.rebuild-backup"
-            self.wait_until(
-                lambda: (
-                    journal.exists()
-                    and "phase=commit-ready\n" in journal.read_text()
-                ),
-                timeout=60,
-            )
-            assert backup.is_dir()
-            self.restart_node(0)
-            self.wait_until(
-                lambda: not journal.exists() and not backup.exists(),
-                timeout=60,
-            )
+            self.run_chainstate_rebuild_first_pass(node, ["-reindex-chainstate"])
+            self.restart_after_chainstate_rebuild(0)
             assert_equal(node.getblockcount(), blockcount)
+        else:
+            self.start_nodes([["-reindex"]])
+            assert_equal(self.nodes[0].getblockcount(), blockcount)  # start_node is blocking on reindex
         self.log.info("Success")
 
     # Check that blocks can be processed out of order

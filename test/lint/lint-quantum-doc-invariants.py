@@ -156,6 +156,7 @@ def check_mainnet_source(root, failures):
         "consensus.nDemurrageActivationHeight = consensus.nQuantumMigrationEndHeight + 1;",
         "consensus.nDemurrageMinActivationHeight = consensus.nDemurrageActivationHeight;",
         "MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;",
+        "consensus.nShadowQQP4ActivationHeight = std::numeric_limits<int>::max();",
     ):
         require_fragment(
             failures,
@@ -166,6 +167,18 @@ def check_mainnet_source(root, failures):
         )
 
     params = read_text(root, "src/consensus/params.h")
+    for fragment in (
+        "QQP2/QQP3 behavior at that historical",
+        "default leaves QQP4 disabled until a separately announced hard fork",
+        "bool IsShadowQQP4Active(int nHeight)",
+    ):
+        require_fragment(
+            failures,
+            "src/consensus/params.h",
+            params,
+            fragment,
+            "independent QQP4 consensus activation",
+        )
     demurrage_activation = source_region(
         params,
         "int EffectiveDemurrageActivationHeight() const",
@@ -446,6 +459,113 @@ def check_documentation_surfaces(root, failures, heights):
     check_v15_document(root, failures, "src/wallet/rpc/spend.cpp")
 
 
+def check_pow_claim_documentation(root, failures, heights):
+    replay_schema = source_integer(
+        root, "src/shadow.cpp", "SHADOW_REPLAY_STATE_VERSION"
+    )
+    schema_pattern = rf"schema(?: is)?(?: version)?[- ]?{replay_schema}\b"
+    for relative in (
+        "README.md",
+        "TRANSITION_GUIDE.md",
+        "doc/release-notes.md",
+        "doc/upgrade-v4.md",
+        "doc/v30.1.1-competing-pow-claims.md",
+    ):
+        require_regex(
+            failures,
+            relative,
+            read_text(root, relative),
+            schema_pattern,
+            f"source-bound shadow replay schema {replay_schema}",
+        )
+
+    validation = read_text(root, "src/validation.cpp")
+    require_fragment(
+        failures,
+        "src/validation.cpp",
+        validation,
+        f"schema-{replay_schema} auxiliary checkpoint",
+        "source-bound replay-rebuild diagnostic",
+    )
+
+    activation_height = formatted_height(
+        heights["MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT"]
+    )
+    hardening = read_text(root, "doc/v30.1.1-cryptographic-hardening.md")
+    require_regex(
+        failures,
+        "doc/v30.1.1-cryptographic-hardening.md",
+        hardening,
+        rf"before height {re.escape(activation_height)}[^.]*`QQP2`",
+        "pre-boundary QQP2 rule",
+    )
+    require_regex(
+        failures,
+        "doc/v30.1.1-cryptographic-hardening.md",
+        hardening,
+        r"at and after\s+(?:the\s+)?QQP3 boundary[^.]*`QQP3`",
+        "QQP3 rule at the existing competing-claim boundary",
+    )
+    require_regex(
+        failures,
+        "doc/v30.1.1-cryptographic-hardening.md",
+        hardening,
+        r"exact single legacy fee-input\s+outpoint",
+        "QQP4 exact-input binding",
+    )
+    require_regex(
+        failures,
+        "doc/v30.1.1-cryptographic-hardening.md",
+        hardening,
+        r"separately scheduled consensus activation[^.]*disabled on mainnet",
+        "mainnet-disabled separate QQP4 activation",
+    )
+    require_regex(
+        failures,
+        "doc/v30.1.1-cryptographic-hardening.md",
+        hardening,
+        r"cannot be activated by readiness or\s+version-bit signalling",
+        "QQP4 non-readiness activation rule",
+    )
+
+    claim_rule = read_text(root, "doc/v30.1.1-competing-pow-claims.md")
+    require_fragment(
+        failures,
+        "doc/v30.1.1-competing-pow-claims.md",
+        claim_rule,
+        "Generic `abandontransaction` intentionally refuses",
+        "safe non-generic-abandon rule",
+    )
+    for fragment in (
+        "This is the existing QQP3/rank-v1",
+        "A readiness bit, version bit, or other signalling state cannot",
+        "still eligible for late inclusion",
+    ):
+        require_fragment(
+            failures,
+            "doc/v30.1.1-competing-pow-claims.md",
+            claim_rule,
+            fragment,
+            "QQP3/QQP4 activation separation",
+        )
+    release_notes = read_text(root, "doc/release-notes.md")
+    require_fragment(
+        failures,
+        "doc/release-notes.md",
+        release_notes,
+        "`abandontransaction` intentionally refuses a quarantined",
+        "safe quarantined-claim release note",
+    )
+    wallet_rpc = read_text(root, "src/wallet/rpc/transactions.cpp")
+    require_fragment(
+        failures,
+        "src/wallet/rpc/transactions.cpp",
+        wallet_rpc,
+        "Gold Rush PoW QQSPROOF claims cannot be abandoned with this RPC.",
+        "safe Gold Rush PoW abandonment RPC help",
+    )
+
+
 def check_release_status(root, failures):
     relative = "doc/v30.1.1-release-gate.md"
     text = read_text(root, relative)
@@ -544,6 +664,7 @@ def verify(root):
         heights = check_mainnet_source(root, failures)
         check_whitepaper_appendix(root, failures, heights)
         check_documentation_surfaces(root, failures, heights)
+        check_pow_claim_documentation(root, failures, heights)
         check_release_status(root, failures)
         check_beta_channel_identity(root, failures)
         check_pdf_provenance(root, failures)

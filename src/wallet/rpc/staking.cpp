@@ -1259,7 +1259,6 @@ static RPCHelpMan sendshadowsignal()
             if (candidate_fee > pwallet->m_default_max_tx_fee) {
                 throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
             }
-
             candidate.vout[0].nValue = candidate_change;
             std::map<int, bilingual_str> input_errors;
             if (!pwallet->SignTransaction(candidate, input_errors)) {
@@ -1310,7 +1309,7 @@ static RPCHelpMan sendshadowpowclaim()
                 "PoW claims are NOT whitelist-gated. A valid mined claim credits the upgraded shadow ledger to quantum_address without changing the legacy block subsidy.\n"
                 "If proof is omitted, grinding is memory-hard (Argon2id, ~1 MiB per try) and synchronous; tune max_tries accordingly.\n"
                 "If proof is supplied, it must be the hex QQSPROOF payload for the current tip, target address, and quantum payout address.\n"
-                "Only valid during the Gold Rush reward window.\n" +
+                "Only valid during the Gold Rush reward window. An unconfirmed QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it; this wallet will not create another fee-input claim until it resolves on chain.\n" +
                 HELP_REQUIRING_PASSPHRASE,
                 {
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet legacy address that owns the UTXO authenticating this PoW claim. It does not need to be whitelisted."},
@@ -1357,9 +1356,13 @@ static RPCHelpMan sendshadowpowclaim()
         throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD,
                            "Gold Rush PoW claims are paused while the node is reindexing, importing blocks, or in initial block download");
     }
-    if (pwallet->CountUnresolvedShadowPowClaims() >= MAX_SHADOW_POW_EVALS_PER_BLOCK) {
+    if (pwallet->CountQuarantinedShadowPowClaims() != 0) {
         throw JSONRPCError(RPC_WALLET_ERROR,
-                           strprintf("The wallet already has the maximum %u unresolved Gold Rush PoW claims; each input remains quarantined until confirmation or an on-chain conflict", MAX_SHADOW_POW_EVALS_PER_BLOCK));
+                           "Gold Rush PoW claim creation is paused because a prior claim remains quarantined outside the local mempool. Its fee input remains reserved until on-chain resolution; the wallet will not create a second fee-input claim");
+    }
+    if (pwallet->CountLiveShadowPowClaims() >= MAX_SHADOW_POW_EVALS_PER_BLOCK) {
+        throw JSONRPCError(RPC_WALLET_ERROR,
+                           strprintf("The wallet already has the maximum %u relayable Gold Rush PoW claims", MAX_SHADOW_POW_EVALS_PER_BLOCK));
     }
 
     ShadowPowClaimSubmissionGuard submission_guard(*pwallet);
@@ -1419,37 +1422,6 @@ static RPCHelpMan sendshadowpowclaim()
         coin_control.fOverrideFeeRate = true;
     }
 
-    ShadowPowWork pow_work;
-    {
-        ChainstateManager& chainman = pwallet->chain().chainman();
-        LOCK(cs_main);
-        const CBlockIndex* tip = chainman.ActiveChain().Tip();
-        if (!tip) {
-            throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "No active chain tip");
-        }
-        const Consensus::Params& consensus = Params().GetConsensus();
-        if (!IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), tip->nHeight + 1)) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Shadow PoW claims are only active during the Gold Rush epoch");
-        }
-        const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
-        pow_work = PrepareShadowPowWork(target, quantum_payout_script, tip, view);
-        if (!pow_work.valid) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Failed to prepare shadow PoW work (outside the reward window or invalid payout script)");
-        }
-    }
-    if (supplied_proof) {
-        const ShadowProofPayloadMode mode = ClassifyShadowProofPayload(*supplied_proof);
-        if (mode == ShadowProofPayloadMode::POS) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof encodes PoS mode; fee-paying QQSPROOF claims require PoW mode byte 0");
-        }
-        if (mode == ShadowProofPayloadMode::UNKNOWN) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof encodes an unknown mode; fee-paying QQSPROOF claims require PoW mode byte 0");
-        }
-        if (!ValidateShadowPowProofForWork(pow_work, *supplied_proof)) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof does not match the current tip, target address, quantum payout address, and PoW channel");
-        }
-    }
-
     ShadowPowClaimInput selected_input;
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
@@ -1473,6 +1445,39 @@ static RPCHelpMan sendshadowpowclaim()
         }
     }
     pwallet->MaybeDelayShadowPowClaimSubmissionForTest(selected_input.outpoint);
+
+    ShadowPowWork pow_work;
+    {
+        ChainstateManager& chainman = pwallet->chain().chainman();
+        LOCK(cs_main);
+        const CBlockIndex* tip = chainman.ActiveChain().Tip();
+        if (!tip) {
+            throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "No active chain tip");
+        }
+        const Consensus::Params& consensus = Params().GetConsensus();
+        if (!IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), tip->nHeight + 1)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Shadow PoW claims are only active during the Gold Rush epoch");
+        }
+        const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
+        pow_work = PrepareShadowPowWork(
+            target, quantum_payout_script, selected_input.outpoint, tip, view);
+        if (!pow_work.valid) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Failed to prepare shadow PoW work (outside the reward window or invalid payout script/input)");
+        }
+    }
+    if (supplied_proof) {
+        const ShadowProofPayloadMode mode = ClassifyShadowProofPayload(
+            *supplied_proof, pow_work.input_bound);
+        if (mode == ShadowProofPayloadMode::POS) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof encodes PoS mode; fee-paying QQSPROOF claims require PoW mode byte 0");
+        }
+        if (mode == ShadowProofPayloadMode::UNKNOWN) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof encodes an unknown mode; fee-paying QQSPROOF claims require PoW mode byte 0");
+        }
+        if (!ValidateShadowPowProofForWork(pow_work, *supplied_proof)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof does not match the current tip, exact fee input, target address, quantum payout address, and PoW channel");
+        }
+    }
 
     std::vector<unsigned char> proof;
     if (supplied_proof) {
@@ -1510,8 +1515,8 @@ static RPCHelpMan sendshadowpowclaim()
             CMutableTransaction candidate;
             candidate.nVersion = CTransaction::CURRENT_VERSION;
             candidate.nTime = current_time;
-            static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
-            candidate.vin.emplace_back(output.outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
+            static constexpr uint32_t SEQUENCE_REPLACEABLE = 0xfffffffd;
+            candidate.vin.emplace_back(output.outpoint, CScript(), SEQUENCE_REPLACEABLE);
             candidate.vout.emplace_back(output.txout.nValue, selected_input.target);
             candidate.vout.emplace_back(0, CScript() << OP_RETURN << proof);
 
@@ -1523,6 +1528,10 @@ static RPCHelpMan sendshadowpowclaim()
             if (!MoneyRange(candidate_change) || candidate_change <= 0 || IsDust(change_out, pwallet->chain().relayDustFee())) continue;
             if (candidate_fee > pwallet->m_default_max_tx_fee) {
                 throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
+            }
+            if (candidate_fee > CENT) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                                   "Gold Rush PoW claim fee exceeds the maximum reimbursable fee of 0.01 BLK");
             }
 
             candidate.vout[0].nValue = candidate_change;
@@ -1623,6 +1632,10 @@ static RPCHelpMan getgoldrushinfo()
                         {RPCResult::Type::BOOL, "competing_claim_rule_active", "Whether the active tip uses canonical competing-claim allocation."},
                         {RPCResult::Type::BOOL, "competing_claim_rule_active_next_block", "Whether the next block uses canonical competing-claim allocation."},
                         {RPCResult::Type::NUM, "blocks_until_competing_claim_rule", "Blocks from the active tip through the activation block; zero once active."},
+                        {RPCResult::Type::BOOL, "qqp4_activation_disabled", "Whether the separate QQP4 exact-input fork is disabled by consensus schedule; readiness signalling cannot enable it."},
+                        {RPCResult::Type::NUM, "qqp4_activation_height", "Separately scheduled QQP4 activation height, or 0 when disabled."},
+                        {RPCResult::Type::BOOL, "qqp4_active", "Whether the active tip uses QQP4 exact-input proof rules."},
+                        {RPCResult::Type::BOOL, "qqp4_active_next_block", "Whether the next block requires QQP4 exact-input proof rules."},
                         {RPCResult::Type::BOOL, "wallet_recent_solve_qualified", "Whether this wallet has at least one known whitelisted script with a recent solver marker."},
                         {RPCResult::Type::ARR, "wallet_scripts", "Bounded wallet-known scripts relevant to Gold Rush signaling; transaction construction performs the final spendability check.",
                         {
@@ -1676,6 +1689,10 @@ static RPCHelpMan getgoldrushinfo()
     int competing_claim_rule_activation_height{std::numeric_limits<int>::max()};
     bool competing_claim_rule_active{false};
     bool competing_claim_rule_active_next_block{false};
+    bool qqp4_activation_disabled{true};
+    int qqp4_activation_height{0};
+    bool qqp4_active{false};
+    bool qqp4_active_next_block{false};
     {
         ChainstateManager& chainman = pwallet->chain().chainman();
         LOCK(cs_main);
@@ -1696,6 +1713,14 @@ static RPCHelpMan getgoldrushinfo()
             consensus.IsShadowCompetingClaimsActive(tip->nHeight);
         competing_claim_rule_active_next_block =
             consensus.IsShadowCompetingClaimsActive(tip->nHeight + 1);
+        qqp4_activation_disabled =
+            consensus.nShadowQQP4ActivationHeight ==
+            std::numeric_limits<int>::max();
+        qqp4_activation_height = qqp4_activation_disabled
+            ? 0 : consensus.nShadowQQP4ActivationHeight;
+        qqp4_active = consensus.IsShadowQQP4Active(tip->nHeight);
+        qqp4_active_next_block =
+            consensus.IsShadowQQP4Active(tip->nHeight + 1);
         shadow_info = GetShadowGoldRushInfo(active_chainstate.CoinsTip(), tip);
         active_signalers = GetActiveShadowSignalCount(active_chainstate.CoinsTip(), tip);
 
@@ -1784,6 +1809,10 @@ static RPCHelpMan getgoldrushinfo()
                   competing_claim_rule_active_next_block);
     result.pushKV("blocks_until_competing_claim_rule",
                   std::max(0, competing_claim_rule_activation_height - tip_height));
+    result.pushKV("qqp4_activation_disabled", qqp4_activation_disabled);
+    result.pushKV("qqp4_activation_height", qqp4_activation_height);
+    result.pushKV("qqp4_active", qqp4_active);
+    result.pushKV("qqp4_active_next_block", qqp4_active_next_block);
     result.pushKV("wallet_recent_solve_qualified", wallet_recent_solve_qualified);
     result.pushKV("wallet_scripts", std::move(wallet_entries));
     return result;
@@ -1854,9 +1883,21 @@ static RPCHelpMan checkkernel()
 
     COutPoint kernel;
     CBlockIndex* pindexPrev = active_chain.Tip();
+    const std::optional<int64_t> pos_time = GetNextBlockPoSTime(
+        active_chainstate, pindexPrev, Params().GetConsensus(),
+        GetAdjustedTimeSeconds());
+
+    UniValue result(UniValue::VOBJ);
+    // Do not floor an unavailable adjusted time to the prior stake mask. A
+    // returned kernel must always correspond to a representable, MTP-valid,
+    // future-drift-valid PoS header that the assembler can build.
+    if (!pos_time) {
+        result.pushKV("found", false);
+        return result;
+    }
+
     unsigned int nBits = GetNextTargetRequired(pindexPrev, Params().GetConsensus(), true);
-    int64_t nTime = GetAdjustedTimeSeconds();
-    nTime &= ~Params().GetConsensus().nStakeTimestampMask;
+    const int64_t nTime = *pos_time;
 
     for (unsigned int idx = 0; idx < inputs.size(); idx++) {
         const UniValue& o = inputs[idx].get_obj();
@@ -1883,7 +1924,6 @@ static RPCHelpMan checkkernel()
         }
     }
 
-    UniValue result(UniValue::VOBJ);
     result.pushKV("found", !kernel.IsNull());
 
     if (kernel.IsNull())
@@ -1901,28 +1941,14 @@ static RPCHelpMan checkkernel()
     if (!pwallet->IsLocked())
         pwallet->TopUpKeyPool();
 
-    bool fPoSCancel = false;
-    int64_t nFees;
-    std::unique_ptr<node::CBlockTemplate> pblocktemplate(BlockAssembler{active_chainstate, &mempool}.CreateNewBlock(CScript(), nullptr, &fPoSCancel, &nFees));
-    if (!pblocktemplate.get())
-        throw JSONRPCError(RPC_INTERNAL_ERROR, "Couldn't create new block");
-
-    CBlock *pblock = &pblocktemplate->block;
-    CMutableTransaction coinstakeTx(*pblock->vtx[0]);
-    pblock->nTime = coinstakeTx.nTime = nTime;
-    pblock->vtx[0] = MakeTransactionRef(std::move(coinstakeTx));
-
-    CDataStream ss(SER_DISK);
-    ss << RPCTxSerParams(*pblock);
-
-    result.pushKV("blocktemplate", HexStr(ss));
-    result.pushKV("blocktemplatefees", nFees);
-
     if (!pwallet->CanGetAddresses(true)) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
     }
 
-    // Prepare reserve destination
+    // Reserve the payout/change destination before assembling the template.
+    // In addition to supplying a real output script for the coinstake, this
+    // lets the assembler prove the exact kernel reported above rather than
+    // selecting an unrelated wallet kernel at the same timestamp.
     OutputType output_type = pwallet->m_default_change_type ? *pwallet->m_default_change_type : pwallet->m_default_address_type;
     auto op_dest = pwallet->GetNewChangeDestination(output_type);
     if (!op_dest) {
@@ -1935,11 +1961,39 @@ static RPCHelpMan checkkernel()
     if (!provider) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: failed to get signing provider");
     }
+    if (vSolutionsTmp.empty()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: failed to resolve template signing key");
+    }
     CKeyID ckey = CKeyID(uint160(vSolutionsTmp[0]));
     CPubKey pkey;
-    if (!provider.get()->GetPubKey(ckey, pkey)) {
+    if (!provider->GetPubKey(ckey, pkey)) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: failed to get key");
     }
+
+    bool fPoSCancel = false;
+    int64_t nFees;
+    std::unique_ptr<node::CBlockTemplate> pblocktemplate(
+        BlockAssembler{active_chainstate, &mempool}.CreateNewBlock(
+            CScript(), pwallet.get(), &fPoSCancel, &nFees, *op_dest, kernel));
+    if (!pblocktemplate || fPoSCancel)
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Couldn't create a valid proof-of-stake block template");
+
+    CBlock *pblock = &pblocktemplate->block;
+    if (!pblock->IsProofOfStake() || pblock->vtx.size() < 2 ||
+        pblock->vtx[1]->vin.empty() ||
+        pblock->vtx[1]->vin[0].prevout != kernel ||
+        pblock->nTime != nTime) {
+        throw JSONRPCError(
+            RPC_INTERNAL_ERROR,
+            "Couldn't create a valid proof-of-stake block template for the requested kernel");
+    }
+
+    CDataStream ss(SER_DISK);
+    ss << RPCTxSerParams(*pblock);
+
+    result.pushKV("blocktemplate", HexStr(ss));
+    result.pushKV("blocktemplatefees", nFees);
     result.pushKV("blocktemplatesignkey", HexStr(pkey));
 
     return result;
@@ -2009,7 +2063,7 @@ static RPCHelpMan getpowmininginfo()
         {},
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is enabled."},
-            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, epoch_inactive, claim_in_flight, ready, hashing, or error."},
+            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, epoch_inactive, claim_in_flight, claim_quarantined, ready, hashing, or error."},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
             {RPCResult::Type::NUM, "cpu_percent", "Per-core CPU duty-cycle target."},
             {RPCResult::Type::NUM, "hashrate", "Aggregate Argon2id tries per second."},
@@ -2528,7 +2582,7 @@ static RPCHelpMan getdemurragewalletinfo()
 
         const auto coin_it = chain_coins.find(out.outpoint);
         const bool chainstate_backed = coin_it != chain_coins.end() && !coin_it->second.IsSpent();
-        Coin coin = chainstate_backed ? coin_it->second : Coin{out.txout, out.depth > 0 ? tip_height - out.depth + 1 : evaluation_height, false, false, static_cast<int>(out.time)};
+        Coin coin = chainstate_backed ? coin_it->second : Coin{out.txout, out.depth > 0 ? tip_height - out.depth + 1 : evaluation_height, false, false, static_cast<uint32_t>(out.time)};
         const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
             Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
         const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(

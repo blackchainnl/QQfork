@@ -9,8 +9,11 @@
 #include <consensus/consensus.h>
 #include <logging.h>
 #include <random.h>
+#include <util/check.h>
 #include <util/trace.h>
 #include <version.h>
+
+#include <limits>
 
 bool CCoinsView::GetCoin(const COutPoint &outpoint, Coin &coin) const { return false; }
 uint256 CCoinsView::GetBestBlock() const { return uint256(); }
@@ -201,16 +204,26 @@ void CCoinsViewCache::EmplaceCoinInternalDANGER(COutPoint&& outpoint, Coin&& coi
         std::forward_as_tuple(std::move(coin), CCoinsCacheEntry::DIRTY));
 }
 
-void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, bool check_for_overwrite, int nBlockTime) {
+uint32_t GetCoinTime(const CTransaction& tx, int64_t nBlockTime)
+{
+    if (tx.nVersion < 2) return tx.nTime;
+
+    // CBlockHeader::nTime is an unsigned 32-bit consensus field. Keep the
+    // conversion explicit so timestamps at and after the signed-int boundary
+    // (including 0xffffffff) cannot silently become zero in the UTXO set.
+    Assert(nBlockTime >= 0);
+    Assert(nBlockTime <= std::numeric_limits<uint32_t>::max());
+    return static_cast<uint32_t>(nBlockTime);
+}
+
+void AddCoins(CCoinsViewCache& cache, const CTransaction &tx, int nHeight, bool check_for_overwrite, int64_t nBlockTime) {
     bool fCoinbase = tx.IsCoinBase();
     bool fCoinstake = tx.IsCoinStake();
     const uint256& txid = tx.GetHash();
     // Version-2 transactions do not serialize nTime. Never persist a hidden
     // local-object value as coin provenance. A containing block supplies the
     // authoritative time; context-free/mempool views use zero until then.
-    const unsigned int coin_time = tx.nVersion < 2
-        ? tx.nTime
-        : (nBlockTime > 0 ? static_cast<unsigned int>(nBlockTime) : 0);
+    const uint32_t coin_time = GetCoinTime(tx, nBlockTime);
     for (size_t i = 0; i < tx.vout.size(); ++i) {
         if (tx.vout[i].scriptPubKey.IsUnspendable()) continue;
         bool overwrite = check_for_overwrite ? cache.HaveCoin(COutPoint(txid, i)) : fCoinbase;

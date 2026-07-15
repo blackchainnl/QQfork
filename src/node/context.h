@@ -75,6 +75,10 @@ struct NodeContext {
     std::function<void()> rpc_interruption_point = [] {};
     std::unique_ptr<KernelNotifications> notifications;
     std::atomic<int> exit_status{EXIT_SUCCESS};
+    //! Set only for the intentional clean exit after a protected chainstate
+    //! rebuild first pass. Shutdown hooks must not treat it as an operational
+    //! node shutdown.
+    std::atomic<bool> rebuild_restart_required{false};
 
     //! Declare default constructor and destructor that are not inline, so code
     //! instantiating the NodeContext struct doesn't need to #include class

@@ -4,8 +4,8 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Exercise post-activation competing QQSPROOF accounting through live nodes.
 
-Policy intentionally admits one next-tip QQSPROOF per mempool.  Consensus must
-still classify a legacy-valid PoS block containing independently received
+Policy admits up to the same bounded 64 QQSPROOF evaluations used by block
+accounting after activation. Consensus classifies independently received
 claims deterministically: transaction order cannot choose the winner, valid
 losers recover their bounded base fee from the same fixed PoW pool, and replay
 must reconstruct the same source provenance and synthetic payouts.
@@ -52,6 +52,9 @@ class GoldRushPowContentionTest(BitcoinTestFramework):
             "-shadowwhitelistheight=1",
             "-shadowgoldrushstartheight=2",
             "-shadowgoldrushblocks=1000",
+            # Pin both transitions for this exact-input contention vector.
+            "-shadowcompetingclaimsheight=2",
+            "-shadowqqp4height=2",
         ]
         self.extra_args = [common_args, common_args]
 
@@ -206,6 +209,9 @@ class GoldRushPowContentionTest(BitcoinTestFramework):
             "total_records": summary["total_records"],
             "winner_count": summary["winner_count"],
             "reimbursed_loser_count": summary["reimbursed_loser_count"],
+            "reimbursed_late_count": summary["reimbursed_late_count"],
+            "origin_mismatch_count": summary["origin_mismatch_count"],
+            "origin_expired_count": summary["origin_expired_count"],
             "rejected_count": summary["rejected_count"],
             "credited_total": summary["credited_total"],
             "winner_credited_total": summary["winner_credited_total"],
@@ -220,6 +226,11 @@ class GoldRushPowContentionTest(BitcoinTestFramework):
                         "disposition",
                         "base_fee_known",
                         "base_fee",
+                        "origin_bound",
+                        "origin_height",
+                        "origin_previous_block_hash",
+                        "inclusion_height",
+                        "origin_age",
                         "credited_amount",
                         "payout_scriptPubKey",
                         "payout_address",
@@ -254,6 +265,9 @@ class GoldRushPowContentionTest(BitcoinTestFramework):
         assert_equal(summary["evaluated_count"], 2)
         assert_equal(summary["winner_count"], 1)
         assert_equal(summary["reimbursed_loser_count"], 1)
+        assert_equal(summary["reimbursed_late_count"], 0)
+        assert_equal(summary["origin_mismatch_count"], 0)
+        assert_equal(summary["origin_expired_count"], 0)
         assert_equal(summary["rejected_count"], 0)
         assert len(summary["accounting_commitment"]) == 64
         assert_equal(self._amount(summary["credited_total"]), expected_pool)
@@ -274,9 +288,14 @@ class GoldRushPowContentionTest(BitcoinTestFramework):
         # of the displayed strings would not reproduce uint256::operator<.
         assert_equal(summary["records"][0]["txid"], winner["txid"])
         assert_equal(summary["records"][1]["txid"], loser["txid"])
+        inclusion_height = node.getblock(block_hash)["height"]
         for txid, record in records.items():
             assert_equal(record["base_fee_known"], True)
             assert self._amount(record["base_fee"]) > 0
+            assert_equal(record["origin_bound"], True)
+            assert_equal(record["origin_height"], inclusion_height)
+            assert_equal(record["inclusion_height"], inclusion_height)
+            assert_equal(record["origin_age"], 0)
             assert_equal(record["payout_address"], payout_by_txid[txid])
             assert record["synthetic_txid"] is not None
 
@@ -369,13 +388,11 @@ class GoldRushPowContentionTest(BitcoinTestFramework):
         assert_equal(self.nodes[0].getrawmempool(), [claim_a["txid"]])
         assert_equal(self.nodes[1].getrawmempool(), [claim_b["txid"]])
 
-        self.log.info("Confirming one-claim relay policy is distinct from block accounting")
+        self.log.info("Confirming post-activation relay admits bounded competing claims")
         reject_b = self.nodes[0].testmempoolaccept([raw_b])[0]
         reject_a = self.nodes[1].testmempoolaccept([raw_a])[0]
-        assert_equal(reject_b["allowed"], False)
-        assert_equal(reject_b["reject-reason"], "shadow-proof-mempool-conflict")
-        assert_equal(reject_a["allowed"], False)
-        assert_equal(reject_a["reject-reason"], "shadow-proof-mempool-conflict")
+        assert_equal(reject_b["allowed"], True)
+        assert_equal(reject_a["allowed"], True)
 
         self.log.info("Direct PoW placement remains base data and earns no synthetic credit")
         pow_case = self.generateblock(

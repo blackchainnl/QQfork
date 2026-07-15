@@ -26,6 +26,7 @@
 
 #include <test/util/setup_common.h>
 
+#include <limits>
 #include <memory>
 
 #include <boost/test/unit_test.hpp>
@@ -88,16 +89,17 @@ void MinerTestingSetup::TestV2ParentChildTimeCanonicalization(const CScript& scr
     constexpr CAmount fee{10'000};
     TestMemPoolEntryHelper entry;
 
-    // Give the confirmed input the exact legal PoW candidate time. Package
-    // selection must use MTP+1 before the final header is assembled; using the
-    // earlier adjusted time would incorrectly omit this otherwise-valid chain.
+    // Give the confirmed input the exact legal generic next-header candidate
+    // time. Package selection must use MTP+1 before the final header is
+    // assembled; using the earlier adjusted time would incorrectly omit this
+    // otherwise-valid chain.
     const COutPoint timed_prevout{InsecureRand256(), 0};
     constexpr CAmount input_value{10 * COIN};
     m_node.chainman->ActiveChainstate().CoinsTip().AddCoin(
         timed_prevout,
         Coin{CTxOut{input_value, CScript() << OP_TRUE},
              m_node.chainman->ActiveChain().Height(), /*coinbase=*/false,
-             /*coinstake=*/false, static_cast<int>(candidate_time + 1)},
+             /*coinstake=*/false, static_cast<uint32_t>(candidate_time + 1)},
         /*possible_overwrite=*/false);
 
     CMutableTransaction parent;
@@ -800,6 +802,159 @@ BOOST_AUTO_TEST_CASE(CreateNewBlock_validity)
     SetMockTime(MinerTestMockTime());
 
     TestPrioritisedMining(scriptPubKey, txFirst);
+}
+
+BOOST_AUTO_TEST_CASE(mempool_check_handles_v2_parent_legacy_child_timestamp_conflict)
+{
+    LOCK(cs_main);
+
+    Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+    CBlockIndex* const tip{Assert(chainstate.m_chain.Tip())};
+    const int64_t adjusted_time{tip->GetMedianTimePast()};
+    const std::optional<int64_t> candidate_time{
+        GetNextBlockHeaderTime(chainstate, tip, adjusted_time)};
+    BOOST_REQUIRE(candidate_time);
+    BOOST_REQUIRE_GT(*candidate_time, 0);
+
+    // The generic helper must retain the full unsigned-header range while
+    // refusing the first unrepresentable second rather than narrowing it.
+    constexpr int64_t max_header_time{std::numeric_limits<uint32_t>::max()};
+    const std::optional<int64_t> exact_max_time{
+        GetNextBlockHeaderTime(chainstate, tip, max_header_time)};
+    BOOST_REQUIRE(exact_max_time);
+    BOOST_CHECK_EQUAL(*exact_max_time, max_header_time);
+    BOOST_CHECK(!GetNextBlockHeaderTime(chainstate, tip, max_header_time + 1));
+
+    CTxMemPool::Options options{MemPoolOptionsForTest(m_node)};
+    options.check_ratio = 1;
+    CTxMemPool mempool{options};
+
+    constexpr CAmount input_value{10 * COIN};
+    constexpr CAmount fee{10'000};
+    const COutPoint source{InsecureRand256(), 0};
+    chainstate.CoinsTip().AddCoin(
+        source,
+        Coin{CTxOut{input_value, CScript() << OP_TRUE}, tip->nHeight,
+             /*coinbase=*/false, /*coinstake=*/false,
+             static_cast<uint32_t>(*candidate_time - 1)},
+        /*possible_overwrite=*/false);
+
+    CMutableTransaction parent;
+    parent.nVersion = 2;
+    parent.nTime = 0;
+    parent.vin.emplace_back(source);
+    parent.vout.emplace_back(input_value - fee, CScript() << OP_TRUE);
+    const uint256 parent_hash{parent.GetHash()};
+
+    // At admission the version-2 parent has a zero, non-authoritative
+    // mempool timestamp. At this concrete header it becomes candidate_time,
+    // which intentionally makes the older legacy child unmineable until a
+    // compatible header exists. This is a legal speculative graph, not a
+    // fatal CTxMemPool::check invariant failure.
+    CMutableTransaction child;
+    child.nVersion = 1;
+    child.nTime = static_cast<uint32_t>(*candidate_time - 1);
+    child.vin.emplace_back(COutPoint{parent_hash, 0});
+    child.vout.emplace_back(parent.vout[0].nValue - fee, CScript() << OP_TRUE);
+
+    TestMemPoolEntryHelper entry;
+    {
+        LOCK(mempool.cs);
+        mempool.addUnchecked(entry.Fee(fee).Time(Now<NodeSeconds>()).FromTx(parent));
+        mempool.addUnchecked(entry.Fee(fee).Time(Now<NodeSeconds>()).FromTx(child));
+    }
+
+    BOOST_CHECK_NO_THROW(mempool.check(chainstate.CoinsTip(), tip->nHeight + 1,
+                                       *candidate_time, *candidate_time));
+    // An unrepresentable check time must retain structural graph validation
+    // without calling GetCoinTime() or aborting on a narrowing assertion.
+    BOOST_CHECK_NO_THROW(mempool.check(chainstate.CoinsTip(), tip->nHeight + 1,
+                                       max_header_time + 1, max_header_time + 1));
+}
+
+BOOST_AUTO_TEST_CASE(next_header_time_refuses_mtp_beyond_future_drift)
+{
+    LOCK(cs_main);
+
+    Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+    CBlockIndex* const tip{Assert(chainstate.m_chain.Tip())};
+    // Regtest permits a 24-hour future drift while its base-PoW schedule is
+    // active. Put MTP one second beyond that ceiling to prove neither the
+    // generic nor aligned helper invents a wrapped or future-invalid header.
+    const int64_t adjusted_time{tip->GetMedianTimePast() - 24 * 60 * 60 - 1};
+    BOOST_REQUIRE_GE(adjusted_time, 0);
+    BOOST_CHECK(!GetNextBlockHeaderTime(chainstate, tip, adjusted_time));
+    BOOST_CHECK(!GetNextBlockPoSTime(chainstate, tip,
+                                     Params().GetConsensus(), adjusted_time));
+
+    CBlock header;
+    header.nTime = static_cast<uint32_t>(tip->GetMedianTimePast());
+    BOOST_CHECK(!node::UpdateTime(&header, chainstate, Params().GetConsensus(), tip,
+                                  adjusted_time));
+}
+
+BOOST_AUTO_TEST_CASE(next_pos_time_ceil_respects_future_drift)
+{
+    LOCK(cs_main);
+
+    Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+    CBlockIndex* const tip{Assert(chainstate.m_chain.Tip())};
+    const int64_t mask{Params().GetConsensus().nStakeTimestampMask};
+    BOOST_REQUIRE_GT(mask, 0);
+    BOOST_REQUIRE_EQUAL(mask & (mask + 1), 0);
+    BOOST_REQUIRE_EQUAL((24 * 60 * 60) & mask, 0);
+
+    // One second after an aligned timestamp must ceiling to the next complete
+    // stake interval, never floor backwards. The regtest future allowance is
+    // large enough for this ordinary candidate.
+    constexpr int64_t aligned_boundary{2'000'000'000};
+    BOOST_REQUIRE_EQUAL(aligned_boundary & mask, 0);
+    const int64_t just_after_boundary{aligned_boundary + 1};
+    const std::optional<int64_t> generic_time{
+        GetNextBlockHeaderTime(chainstate, tip, just_after_boundary)};
+    const std::optional<int64_t> pos_time{
+        GetNextBlockPoSTime(chainstate, tip, Params().GetConsensus(),
+                            just_after_boundary)};
+    BOOST_REQUIRE(generic_time);
+    BOOST_REQUIRE(pos_time);
+    BOOST_CHECK_EQUAL(*generic_time, just_after_boundary);
+    BOOST_CHECK_EQUAL(*pos_time, just_after_boundary + mask);
+
+    // Now put MTP within one stake interval of the regtest future-drift cap.
+    // A generic header at B+1 is legal, but the next aligned PoS header would
+    // be B+16 while the cap is B+15, so the helper must refuse it.
+    std::vector<std::pair<CBlockIndex*, uint32_t>> original_times;
+    original_times.reserve(CBlockIndex::nMedianTimeSpan);
+    for (int i = 0; i < CBlockIndex::nMedianTimeSpan; ++i) {
+        const int height{tip->nHeight - i};
+        if (height < 0) break;
+        CBlockIndex* const index{tip->GetAncestor(height)};
+        BOOST_REQUIRE(index);
+        original_times.emplace_back(index, index->nTime);
+    }
+    BOOST_REQUIRE(!original_times.empty());
+    for (const auto& [index, ntime] : original_times) {
+        (void)ntime;
+        index->nTime = static_cast<uint32_t>(aligned_boundary);
+    }
+    // Regtest's active base-PoW future allowance is 24 hours. Because that
+    // interval is divisible by 16, this adjusted time yields an upper bound
+    // of B+15 and MTP B exactly.
+    const int64_t drift_limited_adjusted{aligned_boundary - 24 * 60 * 60 + mask};
+    const std::optional<int64_t> near_cap_generic{
+        GetNextBlockHeaderTime(chainstate, tip, drift_limited_adjusted)};
+    const std::optional<int64_t> near_cap_pos{
+        GetNextBlockPoSTime(chainstate, tip, Params().GetConsensus(),
+                            drift_limited_adjusted)};
+    BOOST_CHECK(near_cap_generic);
+    if (near_cap_generic) {
+        BOOST_CHECK_EQUAL(*near_cap_generic, aligned_boundary + 1);
+    }
+    BOOST_CHECK(!near_cap_pos);
+
+    for (const auto& [index, ntime] : original_times) {
+        index->nTime = ntime;
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

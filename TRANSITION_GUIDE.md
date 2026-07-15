@@ -11,13 +11,21 @@ upgrade boundary for v30.1.0 chainstate data.
 - The whitelist snapshot is fixed at height 5,945,000.
 - Legacy rules remain active through height 5,949,999.
 - Gold Rush is height 5,950,000 through 6,192,999, inclusive.
-- The emission-neutral competing-claim rule begins at height 5,993,200.
+- The QQP3 canonical competing-claim rule (rank v1) begins at height
+  5,993,200.
+- QQP4 exact-input proofs have a separate consensus activation and are
+  disabled on mainnet in the v30.1.1 alpha/beta channel.
 - Quantum witness spends activate at Migration height 6,193,000.
 - Migration is height 6,193,000 through 6,921,999, inclusive.
 - Final lockout and automatic demurrage begin at height 6,922,000.
 
 These mainnet heights are authoritative. The time values retained in the code
 do not move a mainnet lifecycle boundary.
+
+QQP4 is not selected by a readiness bit, version bit, or other signalling
+state. A future QQP4 release must declare its consensus height separately from
+the 5,993,200 QQP3 boundary and demonstrate the treatment of Q3 claims that
+are still inside their late-inclusion window at that transition.
 
 Use RPC to inspect the active schedule and wallet migration status:
 
@@ -34,7 +42,7 @@ blackcoin-cli -rpcwallet=<wallet> getmigrationstatus
 2. Stop every v30.1.0 daemon or GUI using the datadir and wait for complete
    shutdown.
 3. Install v30.1.1.
-4. Run one explicit schema-11 rebuild before enabling staking or mining:
+4. Run one explicit schema-12 rebuild before enabling staking or mining:
 
    ```bash
    blackcoind -datadir=/path/to/data -networkactive=0 -staking=0 \
@@ -44,7 +52,7 @@ blackcoin-cli -rpcwallet=<wallet> getmigrationstatus
 5. Wait for synchronization, then record `getblockchaininfo`,
    `gettxoutsetinfo muhash`, and `getgoldrushstate`.
 6. At or after the whitelist height, require `getgoldrushstate.replay_state`
-   schema 11 with `present`, `marker_valid`, and `valid_for_tip` all true.
+   schema 12 with `present`, `marker_valid`, and `valid_for_tip` all true.
    Stop cleanly, restart without a reindex option, and confirm the height,
    best-block hash, UTXO MuHash, Gold Rush totals, and replay commitment match.
    Repeat one offline `-reindex-chainstate` comparison for release-candidate

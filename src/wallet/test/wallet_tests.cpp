@@ -317,7 +317,7 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_submission_guard_is_single_flight_and_exce
     BOOST_CHECK(static_cast<bool>(after_exception));
 }
 
-BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_reserves_until_manual_abandon)
+BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_refuses_generic_abandonment)
 {
     CWallet wallet(/*chain=*/nullptr, "", CreateMockableWalletDatabase());
 
@@ -332,9 +332,14 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_reserves_until_manual_abandon)
     BOOST_REQUIRE(TransactionHasShadowProof(*claim_ref));
     BOOST_REQUIRE(wallet.AddToWallet(claim_ref, TxStateInactive{}));
 
+    // A proof need not carry the persistent marker to be unsafe to replace:
+    // it can be absent from this mempool while another peer still has it.
     BOOST_CHECK_EQUAL(wallet.CountUnresolvedShadowPowClaims(), 1U);
+    BOOST_CHECK_EQUAL(wallet.CountLiveShadowPowClaims(), 0U);
+    BOOST_CHECK_EQUAL(wallet.CountQuarantinedShadowPowClaims(), 1U);
     BOOST_REQUIRE(wallet.QuarantineShadowPowClaim(claim_ref->GetHash()));
     BOOST_REQUIRE(wallet.QuarantineShadowPowClaim(claim_ref->GetHash()));
+    BOOST_CHECK_EQUAL(wallet.CountQuarantinedShadowPowClaims(), 1U);
     {
         LOCK(wallet.cs_wallet);
         const CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
@@ -342,11 +347,17 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_reserves_until_manual_abandon)
         BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_quarantine"), "1");
     }
 
-    BOOST_REQUIRE(wallet.AbandonTransaction(claim_ref->GetHash()));
-    BOOST_CHECK_EQUAL(wallet.CountUnresolvedShadowPowClaims(), 0U);
+    // A removed claim can still be held by a peer. Generic abandonment must
+    // not release its exact fee input, and another claim must not consume a
+    // different fee input while this quarantine remains unresolved.
+    BOOST_CHECK(!wallet.TransactionCanBeAbandoned(claim_ref->GetHash()));
+    BOOST_CHECK(!wallet.AbandonTransaction(claim_ref->GetHash()));
+    BOOST_CHECK_EQUAL(wallet.CountUnresolvedShadowPowClaims(), 1U);
     {
         LOCK(wallet.cs_wallet);
-        BOOST_CHECK(wallet.mapWallet.at(claim_ref->GetHash()).isAbandoned());
+        const CWalletTx& stored = wallet.mapWallet.at(claim_ref->GetHash());
+        BOOST_CHECK(!stored.isAbandoned());
+        BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_quarantine"), "1");
     }
 }
 
@@ -431,6 +442,69 @@ BOOST_FIXTURE_TEST_CASE(commit_refreshes_mempool_state_before_async_callbacks, T
 
     unblock_callbacks.set_value();
     SyncWithValidationInterfaceQueue();
+}
+
+BOOST_FIXTURE_TEST_CASE(legacy_shadow_pow_cleanup_is_quarantined_without_rebroadcast_or_input_release, TestChain100Setup)
+{
+    CKey wallet_key;
+    wallet_key.MakeNewKey(/*fCompressed=*/true);
+    const CMutableTransaction funding = TestSimpleSpend(
+        *m_coinbase_txns[0],
+        /*index=*/0,
+        coinbaseKey,
+        GetScriptForRawPubKey(wallet_key.GetPubKey()));
+    CreateAndProcessBlock({funding}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
+
+    auto wallet = CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()),
+        wallet_key);
+    wallet->SetBroadcastTransactions(/*broadcast=*/false);
+    SyncWithValidationInterfaceQueue();
+
+    CKey recipient_key;
+    recipient_key.MakeNewKey(/*fCompressed=*/true);
+    const CRecipient recipient{PKHash{recipient_key.GetPubKey()}, COIN, /*subtract_fee=*/false};
+    CCoinControl coin_control;
+    constexpr int RANDOM_CHANGE_POSITION{-1};
+    const auto cleanup = CreateTransaction(*wallet, {recipient}, RANDOM_CHANGE_POSITION, coin_control);
+    BOOST_REQUIRE_MESSAGE(cleanup, util::ErrorString(cleanup).original);
+    BOOST_REQUIRE_EQUAL(cleanup->tx->vin.size(), 1U);
+    const COutPoint cleanup_input = cleanup->tx->vin.front().prevout;
+    const uint256 cleanup_txid = cleanup->tx->GetHash();
+    const mapValue_t legacy_metadata{
+        {"comment", "PoW Claim Cleanup"},
+        {"qq_shadow_pow_cleanup_for", uint256::ONE.GetHex()},
+    };
+    BOOST_REQUIRE(wallet->CommitTransaction(cleanup->tx, legacy_metadata, {}));
+
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored = wallet->mapWallet.at(cleanup_txid);
+        BOOST_CHECK(stored.isUnconfirmed());
+        BOOST_CHECK(!stored.InMempool());
+        BOOST_CHECK(!stored.isAbandoned());
+        BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_cleanup_for"), uint256::ONE.GetHex());
+        BOOST_CHECK(stored.mapValue.count("qq_shadow_pow_legacy_cleanup_quarantine") == 0);
+        BOOST_CHECK(wallet->IsSpent(cleanup_input));
+    }
+    BOOST_CHECK(!wallet->TransactionCanBeAbandoned(cleanup_txid));
+    BOOST_CHECK(!wallet->AbandonTransaction(cleanup_txid));
+
+    wallet->SetBroadcastTransactions(/*broadcast=*/true);
+    wallet->ResubmitWalletTransactions(/*relay=*/true, /*force=*/true);
+    SyncWithValidationInterfaceQueue();
+
+    BOOST_CHECK(!m_node.chain->isInMempool(cleanup_txid));
+    {
+        LOCK(wallet->cs_wallet);
+        const CWalletTx& stored = wallet->mapWallet.at(cleanup_txid);
+        BOOST_CHECK(stored.isUnconfirmed());
+        BOOST_CHECK(!stored.InMempool());
+        BOOST_CHECK(!stored.isAbandoned());
+        BOOST_CHECK_EQUAL(stored.mapValue.at("qq_shadow_pow_legacy_cleanup_quarantine"), "1");
+        BOOST_CHECK(wallet->IsSpent(cleanup_input));
+    }
 }
 
 static void CheckLiveUnspentStakeIndex(CWallet& wallet)

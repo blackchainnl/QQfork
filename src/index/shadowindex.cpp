@@ -42,11 +42,12 @@ static constexpr uint8_t DB_CUSTOM_TIP{'T'};
 // activation boundary. Schema 6 is reserved for the additive proof-mode
 // accounting update. Schema 7 persists ordered shadow-spend anchors. Schema 8
 // replaces unbounded per-note/per-transaction claim data with a strict
-// top-64 detail set, fixed aggregates, and an authenticated commitment. The
-// schema 9 adds QQP3 origin/inclusion provenance and late-reimbursement
-// classifications. The index is auxiliary and fully reconstructible, so a
+// top-64 detail set, fixed aggregates, and an authenticated commitment. Schema
+// 9 adds origin/inclusion provenance and late-claim classifications. Schema 10
+// adds QQP4 proof-version and exact fee-input provenance. The index is
+// auxiliary and fully reconstructible, so a
 // recognized older schema is wiped and rebuilt instead of being interpreted.
-static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{9};
+static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{10};
 static constexpr size_t MAX_SCRIPT_QUERY_RESULTS{1000};
 static constexpr size_t DIRECT_QUANTUM_SCRIPT_SIZE{2 + QUANTUM_MIGRATION_PROGRAM_SIZE};
 
@@ -314,10 +315,77 @@ bool IsValidShadowPowClaimSource(const ShadowIndexPowClaimSource& source)
          source.origin_age <= SHADOW_POW_LATE_ORIGIN_WINDOW)) {
         return false;
     }
-    return
-        (source.base_fee_known
-             ? source.base_fee >= 0 && MoneyRange(source.base_fee)
-             : source.base_fee == 0);
+
+    // The stored shape must match the decoded QQSPROOF payload plus the
+    // historical accounting context. This is not consensus validation --
+    // malformed proofs deliberately retain a bounded accounting row -- but it
+    // prevents a corrupt auxiliary index from silently changing whether a
+    // credit was bound to an exact fee input.
+    switch (source.proof_version) {
+    case 0:
+        // DecodeProof() failed. The accounting engine leaves all proof
+        // provenance unset and classifies the row as invalid.
+        if (source.disposition != ShadowPowClaimDisposition::INVALID_PROOF ||
+            source.origin_bound || source.origin_height != 0 ||
+            !source.origin_previous_block_hash.IsNull() ||
+            source.origin_age != 0 || source.input_bound ||
+            !source.claim_outpoint.IsNull()) {
+            return false;
+        }
+        break;
+    case 1:
+    case 2:
+        // v30.1.0 stored the inclusion context in these rows even though the
+        // QQP1/QQP2 payload itself is not origin-bound. Preserve that schema
+        // shape for historical lookup/reindex compatibility.
+        if (source.origin_bound || source.input_bound ||
+            !source.claim_outpoint.IsNull()) {
+            return false;
+        }
+        break;
+    case 3:
+        if (!source.origin_bound || source.input_bound ||
+            !source.claim_outpoint.IsNull()) {
+            return false;
+        }
+        break;
+    case 4:
+        if (!source.origin_bound || !source.input_bound ||
+            source.claim_outpoint.IsNull()) {
+            return false;
+        }
+        break;
+    default:
+        return false;
+    }
+
+    // QQP2 remains a valid credited source through the deployed QQP3
+    // canonical-accounting era.  Only origin-bound formats have a current
+    // origin that must equal the inclusion height for a winner/current loser.
+    // Applying this condition globally would reject v30.1.0 QQP2 payouts on
+    // index rebuild even though their provenance was intentionally unbound.
+    if ((source.proof_version == 3 || source.proof_version == 4) &&
+        (source.disposition == ShadowPowClaimDisposition::WINNER ||
+         source.disposition == ShadowPowClaimDisposition::REIMBURSED_LOSER) &&
+        (source.origin_height != source.inclusion_height ||
+         source.origin_age != 0)) {
+        return false;
+    }
+
+    // A synthetic payout after the separately scheduled QQP4 activation is
+    // only legitimate when it came from the exact-input-bound QQP4 wire
+    // format. The existing QQP3 canonical-accounting boundary continues to
+    // index valid QQP2/QQP3 provenance exactly as v30.1.0 did.
+    if (IsCreditedPowDisposition(source.disposition) &&
+        Params().GetConsensus().IsShadowQQP4Active(
+            static_cast<int>(source.inclusion_height)) &&
+        source.proof_version != 4) {
+        return false;
+    }
+
+    return source.base_fee_known
+        ? source.base_fee >= 0 && MoneyRange(source.base_fee)
+        : source.base_fee == 0;
 }
 
 bool ShadowPowClaimSourcesEqual(const ShadowIndexPowClaimSource& lhs,
@@ -328,11 +396,14 @@ bool ShadowPowClaimSourcesEqual(const ShadowIndexPowClaimSource& lhs,
         lhs.base_fee == rhs.base_fee &&
         lhs.base_fee_known == rhs.base_fee_known &&
         lhs.disposition == rhs.disposition &&
+        lhs.proof_version == rhs.proof_version &&
         lhs.origin_bound == rhs.origin_bound &&
         lhs.origin_height == rhs.origin_height &&
         lhs.origin_previous_block_hash == rhs.origin_previous_block_hash &&
         lhs.inclusion_height == rhs.inclusion_height &&
-        lhs.origin_age == rhs.origin_age;
+        lhs.origin_age == rhs.origin_age &&
+        lhs.input_bound == rhs.input_bound &&
+        lhs.claim_outpoint == rhs.claim_outpoint;
 }
 
 bool IsValidShadowPowClaimRecord(const ShadowIndexPowClaimRecord& record)
@@ -352,7 +423,7 @@ bool IsValidShadowPowClaimRecord(const ShadowIndexPowClaimRecord& record)
     case ShadowPowClaimDisposition::REIMBURSED_LATE:
         break;
     default:
-        // Schema 9 represents structural and over-budget outcomes only in
+        // Schema 10 represents structural and over-budget outcomes only in
         // the fixed block aggregate; they can never have detail rows.
         return false;
     }
@@ -483,9 +554,17 @@ bool IsValidShadowIndexRecord(const ShadowIndexRecord& record)
         return false;
     }
     if (record.pow_claim_source_present) {
+        const bool qqp4_active = Params().GetConsensus().IsShadowQQP4Active(
+            static_cast<int>(record.pow_claim_source.inclusion_height));
         if (!IsValidShadowPowClaimSource(record.pow_claim_source) ||
             !record.pow_claim_source.base_fee_known ||
-            !IsCreditedPowDisposition(record.pow_claim_source.disposition)) {
+            !IsCreditedPowDisposition(record.pow_claim_source.disposition) ||
+            record.pow_claim_source.inclusion_height != record.origin_height ||
+            (qqp4_active &&
+             (record.pow_claim_source.proof_version != 4 ||
+              !record.pow_claim_source.input_bound ||
+              record.pow_claim_source.claim_outpoint.IsNull())) ||
+            (!qqp4_active && record.pow_claim_source.proof_version == 4)) {
             return false;
         }
     }
@@ -1121,7 +1200,7 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
             Coin coin{CTxOut{record.nominal_amount, record.script_pub_key},
                       static_cast<int>(record.origin_height),
                       /*coinbase=*/true, /*coinstake=*/false,
-                      static_cast<int>(record.origin_block_time)};
+                      record.origin_block_time};
             std::optional<int> latest_height;
             std::optional<int> coverage_start;
             if (const std::optional<uint256> key =
@@ -1236,12 +1315,15 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         claim_record.source.base_fee = accounting.base_fee;
         claim_record.source.base_fee_known = accounting.base_fee_known;
         claim_record.source.disposition = accounting.disposition;
+        claim_record.source.proof_version = accounting.proof_version;
         claim_record.source.origin_bound = accounting.origin_bound;
         claim_record.source.origin_height = accounting.origin_height;
         claim_record.source.origin_previous_block_hash =
             accounting.origin_previous_block_hash;
         claim_record.source.inclusion_height = accounting.inclusion_height;
         claim_record.source.origin_age = accounting.origin_age;
+        claim_record.source.input_bound = accounting.input_bound;
+        claim_record.source.claim_outpoint = accounting.claim_outpoint;
         claim_record.payout_script = accounting.payout_script;
         claim_record.credited_amount = accounting.credited_amount;
 
@@ -1580,6 +1662,15 @@ bool ShadowIndex::LookupPowClaims(
         ShadowIndexPowClaimRecord record;
         if (!m_db->Read(DBPowClaimKey{block_hash, static_cast<uint32_t>(index)},
                         record) || !IsValidShadowPowClaimRecord(record)) {
+            return false;
+        }
+        if (record.source.inclusion_height != static_cast<uint32_t>(block.height)) {
+            return false;
+        }
+        if (IsCreditedPowDisposition(record.source.disposition) &&
+            Params().GetConsensus().IsShadowQQP4Active(block.height) &&
+            (record.source.proof_version != 4 || !record.source.input_bound ||
+             record.source.claim_outpoint.IsNull())) {
             return false;
         }
         if (record.synthetic_payout_present) {

@@ -343,6 +343,7 @@ UniValue PowClaimSourceToJSON(const ShadowIndexPowClaimSource& source)
     result.pushKV("base_fee_known", source.base_fee_known);
     result.pushKV("base_fee", source.base_fee_known
         ? UniValue(ValueFromAmount(source.base_fee)) : UniValue{});
+    result.pushKV("proof_version", source.proof_version);
     result.pushKV("origin_bound", source.origin_bound);
     result.pushKV("origin_height", source.origin_height);
     result.pushKV("origin_previous_block_hash",
@@ -351,6 +352,15 @@ UniValue PowClaimSourceToJSON(const ShadowIndexPowClaimSource& source)
                       : UniValue(source.origin_previous_block_hash.GetHex()));
     result.pushKV("inclusion_height", source.inclusion_height);
     result.pushKV("origin_age", source.origin_age);
+    result.pushKV("input_bound", source.input_bound);
+    if (source.input_bound) {
+        UniValue outpoint(UniValue::VOBJ);
+        outpoint.pushKV("txid", source.claim_outpoint.hash.GetHex());
+        outpoint.pushKV("vout", source.claim_outpoint.n);
+        result.pushKV("claim_outpoint", std::move(outpoint));
+    } else {
+        result.pushKV("claim_outpoint", UniValue{});
+    }
     return result;
 }
 
@@ -401,7 +411,7 @@ UniValue ShadowRecordToJSON(const ShadowIndexRecord& record,
         Coin coin{CTxOut{record.nominal_amount, record.script_pub_key},
                   static_cast<int>(record.origin_height),
                   /*coinbase=*/true, /*coinstake=*/false,
-                  static_cast<int>(record.origin_block_time)};
+                  record.origin_block_time};
         evaluation = Consensus::EvaluateDemurrage(
             coin, consensus, evaluation_height, evaluation_mtp,
             latest_height, coverage_start);
@@ -1564,7 +1574,7 @@ RPCHelpMan getshadowsupply()
                         Coin coin{CTxOut{record.nominal_amount, record.script_pub_key},
                                   static_cast<int>(record.origin_height),
                                   /*coinbase=*/true, /*coinstake=*/false,
-                                  static_cast<int>(record.origin_block_time)};
+                                  record.origin_block_time};
                         ValueLifecycleClassification classification;
                         if (ClassifyValueLifecycle(
                                 coin, /*authenticated_synthetic_goldrush=*/true,

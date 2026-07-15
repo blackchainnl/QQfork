@@ -5,7 +5,7 @@
 """Verify the explicit v30.1.0-to-v30.1.1 chainstate rebuild contract.
 
 Blocks connected by v30.1.0 can be base-ledger valid while lacking the
-authenticated schema-11 auxiliary state required by v30.1.1. Normal startup
+authenticated schema-12 auxiliary state required by v30.1.1. Normal startup
 must fail closed without changing the old logical chainstate. An explicit
 -reindex-chainstate must preserve the old database until reconstruction fully
 validates the stored block bodies and durably commits a deterministic result.
@@ -254,40 +254,15 @@ class GoldRushShadowReplayTest(BitcoinTestFramework):
         assert_equal(node.getbestblockhash(), legacy_tip)
         assert_equal(self.state_fingerprint(node), legacy_fingerprint)
 
-        self.log.info("Rebuilding schema-11 state with an explicit -reindex-chainstate")
-        self.restart_node(0, BASE_ARGS + ["-reindex-chainstate"])
-        node = self.nodes[0]
+        self.log.info("Rebuilding schema-12 state with an explicit -reindex-chainstate")
+        self.stop_node(0)
+        self.run_chainstate_rebuild_first_pass(
+            node, BASE_ARGS + ["-reindex-chainstate"])
         rebuild_journal = node.chain_path / "chainstate-rebuild.journal"
         rebuild_backup = node.chain_path / "chainstate.rebuild-backup"
-
-        def rebuild_is_commit_ready():
-            return (
-                rebuild_journal.exists()
-                and "phase=commit-ready\n" in rebuild_journal.read_text()
-            )
-
-        self.wait_until(rebuild_is_commit_ready, timeout=60)
         assert rebuild_backup.is_dir()
 
-        repaired_state = node.getgoldrushstate()
-        expected_half_pool = REWARD_BLOCKS_CONNECTED * 290 * COIN
-        assert_equal(repaired_state["pow_amount"], expected_half_pool)
-        assert_equal(repaired_state["pos_amount"], expected_half_pool)
-        assert_equal(repaired_state["claimed_amount"], 0)
-        assert_equal(repaired_state["height"], 1 + REWARD_BLOCKS_CONNECTED)
-        assert_equal(repaired_state["bestblock"], legacy_tip)
-        assert_equal(repaired_state["replay_state"]["schema"], 11)
-        assert_equal(repaired_state["replay_state"]["required_for_tip"], True)
-        assert_equal(repaired_state["replay_state"]["present"], True)
-        assert_equal(repaired_state["replay_state"]["marker_valid"], True)
-        assert_equal(repaired_state["replay_state"]["valid_for_tip"], True)
-        assert_equal(len(repaired_state["replay_state"]["commitment"]), 64)
-        assert_equal(node.getblockcount(), 1 + REWARD_BLOCKS_CONNECTED)
-        assert_equal(node.getbestblockhash(), legacy_tip)
-        rebuilt_fingerprint = self.state_fingerprint(node)
-
         self.log.info("Refusing full -reindex until a separate process verifies the replacement")
-        self.stop_node(0)
         node.assert_start_raises_init_error(
             extra_args=BASE_ARGS + ["-reindex"],
             expected_msg=(
@@ -343,20 +318,32 @@ class GoldRushShadowReplayTest(BitcoinTestFramework):
             lambda: not rebuild_journal.exists() and not rebuild_backup.exists(),
             timeout=60,
         )
-        assert_equal(self.state_fingerprint(self.nodes[0]), rebuilt_fingerprint)
+        node = self.nodes[0]
+        repaired_state = node.getgoldrushstate()
+        expected_half_pool = REWARD_BLOCKS_CONNECTED * 290 * COIN
+        assert_equal(repaired_state["pow_amount"], expected_half_pool)
+        assert_equal(repaired_state["pos_amount"], expected_half_pool)
+        assert_equal(repaired_state["claimed_amount"], 0)
+        assert_equal(repaired_state["height"], 1 + REWARD_BLOCKS_CONNECTED)
+        assert_equal(repaired_state["bestblock"], legacy_tip)
+        assert_equal(repaired_state["replay_state"]["schema"], 12)
+        assert_equal(repaired_state["replay_state"]["required_for_tip"], True)
+        assert_equal(repaired_state["replay_state"]["present"], True)
+        assert_equal(repaired_state["replay_state"]["marker_valid"], True)
+        assert_equal(repaired_state["replay_state"]["valid_for_tip"], True)
+        assert_equal(len(repaired_state["replay_state"]["commitment"]), 64)
+        assert_equal(node.getblockcount(), 1 + REWARD_BLOCKS_CONNECTED)
+        assert_equal(node.getbestblockhash(), legacy_tip)
+        rebuilt_fingerprint = self.state_fingerprint(node)
 
         self.log.info("Confirming a second chainstate rebuild is deterministic")
-        self.restart_node(0, BASE_ARGS + ["-reindex-chainstate"])
-        self.wait_until(rebuild_is_commit_ready, timeout=60)
+        self.stop_node(0)
+        self.run_chainstate_rebuild_first_pass(
+            node, BASE_ARGS + ["-reindex-chainstate"])
         assert rebuild_backup.is_dir()
-        assert_equal(self.state_fingerprint(self.nodes[0]), rebuilt_fingerprint)
 
         self.log.info("Verifying the second rebuilt chainstate before retiring its backup")
-        self.restart_node(0, BASE_ARGS)
-        self.wait_until(
-            lambda: not rebuild_journal.exists() and not rebuild_backup.exists(),
-            timeout=60,
-        )
+        self.restart_after_chainstate_rebuild(0, extra_args=BASE_ARGS)
         assert_equal(self.state_fingerprint(self.nodes[0]), rebuilt_fingerprint)
 
         self.log.info("Confirming shadow state survives disconnect and reconnect")

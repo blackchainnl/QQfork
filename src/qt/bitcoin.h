@@ -69,7 +69,7 @@ public:
     interfaces::Node& node() const { assert(m_node); return *m_node; }
 
 public Q_SLOTS:
-    void initializeResult(bool success, interfaces::BlockAndHeaderTipInfo tip_info);
+    void initializeResult(interfaces::AppInitResult result, interfaces::BlockAndHeaderTipInfo tip_info);
     /// Request core shutdown
     void requestShutdown();
     /// Handle runaway exceptions. Shows a message box with the problem and quits the program.

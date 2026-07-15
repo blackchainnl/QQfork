@@ -118,6 +118,10 @@ hash and time, declares `synthetic: true` and `merkle_included: false`, and
 contains ordered `credits` and `spends`. Credits are ordered by synthetic claim
 index. Spends are ordered by base transaction position and input position.
 Every amount has a BLK JSON value and an exact base-10 atomic-unit string.
+For canonical PoW credits, `pow_claim_source` includes `proof_version`, the
+`input_bound` flag, and `claim_outpoint`. The outpoint is null for the active
+QQP3 rule. It is populated only after a separately scheduled QQP4 activation;
+QQP4 is disabled on mainnet in the v30.1.1 alpha/beta channel.
 
 During a reorganization, disconnect messages are published from the former tip
 down to the common ancestor. Connect messages then run from the ancestor's

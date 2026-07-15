@@ -56,11 +56,14 @@ static const valtype MARKER_CLAIM_PAYOUT_TX{'Q', 'Q', 'C', 'P', 'A', 'Y'};
 static const valtype PROOF_MAGIC_V1{'Q', 'Q', 'P', '1'};
 static const valtype PROOF_MAGIC_V2{'Q', 'Q', 'P', '2'};
 static const valtype PROOF_MAGIC_V3{'Q', 'Q', 'P', '3'};
+static const valtype PROOF_MAGIC_V4{'Q', 'Q', 'P', '4'};
 static const valtype SIGNAL_MAGIC_V2{'Q', 'Q', 'S', '2'};
 static const valtype CLAIM_MAGIC_V2{'Q', 'Q', 'C', '2'};
 static const valtype CLAIM_MARKER_MAGIC_V3{'Q', 'Q', 'C', '3'};
 static constexpr size_t PROOF_SIZE = 13; // magic(4) | mode(1) | nonce(8)
 static constexpr size_t PROOF_V3_ORIGIN_SIZE = 36; // origin_height(4) | origin_parent_hash(32)
+static constexpr size_t PROOF_V4_OUTPOINT_SIZE = 36; // prevout_hash(32) | prevout_n(4)
+static constexpr size_t PROOF_V4_CONTEXT_SIZE = PROOF_V3_ORIGIN_SIZE + PROOF_V4_OUTPOINT_SIZE;
 static constexpr size_t SIGNAL_HEADER_SIZE = 40; // magic(4) | solve_height(4) | solve_hash(32)
 static constexpr size_t POOL_LEGACY_SIZE = 16;
 static constexpr size_t POOL_V1_SIZE = 41;
@@ -143,12 +146,16 @@ enum class ShadowProofMode : unsigned char {
     POS = 1,
 };
 
-ShadowProofPayloadMode ClassifyProofPayloadMode(const valtype& proof)
+ShadowProofPayloadMode ClassifyProofPayloadMode(const valtype& proof,
+                                                bool qqp4_active)
 {
     if (proof.size() < PROOF_SIZE ||
         (!std::equal(PROOF_MAGIC_V1.begin(), PROOF_MAGIC_V1.end(), proof.begin()) &&
          !std::equal(PROOF_MAGIC_V2.begin(), PROOF_MAGIC_V2.end(), proof.begin()) &&
-         !std::equal(PROOF_MAGIC_V3.begin(), PROOF_MAGIC_V3.end(), proof.begin()))) {
+         !std::equal(PROOF_MAGIC_V3.begin(), PROOF_MAGIC_V3.end(), proof.begin()) &&
+         !(qqp4_active &&
+           std::equal(PROOF_MAGIC_V4.begin(), PROOF_MAGIC_V4.end(),
+                      proof.begin())))) {
         return ShadowProofPayloadMode::MALFORMED;
     }
     if (proof[4] == static_cast<unsigned char>(ShadowProofMode::POW)) {
@@ -158,6 +165,20 @@ ShadowProofPayloadMode ClassifyProofPayloadMode(const valtype& proof)
         return ShadowProofPayloadMode::POS;
     }
     return ShadowProofPayloadMode::UNKNOWN;
+}
+
+/**
+ * A QQP4 payload must remain indistinguishable from an undecodable payload
+ * until its separately scheduled fork is active.  v30.1.0's DecodeProof()
+ * did not know this magic at all; keeping this narrow byte check beside the
+ * global decoder lets the post-fork decoder exist without retrospectively
+ * changing pre-fork accounting rows or their commitments.
+ */
+bool IsQQP4ProofPayload(const valtype& proof)
+{
+    return proof.size() >= PROOF_MAGIC_V4.size() &&
+           std::equal(PROOF_MAGIC_V4.begin(), PROOF_MAGIC_V4.end(),
+                      proof.begin());
 }
 
 struct ShadowPoolState {
@@ -281,6 +302,7 @@ struct ShadowActiveSignalUndo {
 };
 
 struct ShadowProof {
+    uint8_t version{0};
     ShadowProofMode mode{ShadowProofMode::POW};
     uint64_t nonce{0};
     CScript target;
@@ -289,6 +311,8 @@ struct ShadowProof {
     bool origin_bound{false};
     uint32_t origin_height{0};
     uint256 origin_previous_block_hash;
+    bool input_bound{false};
+    COutPoint claim_outpoint;
 };
 
 CScript MarkerScript(const valtype& tag, const valtype& payload = {})
@@ -1545,6 +1569,15 @@ valtype ReplayStateFingerprint(const Consensus::Params& consensus, const CBlockI
        << WhitelistStateCommitment(view)
        << GoldRushInventoryCoinCommitment(view)
        << Consensus::DemurrageInventoryCoinCommitment(view);
+    // QQP4 is disabled on mainnet in this release.  Do not alter the exact
+    // deployed schema-12 checkpoint stream before a separately scheduled Q4
+    // activation: doing so would strand a valid v30.1.0 chainstate behind an
+    // unnecessary reindex.  Once Q4 is active its distinct schedule is part
+    // of the post-fork checkpoint domain.
+    if (consensus.IsShadowQQP4Active(pindex->nHeight)) {
+        ss << std::string{"Quantum Quasar QQP4 Replay Schedule v1"}
+           << consensus.nShadowQQP4ActivationHeight;
+    }
     const uint256 hash = ss.GetHash();
     return valtype(hash.begin(), hash.end());
 }
@@ -2009,15 +2042,21 @@ bool DecodeProof(const valtype& proof, ShadowProof& decoded)
     decoded.nonce = ReadLE64(proof.data() + 5);
 
     if (std::equal(PROOF_MAGIC_V1.begin(), PROOF_MAGIC_V1.end(), proof.begin())) {
+        decoded.version = 1;
         decoded.target = CScript(proof.begin() + PROOF_SIZE, proof.end());
         decoded.payout_script = decoded.target;
         decoded.quantum_linked = false;
     } else if (std::equal(PROOF_MAGIC_V2.begin(), PROOF_MAGIC_V2.end(), proof.begin()) ||
-               std::equal(PROOF_MAGIC_V3.begin(), PROOF_MAGIC_V3.end(), proof.begin())) {
-        const bool origin_bound = std::equal(
+               std::equal(PROOF_MAGIC_V3.begin(), PROOF_MAGIC_V3.end(), proof.begin()) ||
+               std::equal(PROOF_MAGIC_V4.begin(), PROOF_MAGIC_V4.end(), proof.begin())) {
+        const bool input_bound = std::equal(
+            PROOF_MAGIC_V4.begin(), PROOF_MAGIC_V4.end(), proof.begin());
+        const bool origin_bound = input_bound || std::equal(
             PROOF_MAGIC_V3.begin(), PROOF_MAGIC_V3.end(), proof.begin());
-        const size_t script_header = PROOF_SIZE +
-            (origin_bound ? PROOF_V3_ORIGIN_SIZE : 0);
+        decoded.version = input_bound ? 4 : (origin_bound ? 3 : 2);
+        const size_t context_size = input_bound ? PROOF_V4_CONTEXT_SIZE
+                                                : (origin_bound ? PROOF_V3_ORIGIN_SIZE : 0);
+        const size_t script_header = PROOF_SIZE + context_size;
         if (proof.size() < script_header + 4) return false;
         if (origin_bound) {
             decoded.origin_bound = true;
@@ -2027,6 +2066,16 @@ bool DecodeProof(const valtype& proof, ShadowProof& decoded)
                       decoded.origin_previous_block_hash.begin());
             if (decoded.origin_height == 0 ||
                 decoded.origin_previous_block_hash.IsNull()) return false;
+        }
+        if (input_bound) {
+            decoded.input_bound = true;
+            const size_t outpoint_offset = PROOF_SIZE + PROOF_V3_ORIGIN_SIZE;
+            std::copy(proof.begin() + outpoint_offset,
+                      proof.begin() + outpoint_offset + uint256::size(),
+                      decoded.claim_outpoint.hash.begin());
+            decoded.claim_outpoint.n = ReadLE32(
+                proof.data() + outpoint_offset + uint256::size());
+            if (decoded.claim_outpoint.IsNull()) return false;
         }
         const size_t target_size = ReadLE16(proof.data() + script_header);
         size_t cursor = script_header + 2;
@@ -2047,19 +2096,26 @@ bool DecodeProof(const valtype& proof, ShadowProof& decoded)
            !decoded.payout_script.empty() && !decoded.payout_script.IsUnspendable();
 }
 
-bool ComputeShadowProofHash(const CScript& target, const CScript& payout_script, int height, const uint256& prev_hash, ShadowProofMode mode, uint64_t nonce, uint256& result)
+bool ComputeShadowProofHash(const CScript& target, const CScript& payout_script,
+                            int height, const uint256& prev_hash,
+                            ShadowProofMode mode, uint64_t nonce,
+                            const COutPoint* claim_outpoint, uint256& result)
 {
+    const bool input_bound = claim_outpoint && !claim_outpoint->IsNull();
     CHashWriter ss;
-    ss << std::string("Quantum Quasar QQPROOF POW Argon2id v1");
+    ss << std::string(input_bound
+        ? "Quantum Quasar QQPROOF POW Argon2id v2"
+        : "Quantum Quasar QQPROOF POW Argon2id v1");
     ss << static_cast<unsigned char>(mode);
     ss << nonce;
     ss << height;
     ss << prev_hash;
     ss << target;
     ss << payout_script;
+    if (input_bound) ss << *claim_outpoint;
     const uint256 prehash = ss.GetHash();
 
-    std::array<unsigned char, 80> input{};
+    std::array<unsigned char, 80 + PROOF_V4_OUTPOINT_SIZE> input{};
     auto out = input.begin();
     out = std::copy(prehash.begin(), prehash.end(), out);
     out = std::copy(prev_hash.begin(), prev_hash.end(), out);
@@ -2071,6 +2127,13 @@ bool ComputeShadowProofHash(const CScript& target, const CScript& payout_script,
     *out++ = 'Q';
     *out++ = 'Q';
     *out++ = 'A';
+    if (input_bound) {
+        out = std::copy(claim_outpoint->hash.begin(),
+                        claim_outpoint->hash.end(), out);
+        WriteLE32(&*out, claim_outpoint->n);
+        out += sizeof(uint32_t);
+    }
+    const size_t input_size = input_bound ? input.size() : 80;
 
     std::array<unsigned char, 16> salt{};
     std::copy(prev_hash.begin(), prev_hash.begin() + salt.size(), salt.begin());
@@ -2090,7 +2153,7 @@ bool ComputeShadowProofHash(const CScript& target, const CScript& payout_script,
         SHADOW_ARGON2_MEMORY_KIB,
         SHADOW_ARGON2_LANES,
         input.data(),
-        input.size(),
+        input_size,
         salt.data(),
         salt.size(),
         result.begin(),
@@ -2144,9 +2207,44 @@ valtype EncodeProofPayloadV3(ShadowProofMode mode, uint64_t nonce,
     return proof;
 }
 
+valtype EncodeProofPayloadV4(ShadowProofMode mode, uint64_t nonce,
+                             uint32_t origin_height,
+                             const uint256& origin_previous_block_hash,
+                             const COutPoint& claim_outpoint,
+                             const CScript& target,
+                             const CScript& quantum_payout_script)
+{
+    valtype proof(PROOF_SIZE + PROOF_V4_CONTEXT_SIZE + 4 + target.size() +
+                  quantum_payout_script.size());
+    std::copy(PROOF_MAGIC_V4.begin(), PROOF_MAGIC_V4.end(), proof.begin());
+    proof[4] = static_cast<unsigned char>(mode);
+    WriteLE64(proof.data() + 5, nonce);
+    WriteLE32(proof.data() + PROOF_SIZE, origin_height);
+    std::copy(origin_previous_block_hash.begin(),
+              origin_previous_block_hash.end(),
+              proof.begin() + PROOF_SIZE + sizeof(uint32_t));
+    const size_t outpoint_offset = PROOF_SIZE + PROOF_V3_ORIGIN_SIZE;
+    std::copy(claim_outpoint.hash.begin(), claim_outpoint.hash.end(),
+              proof.begin() + outpoint_offset);
+    WriteLE32(proof.data() + outpoint_offset + uint256::size(),
+              claim_outpoint.n);
+    const size_t script_header = PROOF_SIZE + PROOF_V4_CONTEXT_SIZE;
+    WriteLE16(proof.data() + script_header,
+              static_cast<uint16_t>(target.size()));
+    auto cursor = proof.begin() + script_header + 2;
+    cursor = std::copy(target.begin(), target.end(), cursor);
+    WriteLE16(&*cursor, static_cast<uint16_t>(quantum_payout_script.size()));
+    cursor += 2;
+    std::copy(quantum_payout_script.begin(), quantum_payout_script.end(), cursor);
+    return proof;
+}
+
 ShadowProofValidationResult ValidateQQProofAtBits(const valtype& proof, int height,
                                                   const uint256& prev_hash,
                                                   unsigned int target_bits,
+                                                  bool require_qqp4,
+                                                  bool q3_active_at_proof_height,
+                                                  bool q4_active_at_proof_height,
                                                   ShadowProof& decoded_out,
                                                   unsigned int& proof_evals,
                                                   bool& proof_limit_exceeded)
@@ -2155,9 +2253,31 @@ ShadowProofValidationResult ValidateQQProofAtBits(const valtype& proof, int heig
     if (!DecodeProof(proof, decoded)) return ShadowProofValidationResult::INVALID;
     if (decoded.mode != ShadowProofMode::POW) return ShadowProofValidationResult::INVALID;
     if (!decoded.quantum_linked) return ShadowProofValidationResult::INVALID;
-    if (decoded.origin_bound &&
-        (!Params().GetConsensus().IsShadowCompetingClaimsActive(height) ||
-         decoded.origin_height != static_cast<uint32_t>(height) ||
+    // The existing 5,993,200 canonical-accounting boundary is QQP3, not
+    // QQP4. Preserve v30.1.0's byte-exact QQP2/QQP3 admission and late-origin
+    // behavior through that boundary. QQP4 becomes mandatory only after its
+    // separately scheduled consensus activation.
+    if (require_qqp4) {
+        if (decoded.version != 4 || !decoded.origin_bound ||
+            !decoded.input_bound || decoded.origin_height == 0 ||
+            decoded.origin_previous_block_hash.IsNull() ||
+            decoded.claim_outpoint.IsNull() ||
+            !q4_active_at_proof_height) {
+            return ShadowProofValidationResult::INVALID;
+        }
+    } else {
+        if (decoded.version == 4 || decoded.input_bound) {
+            return ShadowProofValidationResult::INVALID;
+        }
+        if (decoded.origin_bound &&
+            (!q3_active_at_proof_height ||
+             decoded.origin_height != static_cast<uint32_t>(height) ||
+             decoded.origin_previous_block_hash != prev_hash)) {
+            return ShadowProofValidationResult::INVALID;
+        }
+    }
+    if (require_qqp4 &&
+        (decoded.origin_height != static_cast<uint32_t>(height) ||
          decoded.origin_previous_block_hash != prev_hash)) {
         return ShadowProofValidationResult::INVALID;
     }
@@ -2171,7 +2291,11 @@ ShadowProofValidationResult ValidateQQProofAtBits(const valtype& proof, int heig
     ++proof_evals;
 
     uint256 proof_hash;
-    if (!ComputeShadowProofHash(decoded.target, decoded.payout_script, height, prev_hash, decoded.mode, decoded.nonce, proof_hash)) {
+    const COutPoint* claim_outpoint = decoded.input_bound
+        ? &decoded.claim_outpoint : nullptr;
+    if (!ComputeShadowProofHash(decoded.target, decoded.payout_script, height,
+                                prev_hash, decoded.mode, decoded.nonce,
+                                claim_outpoint, proof_hash)) {
         return ShadowProofValidationResult::LOCAL_INTERNAL_ERROR;
     }
     if (!HashMeetsLeadingZeroBits(proof_hash, target_bits)) return ShadowProofValidationResult::INVALID;
@@ -2187,7 +2311,11 @@ ShadowProofValidationResult ValidateQQProofAt(const valtype& proof, int height,
                                               bool& proof_limit_exceeded)
 {
     return ValidateQQProofAtBits(proof, height, prev_hash,
-        RetargetedBits(ShadowProofMode::POW, pool, height), decoded_out,
+        RetargetedBits(ShadowProofMode::POW, pool, height),
+        Params().GetConsensus().IsShadowQQP4Active(height),
+        Params().GetConsensus().IsShadowCompetingClaimsActive(height),
+        Params().GetConsensus().IsShadowQQP4Active(height),
+        decoded_out,
         proof_evals, proof_limit_exceeded);
 }
 
@@ -2262,6 +2390,21 @@ bool TxSpendsFromScript(const CTransaction& tx, size_t tx_index, const CBlockUnd
         if (input_script && IsLegacyShadowTargetScript(*input_script) && CanonicalLegacyStakeScript(*input_script) == canonical_script) return true;
     }
     return false;
+}
+
+bool TxSpendsBoundOutpointFromScript(const CTransaction& tx, size_t tx_index,
+                                     const CBlockUndo* blockundo,
+                                     const COutPoint& claim_outpoint,
+                                     const CScript& script)
+{
+    if (claim_outpoint.IsNull() || tx.vin.size() != 1 ||
+        tx.vin.front().prevout != claim_outpoint) {
+        return false;
+    }
+    const CScript* input_script = GetInputScript(blockundo, tx_index, 0);
+    return input_script && IsLegacyShadowTargetScript(*input_script) &&
+           CanonicalLegacyStakeScript(*input_script) ==
+               CanonicalLegacyStakeScript(script);
 }
 
 enum class ShadowBaseFeeResult {
@@ -2692,6 +2835,8 @@ ShadowPowClaimResult FindLegacyPowShadowClaims(const CBlock& block, const CBlock
     // blocks. A proof accidentally included by a proof-of-work block remains a
     // legacy-visible transaction, but it is not a Gold Rush payout venue.
     if (!block.IsProofOfStake()) return result;
+    const bool qqp4_active = pindex &&
+        Params().GetConsensus().IsShadowQQP4Active(pindex->nHeight);
     for (size_t tx_index = 0; tx_index < block.vtx.size(); ++tx_index) {
         const auto& ptx = block.vtx[tx_index];
         const CTransaction& tx = *ptx;
@@ -2704,7 +2849,8 @@ ShadowPowClaimResult FindLegacyPowShadowClaims(const CBlock& block, const CBlock
         for (const CTxOut& out : tx.vout) {
             const auto proof = ExtractProofPayload(out.scriptPubKey);
             if (!proof) continue;
-            const ShadowProofPayloadMode payload_mode = ClassifyProofPayloadMode(*proof);
+            const ShadowProofPayloadMode payload_mode =
+                ClassifyProofPayloadMode(*proof, qqp4_active);
             if (payload_mode == ShadowProofPayloadMode::POS) {
                 result.wrong_mode_claim = true;
             } else if (payload_mode == ShadowProofPayloadMode::UNKNOWN) {
@@ -2751,15 +2897,33 @@ struct CanonicalPowCandidate {
     CAmount base_fee{0};
 };
 
-uint256 CanonicalPowCandidateRank(int height, const uint256& previous_block_hash,
-                                 const uint256& txid, uint32_t output_index,
-                                 const valtype& proof)
+uint256 CanonicalPowCandidateRankV1(int height,
+                                   const uint256& previous_block_hash,
+                                   const uint256& txid,
+                                   uint32_t output_index,
+                                   const valtype& proof)
 {
     CHashWriter ss;
+    // This is the deployed v30.1.0 canonical rank. It must remain byte-for-
+    // byte stable at and after the existing QQP3 boundary.
     ss << std::string("Quantum Quasar Canonical POW Claim Rank v1")
        << height
        << previous_block_hash
        << txid << output_index << proof;
+    return ss.GetHash();
+}
+
+uint256 CanonicalPowCandidateRankV2(int height,
+                                   const uint256& previous_block_hash,
+                                   const valtype& proof)
+{
+    CHashWriter ss;
+    // QQP4 binds an exact input into the proof work. Its separately activated
+    // rank therefore excludes mutable carrier-transaction bytes.
+    ss << std::string("Quantum Quasar Canonical POW Claim Rank v2")
+       << height
+       << previous_block_hash
+       << proof;
     return ss.GetHash();
 }
 
@@ -2792,18 +2956,23 @@ std::vector<CanonicalPowCandidate> SelectCanonicalPowCandidates(
             const auto extracted = ExtractProofPayload(
                 tx.vout[output_pos].scriptPubKey);
             if (!extracted ||
-                ClassifyProofPayloadMode(*extracted) ==
+                ClassifyProofPayloadMode(*extracted,
+                                         context.qqp4_rule_active) ==
                     ShadowProofPayloadMode::POS ||
-                ClassifyProofPayloadMode(*extracted) ==
+                ClassifyProofPayloadMode(*extracted,
+                                         context.qqp4_rule_active) ==
                     ShadowProofPayloadMode::UNKNOWN ||
                 output_pos > std::numeric_limits<uint32_t>::max()) continue;
             CanonicalPowCandidate candidate;
             candidate.tx_index = tx_index;
             candidate.output_index = static_cast<uint32_t>(output_pos);
             candidate.txid = tx.GetHash();
-            candidate.rank = CanonicalPowCandidateRank(
-                context.height, context.previous_block_hash, candidate.txid,
-                candidate.output_index, *extracted);
+            candidate.rank = context.qqp4_rule_active
+                ? CanonicalPowCandidateRankV2(
+                      context.height, context.previous_block_hash, *extracted)
+                : CanonicalPowCandidateRankV1(
+                      context.height, context.previous_block_hash,
+                      candidate.txid, candidate.output_index, *extracted);
             candidate.proof = *extracted;
             if (candidates.size() < MAX_SHADOW_POW_EVALS_PER_BLOCK) {
                 candidates.push_back(std::move(candidate));
@@ -2889,7 +3058,14 @@ bool FinalizePowClaimAggregate(ShadowPowClaimResult& result,
     if (classified != result.aggregate.observed_count) return false;
 
     CHashWriter commitment;
-    commitment << std::string{"Quantum Quasar Bounded POW Claim Accounting v2"}
+    // QQP3 accounting is already deployed history.  Preserve its exact
+    // domain and byte stream through the existing 5,993,200 boundary.  QQP4
+    // provenance gets an independent v3 commitment only after its own hard
+    // fork; appending fields to the v2 stream would silently change v30.1.0
+    // replay/index commitments.
+    commitment << std::string{context.qqp4_rule_active
+                                  ? "Quantum Quasar Bounded POW Claim Accounting v3"
+                                  : "Quantum Quasar Bounded POW Claim Accounting v2"}
                << context.height << context.previous_block_hash
                << context.credited_pow_pool << context.target_bits
                << observation_commitment
@@ -2912,11 +3088,18 @@ bool FinalizePowClaimAggregate(ShadowPowClaimResult& result,
         commitment << accounting.source_txid << accounting.source_vout
                    << accounting.canonical_rank << accounting.payout_script
                    << accounting.base_fee << accounting.credited_amount
-                   << accounting.base_fee_known << accounting.origin_bound
+                   << accounting.base_fee_known;
+        if (context.qqp4_rule_active) {
+            commitment << accounting.proof_version;
+        }
+        commitment << accounting.origin_bound
                    << accounting.origin_height
                    << accounting.origin_previous_block_hash
-                   << accounting.inclusion_height << accounting.origin_age
-                   << static_cast<uint8_t>(accounting.disposition);
+                   << accounting.inclusion_height << accounting.origin_age;
+        if (context.qqp4_rule_active) {
+            commitment << accounting.input_bound << accounting.claim_outpoint;
+        }
+        commitment << static_cast<uint8_t>(accounting.disposition);
     }
     result.aggregate.accounting_commitment = commitment.GetHash();
     return !result.aggregate.accounting_commitment.IsNull();
@@ -2988,7 +3171,7 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
                 continue;
             }
             const ShadowProofPayloadMode payload_mode =
-                ClassifyProofPayloadMode(proof);
+                ClassifyProofPayloadMode(proof, context.qqp4_rule_active);
             if (payload_mode == ShadowProofPayloadMode::POS ||
                 payload_mode == ShadowProofPayloadMode::UNKNOWN) {
                 result.wrong_mode_claim |=
@@ -3013,9 +3196,12 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
             candidate.tx_index = tx_index;
             candidate.output_index = output_index;
             candidate.txid = txid;
-            candidate.rank = CanonicalPowCandidateRank(
-                context.height, context.previous_block_hash, candidate.txid,
-                output_index, proof);
+            candidate.rank = context.qqp4_rule_active
+                ? CanonicalPowCandidateRankV2(
+                      context.height, context.previous_block_hash, proof)
+                : CanonicalPowCandidateRankV1(
+                      context.height, context.previous_block_hash, candidate.txid,
+                      output_index, proof);
             candidate.proof = std::move(proof);
             if (candidates.size() < MAX_SHADOW_POW_EVALS_PER_BLOCK) {
                 candidates.push_back(std::move(candidate));
@@ -3053,9 +3239,20 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
         accounting.canonical_rank = candidate.rank;
         accounting.inclusion_height = static_cast<uint32_t>(context.height);
 
+        // Preserve the deployed decoder boundary exactly.  Before the
+        // independently scheduled QQP4 fork, v30.1.0 could not decode this
+        // magic at all.  In particular, do not populate provenance or let a
+        // malformed future-format note reach fee/input classification: the
+        // resulting INVALID_PROOF row is part of the v2 commitment stream.
+        if (!context.qqp4_rule_active &&
+            IsQQP4ProofPayload(candidate.proof)) {
+            continue;
+        }
+
         ShadowProof decoded_shape;
         if (!DecodeProof(candidate.proof, decoded_shape)) continue;
         accounting.payout_script = decoded_shape.payout_script;
+        accounting.proof_version = decoded_shape.version;
         accounting.origin_bound = decoded_shape.origin_bound;
         accounting.origin_height = decoded_shape.origin_bound
             ? decoded_shape.origin_height
@@ -3063,6 +3260,18 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
         accounting.origin_previous_block_hash = decoded_shape.origin_bound
             ? decoded_shape.origin_previous_block_hash
             : context.previous_block_hash;
+        accounting.input_bound = decoded_shape.input_bound;
+        accounting.claim_outpoint = decoded_shape.claim_outpoint;
+
+        // QQP4's exact-input rule is a separate future hard fork. Until it
+        // activates, retain the deployed QQP2/QQP3 canonical accounting,
+        // including QQP3 late-origin reimbursement.
+        if (context.qqp4_rule_active &&
+            (decoded_shape.version != 4 || !decoded_shape.origin_bound ||
+             !decoded_shape.input_bound || decoded_shape.claim_outpoint.IsNull())) {
+            accounting.disposition = ShadowPowClaimDisposition::INVALID_PROOF;
+            continue;
+        }
 
         int proof_height = context.height;
         uint256 proof_previous_block_hash = context.previous_block_hash;
@@ -3109,10 +3318,17 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
             }
         }
 
+        // Validation ran before fee/input classification in the deployed
+        // QQP2/QQP3 canonical engine.  Keep that order on both sides of the
+        // fork: it fixes the pre-QQP4 aggregate/disposition byte stream and
+        // also avoids classifying an invalid proof as a fee or input error.
         bool proof_limit_exceeded{false};
         const ShadowProofValidationResult status = ValidateQQProofAtBits(
             candidate.proof, proof_height, proof_previous_block_hash,
-            proof_target_bits, candidate.decoded, proof_evals,
+            proof_target_bits, context.qqp4_rule_active,
+            proof_height >= context.competing_claims_activation_height,
+            proof_height >= context.qqp4_activation_height,
+            candidate.decoded, proof_evals,
             proof_limit_exceeded);
         if (proof_limit_exceeded) {
             result.internal_error = true;
@@ -3137,11 +3353,17 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
         }
         accounting.base_fee = candidate.base_fee;
         accounting.base_fee_known = true;
-        if (!TxSpendsFromScript(tx, candidate.tx_index, blockundo,
-                                candidate.decoded.target)) {
+        const bool spends_bound_input = context.qqp4_rule_active
+            ? TxSpendsBoundOutpointFromScript(
+                  tx, candidate.tx_index, blockundo,
+                  decoded_shape.claim_outpoint, decoded_shape.target)
+            : TxSpendsFromScript(tx, candidate.tx_index, blockundo,
+                                 decoded_shape.target);
+        if (!spends_bound_input) {
             accounting.disposition = ShadowPowClaimDisposition::INPUT_MISMATCH;
             continue;
         }
+
         accounting.disposition = late_origin
             ? ShadowPowClaimDisposition::REIMBURSED_LATE
             : ShadowPowClaimDisposition::REIMBURSED_LOSER;
@@ -3160,7 +3382,8 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
     }
 
     // The first current-origin candidate in canonical rank order wins. Every
-    // other current candidate and every eligible late-origin QQP3 receives
+    // other current candidate and every eligible late-origin QQP3/QQP4 proof
+    // receives
     // only its actual base fee capped at 0.01 BLK. A block containing only
     // late claims leaves the unreimbursed pool remainder accumulated; no late
     // proof can capture the jackpot or reset PoW difficulty.
@@ -4446,6 +4669,12 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
                                              pindex->nHeight);
     context_out.canonical_rule_active =
         consensus.IsShadowCompetingClaimsActive(pindex->nHeight);
+    context_out.qqp4_rule_active = context_out.canonical_rule_active &&
+        consensus.IsShadowQQP4Active(pindex->nHeight);
+    context_out.competing_claims_activation_height =
+        consensus.nShadowCompetingClaimsActivationHeight;
+    context_out.qqp4_activation_height =
+        consensus.nShadowQQP4ActivationHeight;
     context_out.valid = true;
     return ShadowPowAccountingResult::OK;
 }
@@ -4475,9 +4704,28 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
     for (const CanonicalPowCandidate& candidate : candidates) {
         ShadowProof decoded;
         if (!DecodeProof(candidate.proof, decoded) || !decoded.origin_bound ||
-            decoded.origin_height >= static_cast<uint32_t>(context_out.height) ||
-            !consensus.IsShadowCompetingClaimsActive(
-                static_cast<int>(decoded.origin_height))) continue;
+            decoded.origin_height >= static_cast<uint32_t>(context_out.height)) {
+            continue;
+        }
+        if (context_out.qqp4_rule_active) {
+            // QQP4 makes the exact input part of the proof work. Do not look
+            // up historical state for a retired QQP2/QQP3 candidate once the
+            // future QQP4 hard fork is active.
+            if (decoded.version != 4 || !decoded.input_bound ||
+                decoded.claim_outpoint.IsNull() ||
+                !consensus.IsShadowQQP4Active(
+                    static_cast<int>(decoded.origin_height))) {
+                continue;
+            }
+        } else {
+            // The v30.1.0 canonical boundary accepts QQP3 origins, exactly as
+            // deployed. QQP4 remains non-consensus data until its own fork.
+            if (decoded.version != 3 || decoded.input_bound ||
+                !consensus.IsShadowCompetingClaimsActive(
+                    static_cast<int>(decoded.origin_height))) {
+                continue;
+            }
+        }
         const uint32_t age = static_cast<uint32_t>(context_out.height) -
                              decoded.origin_height;
         if (age > SHADOW_POW_LATE_ORIGIN_WINDOW) continue;
@@ -5085,7 +5333,8 @@ bool UndoSpentGoldRushPayouts(CCoinsViewCache& view, const CBlock& block,
         const CTransactionRef& tx = block.vtx[tx_pos];
         const CTxUndo& tx_undo = block_undo.vtxundo[tx_pos - 1];
         if (tx_undo.vprevout.size() != tx->vin.size()) return false;
-        for (size_t input_pos = tx->vin.size(); input_pos-- > 0;) {
+        for (size_t input_pos = tx->vin.size(); input_pos > 0;) {
+            --input_pos;
             const CTxIn& input = tx->vin[input_pos];
             const Coin& undo_coin = tx_undo.vprevout[input_pos];
             const uint32_t input_index = static_cast<uint32_t>(input_pos);
@@ -5156,15 +5405,39 @@ const std::vector<unsigned char>& GetShadowPrefix()
     return SHADOW_PREFIX;
 }
 
+size_t GetShadowPowProofPayloadSize(int height, size_t target_script_size,
+                                    size_t payout_script_size)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const size_t context_size = consensus.IsShadowQQP4Active(height)
+        ? PROOF_V4_CONTEXT_SIZE
+        : (consensus.IsShadowCompetingClaimsActive(height)
+               ? PROOF_V3_ORIGIN_SIZE : 0);
+    return SHADOW_PREFIX.size() + PROOF_SIZE + context_size + 4 +
+           target_script_size + payout_script_size;
+}
+
 ShadowProofPayloadMode ClassifyShadowProofPayload(const std::vector<unsigned char>& prefixed_proof)
+{
+    // This context-free helper is intentionally legacy-shaped. Callers that
+    // know the block/next-block activation must use the overload below, so a
+    // historical explorer read never retroactively relabels QQP4 bytes as a
+    // v30.1.0 PoW/POS payload.
+    return ClassifyShadowProofPayload(prefixed_proof, /*qqp4_active=*/false);
+}
+
+ShadowProofPayloadMode ClassifyShadowProofPayload(
+    const std::vector<unsigned char>& prefixed_proof, bool qqp4_active)
 {
     if (prefixed_proof.size() <= SHADOW_PREFIX.size() ||
         !std::equal(SHADOW_PREFIX.begin(), SHADOW_PREFIX.end(),
                     prefixed_proof.begin())) {
         return ShadowProofPayloadMode::MALFORMED;
     }
-    return ClassifyProofPayloadMode(valtype{
-        prefixed_proof.begin() + SHADOW_PREFIX.size(), prefixed_proof.end()});
+    return ClassifyProofPayloadMode(
+        valtype{prefixed_proof.begin() + SHADOW_PREFIX.size(),
+                prefixed_proof.end()},
+        qqp4_active);
 }
 
 void SetShadowArgon2FailuresForTesting(uint64_t count)
@@ -5201,14 +5474,33 @@ bool TransactionHasShadowProof(const CTransaction& tx)
     return false;
 }
 
+std::optional<COutPoint> GetShadowPowProofBoundOutpoint(
+    const CTransaction& tx)
+{
+    std::optional<COutPoint> bound_outpoint;
+    for (const CTxOut& out : tx.vout) {
+        const std::optional<valtype> proof =
+            ExtractProofPayload(out.scriptPubKey);
+        if (!proof) continue;
+        if (bound_outpoint) return std::nullopt;
+        ShadowProof decoded;
+        if (!DecodeProof(*proof, decoded) || !decoded.input_bound) {
+            return std::nullopt;
+        }
+        bound_outpoint = decoded.claim_outpoint;
+    }
+    return bound_outpoint;
+}
+
 std::vector<ShadowProofObservation> GetShadowProofObservations(const CBlock& block)
 {
     ShadowProofObservationSummary summary;
     return GetShadowProofObservations(block, summary);
 }
 
-std::vector<ShadowProofObservation> GetShadowProofObservations(
-    const CBlock& block, ShadowProofObservationSummary& summary)
+static std::vector<ShadowProofObservation> GetShadowProofObservationsImpl(
+    const CBlock& block, bool qqp4_active,
+    ShadowProofObservationSummary& summary)
 {
     summary = {};
     std::vector<ShadowProofObservation> observations;
@@ -5244,8 +5536,8 @@ std::vector<ShadowProofObservation> GetShadowProofObservations(
             if (observations.size() < MAX_SHADOW_POW_EVALS_PER_BLOCK) {
                 observations.push_back(ShadowProofObservation{
                     tx.GetHash(), output_index,
-                    ClassifyProofPayloadMode(*proof), fee_paying_location,
-                    duplicate});
+                    ClassifyProofPayloadMode(*proof, qqp4_active),
+                    fee_paying_location, duplicate});
             }
         }
     }
@@ -5253,6 +5545,21 @@ std::vector<ShadowProofObservation> GetShadowProofObservations(
     summary.omitted_count = summary.observed_count - summary.returned_count;
     summary.commitment = commitment.GetHash();
     return observations;
+}
+
+std::vector<ShadowProofObservation> GetShadowProofObservations(
+    const CBlock& block, ShadowProofObservationSummary& summary)
+{
+    return GetShadowProofObservationsImpl(
+        block, /*qqp4_active=*/false, summary);
+}
+
+std::vector<ShadowProofObservation> GetShadowProofObservations(
+    const CBlock& block, const Consensus::Params& consensus, int block_height,
+    ShadowProofObservationSummary& summary)
+{
+    return GetShadowProofObservationsImpl(
+        block, consensus.IsShadowQQP4Active(block_height), summary);
 }
 
 bool IsAuthenticatedShadowMarkerOutpoint(const COutPoint& outpoint, const Coin& coin, const CBlockIndex* pindexTip)
@@ -5976,9 +6283,12 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
         return ShadowProofValidationResult::INVALID;
     }
 
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const bool require_qqp4 = consensus.IsShadowQQP4Active(height);
     unsigned int proof_evals = 0;
     bool proof_limit_exceeded = false;
-    const ShadowProofPayloadMode payload_mode = ClassifyProofPayloadMode(proofs.front());
+    const ShadowProofPayloadMode payload_mode =
+        ClassifyProofPayloadMode(proofs.front(), require_qqp4);
     if (payload_mode == ShadowProofPayloadMode::POS) {
         reject_reason = "shadow-proof-wrong-mode-pos";
         return ShadowProofValidationResult::INVALID;
@@ -5988,9 +6298,26 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
         return ShadowProofValidationResult::INVALID;
     }
 
+    // v30.1.0 did not recognize QQP4 magic at all. Preserve its policy
+    // surface before the fork rather than turning a future-format carrier
+    // into a distinct "version" rejection.
+    if (!require_qqp4 && IsQQP4ProofPayload(proofs.front())) {
+        reject_reason = "shadow-proof-invalid";
+        return ShadowProofValidationResult::INVALID;
+    }
+
     ShadowProof decoded_shape;
     if (!DecodeProof(proofs.front(), decoded_shape)) {
         reject_reason = "shadow-proof-invalid";
+        return ShadowProofValidationResult::INVALID;
+    }
+
+    if ((require_qqp4 &&
+         (decoded_shape.version != 4 || !decoded_shape.origin_bound ||
+          !decoded_shape.input_bound || decoded_shape.claim_outpoint.IsNull())) ||
+        (!require_qqp4 &&
+         (decoded_shape.version == 4 || decoded_shape.input_bound))) {
+        reject_reason = "shadow-proof-version";
         return ShadowProofValidationResult::INVALID;
     }
 
@@ -5999,9 +6326,12 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
     unsigned int proof_target_bits = RetargetedBits(
         ShadowProofMode::POW, pool, height);
     if (decoded_shape.origin_bound) {
-        const Consensus::Params& consensus = Params().GetConsensus();
-        if (!consensus.IsShadowCompetingClaimsActive(
-                static_cast<int>(decoded_shape.origin_height)) ||
+        const bool origin_format_active = require_qqp4
+            ? consensus.IsShadowQQP4Active(
+                  static_cast<int>(decoded_shape.origin_height))
+            : consensus.IsShadowCompetingClaimsActive(
+                  static_cast<int>(decoded_shape.origin_height));
+        if (!origin_format_active ||
             decoded_shape.origin_height > static_cast<uint32_t>(height)) {
             reject_reason = "shadow-proof-origin-mismatch";
             return ShadowProofValidationResult::INVALID;
@@ -6047,7 +6377,10 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
     ShadowProof decoded;
     const ShadowProofValidationResult status = ValidateQQProofAtBits(
         proofs.front(), proof_height, proof_previous_block_hash,
-        proof_target_bits, decoded, proof_evals, proof_limit_exceeded);
+        proof_target_bits, require_qqp4,
+        consensus.IsShadowCompetingClaimsActive(proof_height),
+        consensus.IsShadowQQP4Active(proof_height),
+        decoded, proof_evals, proof_limit_exceeded);
     if (proof_limit_exceeded) {
         reject_reason = "shadow-proof-limit";
         return ShadowProofValidationResult::INVALID;
@@ -6059,14 +6392,26 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
         return status;
     }
 
-    bool spends_target = false;
     const CScript canonical_target = CanonicalLegacyStakeScript(decoded.target);
-    for (const CTxIn& txin : tx.vin) {
-        Coin coin;
-        if (view.GetCoin(txin.prevout, coin) && !coin.IsSpent() &&
-            CanonicalLegacyStakeScript(coin.out.scriptPubKey) == canonical_target) {
-            spends_target = true;
-            break;
+    bool spends_target{false};
+    if (decoded.input_bound) {
+        if (tx.vin.size() == 1 &&
+            tx.vin.front().prevout == decoded.claim_outpoint) {
+            Coin coin;
+            spends_target = view.GetCoin(decoded.claim_outpoint, coin) &&
+                !coin.IsSpent() && IsLegacyShadowTargetScript(coin.out.scriptPubKey) &&
+                CanonicalLegacyStakeScript(coin.out.scriptPubKey) ==
+                    canonical_target;
+        }
+    } else {
+        for (const CTxIn& txin : tx.vin) {
+            Coin coin;
+            if (view.GetCoin(txin.prevout, coin) && !coin.IsSpent() &&
+                CanonicalLegacyStakeScript(coin.out.scriptPubKey) ==
+                    canonical_target) {
+                spends_target = true;
+                break;
+            }
         }
     }
     if (!spends_target) {
@@ -6288,7 +6633,7 @@ bool IsWhitelisted(const CCoinsViewCache& view, const CScript& scriptPubKey)
             return true;
         }
         // v30.1.0/v30.1.1 prerelease cache bridge. The sharded manifest below
-        // remains authoritative, and schema-11 replay rewrites this as v3.
+        // remains authoritative, and schema-12 replay rewrites this as v3.
         if (member_payload.size() == 1 + 3 * uint256::size() && member_payload[0] == 2) {
             uint256 snapshot_hash;
             uint256 manifest_hash;
@@ -6353,7 +6698,23 @@ bool MineShadowProofData(const CScript& target, const CScript& quantum_payout_sc
     return MineShadowProofDataRange(target, quantum_payout_script, pindexPrev, view, 0, 1, max_tries, data_out);
 }
 
-ShadowPowWork PrepareShadowPowWork(const CScript& target, const CScript& quantum_payout_script, const CBlockIndex* pindexPrev, const CCoinsViewCache& view)
+bool MineShadowProofData(const CScript& target,
+                         const CScript& quantum_payout_script,
+                         const COutPoint& claim_outpoint,
+                         const CBlockIndex* pindexPrev,
+                         const CCoinsViewCache& view, uint64_t max_tries,
+                         std::vector<unsigned char>& data_out)
+{
+    return MineShadowProofDataRange(target, quantum_payout_script,
+                                    claim_outpoint, pindexPrev, view, 0, 1,
+                                    max_tries, data_out);
+}
+
+ShadowPowWork PrepareShadowPowWork(const CScript& target,
+                                   const CScript& quantum_payout_script,
+                                   const COutPoint& claim_outpoint,
+                                   const CBlockIndex* pindexPrev,
+                                   const CCoinsViewCache& view)
 {
     ShadowPowWork work;
     if (!pindexPrev) return work;
@@ -6364,9 +6725,13 @@ ShadowPowWork PrepareShadowPowWork(const CScript& target, const CScript& quantum
     if (IsQuantumMigrationScript(canonical_target) || IsQuantumColdStakeScript(canonical_target) || IsEUTXOScript(canonical_target)) return work;
     if (!IsDirectQuantumMigrationScript(quantum_payout_script)) return work;
     if (canonical_target.size() > std::numeric_limits<uint16_t>::max() || quantum_payout_script.size() > std::numeric_limits<uint16_t>::max()) return work;
-    work.origin_bound = Params().GetConsensus().IsShadowCompetingClaimsActive(height);
-    const size_t origin_size = work.origin_bound ? PROOF_V3_ORIGIN_SIZE : 0;
-    if (SHADOW_PREFIX.size() + PROOF_SIZE + origin_size + 4 +
+    const Consensus::Params& consensus = Params().GetConsensus();
+    work.origin_bound = consensus.IsShadowCompetingClaimsActive(height);
+    work.input_bound = consensus.IsShadowQQP4Active(height);
+    if (work.input_bound && claim_outpoint.IsNull()) return work;
+    const size_t context_size = work.input_bound ? PROOF_V4_CONTEXT_SIZE
+        : (work.origin_bound ? PROOF_V3_ORIGIN_SIZE : 0);
+    if (SHADOW_PREFIX.size() + PROOF_SIZE + context_size + 4 +
         canonical_target.size() + quantum_payout_script.size() >
         MAX_SCRIPT_ELEMENT_SIZE) return work;
 
@@ -6384,8 +6749,18 @@ ShadowPowWork PrepareShadowPowWork(const CScript& target, const CScript& quantum
     work.quantum_payout_script = quantum_payout_script;
     work.height = height;
     work.prev_hash = pindexPrev->GetBlockHash();
+    if (work.input_bound) work.claim_outpoint = claim_outpoint;
     work.valid = true;
     return work;
+}
+
+ShadowPowWork PrepareShadowPowWork(const CScript& target,
+                                   const CScript& quantum_payout_script,
+                                   const CBlockIndex* pindexPrev,
+                                   const CCoinsViewCache& view)
+{
+    return PrepareShadowPowWork(target, quantum_payout_script, COutPoint{},
+                                pindexPrev, view);
 }
 
 ShadowPowGrindResult GrindShadowPowWorkDetailed(const ShadowPowWork& work, uint64_t start_nonce, uint64_t nonce_step, uint64_t max_tries, std::vector<unsigned char>& data_out, uint64_t* tries_done)
@@ -6394,25 +6769,42 @@ ShadowPowGrindResult GrindShadowPowWorkDetailed(const ShadowPowWork& work, uint6
     data_out.clear();
     if (tries_done) *tries_done = 0;
     if (!work.valid || nonce_step == 0 || max_tries == 0) return ShadowPowGrindResult::INVALID_WORK;
-    if (work.origin_bound !=
-        Params().GetConsensus().IsShadowCompetingClaimsActive(work.height)) {
+    // A work item is an off-chain mining artifact.  Consensus activation is
+    // enforced when the resulting claim enters mempool/block validation; the
+    // work verifier only checks that its self-contained version flags are
+    // coherent.  This also permits explicit regtest schedules without making
+    // the helper depend on the process-global chain parameters.
+    if ((work.input_bound && !work.origin_bound) ||
+        (work.input_bound && work.claim_outpoint.IsNull())) {
         return ShadowPowGrindResult::INVALID_WORK;
     }
     uint64_t nonce = start_nonce;
     for (uint64_t tries = 0; tries < max_tries; ++tries) {
         if (tries_done) *tries_done = tries + 1;
         uint256 proof_hash;
-        if (!ComputeShadowProofHash(work.target, work.quantum_payout_script, work.height, work.prev_hash, ShadowProofMode::POW, nonce, proof_hash)) {
+        const COutPoint* claim_outpoint = work.input_bound
+            ? &work.claim_outpoint : nullptr;
+        if (!ComputeShadowProofHash(work.target, work.quantum_payout_script,
+                                    work.height, work.prev_hash,
+                                    ShadowProofMode::POW, nonce,
+                                    claim_outpoint, proof_hash)) {
             return ShadowPowGrindResult::LOCAL_INTERNAL_ERROR;
         }
         if (HashMeetsLeadingZeroBits(proof_hash, work.bits)) {
-            const valtype payload = work.origin_bound
-                ? EncodeProofPayloadV3(ShadowProofMode::POW, nonce,
+            const valtype payload = work.input_bound
+                ? EncodeProofPayloadV4(ShadowProofMode::POW, nonce,
                                        static_cast<uint32_t>(work.height),
-                                       work.prev_hash, work.target,
+                                       work.prev_hash, work.claim_outpoint,
+                                       work.target,
                                        work.quantum_payout_script)
-                : EncodeProofPayloadV2(ShadowProofMode::POW, nonce, work.target,
-                                       work.quantum_payout_script);
+                : (work.origin_bound
+                    ? EncodeProofPayloadV3(ShadowProofMode::POW, nonce,
+                                           static_cast<uint32_t>(work.height),
+                                           work.prev_hash, work.target,
+                                           work.quantum_payout_script)
+                    : EncodeProofPayloadV2(ShadowProofMode::POW, nonce,
+                                           work.target,
+                                           work.quantum_payout_script));
             data_out = SHADOW_PREFIX;
             data_out.insert(data_out.end(), payload.begin(), payload.end());
             return ShadowPowGrindResult::FOUND;
@@ -6434,8 +6826,8 @@ bool GrindShadowPowWork(const ShadowPowWork& work, uint64_t start_nonce, uint64_
 ShadowProofValidationResult ValidateShadowPowProofForWorkDetailed(const ShadowPowWork& work, const std::vector<unsigned char>& prefixed_proof)
 {
     if (!work.valid) return ShadowProofValidationResult::INVALID;
-    if (work.origin_bound !=
-        Params().GetConsensus().IsShadowCompetingClaimsActive(work.height)) {
+    if ((work.input_bound && !work.origin_bound) ||
+        (work.input_bound && work.claim_outpoint.IsNull())) {
         return ShadowProofValidationResult::INVALID;
     }
     const std::vector<unsigned char>& prefix = GetShadowPrefix();
@@ -6451,14 +6843,22 @@ ShadowProofValidationResult ValidateShadowPowProofForWorkDetailed(const ShadowPo
     if (decoded.mode != ShadowProofMode::POW || !decoded.quantum_linked) return ShadowProofValidationResult::INVALID;
     if (decoded.target != work.target || decoded.payout_script != work.quantum_payout_script) return ShadowProofValidationResult::INVALID;
     if (work.origin_bound != decoded.origin_bound) return ShadowProofValidationResult::INVALID;
+    if (work.input_bound != decoded.input_bound) return ShadowProofValidationResult::INVALID;
     if (decoded.origin_bound &&
         (decoded.origin_height != static_cast<uint32_t>(work.height) ||
          decoded.origin_previous_block_hash != work.prev_hash)) {
         return ShadowProofValidationResult::INVALID;
     }
+    if (decoded.input_bound && decoded.claim_outpoint != work.claim_outpoint) {
+        return ShadowProofValidationResult::INVALID;
+    }
 
     uint256 proof_hash;
-    if (!ComputeShadowProofHash(decoded.target, decoded.payout_script, work.height, work.prev_hash, decoded.mode, decoded.nonce, proof_hash)) {
+    const COutPoint* claim_outpoint = decoded.input_bound
+        ? &decoded.claim_outpoint : nullptr;
+    if (!ComputeShadowProofHash(decoded.target, decoded.payout_script,
+                                work.height, work.prev_hash, decoded.mode,
+                                decoded.nonce, claim_outpoint, proof_hash)) {
         return ShadowProofValidationResult::LOCAL_INTERNAL_ERROR;
     }
     return HashMeetsLeadingZeroBits(proof_hash, work.bits)
@@ -6472,11 +6872,44 @@ bool ValidateShadowPowProofForWork(const ShadowPowWork& work, const std::vector<
            ShadowProofValidationResult::VALID;
 }
 
+bool GetShadowPowProofBoundOutpoint(
+    const std::vector<unsigned char>& prefixed_proof, COutPoint& outpoint_out)
+{
+    const std::vector<unsigned char>& prefix = GetShadowPrefix();
+    if (prefixed_proof.size() <= prefix.size() ||
+        prefixed_proof.size() > MAX_SCRIPT_ELEMENT_SIZE ||
+        !std::equal(prefix.begin(), prefix.end(), prefixed_proof.begin())) {
+        return false;
+    }
+    ShadowProof decoded;
+    const valtype proof(prefixed_proof.begin() + prefix.size(),
+                        prefixed_proof.end());
+    if (!DecodeProof(proof, decoded) || !decoded.input_bound) return false;
+    outpoint_out = decoded.claim_outpoint;
+    return true;
+}
+
 bool MineShadowProofDataRange(const CScript& target, const CScript& quantum_payout_script, const CBlockIndex* pindexPrev, const CCoinsViewCache& view, uint64_t start_nonce, uint64_t nonce_step, uint64_t max_tries, std::vector<unsigned char>& data_out, uint64_t* tries_done)
 {
     // Convenience wrapper (used by the RPC path): prepare under the caller's lock, then grind.
     const ShadowPowWork work = PrepareShadowPowWork(target, quantum_payout_script, pindexPrev, view);
     return GrindShadowPowWork(work, start_nonce, nonce_step, max_tries, data_out, tries_done);
+}
+
+bool MineShadowProofDataRange(const CScript& target,
+                              const CScript& quantum_payout_script,
+                              const COutPoint& claim_outpoint,
+                              const CBlockIndex* pindexPrev,
+                              const CCoinsViewCache& view,
+                              uint64_t start_nonce, uint64_t nonce_step,
+                              uint64_t max_tries,
+                              std::vector<unsigned char>& data_out,
+                              uint64_t* tries_done)
+{
+    const ShadowPowWork work = PrepareShadowPowWork(
+        target, quantum_payout_script, claim_outpoint, pindexPrev, view);
+    return GrindShadowPowWork(work, start_nonce, nonce_step, max_tries,
+                              data_out, tries_done);
 }
 
 static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CBlock& block, const CBlockIndex* pindex, const CBlockUndo* blockundo, bool gold_rush_active)

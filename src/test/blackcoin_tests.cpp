@@ -151,6 +151,11 @@ BOOST_AUTO_TEST_CASE(mainnet_lifecycle_is_height_coherent_and_demurrage_is_autom
         MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT - 1));
     BOOST_CHECK(consensus.IsShadowCompetingClaimsActive(
         MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT));
+    // QQP4 is intentionally not piggy-backed on the deployed QQP3 boundary.
+    // Alpha/beta mainnet must remain on the exact v30.1.0 QQP2/QQP3 wire
+    // rules throughout the whole Gold Rush window.
+    BOOST_CHECK(!consensus.IsShadowQQP4Active(
+        MAINNET_SHADOW_REWARD_END_HEIGHT));
     BOOST_CHECK_EQUAL(SHADOW_HALVING_INTERVAL_BLOCKS, MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS);
 
     // Mainnet phase transitions are height-exact and ignore both fast and
@@ -212,7 +217,7 @@ BOOST_AUTO_TEST_CASE(mainnet_gold_rush_v2_missing_time_is_deterministic)
         bool accepted;
         std::string reject_reason;
     };
-    const auto check_at_mock_time = [&](int coin_time, int64_t mock_time) {
+    const auto check_at_mock_time = [&](uint32_t coin_time, int64_t mock_time) {
         CCoinsView base;
         CCoinsViewCache view{&base};
         const COutPoint outpoint{uint256::ONE, 0};

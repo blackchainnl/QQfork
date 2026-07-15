@@ -29,6 +29,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <limits>
 #include <memory>
@@ -821,7 +822,7 @@ BOOST_FIXTURE_TEST_CASE(script_queue_internal_failure_is_fail_stop_retryable_and
             spend.transaction.vin[0].prevout,
             Coin{spend.spent_output, parent->nHeight,
                  /*coinbase=*/false, /*coinstake=*/false,
-                 static_cast<int>(parent->GetBlockTime())},
+                 static_cast<uint32_t>(parent->GetBlockTime())},
             /*possible_overwrite=*/false);
         return view;
     };

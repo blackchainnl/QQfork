@@ -169,6 +169,10 @@ public:
         consensus.nStakeRewardSplitActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
         consensus.nShadowCompetingClaimsActivationHeight =
             MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
+        // QQP4 is intentionally not activated by this alpha/beta release.
+        // The established QQP3 boundary above remains the only mainnet
+        // competing-claim transition until a separately announced hard fork.
+        consensus.nShadowQQP4ActivationHeight = std::numeric_limits<int>::max();
         consensus.nLastPOWBlock = 10000;
         consensus.nStakeTimestampMask = 0xf; // 15
         consensus.nCoinbaseMaturity = 500;
@@ -688,6 +692,21 @@ public:
                 consensus.nShadowCompetingClaimsActivationHeight,
                 SHADOW_REWARD_START_HEIGHT,
                 SHADOW_REWARD_END_HEIGHT));
+        }
+        consensus.nShadowQQP4ActivationHeight =
+            opts.shadow_qqp4_activation_height.value_or(
+                std::numeric_limits<int>::max());
+        if (opts.shadow_qqp4_activation_height &&
+            (consensus.nShadowQQP4ActivationHeight <
+                 consensus.nShadowCompetingClaimsActivationHeight ||
+             consensus.nShadowQQP4ActivationHeight < SHADOW_REWARD_START_HEIGHT ||
+             consensus.nShadowQQP4ActivationHeight > SHADOW_REWARD_END_HEIGHT)) {
+            throw std::runtime_error(strprintf(
+                "-shadowqqp4height (%d) must be inside the Gold Rush reward window [%d, %d] and not precede -shadowcompetingclaimsheight (%d).",
+                consensus.nShadowQQP4ActivationHeight,
+                SHADOW_REWARD_START_HEIGHT,
+                SHADOW_REWARD_END_HEIGHT,
+                consensus.nShadowCompetingClaimsActivationHeight));
         }
         if (consensus.UsesHeightLifecycle() && consensus.IsQuantumLifecycleScheduleOrdered()) {
             const int automatic_demurrage_height = consensus.nQuantumMigrationEndHeight + 1;

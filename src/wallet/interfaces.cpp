@@ -1369,7 +1369,7 @@ WalletDemurrageInfo GetWalletDemurrageInfo(CWallet& wallet)
         const bool chainstate_backed = coin_it != chain_coins.end() && !coin_it->second.IsSpent();
         Coin coin = chainstate_backed
             ? coin_it->second
-            : Coin{out.txout, out.depth > 0 ? info.tip_height - out.depth + 1 : info.evaluation_height, false, false, static_cast<int>(out.time)};
+            : Coin{out.txout, out.depth > 0 ? info.tip_height - out.depth + 1 : info.evaluation_height, false, false, static_cast<uint32_t>(out.time)};
         const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
             Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
         const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(

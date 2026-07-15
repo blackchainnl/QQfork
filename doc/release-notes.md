@@ -55,7 +55,7 @@ the legacy HD seed, so the backup must be newer than every quantum address it
 is expected to recover. Shut down every old daemon or GUI using the datadir and
 wait for complete shutdown before replacing the binaries.
 
-An existing v30.1.0 datadir requires one explicit authenticated schema-11
+An existing v30.1.0 datadir requires one explicit authenticated schema-12
 chainstate rebuild before staking or mining under v30.1.1:
 
 ```bash
@@ -94,7 +94,7 @@ journal or backup-topology diagnostic appears.
 
 After synchronization, record `getblockchaininfo`, `gettxoutsetinfo muhash`, and
 `getgoldrushstate`. Stop cleanly, restart without a reindex option, and confirm
-that height, best-block hash, UTXO MuHash, Gold Rush totals, and the schema-11
+that height, best-block hash, UTXO MuHash, Gold Rush totals, and the schema-12
 `replay_state` commitment match. At or after the whitelist height, `present`,
 `marker_valid`, and `valid_for_tip` must all be true. Repeat one offline
 chainstate rebuild comparison before enabling networking, staking, or mining.
@@ -131,11 +131,20 @@ sanitizer or changing CRC32C results.
   quantum addresses while preserving legacy-compatible base block rewards during
   the bridge period.
 - Already-mined Gold Rush blocks retain v30.1.0 PoW-claim allocation exactly.
-  From the first scheduled halving at height 5,993,200, competing valid PoW
-  claims are ranked independently of transaction order. Evaluated valid losers
-  recover their actual base fee up to 0.01 BLK from the fixed pool, the canonical
-  winner receives the remainder, and authenticated shadow replay commits to the
-  activation boundary under schema 11.
+  From the first scheduled halving at height 5,993,200, the existing QQP3
+  canonical rule ranks competing valid PoW claims independently of transaction
+  order. QQP3 binds the origin height and parent hash and remains eligible for
+  the bounded late-inclusion path. Current-origin losers and eligible late
+  claims recover their actual base fee up to 0.01 BLK from the fixed pool. Only
+  a current-origin claim can
+  win and reset the jackpot; a late-only block leaves the unreimbursed pool
+  accumulated. Authenticated shadow replay commits to this boundary under
+  schema 12.
+- QQP4 exact-input binding is staged behind a separate consensus activation.
+  It is disabled on mainnet in this beta channel (`INT_MAX`), and no readiness
+  or version bit can activate it. A future activation must publish its own
+  height and demonstrate the Q3 late-claim transition in block, mempool, reorg,
+  and replay tests.
 - Height 5,993,200 is an upgrade deadline for wallets, staking and mining
   nodes, explorers, and indexers that consume shadow state. v30.1.0 and
   v30.1.1 accept the same Gold Rush base blocks but intentionally derive
@@ -143,13 +152,15 @@ sanitizer or changing CRC32C results.
   post-boundary v30.1.1 wallet/datadir in v30.1.0; restore the cold pre-upgrade
   copy for rollback. Base-chain compatibility does not imply identical shadow
   state.
-- Optional shadowindex schema 8 and coinstatsindex schema 3 automatically
+- Optional shadowindex schema 10 and coinstatsindex schema 3 automatically
   invalidate and rebuild incompatible prerelease records derived with the
   superseded height-5,950,000 competing-claim boundary or incomplete
   proof-mode, spend-anchor, or claim-accounting classification. Shadowindex
-  schema 8 persists at most 64 evaluated claim rows per block plus fixed
-  disposition totals and a deterministic commitment to the complete ordered
-  note stream. The corresponding explorer response is versioned as
+  schema 10 persists at most 64 evaluated claim rows per block plus fixed
+  disposition totals, origin/inclusion provenance, and (when QQP4 is
+  separately active) exact fee-input provenance, and a deterministic commitment
+  to the complete ordered note stream. The
+  corresponding explorer response is versioned as
   `blackcoin.shadow.block.v3`; v2's unbounded per-note detail contract is not
   reused with different semantics.
 - Ordinary v14/v16 quantum funding, ML-DSA spends, and larger post-quantum
@@ -194,6 +205,13 @@ sanitizer or changing CRC32C results.
   path.
 - Successful wallet broadcasts refresh mempool state before returning, which
   prevents rapid consecutive sends from observing stale spendability state.
+- PoW claim creation pauses during reindex, import, or initial sync and
+  rechecks the exact tip through commit. A claim that leaves the local mempool
+  remains persisted and keeps its input reserved because a peer may still
+  confirm it. The miner can use distinct inputs on later tips up to the bounded
+  64-claim limit. `abandontransaction` intentionally refuses a quarantined
+  Gold Rush PoW claim; its exact fee input remains reserved until the claim or
+  a conflicting cleanup transaction confirms on chain.
 - Wallet backups reject destinations that resolve to the wallet root itself,
   and failed wallet-dump imports clean up incomplete databases without
   terminating the wallet tool.

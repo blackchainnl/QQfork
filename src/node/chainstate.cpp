@@ -546,6 +546,7 @@ ChainstateLoadResult RecoverInterruptedRebuild(ChainstateManager& chainman)
         // process, but the preserved source must remain until this process has
         // reopened and verified the replacement. FinalizeChainstateRebuild()
         // advances to CLEANUP_READY only after that succeeds.
+        chainman.m_chainstate_rebuild_reopened_committed_this_process = true;
         return {ChainstateLoadStatus::SUCCESS, {}};
     }
 
@@ -601,6 +602,8 @@ ChainstateLoadResult RecoverInterruptedRebuild(ChainstateManager& chainman)
         }
         CleanupTree(BasePartialPath(datadir));
         CleanupTree(SnapshotPartialPath(datadir));
+        chainman.m_chainstate_rebuild_cleanup_completed_this_process = true;
+        LogPrintf("Recovered verified chainstate rebuild cleanup before normal service initialization\n");
         return {ChainstateLoadStatus::SUCCESS, {}};
     }
 
@@ -747,8 +750,11 @@ static ChainstateLoadResult BeginStagedChainstateRebuild(
     AssertLockHeld(::cs_main);
     const fs::path& datadir = chainman.m_options.datadir;
     chainman.m_chainstate_rebuild_interrupted = false;
+    chainman.m_chainstate_rebuild_staged_this_process = false;
     chainman.m_chainstate_rebuild_committed_this_process = false;
+    chainman.m_chainstate_rebuild_reopened_committed_this_process = false;
     chainman.m_chainstate_rebuild_verified_this_process = false;
+    chainman.m_chainstate_rebuild_cleanup_completed_this_process = false;
     RebuildJournal journal{
         2,
         RebuildPhase::PREPARED,
@@ -809,6 +815,7 @@ static ChainstateLoadResult BeginStagedChainstateRebuild(
         return {ChainstateLoadStatus::FAILURE_FATAL,
                 _("Unable to durably enter the chainstate rebuild phase. Preserved backups remain journaled and will be restored on next startup.")};
     }
+    chainman.m_chainstate_rebuild_staged_this_process = true;
     LogPrintf("Staged chainstate rebuild: original databases preserved until rebuilt state commits\n");
     return {ChainstateLoadStatus::SUCCESS, {}};
 }
@@ -1008,10 +1015,15 @@ static ChainstateLoadResult CompleteChainstateInitialization(
 ChainstateLoadResult LoadChainstate(ChainstateManager& chainman, const CacheSizes& cache_sizes,
                                     const ChainstateLoadOptions& options)
 {
-    // A load invalidates any verification result previously obtained through
-    // this manager. COMMIT_READY cleanup requires verification of the state
-    // produced by this exact load operation.
+    // A load establishes a new rebuild lifecycle. None of the outcome flags
+    // may carry across a failed, interrupted, or repeated load on this
+    // manager.
+    chainman.m_chainstate_rebuild_interrupted = false;
+    chainman.m_chainstate_rebuild_staged_this_process = false;
+    chainman.m_chainstate_rebuild_committed_this_process = false;
+    chainman.m_chainstate_rebuild_reopened_committed_this_process = false;
     chainman.m_chainstate_rebuild_verified_this_process = false;
+    chainman.m_chainstate_rebuild_cleanup_completed_this_process = false;
     if (!chainman.AssumedValidBlock().IsNull()) {
         LogPrintf("Assuming ancestors of block %s have valid signatures.\n", chainman.AssumedValidBlock().GetHex());
     } else {
@@ -1301,6 +1313,7 @@ bool FinalizeChainstateRebuild(ChainstateManager& chainman, bilingual_str& error
         CleanupTree(BasePartialPath(datadir));
         CleanupTree(SnapshotPartialPath(datadir));
         DirectoryCommit(datadir);
+        chainman.m_chainstate_rebuild_cleanup_completed_this_process = true;
         LogPrintf("Verified the rebuilt chainstate after restart and retired preserved databases\n");
         return true;
     } catch (const std::exception& e) {

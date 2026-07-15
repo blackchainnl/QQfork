@@ -310,27 +310,15 @@ class AssumeutxoTest(BitcoinTestFramework):
                 self.wait_for_indexes(n, n2_indexes)
 
         self.log.info("Test -reindex-chainstate of an assumeutxo-synced node")
-        self.restart_node(2, extra_args=[
-            '-reindex-chainstate=1', *self.extra_args[2]])
+        self.stop_node(2)
+        self.run_chainstate_rebuild_first_pass(
+            n2, ['-reindex-chainstate=1', *self.extra_args[2]])
         rebuild_journal = n2.chain_path / "chainstate-rebuild.journal"
         rebuild_backup = n2.chain_path / "chainstate.rebuild-backup"
-        self.wait_until(
-            lambda: (
-                rebuild_journal.exists()
-                and "phase=commit-ready\n" in rebuild_journal.read_text()
-            ),
-            timeout=60,
-        )
         assert rebuild_backup.is_dir()
-        assert_equal(n2.getblockchaininfo()["blocks"], FINAL_HEIGHT)
-        assert_equal(n2.getblockcount(), FINAL_HEIGHT)
 
         self.log.info("Verify the rebuilt chainstate before testing full -reindex")
-        self.restart_node(2, extra_args=self.extra_args[2])
-        self.wait_until(
-            lambda: not rebuild_journal.exists() and not rebuild_backup.exists(),
-            timeout=60,
-        )
+        self.restart_after_chainstate_rebuild(2, extra_args=self.extra_args[2])
         assert_equal(n2.getblockcount(), FINAL_HEIGHT)
         self.wait_for_indexes(n2, n2_indexes)
 

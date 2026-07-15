@@ -43,6 +43,11 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
             "-shadowwhitelistheight=1",
             "-shadowgoldrushstartheight=20",
             "-shadowgoldrushblocks=10",
+            # This is an explicit QQP4/index vector.  Keep the Q3 and Q4
+            # schedules independently declared rather than inheriting a
+            # production default.
+            "-shadowcompetingclaimsheight=20",
+            "-shadowqqp4height=20",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
         ]
         self.extra_args = [
@@ -323,6 +328,12 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         payout_address = wallet.getnewquantumaddress()["address"]
         claim = wallet.sendshadowpowclaim(claim_address, payout_address, 500000)
         assert claim["txid"] in self.nodes[0].getrawmempool()
+        raw_claim = self.nodes[0].getrawtransaction(claim["txid"], True)
+        assert_equal(len(raw_claim["vin"]), 1)
+        expected_claim_outpoint = {
+            "txid": raw_claim["vin"][0]["txid"],
+            "vout": raw_claim["vin"][0]["vout"],
+        }
         claim_block_hash = self._mine_pos_block_with_claim(wallet, claim["txid"])
         claim_block_height = self.nodes[0].getblockcount()
         self._wait_index_synced()
@@ -377,6 +388,9 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         assert_equal(claim_accounting["records"][0]["txid"], claim["txid"])
         assert_equal(claim_accounting["records"][0]["disposition"], "winner")
         assert_equal(claim_accounting["records"][0]["synthetic_txid"], payout_utxo["txid"])
+        assert_equal(claim_accounting["records"][0]["proof_version"], 4)
+        assert_equal(claim_accounting["records"][0]["input_bound"], True)
+        assert_equal(claim_accounting["records"][0]["claim_outpoint"], expected_claim_outpoint)
         assert_equal(
             self._amount(claim_accounting["credited_total"]),
             self._amount(claim_shadow["pow_payout_total"]),
@@ -390,6 +404,9 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         assert_equal(payout_record["base_anchor"]["blockhash"], claim_block_hash)
         assert_equal(payout_record["pow_claim_source"]["txid"], claim["txid"])
         assert_equal(payout_record["pow_claim_source"]["disposition"], "winner")
+        assert_equal(payout_record["pow_claim_source"]["proof_version"], 4)
+        assert_equal(payout_record["pow_claim_source"]["input_bound"], True)
+        assert_equal(payout_record["pow_claim_source"]["claim_outpoint"], expected_claim_outpoint)
         address_history = self.nodes[1].getshadowaddress(payout_address)
         assert_equal(address_history["schema"], "blackcoin.shadow.address.v1")
         assert_equal(address_history["address"], payout_address)
@@ -640,14 +657,22 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
             (self.extra_args[1] + ["-reindex-chainstate"], None),
             (
                 self.extra_args[1] + ["-shadowindexmockobsoleteschema=1"],
-                "ShadowIndex: rebuilding incompatible schema version 7 as version 8",
+                "ShadowIndex: rebuilding incompatible schema version 9 as version 10",
             ),
         ):
-            if expected_shadow_log:
+            restart_args = restart_args + [f"-mocktime={self.mock_time}"]
+            if "-reindex-chainstate" in restart_args:
+                self.stop_node(1)
+                self.run_chainstate_rebuild_first_pass(self.nodes[1], restart_args)
+                self.restart_after_chainstate_rebuild(
+                    1,
+                    extra_args=self.extra_args[1] + [f"-mocktime={self.mock_time}"],
+                )
+            elif expected_shadow_log:
                 with self.nodes[1].assert_debug_log([expected_shadow_log], timeout=60):
-                    self.restart_node(1, extra_args=restart_args + [f"-mocktime={self.mock_time}"])
+                    self.restart_node(1, extra_args=restart_args)
             else:
-                self.restart_node(1, extra_args=restart_args + [f"-mocktime={self.mock_time}"])
+                self.restart_node(1, extra_args=restart_args)
             self.nodes[1].setmocktime(self.mock_time)
             self.connect_nodes(0, 1)
             self.sync_blocks()
@@ -667,6 +692,9 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
             assert_equal(rebuilt_claim["records"][0]["txid"], claim["txid"])
             assert_equal(rebuilt_claim["records"][0]["disposition"], "winner")
             assert_equal(rebuilt_claim["records"][0]["synthetic_txid"], payout_utxo["txid"])
+            assert_equal(rebuilt_claim["records"][0]["proof_version"], 4)
+            assert_equal(rebuilt_claim["records"][0]["input_bound"], True)
+            assert_equal(rebuilt_claim["records"][0]["claim_outpoint"], expected_claim_outpoint)
             rebuilt_supply = self.nodes[1].getshadowsupply()
             assert_equal(rebuilt_supply["spent_count"], 1)
             assert_equal(rebuilt_supply["unspent_count"], 0)

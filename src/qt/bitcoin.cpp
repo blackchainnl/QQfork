@@ -107,6 +107,7 @@ static void RegisterMetaTypes()
     qRegisterMetaType<std::function<void()>>("std::function<void()>");
     qRegisterMetaType<QMessageBox::Icon>("QMessageBox::Icon");
     qRegisterMetaType<interfaces::BlockAndHeaderTipInfo>("interfaces::BlockAndHeaderTipInfo");
+    qRegisterMetaType<interfaces::AppInitResult>("interfaces::AppInitResult");
 
 #if (QT_VERSION < QT_VERSION_CHECK(6, 0, 0))
     qRegisterMetaTypeStreamOperators<BitcoinUnit>("BitcoinUnit");
@@ -468,11 +469,21 @@ void BitcoinApplication::requestShutdown()
     Q_EMIT requestedShutdown();
 }
 
-void BitcoinApplication::initializeResult(bool success, interfaces::BlockAndHeaderTipInfo tip_info)
+void BitcoinApplication::initializeResult(interfaces::AppInitResult result, interfaces::BlockAndHeaderTipInfo tip_info)
 {
-    qDebug() << __func__ << ": Initialization result: " << success;
+    qDebug() << __func__ << ": Initialization result: " << static_cast<int>(result);
 
-    if (success) {
+    if (result == interfaces::AppInitResult::REBUILD_RESTART_REQUIRED) {
+        // The isolated first rebuild pass completed safely, but it must exit
+        // before normal GUI models or wallet controllers are created.
+        requestShutdown();
+        return;
+    }
+    if (result == interfaces::AppInitResult::FAILURE) {
+        requestShutdown();
+        return;
+    }
+    {
         delete m_splash;
         m_splash = nullptr;
 
@@ -516,8 +527,6 @@ void BitcoinApplication::initializeResult(bool success, interfaces::BlockAndHead
         }
 #endif
         pollShutdownTimer->start(SHUTDOWN_POLLING_DELAY);
-    } else {
-        requestShutdown();
     }
 }
 

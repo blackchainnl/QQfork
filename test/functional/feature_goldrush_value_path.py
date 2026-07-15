@@ -15,7 +15,7 @@ import time
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 GOLD_RUSH_END_TIME = 2_000_000_000
@@ -39,6 +39,8 @@ class GoldRushValuePathTest(BitcoinTestFramework):
             "-txindex=1",
             "-staketimio=50",
             "-shadowwhitelistheight=1",
+            "-shadowcompetingclaimsheight=2",
+            "-shadowqqp4height=2",
             "-shadowgoldrushblocks=500",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
         ]]
@@ -122,6 +124,40 @@ class GoldRushValuePathTest(BitcoinTestFramework):
     def _is_abandoned(wallet, txid):
         return any(detail.get("abandoned", False) for detail in wallet.gettransaction(txid)["details"])
 
+    def _claim_input(self, txid):
+        decoded = self.nodes[0].decoderawtransaction(
+            self.nodes[0].getrawtransaction(txid)
+        )
+        assert_equal(len(decoded["vin"]), 1)
+        return {"txid": decoded["vin"][0]["txid"], "vout": decoded["vin"][0]["vout"]}
+
+    def _assert_live_reserved_claim(self, wallet, txid, address, claim_input):
+        """A late-eligible claim remains relayable, but its exact fee input stays reserved."""
+        node = self.nodes[0]
+        self.wait_until(lambda: txid in node.getrawmempool(), timeout=20)
+        record = wallet.gettransaction(txid)
+        assert_equal(self._is_abandoned(wallet, txid), False)
+        # Block callbacks pessimistically set this persistent reservation marker
+        # before the scheduler confirms that a still-live claim remains valid.
+        # Its presence must never be treated as permission to make the input
+        # reusable or to create a conflicting cleanup while the claim remains
+        # in the mempool.
+        assert record.get("qq_shadow_pow_quarantine") in (None, "1")
+        assert not any(
+            entry.get("qq_shadow_pow_cleanup_for") == txid
+            for entry in wallet.listtransactions("*", 1000, 0, True)
+        )
+        assert_raises_rpc_error(
+            -5,
+            "Transaction not eligible for abandonment",
+            wallet.abandontransaction,
+            txid,
+        )
+        assert all(
+            {"txid": utxo["txid"], "vout": utxo["vout"]} != claim_input
+            for utxo in wallet.listunspent(1, 9999999, [address])
+        )
+
     def _assert_no_onchain_block_output_to(self, block_hash, address):
         block = self.nodes[0].getblock(block_hash, 2)
         for tx in block["tx"]:
@@ -182,17 +218,17 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         assert claim_entries, "PoW claim target must be visible in wallet Gold Rush status"
         assert_equal(claim_entries[0]["whitelisted"], False)
 
-        self.log.info("A proof-of-work template excludes QQSPROOF so the claimant cannot pay for an ineligible claim")
+        self.log.info("A proof-of-work template excludes QQSPROOF without spending or abandoning the late-eligible claim")
         pow_block_payout = wallet.getnewquantumaddress()["address"]
         pow_block_state_before = node.getgoldrushstate()
         pow_block_claim = wallet.sendshadowpowclaim(claim_address, pow_block_payout, 500000)
+        pow_block_input = self._claim_input(pow_block_claim["txid"])
         assert pow_block_claim["txid"] in node.getrawmempool()
         pow_block_hash = self.generatetoaddress(node, 1, node.get_deterministic_priv_key().address, sync_fun=self.no_op)[0]
         pow_block = node.getblock(pow_block_hash, 2)
         assert "proof-of-work" in pow_block["flags"]
         assert pow_block_claim["txid"] not in [tx["txid"] for tx in pow_block["tx"]]
-        self.wait_until(lambda: pow_block_claim["txid"] not in node.getrawmempool(), timeout=10)
-        self.wait_until(lambda: self._is_abandoned(wallet, pow_block_claim["txid"]), timeout=10)
+        self._assert_live_reserved_claim(wallet, pow_block_claim["txid"], claim_address, pow_block_input)
         self._assert_no_onchain_block_output_to(pow_block_hash, pow_block_payout)
         self._assert_no_quantum_utxo(wallet, pow_block_payout)
         pow_block_state_after = node.getgoldrushstate()
@@ -201,22 +237,36 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         assert_equal(pow_block_state_after["last_pow_height"], pow_block_state_before["last_pow_height"])
         assert pow_block_state_after["pow_amount"] > pow_block_state_before["pow_amount"]
 
-        self.log.info("Disconnecting and reconnecting the proof-of-work block preserves no-credit accounting")
+        self.log.info("Disconnecting and reconnecting the proof-of-work block preserves no-credit accounting and reservation")
         node.invalidateblock(pow_block_hash)
+        self._assert_live_reserved_claim(wallet, pow_block_claim["txid"], claim_address, pow_block_input)
         self._assert_no_quantum_utxo(wallet, pow_block_payout)
         assert_equal(node.getgoldrushstate()["claimed_amount"], pow_block_state_before["claimed_amount"])
         node.reconsiderblock(pow_block_hash)
         self.wait_until(lambda: node.getbestblockhash() == pow_block_hash)
-        self.wait_until(lambda: pow_block_claim["txid"] not in node.getrawmempool(), timeout=10)
-        self.wait_until(lambda: self._is_abandoned(wallet, pow_block_claim["txid"]), timeout=10)
+        self._assert_live_reserved_claim(wallet, pow_block_claim["txid"], claim_address, pow_block_input)
         self._assert_no_quantum_utxo(wallet, pow_block_payout)
         pow_block_state_reconnected = node.getgoldrushstate()
         assert_equal(pow_block_state_reconnected["claimed_amount"], pow_block_state_after["claimed_amount"])
         assert_equal(pow_block_state_reconnected["pow_count"], pow_block_state_after["pow_count"])
         assert_equal(pow_block_state_reconnected["pow_amount"], pow_block_state_after["pow_amount"])
+
+        self.log.info("The retained QQP4 claim can resolve only by later on-chain inclusion")
+        retained_claim_block = self._mine_pos_block_with_claim(
+            wallet, pow_block_claim["txid"]
+        )
+        assert pow_block_claim["txid"] in [
+            tx["txid"] for tx in node.getblock(retained_claim_block, 2)["tx"]
+        ]
+        retained_payout_utxo = self._wait_for_quantum_utxo(
+            wallet, pow_block_payout
+        )
+        assert node.gettxout(
+            retained_payout_utxo["txid"], retained_payout_utxo["vout"], False
+        ) is not None
         self._sync_mocktime_to_tip()
 
-        self.log.info("Broadcasting a fee-paying QQSPROOF claim to a wallet-backed quantum address")
+        self.log.info("Broadcasting a fresh fee-paying QQSPROOF claim for the spendability lifecycle")
         payout_address = wallet.getnewquantumaddress()["address"]
         node.createwallet(
             wallet_name=WATCH_WALLET_NAME,

@@ -18,12 +18,13 @@
 #include <util/strencodings.h>
 
 #include <map>
+#include <limits>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
 
 int ApplyTxInUndo(Coin&& undo, CCoinsViewCache& view, const COutPoint& out);
-void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight, int nBlockTime = 0);
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight, int64_t nBlockTime = 0);
 
 namespace
 {
@@ -816,6 +817,27 @@ BOOST_AUTO_TEST_CASE(ccoins_add)
     CheckAddCoin(VALUE2, VALUE3, VALUE3, DIRTY      , DIRTY      , true );
     CheckAddCoin(VALUE2, VALUE3, FAIL  , DIRTY|FRESH, NO_ENTRY   , false);
     CheckAddCoin(VALUE2, VALUE3, VALUE3, DIRTY|FRESH, DIRTY|FRESH, true );
+}
+
+BOOST_AUTO_TEST_CASE(ccoins_v2_block_time_uint32_boundary)
+{
+    CMutableTransaction mutable_tx;
+    mutable_tx.nVersion = 2;
+    mutable_tx.vin.emplace_back();
+    mutable_tx.vout.emplace_back(1, CScript{});
+    const CTransaction tx{mutable_tx};
+    constexpr int64_t block_time{std::numeric_limits<uint32_t>::max()};
+
+    BOOST_CHECK_EQUAL(GetCoinTime(tx, block_time),
+                      std::numeric_limits<uint32_t>::max());
+
+    CCoinsView base;
+    CCoinsViewCache cache{&base};
+    AddCoins(cache, tx, /*nHeight=*/1, /*check=*/false, block_time);
+
+    Coin coin;
+    BOOST_REQUIRE(cache.GetCoin(COutPoint{tx.GetHash(), 0}, coin));
+    BOOST_CHECK_EQUAL(coin.nTime, std::numeric_limits<uint32_t>::max());
 }
 
 void CheckWriteCoins(CAmount parent_value, CAmount child_value, CAmount expected_value, char parent_flags, char child_flags, char expected_flags)

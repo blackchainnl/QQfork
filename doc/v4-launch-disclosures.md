@@ -30,12 +30,21 @@ quantum address when an upgraded node validates the block.
 
 Through height 5,993,199, the PoW side preserves v30.1.0's first-valid-claim
 allocation. From height 5,993,200, competing valid claims are ranked
-independently of transaction order; evaluated losers recover their capped base
-fee from the fixed pool and the winner receives the remainder. Total shadow
+independently of transaction order under the QQP3 rank-v1 rule. QQP3 binds
+height and parent hash, remains eligible for 64 later blocks on the same
+branch, and reimburses current losers and eligible late claims their capped
+base fee from the fixed pool. Only a
+current-origin claim can win; late-only blocks preserve the pool remainder. Total shadow
 issuance is unchanged. A well-resourced miner can still win more of the PoW
 migration pool than a lightly provisioned miner. The PoW path exists to give
 non-whitelisted and smaller holders a direct quantum-entry path, while the PoS
 side remains snapshot-limited and equalized across active eligible targets.
+
+QQP4 exact-input binding is a separate future consensus change. It is disabled
+on mainnet in this alpha/beta channel and cannot be activated by readiness or
+version-bit signalling. Before it is scheduled, its release must publish an
+explicit height and a tested transition for QQP3 claims that remain eligible
+for late inclusion.
 
 ## Wallet protections and consensus backstops
 

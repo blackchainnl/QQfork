@@ -245,7 +245,10 @@ class CoinStatsIndexTest(BitcoinTestFramework):
 
         self.log.info("Test that the index works with -reindex-chainstate")
 
-        self.restart_node(1, extra_args=["-coinstatsindex", "-reindex-chainstate"])
+        self.stop_node(1)
+        self.run_chainstate_rebuild_first_pass(
+            index_node, ["-coinstatsindex", "-reindex-chainstate"])
+        self.restart_after_chainstate_rebuild(1, extra_args=self.extra_args[1])
         self.sync_index_node()
         res12 = index_node.gettxoutsetinfo('muhash')
         assert_equal(res12, res10)

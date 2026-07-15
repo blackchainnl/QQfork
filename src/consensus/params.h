@@ -150,6 +150,14 @@ struct Params {
     /** Height at which competing Gold Rush proof claims use the canonical,
      *  order-independent winner and bounded loser-fee reimbursement rule. */
     int nShadowCompetingClaimsActivationHeight{std::numeric_limits<int>::max()};
+    /**
+     * Height at which the *new* QQP4 wire format is required for Gold Rush
+     * PoW claims. This is deliberately independent of the existing QQP3
+     * canonical-accounting activation: QQP2/QQP3 behavior at that historical
+     * boundary is consensus history, not a readiness deployment. The max-int
+     * default leaves QQP4 disabled until a separately announced hard fork.
+     */
+    int nShadowQQP4ActivationHeight{std::numeric_limits<int>::max()};
     int nDemurrageActivationHeight{std::numeric_limits<int>::max()};
     int nDemurrageMinActivationHeight{0};
     int nDemurrageBlocksPerMonth{40500};
@@ -275,6 +283,7 @@ struct Params {
     bool IsStakeTiersActive(int nHeight) const { return nHeight >= nStakeTierActivationHeight; }
     bool IsStakeRewardSplitActive(int nHeight) const { return nHeight >= nStakeRewardSplitActivationHeight; }
     bool IsShadowCompetingClaimsActive(int nHeight) const { return nHeight >= nShadowCompetingClaimsActivationHeight; }
+    bool IsShadowQQP4Active(int nHeight) const { return nHeight >= nShadowQQP4ActivationHeight; }
     int EffectiveDemurrageActivationHeight() const
     {
         // A complete height-authoritative lifecycle has one atomic transition:
