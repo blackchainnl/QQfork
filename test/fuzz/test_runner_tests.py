@@ -37,6 +37,12 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
         self.assertEqual(len(data), 89)
         self.assertEqual(data[:4], bytes.fromhex('01800000'))
 
+    def test_mini_miner_minimum_fee_regression_is_exact(self):
+        regression = PINNED_REGRESSION_INPUTS['mini_miner_selection'][0]
+        data = decode_pinned_regression(regression)
+        self.assertEqual(regression['name'], 'contextual-minimum-fee')
+        self.assertEqual(data, bytes.fromhex('02f7'))
+
     def test_corrupt_regression_fails_closed(self):
         with self.assertRaisesRegex(ValueError, 'hash mismatch'):
             decode_pinned_regression({
@@ -53,12 +59,17 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
                 'sha256': '0' * 64,
             })
 
-    def test_required_block_regression_cannot_be_omitted(self):
-        self.assertEqual(missing_pinned_regression_targets([]), ['block'])
-        self.assertEqual(missing_pinned_regression_targets(['transaction']), ['block'])
-        self.assertEqual(missing_pinned_regression_targets(['block']), [])
+    def test_required_regressions_cannot_be_omitted(self):
+        required = ['block', 'mini_miner_selection']
+        self.assertEqual(missing_pinned_regression_targets([]), required)
+        self.assertEqual(missing_pinned_regression_targets(['transaction']), required)
+        self.assertEqual(
+            missing_pinned_regression_targets(['block']),
+            ['mini_miner_selection'],
+        )
+        self.assertEqual(missing_pinned_regression_targets(required), [])
 
-    def test_ordinary_targeted_run_may_omit_pinned_block(self):
+    def test_ordinary_targeted_run_may_omit_pinned_regressions(self):
         help_result = subprocess.CompletedProcess([], 0, stderr='standalone fuzz driver')
         with tempfile.TemporaryDirectory() as corpus_dir:
             (Path(corpus_dir) / 'transaction').mkdir()
@@ -73,7 +84,7 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
         run_once.assert_called_once()
         self.assertEqual(run_once.call_args.kwargs['test_list'], ['transaction'])
 
-    def test_required_run_rejects_absent_or_excluded_block(self):
+    def test_required_run_rejects_absent_or_excluded_regressions(self):
         cases = (
             ('absent', ['test_runner.py', '--require-pinned-regressions', 'corpus', 'transaction']),
             ('excluded', ['test_runner.py', '--require-pinned-regressions', '--exclude', 'block', 'corpus']),
@@ -82,7 +93,7 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
             with self.subTest(name=name):
                 with mock.patch.object(sys, 'argv', argv), \
                         mock.patch('builtins.open', mock.mock_open(read_data=FAKE_CONFIG)), \
-                        mock.patch.object(test_runner, 'parse_test_list', return_value=['block', 'transaction']), \
+                        mock.patch.object(test_runner, 'parse_test_list', return_value=['block', 'mini_miner_selection', 'transaction']), \
                         mock.patch.object(test_runner.subprocess, 'run') as subprocess_run, \
                         mock.patch.object(test_runner, 'run_pinned_regressions') as pinned, \
                         self.assertLogs(level='ERROR'):
@@ -121,15 +132,15 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
             Path(corpus_dir).mkdir()
             Path(merge_dir).mkdir()
             cases = (
-                ('generate', ['test_runner.py', '--require-pinned-regressions', '--generate', corpus_dir, 'block'], 'generate_corpus'),
-                ('merge', ['test_runner.py', '--require-pinned-regressions', '--m_dir', merge_dir, corpus_dir, 'block'], 'merge_inputs'),
+                ('generate', ['test_runner.py', '--require-pinned-regressions', '--generate', corpus_dir, 'block', 'mini_miner_selection'], 'generate_corpus'),
+                ('merge', ['test_runner.py', '--require-pinned-regressions', '--m_dir', merge_dir, corpus_dir, 'block', 'mini_miner_selection'], 'merge_inputs'),
             )
             for name, argv, mode_function in cases:
                 with self.subTest(name=name):
                     calls = []
 
                     def record_pinned(**kwargs):
-                        self.assertEqual(kwargs['targets'], ['block'])
+                        self.assertEqual(kwargs['targets'], ['block', 'mini_miner_selection'])
                         self.assertTrue(kwargs['using_libfuzzer'])
                         calls.append('pinned')
 
@@ -138,7 +149,7 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
 
                     with mock.patch.object(sys, 'argv', argv), \
                             mock.patch('builtins.open', mock.mock_open(read_data=FAKE_CONFIG)), \
-                            mock.patch.object(test_runner, 'parse_test_list', return_value=['block']), \
+                            mock.patch.object(test_runner, 'parse_test_list', return_value=['block', 'mini_miner_selection']), \
                             mock.patch.object(test_runner.subprocess, 'run', return_value=help_result), \
                             mock.patch.object(test_runner, 'run_pinned_regressions', side_effect=record_pinned), \
                             mock.patch.object(test_runner, mode_function, side_effect=record_mode), \

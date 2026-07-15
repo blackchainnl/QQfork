@@ -1,3 +1,5 @@
+#include <coins.h>
+#include <consensus/tx_verify.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
 #include <test/fuzz/util.h>
@@ -14,18 +16,33 @@
 #include <txmempool.h>
 
 #include <deque>
+#include <limits>
+#include <map>
+#include <utility>
 #include <vector>
 
 namespace {
 
 const TestingSetup* g_setup;
 std::deque<COutPoint> g_available_coins;
+std::map<COutPoint, CAmount> g_available_coin_values;
 void initialize_miner()
 {
     static const auto testing_setup = MakeNoLogFileContext<const TestingSetup>();
     g_setup = testing_setup.get();
+    LOCK(::cs_main);
+    auto& chainstate = g_setup->m_node.chainman->ActiveChainstate();
+    const int coin_height{chainstate.m_chain.Height()};
+    constexpr CAmount coin_value{MAX_MONEY / 100000};
     for (uint32_t i = 0; i < uint32_t{100}; ++i) {
-        g_available_coins.emplace_back(uint256::ZERO, i);
+        const COutPoint outpoint{uint256::ZERO, i};
+        g_available_coins.push_back(outpoint);
+        g_available_coin_values.emplace(outpoint, coin_value);
+        chainstate.CoinsTip().AddCoin(
+            outpoint,
+            Coin{CTxOut{coin_value, P2WSH_OP_TRUE}, coin_height,
+                 /*coinbase=*/false, /*coinstake=*/false, /*nTime=*/0},
+            /*possible_overwrite=*/false);
     }
 }
 
@@ -111,7 +128,10 @@ FUZZ_TARGET(mini_miner_selection, .init = initialize_miner)
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
     CTxMemPool pool{CTxMemPool::Options{}};
     // Make a copy to preserve determinism.
-    std::deque<COutPoint> available_coins = g_available_coins;
+    std::deque<std::pair<COutPoint, CAmount>> available_coins;
+    for (const auto& outpoint : g_available_coins) {
+        available_coins.emplace_back(outpoint, g_available_coin_values.at(outpoint));
+    }
     std::vector<CTransactionRef> transactions;
 
     LOCK2(::cs_main, pool.cs);
@@ -121,24 +141,47 @@ FUZZ_TARGET(mini_miner_selection, .init = initialize_miner)
         assert(!available_coins.empty());
         const size_t num_inputs = std::min(size_t{2}, available_coins.size());
         const size_t num_outputs = fuzzed_data_provider.ConsumeIntegralInRange<size_t>(2, 5);
+        CAmount input_value{0};
         for (size_t n{0}; n < num_inputs; ++n) {
-            auto prevout = available_coins.at(0);
+            const auto [prevout, value] = available_coins.front();
             mtx.vin.emplace_back(prevout, CScript());
+            mtx.vin.back().scriptWitness.stack.push_back(WITNESS_STACK_ELEM_OP_TRUE);
+            input_value += value;
             available_coins.pop_front();
         }
+        if (input_value < static_cast<CAmount>(num_outputs)) break;
+        // BlockAssembler contextually rechecks Blackcoin's consensus fee floor.
+        // Build the final transaction shape first, then keep this unchecked
+        // mempool fixture inside the same valid fee range as the oracle.
         for (uint32_t n{0}; n < num_outputs; ++n) {
-            mtx.vout.emplace_back(100, P2WSH_OP_TRUE);
+            mtx.vout.emplace_back(1, P2WSH_OP_TRUE);
+        }
+        const CAmount min_fee{GetMinFee(
+            CTransaction{mtx}, std::numeric_limits<uint32_t>::max())};
+        const CAmount max_fee{std::min<CAmount>(
+            MAX_MONEY / 100000,
+            input_value - static_cast<CAmount>(num_outputs))};
+        if (max_fee < min_fee) break;
+        const CAmount fee{min_fee + ConsumeMoney(
+            fuzzed_data_provider, /*max=*/max_fee - min_fee)};
+        const CAmount output_total{input_value - fee};
+        const CAmount output_value{output_total / static_cast<CAmount>(num_outputs)};
+        const CAmount output_remainder{output_total % static_cast<CAmount>(num_outputs)};
+        for (uint32_t n{0}; n < num_outputs; ++n) {
+            mtx.vout[n].nValue = output_value + (n == 0 ? output_remainder : 0);
         }
         CTransactionRef tx = MakeTransactionRef(mtx);
 
-        // First 2 outputs are available to spend. The rest are added to outpoints to calculate bumpfees.
+        // All but the last output are available to spend. The remainder is
+        // added to outpoints below to calculate bump fees.
         // There is no overlap between spendable coins and outpoints passed to MiniMiner because the
         // MiniMiner interprets spent coins as to-be-replaced and excludes them.
         for (uint32_t n{0}; n < num_outputs - 1; ++n) {
+            const auto available = std::make_pair(COutPoint{tx->GetHash(), n}, tx->vout[n].nValue);
             if (fuzzed_data_provider.ConsumeBool()) {
-                available_coins.emplace_front(tx->GetHash(), n);
+                available_coins.push_front(available);
             } else {
-                available_coins.emplace_back(tx->GetHash(), n);
+                available_coins.push_back(available);
             }
         }
 
@@ -146,7 +189,6 @@ FUZZ_TARGET(mini_miner_selection, .init = initialize_miner)
         // block template reaches that, but the MiniMiner will keep going.
         if (pool.GetTotalTxSize() + GetVirtualTransactionSize(*tx) >= DEFAULT_BLOCK_MAX_WEIGHT) break;
         TestMemPoolEntryHelper entry;
-        const CAmount fee{ConsumeMoney(fuzzed_data_provider, /*max=*/MAX_MONEY/100000)};
         assert(MoneyRange(fee));
         pool.addUnchecked(entry.Fee(fee).FromTx(tx));
         transactions.push_back(tx);

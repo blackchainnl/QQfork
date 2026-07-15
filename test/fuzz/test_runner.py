@@ -29,6 +29,11 @@ PINNED_REGRESSION_INPUTS = {
         ),
         'sha256': '4cc1cc0892fd66dbde05b5b75332caab5f158f31068d368c82bca03b8802b936',
     },),
+    'mini_miner_selection': ({
+        'name': 'contextual-minimum-fee',
+        'base64': 'Avc=',
+        'sha256': '1284a5ab316ad2ff5bf5d6a93ae46ead8605ca02c1270309f088b3bf80187b9e',
+    },),
 }
 
 
