@@ -1282,17 +1282,17 @@ void StakingMiningPage::onAutomationToggled(QCheckBox* control, const std::strin
 
     QString consequence;
     if (setting == "autostartstaking") {
-        consequence = tr("Blackcoin will start staking each time this wallet loads. This affects future wallet loads; it does not unlock an encrypted wallet.");
+        consequence = tr("Blackcoin will start staking for every eligible private-key wallet loaded by this process. This affects future wallet loads; it does not unlock an encrypted wallet.");
     } else if (setting == "powmining") {
-        consequence = tr("Blackcoin will try to start the built-in Gold Rush PoW miner after wallet startup using %1 core(s) at %2% CPU per core. Each successful claim spends a legacy fee UTXO. Startup fails safely if the wallet is locked or no existing payout key is available.")
+        consequence = tr("Blackcoin will try to start the built-in Gold Rush PoW miner for every eligible private-key wallet loaded by this process, using %1 core(s) at %2% CPU per core for each miner. Each successful claim spends a legacy fee UTXO. Startup fails safely for any wallet that is locked or has no existing payout key.")
             .arg(m_pow_cores ? m_pow_cores->value() : 1)
             .arg(m_pow_percent ? m_pow_percent->value() : 1);
     } else if (setting == "qqautoshadowsignal") {
-        consequence = tr("When this wallet is eligible and normally unlocked, Blackcoin may automatically create and broadcast fee-paying QQSIGNAL transactions. This does not activate consensus rules or unlock the wallet.");
+        consequence = tr("For every eligible normally unlocked wallet loaded by this process, Blackcoin may automatically create and broadcast fee-paying QQSIGNAL transactions. This does not activate consensus rules or unlock any wallet.");
     } else if (setting == "qqautodemurrageattest") {
-        consequence = tr("After Final activation, this wallet may automatically create and broadcast fee-paying liveness attestations. Mandatory consensus demurrage and burn are automatic and remain active whether this optional wallet automation is on or off.");
+        consequence = tr("After Final activation, every eligible normally unlocked wallet loaded by this process may automatically create and broadcast fee-paying liveness attestations. Mandatory consensus demurrage and burn are automatic and remain active whether this optional wallet automation is on or off.");
     } else if (setting == "qqautoredelegate") {
-        consequence = tr("Blackcoin may spend eligible delegated outputs and a transaction fee to create a replacement delegation after the configured no-win threshold. Each redelegation creates a new non-HD owner key that requires an immediate wallet backup.");
+        consequence = tr("In every eligible normally unlocked wallet loaded by this process, Blackcoin may spend delegated outputs and a transaction fee to create a replacement delegation after the configured no-win threshold. Each redelegation creates a new non-HD owner key that requires an immediate wallet backup.");
     } else if (setting == "qqallowautokeycreation") {
         consequence = tr("Background wallet tasks may create new non-HD ML-DSA keys. These keys are not recoverable from the wallet seed. You must back up the wallet after every generated key; an older backup cannot recover it.");
     }

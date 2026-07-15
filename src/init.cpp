@@ -1235,14 +1235,6 @@ static bool AppInitMainImpl(NodeContext& node,
     const bool chainstate_verification_pending =
         node::GetChainstateRebuildJournalStatus(args.GetDataDirNet()) ==
         node::ChainstateRebuildJournalStatus::VERIFICATION_PENDING;
-    // The protected rebuild and its separate-process verification must not
-    // expose even a warmup RPC/HTTP endpoint. In particular, a configured
-    // -server would otherwise bind before LoadChainstate() reaches the
-    // journaled handoff. Ordinary startup keeps its existing early warmup
-    // behavior.
-    const bool defer_rpc_startup = args.GetBoolArg("-server", false) &&
-        (requested_chainstate_rebuild || chainstate_verification_pending);
-
     // A command-line/manual rebuild and a service-managed verification restart
     // receive the same fail-closed protection as the GUI assistant. These
     // settings are process-local; command-line, config, and settings.json
@@ -1354,12 +1346,9 @@ static bool AppInitMainImpl(NodeContext& node,
      * that the server is there and will be ready later).  Warmup mode will
      * be disabled when initialisation is finished.
      */
-    const auto start_rpc_servers = [&node] {
+    if (args.GetBoolArg("-server", false)) {
         uiInterface.InitMessage_connect(SetRPCWarmupStatus);
-        return AppInitServers(node);
-    };
-    if (args.GetBoolArg("-server", false) && !defer_rpc_startup) {
-        if (!start_rpc_servers())
+        if (!AppInitServers(node))
             return InitError(_("Unable to start HTTP server. See debug log for details."));
     }
 
@@ -1900,16 +1889,6 @@ static bool AppInitMainImpl(NodeContext& node,
         return false;
     }
 
-    // A verification restart reaches this point only after the replacement
-    // was reopened, verified, and its retained backup was safely retired, so
-    // normal RPC/HTTP startup may resume. The rebuilding process has not yet
-    // performed its isolated ImportBlocks() pass and must never bind a server;
-    // it exits through the requested_chainstate_rebuild handoff below.
-    if (defer_rpc_startup && !requested_chainstate_rebuild) {
-        if (!start_rpc_servers())
-            return InitError(_("Unable to start HTTP server. See debug log for details."));
-    }
-
     ChainstateManager& chainman = *Assert(node.chainman);
     const bool staged_chainstate_rebuild =
         chainman.m_chainstate_rebuild_staged_this_process.load();
@@ -2097,22 +2076,6 @@ static bool AppInitMainImpl(NodeContext& node,
             pool->SetLoadTried(!chainman.m_interrupt);
         }
     });
-
-    if (requested_chainstate_rebuild) {
-        // A chainstate-only rebuild is performed by ImportBlocks(). Wait for
-        // its protected COMMIT_READY handoff before deciding whether ordinary
-        // services may start. The successful handoff requests shutdown, so no
-        // wallet, P2P, or RPC/HTTP service can race the rebuilding process.
-        chainman.m_thread_load.join();
-        if (!ShutdownRequested()) {
-            return InitError(_(
-                "Protected chainstate rebuild ended without requesting its required verification restart."));
-        }
-        // The daemon exits cleanly after its one-shot rebuild. The GUI must
-        // instead hand REBUILD_COMMITTED to the assistant, which relaunches a
-        // separate verification process after orderly shutdown.
-        return !node.gui_process;
-    }
 
     // Wait for genesis block to be processed
     {
