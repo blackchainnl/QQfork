@@ -23,10 +23,13 @@ To receive security and update notifications, please subscribe to:
 Beta 1 canary identity
 ======================
 
-The v30.1.1 beta 1 packages are unpublished, unsigned canary artifacts. They
-are not the signed v30.1.1 production release. A manual exact-SHA build accepts
-only the `30.1.1-beta1` package label while the source remains configured as
-`30.1.1rc1` with `CLIENT_VERSION_IS_RELEASE=false`.
+The v30.1.1 beta 1 packages are publisher-unsigned, unnotarized canary
+artifacts. They are not the signed v30.1.1 production release. A manual
+exact-SHA build initially creates an unpublished bundle and accepts only the
+`30.1.1-beta1` package label while the source remains configured as
+`30.1.1rc1` with `CLIENT_VERSION_IS_RELEASE=false`. After the complete beta
+gate and public-prerelease controls pass, the project may attach those
+unchanged bytes to an immutable `v30.1.1-beta1` GitHub prerelease for testing.
 
 Every downloadable canary archive name includes both
 `Blackcoin-30.1.1-beta1` and the full 40-character source commit. The combined
@@ -50,9 +53,13 @@ checksums, an SPDX SBOM, and provenance attestations.
 Known Beta 1 limitations
 ========================
 
-This is a test-only prerelease, not a production recommendation. The safe
-one-click first-launch rebuild assistant tracked in issue #30 is not included
-in Beta 1; follow the explicit command-line rebuild procedure below.
+This is a test-only prerelease, not a production recommendation. Beta 1
+includes the consent-based first-launch rebuild assistant tracked in issue
+#30. Back up every wallet and preserve a cold datadir copy before using it.
+Operators who do not want the GUI to start the protected rebuild can choose
+the default manual/exit path and follow the explicit command-line procedure
+below. The assistant remains a beta candidate until the exact published
+artifacts complete operator upgrade and rollback testing on each platform.
 
 A fee-paying Gold Rush PoW claim that leaves the local mempool remains
 quarantined because a peer can retain and later confirm the base-valid

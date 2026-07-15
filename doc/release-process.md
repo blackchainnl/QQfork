@@ -30,11 +30,12 @@ functional/soak suite, native macOS vectors, address/undefined/thread
 sanitizers, pinned fuzz corpus, and the core unit, lint, critical, and real
 mixed-version gates.
 
-A beta remains unsigned, unnotarized, unpublished, and unsuitable for a fleet
-rollout until an isolated canary succeeds. It may be prepared only after every
-P0/P1 implementation assigned to the beta is present on the candidate branch;
-passing the beta workflow is evidence for review, not permission to call the
-candidate production-ready.
+A beta remains unsigned, unnotarized, and unsuitable for a fleet rollout until
+an isolated canary succeeds. It is initially unpublished and may become a
+public GitHub prerelease only under the immutable public-beta controls below.
+It may be prepared only after every P0/P1 implementation assigned to the beta
+is present on the candidate branch; passing the beta workflow is evidence for
+review, not permission to call the candidate production-ready.
 
 ### Optional public alpha prerelease
 

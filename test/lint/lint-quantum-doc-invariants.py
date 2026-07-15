@@ -638,7 +638,8 @@ def check_beta_channel_identity(root, failures):
     release_notes = read_text(root, "doc/release-notes.md")
     for fragment in (
         "Beta 1 canary identity",
-        "The v30.1.1 beta 1 packages are unpublished, unsigned canary artifacts.",
+        "The v30.1.1 beta 1 packages are publisher-unsigned, unnotarized canary",
+        "immutable `v30.1.1-beta1` GitHub prerelease for testing.",
         "`30.1.1-beta1`",
         "`Blackcoin-30.1.1-beta1`",
         "`unsigned-canary-30.1.1-beta1-<FULL_SOURCE_COMMIT>`",
