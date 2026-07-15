@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -373,6 +374,40 @@ class ConfArgsTest(BitcoinTestFramework):
             f'different configuration file "{default_datadir}/blackcoin.conf" from data directory "{default_datadir}" '
             f'is being used instead.') + r"[\s\S]*", env=env, match=ErrorMatch.FULL_REGEX)
         node.args = node_args
+
+    def test_early_info_commands_do_not_touch_wallet_data(self):
+        if sys.platform == "win32":
+            return
+
+        self.log.info("Test -help and -version exit before legacy wallet-data inspection")
+        env_overrides, default_datadir = util.get_temp_default_datadir(
+            Path(self.options.tmpdir, "early_info_home")
+        )
+        default_datadir.mkdir(parents=True)
+        (default_datadir / "blackcoin.conf").write_text("server=1\n", encoding="utf8")
+        wallet_path = default_datadir / "wallet.dat"
+        wallet_bytes = b"read-only informational command wallet fixture\n"
+        wallet_path.write_bytes(wallet_bytes)
+        backup_root = default_datadir.parent / f"{default_datadir.name}.backup"
+        marker_path = default_datadir / ".blackcoin-migration-done"
+        process_env = dict(os.environ)
+        process_env.update(env_overrides)
+
+        for argument, expected in (("-version", "Source commit:"), ("-help", "Options")):
+            result = subprocess.run(
+                [self.nodes[0].binary, argument],
+                env=process_env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            assert_equal(result.returncode, 0)
+            assert expected in result.stdout
+            assert "Legacy datadir migration" not in result.stderr
+            assert_equal(wallet_path.read_bytes(), wallet_bytes)
+            assert not marker_path.exists()
+            assert not backup_root.exists()
 
     def _legacy_datadir_for_env(self, env):
         if sys.platform == "win32":
@@ -984,6 +1019,7 @@ class ConfArgsTest(BitcoinTestFramework):
         self.test_invalid_command_line_options()
         self.test_ignored_conf()
         self.test_ignored_default_conf()
+        self.test_early_info_commands_do_not_touch_wallet_data()
         self.test_legacy_datadir_migration()
         self.test_acceptstalefeeestimates_arg_support()
         self.test_powmining_arg_ranges()
