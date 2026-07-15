@@ -38,6 +38,12 @@ struct WalletLifecycleSummary {
     WalletLifecycleAmounts watchonly;
 };
 
+/** Whether the wallet transaction view and active UTXO view describe the
+ * same chain tip. Lifecycle accounting must not combine the wallet state from
+ * one tip with coins from another. */
+bool WalletLifecycleViewIsSynchronized(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
 /** Classify one wallet output against the candidate next block using the
  * active-chain coin and authenticated Gold Rush provenance. */
 bool GetWalletOutputLifecycle(const CWallet& wallet, const COutPoint& outpoint,

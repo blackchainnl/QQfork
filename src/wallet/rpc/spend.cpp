@@ -3950,11 +3950,13 @@ RPCHelpMan getmigrationstatus()
     {
         const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
         if (!pwallet) return UniValue::VNULL;
+        for (;;) {
         // Keep wallet spend state and the active UTXO snapshot on the same tip.
-        // Without this barrier an RPC can race a just-connected staking block
-        // and briefly classify an already-consumed wallet output as corrupt.
+        // A block can connect after this wait, so verify both views again while
+        // holding the wallet and chain locks and retry if they differ.
         pwallet->BlockUntilSyncedToCurrentChain();
         LOCK2(cs_main, pwallet->cs_wallet);
+        if (!WalletLifecycleViewIsSynchronized(*pwallet)) continue;
 
         const Consensus::Params& c = Params().GetConsensus();
         int64_t mtp = 0;
@@ -4087,6 +4089,7 @@ RPCHelpMan getmigrationstatus()
         else                     advice = "Run migratetoquantum before the deadline to move legacy coins into a quantum address.";
         r.pushKV("advice", advice);
         return r;
+        }
     }};
 }
 } // namespace wallet

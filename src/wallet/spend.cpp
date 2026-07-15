@@ -50,6 +50,17 @@ struct QuantumFundingPhase {
     int64_t spend_time{0};
 };
 
+bool WalletLifecycleViewIsSynchronized(const CWallet& wallet)
+{
+    AssertLockHeld(::cs_main);
+    AssertLockHeld(wallet.cs_wallet);
+
+    const CBlockIndex* tip = wallet.chain().getTip();
+    const std::optional<int> wallet_height = wallet.GetLastBlockHeightIfSet();
+    return tip && wallet_height && *wallet_height == tip->nHeight &&
+        wallet.GetLastBlockHash() == tip->GetBlockHash();
+}
+
 static QuantumFundingPhase GetQuantumFundingPhase(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
 {
     QuantumFundingPhase phase;
@@ -76,6 +87,11 @@ bool GetWalletOutputLifecycle(const CWallet& wallet, const COutPoint& outpoint,
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
     error.clear();
+
+    if (!WalletLifecycleViewIsSynchronized(wallet)) {
+        error = "Wallet lifecycle view is not synchronized with the active chain tip";
+        return false;
+    }
 
     const CBlockIndex* tip = wallet.chain().getTip();
     if (!tip) {
@@ -186,6 +202,12 @@ bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
     error.clear();
+
+    if (!WalletLifecycleViewIsSynchronized(wallet)) {
+        error = "Wallet lifecycle view is not synchronized with the active chain tip";
+        return false;
+    }
+
     balance = GetBalance(wallet, min_depth, avoid_reuse);
     summary = {};
 

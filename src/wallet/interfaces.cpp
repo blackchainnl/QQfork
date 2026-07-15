@@ -2234,9 +2234,10 @@ public:
     {
         return {m_wallet->GetActiveScriptVerifyFlags(), Params().GetConsensus().nQuantumSighashChainId};
     }
-    WalletBalances getBalances() override
+    WalletBalances getBalancesLocked()
     {
-        LOCK2(::cs_main, m_wallet->cs_wallet);
+        AssertLockHeld(::cs_main);
+        AssertLockHeld(m_wallet->cs_wallet);
         WalletBalances result;
         Balance bal;
         WalletLifecycleSummary lifecycle;
@@ -2281,6 +2282,15 @@ public:
         }
         return result;
     }
+    WalletBalances getBalances() override
+    {
+        for (;;) {
+            m_wallet->BlockUntilSyncedToCurrentChain();
+            LOCK2(::cs_main, m_wallet->cs_wallet);
+            if (!WalletLifecycleViewIsSynchronized(*m_wallet)) continue;
+            return getBalancesLocked();
+        }
+    }
     bool tryGetBalances(WalletBalances& balances, uint256& block_hash) override
     {
         TRY_LOCK(::cs_main, locked_main);
@@ -2291,22 +2301,29 @@ public:
         if (!locked_wallet) {
             return false;
         }
+        // Notification delivery can lag a newly connected block. Returning
+        // false keeps the GUI's last valid balance until both views catch up.
+        if (!WalletLifecycleViewIsSynchronized(*m_wallet)) return false;
         block_hash = m_wallet->GetLastBlockHash();
-        balances = getBalances();
+        balances = getBalancesLocked();
         return true;
     }
     CAmount getBalance() override
     {
-        LOCK2(::cs_main, m_wallet->cs_wallet);
-        Balance balance;
-        WalletLifecycleSummary lifecycle;
-        std::string error;
-        if (!GetLifecycleAdjustedBalance(*m_wallet, 0, /*avoid_reuse=*/true,
-                                         balance, lifecycle, error)) {
-            m_wallet->WalletLogPrintf("Unable to calculate lifecycle-adjusted balance: %s\n", error);
-            return 0;
+        for (;;) {
+            m_wallet->BlockUntilSyncedToCurrentChain();
+            LOCK2(::cs_main, m_wallet->cs_wallet);
+            if (!WalletLifecycleViewIsSynchronized(*m_wallet)) continue;
+            Balance balance;
+            WalletLifecycleSummary lifecycle;
+            std::string error;
+            if (!GetLifecycleAdjustedBalance(*m_wallet, 0, /*avoid_reuse=*/true,
+                                             balance, lifecycle, error)) {
+                m_wallet->WalletLogPrintf("Unable to calculate lifecycle-adjusted balance: %s\n", error);
+                return 0;
+            }
+            return balance.m_mine_trusted;
         }
-        return balance.m_mine_trusted;
     }
     CAmount getAvailableBalance(const CCoinControl& coin_control) override
     {

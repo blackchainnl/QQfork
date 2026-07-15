@@ -211,11 +211,14 @@ RPCHelpMan getbalance()
     const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
+    for (;;) {
     // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now
+    // the user could have gotten from another RPC command prior to now. Retry
+    // if chainstate advances before the wallet and chain locks are acquired.
     pwallet->BlockUntilSyncedToCurrentChain();
 
     LOCK2(::cs_main, pwallet->cs_wallet);
+    if (!WalletLifecycleViewIsSynchronized(*pwallet)) continue;
 
     const auto dummy_value{self.MaybeArg<std::string>(0)};
     if (dummy_value && *dummy_value != "*") {
@@ -240,6 +243,7 @@ RPCHelpMan getbalance()
     }
 
     return ValueFromAmount(bal.m_mine_trusted + (include_watchonly ? bal.m_watchonly_trusted : 0));
+    }
 },
     };
 }
@@ -520,11 +524,14 @@ RPCHelpMan getbalances()
     if (!rpc_wallet) return UniValue::VNULL;
     const CWallet& wallet = *rpc_wallet;
 
+    for (;;) {
     // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now
+    // the user could have gotten from another RPC command prior to now. Retry
+    // if chainstate advances before the wallet and chain locks are acquired.
     wallet.BlockUntilSyncedToCurrentChain();
 
     LOCK2(::cs_main, wallet.cs_wallet);
+    if (!WalletLifecycleViewIsSynchronized(wallet)) continue;
 
     Balance bal;
     WalletLifecycleSummary lifecycle;
@@ -569,6 +576,7 @@ RPCHelpMan getbalances()
     balances.pushKV("lifecycle_evaluation_mtp", lifecycle.evaluation_mtp);
     AppendLastProcessedBlock(balances, wallet);
     return balances;
+    }
 },
     };
 }
@@ -725,15 +733,18 @@ RPCHelpMan listunspent()
         }
     }
 
-    // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now
-    pwallet->BlockUntilSyncedToCurrentChain();
-
     UniValue results(UniValue::VARR);
     std::vector<COutput> vecOutputs;
     std::vector<ValueLifecycleClassification> lifecycles;
+    for (;;) {
+    // Make sure the results are valid at least up to the most recent block
+    // the user could have gotten from another RPC command prior to now. Retry
+    // if chainstate advances before the wallet and chain locks are acquired.
+    pwallet->BlockUntilSyncedToCurrentChain();
+
     {
         LOCK2(::cs_main, pwallet->cs_wallet);
+        if (!WalletLifecycleViewIsSynchronized(*pwallet)) continue;
         CCoinControl cctl;
         cctl.m_avoid_address_reuse = false;
         cctl.m_min_depth = nMinDepth;
@@ -751,6 +762,8 @@ RPCHelpMan listunspent()
             }
             lifecycles.push_back(std::move(lifecycle));
         }
+    }
+    break;
     }
 
     LOCK(pwallet->cs_wallet);

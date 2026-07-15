@@ -25,6 +25,7 @@
 #include <coins.h>
 #include <crypto/mldsa.h>
 #include <interfaces/chain.h>
+#include <interfaces/wallet.h>
 #include <key_io.h>
 #include <node/blockstorage.h>
 #include <policy/policy.h>
@@ -44,6 +45,7 @@
 #include <validation.h>
 #include <validationinterface.h>
 #include <wallet/coincontrol.h>
+#include <wallet/context.h>
 #include <wallet/context.h>
 #include <wallet/quantum_stake_ops.h>
 #include <wallet/receive.h>
@@ -974,6 +976,66 @@ BOOST_AUTO_TEST_CASE(goldrush_pow_miner_lifecycle_creates_quantum_payout)
         LOCK(m_wallet.cs_wallet);
         BOOST_CHECK_EQUAL(m_wallet.m_pow_payout_quantum, original_payout);
     }
+}
+
+BOOST_FIXTURE_TEST_CASE(lifecycle_balance_requires_matching_wallet_and_chain_tips, TestChain100Setup)
+{
+    std::shared_ptr<CWallet> wallet{CreateSyncedWallet(
+        *m_node.chain,
+        WITH_LOCK(Assert(m_node.chainman)->GetMutex(),
+                  return m_node.chainman->ActiveChain()),
+        coinbaseKey).release()};
+    WalletContext wallet_context;
+    wallet_context.chain = m_node.chain.get();
+    auto wallet_interface = interfaces::MakeWallet(wallet_context, wallet);
+
+    const CBlockIndex* tip = WITH_LOCK(
+        Assert(m_node.chainman)->GetMutex(),
+        return m_node.chainman->ActiveChain().Tip());
+    BOOST_REQUIRE(tip);
+    BOOST_REQUIRE(tip->pprev);
+    {
+        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+        BOOST_CHECK(WalletLifecycleViewIsSynchronized(*wallet));
+        wallet->SetLastBlockProcessed(tip->pprev->nHeight, tip->pprev->GetBlockHash());
+        BOOST_CHECK(!WalletLifecycleViewIsSynchronized(*wallet));
+    }
+
+    interfaces::WalletBalances gui_balance;
+    uint256 gui_block_hash;
+    BOOST_CHECK(!wallet_interface->tryGetBalances(gui_balance, gui_block_hash));
+
+    Balance balance;
+    WalletLifecycleSummary lifecycle;
+    std::string error;
+    {
+        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+        BOOST_CHECK(!GetLifecycleAdjustedBalance(
+            *wallet, /*min_depth=*/0, /*avoid_reuse=*/true,
+            balance, lifecycle, error));
+    }
+    BOOST_CHECK_EQUAL(
+        error,
+        "Wallet lifecycle view is not synchronized with the active chain tip");
+
+    auto blocking_balance = std::async(std::launch::async, [&] {
+        return wallet_interface->getBalances();
+    });
+    BOOST_CHECK(blocking_balance.wait_for(50ms) == std::future_status::timeout);
+
+    {
+        LOCK2(Assert(m_node.chainman)->GetMutex(), wallet->cs_wallet);
+        wallet->SetLastBlockProcessed(tip->nHeight, tip->GetBlockHash());
+        BOOST_CHECK(WalletLifecycleViewIsSynchronized(*wallet));
+        BOOST_CHECK(GetLifecycleAdjustedBalance(
+            *wallet, /*min_depth=*/0, /*avoid_reuse=*/true,
+            balance, lifecycle, error));
+    }
+    BOOST_REQUIRE(blocking_balance.wait_for(5s) == std::future_status::ready);
+    gui_balance = blocking_balance.get();
+    BOOST_CHECK_EQUAL(gui_balance.balance, balance.m_mine_trusted);
+    BOOST_CHECK(wallet_interface->tryGetBalances(gui_balance, gui_block_hash));
+    BOOST_CHECK_EQUAL(gui_block_hash, tip->GetBlockHash());
 }
 
 BOOST_FIXTURE_TEST_CASE(scan_for_wallet_transactions, TestChain100Setup)

@@ -127,11 +127,15 @@ static RPCHelpMan getwalletinfo()
     const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
+    for (;;) {
     // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now
+    // the user could have gotten from another RPC command prior to now. A
+    // block can connect after this wait and before both locks are held, so
+    // retry until wallet transactions and the UTXO set identify the same tip.
     pwallet->BlockUntilSyncedToCurrentChain();
 
     LOCK2(::cs_main, pwallet->cs_wallet);
+    if (!WalletLifecycleViewIsSynchronized(*pwallet)) continue;
 
     UniValue obj(UniValue::VOBJ);
 
@@ -196,6 +200,7 @@ static RPCHelpMan getwalletinfo()
 
     AppendLastProcessedBlock(obj, *pwallet);
     return obj;
+    }
 },
     };
 }
