@@ -3900,28 +3900,21 @@ BOOST_AUTO_TEST_CASE(shadow_max_block_direct_total_bounds_to_schedule)
     BOOST_CHECK_EQUAL(ShadowMaxBlockDirectTotal(view, &first), ShadowBaseReward(SHADOW_REWARD_START_HEIGHT));
 }
 
-BOOST_AUTO_TEST_SUITE_END()
-
-// QQP4 tests need a real regtest schedule. Register them only after the
-// file-wide BasicTestingSetup suite has fully torn down; nesting a second
-// global chain fixture would reinitialize gArgs/chainparams mid-test.
-namespace shadow_tests {
-BOOST_FIXTURE_TEST_SUITE(qqp4_activation_tests, QQP4ActivationTestingSetup)
-
-BOOST_AUTO_TEST_CASE(
-    shadow_index_record_validation_enforces_qqp4_exact_input_after_separate_activation)
+// QQP4 tests need a real regtest schedule. Give each case its own explicit
+// fixture so the file-level shadow_tests suite keeps its canonical name and
+// the preceding BasicTestingSetup fixture is torn down before construction.
+BOOST_FIXTURE_TEST_CASE(
+    shadow_index_record_validation_enforces_qqp4_exact_input_after_separate_activation,
+    QQP4ActivationTestingSetup)
 {
     CheckShadowIndexRecordQQP4ExactInputAfterSeparateActivation();
 }
 
-BOOST_AUTO_TEST_SUITE_END()
-
-BOOST_FIXTURE_TEST_SUITE(qqp4_payload_tests, QQP4ActivationTestingSetup)
-
-BOOST_AUTO_TEST_CASE(pow_shadow_payload_modes_are_strictly_bound_to_pow_accounting)
+BOOST_FIXTURE_TEST_CASE(
+    pow_shadow_payload_modes_are_strictly_bound_to_pow_accounting,
+    QQP4ActivationTestingSetup)
 {
     CheckQQP4PayloadModesAreStrictlyBoundToPowAccounting();
 }
 
 BOOST_AUTO_TEST_SUITE_END()
-} // namespace shadow_tests
