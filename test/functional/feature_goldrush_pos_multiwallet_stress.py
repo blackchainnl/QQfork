@@ -360,7 +360,10 @@ class GoldRushPosMultiwalletStressTest(BitcoinTestFramework):
         finally:
             self._stop_staking(wallets)
         confirm_latencies = self._stop_health_pollers(confirm_health, require_staking=(WALLET_A, WALLET_B))
-        pos_block = node.getblock(node.getbestblockhash(), 2)
+        signal_a_tx = wallet_a.gettransaction(signal_a)
+        signal_b_tx = wallet_b.gettransaction(signal_b)
+        assert_equal(signal_a_tx["blockhash"], signal_b_tx["blockhash"])
+        pos_block = node.getblock(signal_a_tx["blockhash"], 2)
         assert "proof-of-stake" in pos_block["flags"]
         txids = [tx["txid"] for tx in pos_block["tx"]]
         assert signal_a in txids[2:]
@@ -373,8 +376,8 @@ class GoldRushPosMultiwalletStressTest(BitcoinTestFramework):
             ),
             2,
         )
-        assert wallet_a.gettransaction(signal_a)["confirmations"] >= 1
-        assert wallet_b.gettransaction(signal_b)["confirmations"] >= 1
+        assert signal_a_tx["confirmations"] >= 1
+        assert signal_b_tx["confirmations"] >= 1
 
         self.log.info("Unloading one actively staking wallet does not stall the other wallet or node")
         for wallet in wallets:
