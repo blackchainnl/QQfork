@@ -62,13 +62,24 @@ class GoldRushLocalMiningPolicyTest(BitcoinTestFramework):
             node.generatetoaddress, 1, quantum_address, invalid_call=False)
         assert_equal(node.getblockcount(), SHADOW_REWARD_END_HEIGHT)
 
-        self.log.info("Allowing a recognized quantum coinbase once Migration begins")
+        self.log.info("Rejecting a quantum coinbase at the exact final Gold Rush height")
         self.generatetoaddress(
             node,
-            GOLD_RUSH_END_HEIGHT - SHADOW_REWARD_END_HEIGHT,
+            GOLD_RUSH_END_HEIGHT - SHADOW_REWARD_END_HEIGHT - 1,
             legacy_address,
             sync_fun=self.no_op,
         )
+        assert_equal(node.getblockcount(), GOLD_RUSH_END_HEIGHT - 1)
+        phase = node.getquantumquasarinfo()
+        assert_equal(phase["next_block_height"], GOLD_RUSH_END_HEIGHT)
+        assert_equal(phase["phase"], "gold_rush")
+        self._assert_gold_rush_reject(
+            node.generatetoaddress, 1, quantum_address, invalid_call=False)
+        assert_equal(node.getblockcount(), GOLD_RUSH_END_HEIGHT - 1)
+
+        self.log.info("Allowing a recognized quantum coinbase once Migration begins")
+        self.generatetoaddress(
+            node, 1, legacy_address, sync_fun=self.no_op)
         assert_equal(node.getblockcount(), GOLD_RUSH_END_HEIGHT)
         phase = node.getquantumquasarinfo()
         assert_equal(phase["active_tip_phase"], "gold_rush")

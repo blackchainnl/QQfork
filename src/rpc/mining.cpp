@@ -149,6 +149,30 @@ static bool HasV2ToV1TemplateDependency(const CBlock& block)
     return false;
 }
 
+static bool IsFutureWitnessScript(const CScript& script_pub_key)
+{
+    int witness_version{0};
+    std::vector<unsigned char> witness_program;
+    return script_pub_key.IsWitnessProgram(witness_version, witness_program) && witness_version > 1;
+}
+
+static bool HasFutureWitnessCoinbaseOutput(const CBlock& block)
+{
+    if (block.vtx.empty() || !block.vtx.front()) return false;
+    for (const CTxOut& txout : block.vtx.front()->vout) {
+        if (IsFutureWitnessScript(txout.scriptPubKey)) return true;
+    }
+    return false;
+}
+
+static bool IsGoldRushFutureWitnessCoinbase(const Consensus::Params& consensus,
+                                            const CBlockIndex& pindex_prev,
+                                            const CBlock& block)
+{
+    return consensus.IsGoldRushEpoch(pindex_prev.GetMedianTimePast(), pindex_prev.nHeight + 1) &&
+           HasFutureWitnessCoinbaseOutput(block);
+}
+
 /**
  * Local convenience mining RPCs must not create a direct future-witness
  * coinbase while Gold Rush is active. Such an output is not a shadow-ledger
@@ -173,19 +197,10 @@ static void EnforceGoldRushCoinbaseOutputPolicy(const ChainstateManager& chainma
         throw JSONRPCError(RPC_INTERNAL_ERROR, "Generated block template has an unknown previous block");
     }
 
-    const Consensus::Params& consensus = chainman.GetConsensus();
-    if (!consensus.IsGoldRushEpoch(pindex_prev->GetMedianTimePast(), pindex_prev->nHeight + 1)) {
-        return;
-    }
-
-    for (const CTxOut& txout : block.vtx.front()->vout) {
-        int witness_version{0};
-        std::vector<unsigned char> witness_program;
-        if (txout.scriptPubKey.IsWitnessProgram(witness_version, witness_program) && witness_version > 1) {
-            throw JSONRPCError(
-                RPC_INVALID_PARAMETER,
-                "Future-witness coinbase outputs are disabled during the Gold Rush epoch; use a legacy payout address.");
-        }
+    if (IsGoldRushFutureWitnessCoinbase(chainman.GetConsensus(), *pindex_prev, block)) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "Future-witness coinbase outputs are disabled during the Gold Rush epoch; use a legacy payout address.");
     }
 }
 
@@ -1201,6 +1216,12 @@ static RPCHelpMan submitblock()
             if (pindex->nStatus & BLOCK_FAILED_MASK) {
                 return "duplicate-invalid";
             }
+        }
+
+        const CBlockIndex* const pindex_prev = chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+        if (pindex_prev && chainman.GetParams().GetChainType() != ChainType::REGTEST &&
+            IsGoldRushFutureWitnessCoinbase(chainman.GetConsensus(), *pindex_prev, block)) {
+            return "goldrush-future-witness-coinbase";
         }
     }
 

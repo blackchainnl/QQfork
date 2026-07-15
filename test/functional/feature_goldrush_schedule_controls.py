@@ -14,6 +14,8 @@ from decimal import Decimal
 import os
 import subprocess
 
+from test_framework.blocktools import create_block, create_coinbase
+from test_framework.script import CScript, OP_16
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.test_node import ErrorMatch
 from test_framework.util import assert_equal, assert_raises_rpc_error
@@ -154,6 +156,22 @@ class GoldRushScheduleControlsTest(BitcoinTestFramework):
             [raw_tx],
             False,
             invalid_call=False,
+        )
+
+        self.log.info("Rejecting a known-parent future-witness coinbase through submitblock")
+        tip = node.getbestblockhash()
+        coinbase = create_coinbase(
+            node.getblockcount() + 1,
+            script_pubkey=CScript([OP_16, bytes([16]) * 32]),
+        )
+        block = create_block(
+            int(tip, 16),
+            coinbase,
+            node.getblockheader(tip)["time"] + 1,
+        )
+        assert_equal(
+            node.submitblock(block.serialize().hex()),
+            "goldrush-future-witness-coinbase",
         )
 
 
