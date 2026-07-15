@@ -110,14 +110,22 @@ class WalletPoSV2TemplateTimeTest(BitcoinTestFramework):
         assert "blocktemplatefees" in kernel_template
         assert "blocktemplatesignkey" in kernel_template
 
+        source = self._spendable_utxo(wallet)
         # Constructing a template records that interval as searched, which is
         # correct for a caller that will sign and submit it. Advance to a fresh
         # aligned interval before asking the automatic staker to produce a
         # block in the independent package-selection portion of this test.
-        kernel_time = self._find_next_kernel_time(wallet)
+        # Exclude the package's funding input from the kernel search: spending
+        # the exact UTXO selected by checkkernel would make the advertised
+        # kernel unavailable before the automatic staker can use it.
+        kernel_inputs = [
+            entry for entry in self._staking_inputs(wallet)
+            if (entry["txid"], entry["vout"]) !=
+            (source["txid"], source["vout"])
+        ]
+        kernel_time = self._find_next_kernel_time(wallet, kernel_inputs)
         self._set_mocktime(kernel_time - 1)
 
-        source = self._spendable_utxo(wallet)
         parent_destination = wallet.getnewaddress("v1-parent", "legacy")
         parent_amount = Decimal(str(source["amount"])) - FEE
         parent_raw = node.createrawtransaction(

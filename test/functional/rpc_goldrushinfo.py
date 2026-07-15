@@ -221,10 +221,15 @@ class GoldRushInfoTest(BitcoinTestFramework):
         self._assert_builtin_pow_miner_lifecycle()
 
         # The built-in worker can win while its lifecycle telemetry is sampled.
-        # Its next-block-only claim must expire before the manual claim checks.
+        # QQP3 claims remain eligible for the bounded late-origin window, so
+        # advance beyond that window before beginning the manual claim checks.
         if self._mempool_pow_claims(node):
             self.log.info("Advancing the tip to expire a claim found by the built-in PoW miner")
-            self._generate_with_peer_offline(node, 1, node.get_deterministic_priv_key().address)
+            self._generate_with_peer_offline(
+                node,
+                QQP3_LATE_ORIGIN_WINDOW,
+                node.get_deterministic_priv_key().address,
+            )
             self._sync_mocktime_to_tip()
         assert_equal(self._mempool_pow_claims(node), [])
 
@@ -271,20 +276,18 @@ class GoldRushInfoTest(BitcoinTestFramework):
         )
         stolen_quantum = wallet.getnewquantumaddress()["address"]
         assert_raises_rpc_error(-8, proof_mismatch_error, wallet.sendshadowpowclaim, rpc_target, stolen_quantum, 1, None, stale_claim["proof"])
-        # Known P0 (#26): before separately activated QQP4 exact-input binding,
-        # an identical QQP3 proof can currently be replayed through a second
-        # fee input and receive a distinct canonical rank. Keep this behavior
-        # explicit until the duplicate-proof amplification rule is repaired;
-        # silently accepting it here would hide the release blocker.
-        duplicate_claim = wallet.sendshadowpowclaim(
-            rpc_target, rpc_quantum, 1, None, stale_claim["proof"]
+        self.log.info("Rejecting a second fee-paying carrier for the same logical QQP3 proof")
+        assert_raises_rpc_error(
+            -26,
+            "shadow-proof-mempool-duplicate",
+            wallet.sendshadowpowclaim,
+            rpc_target,
+            rpc_quantum,
+            1,
+            None,
+            stale_claim["proof"],
         )
-        assert duplicate_claim["txid"] != stale_claim["txid"]
-        assert_equal(duplicate_claim["proof"], stale_claim["proof"])
-        assert_equal(
-            set(self._mempool_pow_claims(node)),
-            {stale_claim["txid"], duplicate_claim["txid"]},
-        )
+        assert_equal(self._mempool_pow_claims(node), [stale_claim["txid"]])
 
         self.log.info("Retaining QQP3 claims through the bounded late-origin window")
         stale_parent = node.getbestblockhash()
@@ -292,10 +295,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
         self.connect_nodes(0, 1)
         self.sync_blocks()
         assert node.getbestblockhash() != stale_parent
-        assert_equal(
-            set(self._mempool_pow_claims(node)),
-            {stale_claim["txid"], duplicate_claim["txid"]},
-        )
+        assert_equal(self._mempool_pow_claims(node), [stale_claim["txid"]])
 
         self.log.info("Expiring QQP3 claims only after their 64-block late-origin window")
         blocks_to_expire = claim_origin_height + QQP3_LATE_ORIGIN_WINDOW - node.getblockcount()
@@ -306,7 +306,6 @@ class GoldRushInfoTest(BitcoinTestFramework):
             self.nodes[1].get_deterministic_priv_key().address,
         )
         self.wait_until(lambda: stale_claim["txid"] not in node.getrawmempool(), timeout=10)
-        self.wait_until(lambda: duplicate_claim["txid"] not in node.getrawmempool(), timeout=10)
         stale_accept = node.testmempoolaccept([stale_claim["hex"]])[0]
         assert_equal(stale_accept["allowed"], False)
         assert_equal(stale_accept["reject-reason"], "shadow-proof-origin-expired")
