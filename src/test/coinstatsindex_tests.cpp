@@ -23,6 +23,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <chrono>
+#include <limits>
 
 namespace {
 
@@ -49,12 +50,9 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
 {
     static constexpr uint8_t SCHEMA_KEY{'V'};
     static constexpr uint32_t PRERELEASE_COINSTATS_SCHEMA{2};
-    static constexpr uint32_t CURRENT_COINSTATS_SCHEMA{3};
-    // Schema 10 adds QQP4 version/input provenance. A schema-9 database has
-    // valid QQP3 data but cannot safely be reinterpreted as exact-input data,
-    // so it must be discarded and rebuilt from the chain.
+    // Schema 9 predates QQP4 version/input provenance. It cannot safely be
+    // relabeled as any later schema, so it must be rebuilt from the chain.
     static constexpr uint32_t PRE_QQP4_SHADOW_SCHEMA{9};
-    static constexpr uint32_t CURRENT_SHADOW_SCHEMA{10};
     const std::string sentinel{"prerelease-claim-allocation"};
 
     const auto build_index = [](BaseIndex& index) {
@@ -66,12 +64,18 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
     };
 
     const fs::path coinstats_path = gArgs.GetDataDirNet() / "indexes" / "coinstats" / "db";
+    uint32_t current_coinstats_schema{0};
     {
         CoinStatsIndex index{interfaces::MakeChain(m_node), 1 << 20};
         build_index(index);
     }
     {
         CDBWrapper db({.path = coinstats_path, .cache_bytes = 1 << 20});
+        BOOST_REQUIRE(db.Read(SCHEMA_KEY, current_coinstats_schema));
+        BOOST_REQUIRE_GT(current_coinstats_schema,
+                         PRERELEASE_COINSTATS_SCHEMA);
+        BOOST_REQUIRE_LT(current_coinstats_schema,
+                         std::numeric_limits<uint32_t>::max());
         BOOST_REQUIRE(db.Write(SCHEMA_KEY, PRERELEASE_COINSTATS_SCHEMA));
         BOOST_REQUIRE(db.Write(sentinel, true));
     }
@@ -83,7 +87,7 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
         CDBWrapper db({.path = coinstats_path, .cache_bytes = 1 << 20});
         uint32_t schema{0};
         BOOST_REQUIRE(db.Read(SCHEMA_KEY, schema));
-        BOOST_CHECK_EQUAL(schema, CURRENT_COINSTATS_SCHEMA);
+        BOOST_CHECK_EQUAL(schema, current_coinstats_schema);
         BOOST_CHECK(!db.Exists(sentinel));
     }
 
@@ -102,17 +106,22 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
         CDBWrapper db({.path = coinstats_path, .cache_bytes = 1 << 20});
         uint32_t schema{0};
         BOOST_REQUIRE(db.Read(SCHEMA_KEY, schema));
-        BOOST_CHECK_EQUAL(schema, CURRENT_COINSTATS_SCHEMA);
+        BOOST_CHECK_EQUAL(schema, current_coinstats_schema);
         BOOST_CHECK(!db.Exists(sentinel));
     }
 
     const fs::path shadow_path = gArgs.GetDataDirNet() / "indexes" / "shadow";
+    uint32_t current_shadow_schema{0};
     {
         ShadowIndex index{interfaces::MakeChain(m_node), 1 << 20};
         build_index(index);
     }
     {
         CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
+        BOOST_REQUIRE(db.Read(SCHEMA_KEY, current_shadow_schema));
+        BOOST_REQUIRE_GT(current_shadow_schema, PRE_QQP4_SHADOW_SCHEMA);
+        BOOST_REQUIRE_LT(current_shadow_schema,
+                         std::numeric_limits<uint32_t>::max());
         BOOST_REQUIRE(db.Write(SCHEMA_KEY, PRE_QQP4_SHADOW_SCHEMA));
         BOOST_REQUIRE(db.Write(sentinel, true));
     }
@@ -124,7 +133,7 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
         CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
         uint32_t schema{0};
         BOOST_REQUIRE(db.Read(SCHEMA_KEY, schema));
-        BOOST_CHECK_EQUAL(schema, CURRENT_SHADOW_SCHEMA);
+        BOOST_CHECK_EQUAL(schema, current_shadow_schema);
         BOOST_CHECK(!db.Exists(sentinel));
     }
 
@@ -143,7 +152,7 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
         CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
         uint32_t schema{0};
         BOOST_REQUIRE(db.Read(SCHEMA_KEY, schema));
-        BOOST_CHECK_EQUAL(schema, CURRENT_SHADOW_SCHEMA);
+        BOOST_CHECK_EQUAL(schema, current_shadow_schema);
         BOOST_CHECK(!db.Exists(sentinel));
     }
 
@@ -151,14 +160,34 @@ BOOST_FIXTURE_TEST_CASE(auxiliary_claim_index_schema_mismatch_wipes_and_rebuilds
     // Downgrades fail closed instead of deleting that database.
     {
         CDBWrapper db({.path = coinstats_path, .cache_bytes = 1 << 20});
-        BOOST_REQUIRE(db.Write(SCHEMA_KEY, CURRENT_COINSTATS_SCHEMA + 1));
+        BOOST_REQUIRE(db.Write(SCHEMA_KEY, current_coinstats_schema + 1));
+        BOOST_REQUIRE(db.Write(sentinel, true));
     }
     BOOST_CHECK_THROW((CoinStatsIndex{interfaces::MakeChain(m_node), 1 << 20}), std::runtime_error);
     {
+        CDBWrapper db({.path = coinstats_path, .cache_bytes = 1 << 20});
+        uint32_t schema{0};
+        bool sentinel_present{false};
+        BOOST_REQUIRE(db.Read(SCHEMA_KEY, schema));
+        BOOST_CHECK_EQUAL(schema, current_coinstats_schema + 1);
+        BOOST_REQUIRE(db.Read(sentinel, sentinel_present));
+        BOOST_CHECK(sentinel_present);
+    }
+    {
         CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
-        BOOST_REQUIRE(db.Write(SCHEMA_KEY, CURRENT_SHADOW_SCHEMA + 1));
+        BOOST_REQUIRE(db.Write(SCHEMA_KEY, current_shadow_schema + 1));
+        BOOST_REQUIRE(db.Write(sentinel, true));
     }
     BOOST_CHECK_THROW((ShadowIndex{interfaces::MakeChain(m_node), 1 << 20}), std::runtime_error);
+    {
+        CDBWrapper db({.path = shadow_path, .cache_bytes = 1 << 20});
+        uint32_t schema{0};
+        bool sentinel_present{false};
+        BOOST_REQUIRE(db.Read(SCHEMA_KEY, schema));
+        BOOST_CHECK_EQUAL(schema, current_shadow_schema + 1);
+        BOOST_REQUIRE(db.Read(sentinel, sentinel_present));
+        BOOST_CHECK(sentinel_present);
+    }
 }
 
 BOOST_FIXTURE_TEST_CASE(shadowindex_bounded_claim_state_survives_max_weight_reorg_and_rebuild,

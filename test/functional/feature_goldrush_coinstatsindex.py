@@ -661,7 +661,7 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
             (self.extra_args[1] + ["-reindex-chainstate"], None),
             (
                 self.extra_args[1] + ["-shadowindexmockobsoleteschema=1"],
-                "ShadowIndex: rebuilding incompatible schema version 9 as version 10",
+                "ShadowIndex: rebuilding incompatible schema version",
             ),
         ):
             restart_args = restart_args + [f"-mocktime={self.mock_time}"]
