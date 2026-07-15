@@ -315,6 +315,7 @@ class AssumeutxoTest(BitcoinTestFramework):
             n2, ['-reindex-chainstate=1', *self.extra_args[2]])
         rebuild_journal = n2.chain_path / "chainstate-rebuild.journal"
         rebuild_backup = n2.chain_path / "chainstate.rebuild-backup"
+        assert rebuild_journal.is_file()
         assert rebuild_backup.is_dir()
 
         self.log.info("Verify the rebuilt chainstate before testing full -reindex")

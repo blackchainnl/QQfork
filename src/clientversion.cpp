@@ -81,7 +81,7 @@ std::string FormatSourceCommit()
     static const std::string source_commit{SOURCE_COMMIT_ID};
     if (source_commit.size() != 40 ||
         !std::all_of(source_commit.begin(), source_commit.end(), [](unsigned char character) {
-            return std::isdigit(character) ||
+            return (character >= '0' && character <= '9') ||
                    (character >= 'a' && character <= 'f');
         })) {
         return {};

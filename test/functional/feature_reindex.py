@@ -31,6 +31,8 @@ class ReindexTest(BitcoinTestFramework):
             journal = node.chain_path / "chainstate-rebuild.journal"
             backup = node.chain_path / "chainstate.rebuild-backup"
             self.run_chainstate_rebuild_first_pass(node, ["-reindex-chainstate"])
+            assert journal.is_file()
+            assert backup.is_dir()
             self.restart_after_chainstate_rebuild(0)
             assert_equal(node.getblockcount(), blockcount)
         else:

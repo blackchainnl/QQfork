@@ -346,7 +346,7 @@ class VerifierOwnedDaemon(AbstractContextManager):
             "network_frozen_during_snapshot": True,
         }
 
-    def __exit__(self, exc_type, exc_value, traceback):
+    def __exit__(self, exc_type, _exc_value, _traceback):
         shutdown_error = None
         if self.process is not None and self.process.poll() is None:
             try:
