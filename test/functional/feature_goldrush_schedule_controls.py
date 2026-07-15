@@ -10,12 +10,13 @@ so live testnet wallets can exercise the whitelist and Gold Rush paths without
 waiting for mainnet heights.
 """
 
+from decimal import Decimal
 import os
 import subprocess
 
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.test_node import ErrorMatch
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 class GoldRushScheduleControlsTest(BitcoinTestFramework):
@@ -138,6 +139,22 @@ class GoldRushScheduleControlsTest(BitcoinTestFramework):
         assert_equal(info["gold_rush_end_height"], 119)
         assert_equal(info["quantum_migration_end_height"], 219)
         assert_equal(info["phase"], "gold_rush")
+
+        self.log.info("Rejecting raw generateblock transaction injection outside regtest")
+        address = node.get_deterministic_priv_key().address
+        raw_tx = node.createrawtransaction(
+            [{"txid": "00" * 32, "vout": 0}],
+            [{address: Decimal("1")}],
+        )
+        assert_raises_rpc_error(
+            -8,
+            "Raw transaction injection through generateblock is only available on regtest",
+            node.generateblock,
+            address,
+            [raw_tx],
+            False,
+            invalid_call=False,
+        )
 
 
 if __name__ == "__main__":

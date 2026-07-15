@@ -39,6 +39,7 @@
 #include <timedata.h>
 #include <txmempool.h>
 #include <univalue.h>
+#include <util/chaintype.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/translation.h>
@@ -148,6 +149,46 @@ static bool HasV2ToV1TemplateDependency(const CBlock& block)
     return false;
 }
 
+/**
+ * Local convenience mining RPCs must not create a direct future-witness
+ * coinbase while Gold Rush is active. Such an output is not a shadow-ledger
+ * reward, and direct blocks intentionally remain legacy-compatible during the
+ * transition. Keep this at the RPC boundary: it is not a consensus rule.
+ *
+ * The caller must hold cs_main. The phase is evaluated from the template's
+ * actual parent, rather than the current active tip, so a tip change cannot
+ * turn a safe template into an unsafe one (or vice versa) between construction
+ * and this check.
+ */
+static void EnforceGoldRushCoinbaseOutputPolicy(const ChainstateManager& chainman, const CBlock& block)
+{
+    AssertLockHeld(::cs_main);
+
+    if (block.vtx.empty() || !block.vtx.front()) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Generated block template is missing a coinbase transaction");
+    }
+
+    const CBlockIndex* const pindex_prev = chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+    if (!pindex_prev) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Generated block template has an unknown previous block");
+    }
+
+    const Consensus::Params& consensus = chainman.GetConsensus();
+    if (!consensus.IsGoldRushEpoch(pindex_prev->GetMedianTimePast(), pindex_prev->nHeight + 1)) {
+        return;
+    }
+
+    for (const CTxOut& txout : block.vtx.front()->vout) {
+        int witness_version{0};
+        std::vector<unsigned char> witness_program;
+        if (txout.scriptPubKey.IsWitnessProgram(witness_version, witness_program) && witness_version > 1) {
+            throw JSONRPCError(
+                RPC_INVALID_PARAMETER,
+                "Future-witness coinbase outputs are disabled during the Gold Rush epoch; use a legacy payout address.");
+        }
+    }
+}
+
 static RPCHelpMan getnetworkhashps()
 {
     return RPCHelpMan{"getnetworkhashps",
@@ -207,6 +248,11 @@ static UniValue generateBlocks(ChainstateManager& chainman, const CTxMemPool& me
         std::unique_ptr<CBlockTemplate> pblocktemplate(BlockAssembler{chainman.ActiveChainstate(), &mempool}.CreateNewBlock(coinbase_script, nullptr, nullptr));
         if (!pblocktemplate.get())
             throw JSONRPCError(RPC_INTERNAL_ERROR, "Couldn't create new block");
+
+        {
+            LOCK(cs_main);
+            EnforceGoldRushCoinbaseOutputPolicy(chainman, pblocktemplate->block);
+        }
 
         std::shared_ptr<const CBlock> block_out;
         if (!GenerateBlock(chainman, pblocktemplate->block, nMaxTries, block_out, /*process_new_block=*/true)) {
@@ -348,7 +394,7 @@ static RPCHelpMan generateblock()
         {
             {"output", RPCArg::Type::STR, RPCArg::Optional::NO, "The address or descriptor to send the newly generated bitcoin to."},
             {"transactions", RPCArg::Type::ARR, RPCArg::Optional::NO, "An array of hex strings which are either txids or raw transactions.\n"
-                "Txids must reference transactions currently in the mempool.\n"
+                "Txids must reference transactions currently in the mempool. Raw transactions are accepted only on regtest.\n"
                 "All transactions must be valid and in valid order, otherwise the block will be rejected.",
                 {
                     {"rawtx/txid", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""},
@@ -384,6 +430,7 @@ static RPCHelpMan generateblock()
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
     const CTxMemPool& mempool = EnsureMemPool(node);
+    ChainstateManager& chainman = EnsureChainman(node);
 
     std::vector<CTransactionRef> txs;
     const auto raw_txs_or_txids = request.params[1].get_array();
@@ -402,6 +449,11 @@ static RPCHelpMan generateblock()
             txs.emplace_back(tx);
 
         } else if (DecodeHexTx(mtx, str)) {
+            if (chainman.GetParams().GetChainType() != ChainType::REGTEST) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "Raw transaction injection through generateblock is only available on regtest; submit transactions to the mempool and pass txids instead.");
+            }
             txs.push_back(MakeTransactionRef(std::move(mtx)));
 
         } else {
@@ -412,7 +464,6 @@ static RPCHelpMan generateblock()
     const bool process_new_block{request.params[2].isNull() ? true : request.params[2].get_bool()};
     CBlock block;
 
-    ChainstateManager& chainman = EnsureChainman(node);
     {
         LOCK(cs_main);
 
@@ -420,6 +471,7 @@ static RPCHelpMan generateblock()
         if (!blocktemplate) {
             throw JSONRPCError(RPC_INTERNAL_ERROR, "Couldn't create new block");
         }
+        EnforceGoldRushCoinbaseOutputPolicy(chainman, blocktemplate->block);
         block = blocktemplate->block;
     }
 

@@ -168,6 +168,7 @@ BASE_SCRIPTS = [
     'feature_goldrush_shadow_replay.py',
     'feature_goldrush_height_schedule_multinode.py',
     'feature_goldrush_legacy_compat.py',
+    'feature_goldrush_local_mining_policy.py',
     'feature_goldrush_mixed_version.py',
     'feature_goldrush_migration_rpc.py',
     'feature_goldrush_coldstake_auto_migration.py',
