@@ -1155,7 +1155,6 @@ static RPCHelpMan getcirculatingsupply()
     const int evaluation_height = tip->nHeight + 1;
 
     std::map<uint256, Consensus::DemurrageAttestationState> attestation_states;
-    std::map<COutPoint, GoldRushPayoutMarkerInfo> payout_markers;
     std::optional<GoldRushInventoryInfo> inventory;
     std::optional<ShadowGoldRushInfo> pool;
     uint64_t payout_marker_count{0};
@@ -1181,8 +1180,7 @@ static RPCHelpMan getcirculatingsupply()
             GoldRushPayoutMarkerInfo payout_info;
             if (DecodeAuthenticatedGoldRushPayoutMarker(
                     marker_key, marker_coin, tip, payout_info)) {
-                if (!payout_markers.emplace(payout_info.payout_outpoint, payout_info).second ||
-                    !AddCirculatingSupplyCount(payout_marker_count) ||
+                if (!AddCirculatingSupplyCount(payout_marker_count) ||
                     !AddCirculatingSupplyAmount(payout_marker_nominal,
                                                 payout_info.nominal_amount)) {
                     throw JSONRPCError(RPC_INTERNAL_ERROR,
@@ -1249,15 +1247,26 @@ static RPCHelpMan getcirculatingsupply()
             continue;
         }
 
+        GoldRushPayoutMarkerInfo payout;
+        GoldRushPayoutMarkerLookupResult payout_lookup{
+            GoldRushPayoutMarkerLookupResult::MISSING};
+        if (HasGoldRushPayoutShape(coin)) {
+            payout_lookup = LookupAuthenticatedGoldRushPayoutMarker(
+                *marker_cursor, key, tip, payout);
+        }
+        if (payout_lookup == GoldRushPayoutMarkerLookupResult::CORRUPT) {
+            throw JSONRPCError(
+                RPC_INTERNAL_ERROR,
+                "Gold Rush payout candidate has corrupt authenticated provenance");
+        }
         const bool candidate = IsGoldRushPayoutCandidateCoin(coin, consensus);
-        const auto payout_it = payout_markers.find(key);
-        const bool authenticated_synthetic = payout_it != payout_markers.end();
+        const bool authenticated_synthetic =
+            payout_lookup == GoldRushPayoutMarkerLookupResult::AUTHENTICATED;
         if (candidate && !authenticated_synthetic) {
             throw JSONRPCError(RPC_INTERNAL_ERROR,
                                "Gold Rush payout candidate lacks authenticated provenance");
         }
         if (authenticated_synthetic) {
-            const GoldRushPayoutMarkerInfo& payout = payout_it->second;
             if (payout.nominal_amount != coin.out.nValue ||
                 payout.payout_script != coin.out.scriptPubKey ||
                 payout.origin_height != coin.nHeight ||

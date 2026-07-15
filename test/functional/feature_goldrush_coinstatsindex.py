@@ -356,6 +356,10 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         assert_equal(self._amount(claim_indexed_full["block_info"]["unspendables"]["unclaimed_rewards"]), ZERO_AMOUNT)
         assert_equal(claim_indexed_full["total_unspendable_amount"], parent_indexed_full["total_unspendable_amount"])
         claim_lifecycle = self._lifecycle_supply()
+        # The bounded point-lookup implementation must be byte-for-byte
+        # equivalent on two independent immutable chainstate snapshots; it may
+        # not depend on a process-local payout-marker map.
+        assert_equal(self._lifecycle_supply(self.nodes[0]), claim_lifecycle)
         assert_equal(claim_lifecycle["shadow"]["issued_count"], 1)
         assert_equal(claim_lifecycle["shadow"]["unspent_count"], 1)
         assert_equal(claim_lifecycle["goldrush_synthetic_immature_txouts"], 1)

@@ -514,6 +514,50 @@ public:
             "repeated synthetic benchmark transitions changed parent state");
     }
 
+    void PrepareSnapshotLookupBenchmark()
+    {
+        m_lookup_view = std::make_unique<CCoinsViewCache>(&m_view, true);
+        RequireSyntheticFixture(
+            ApplyShadowBlockResult(*m_lookup_view, m_block, m_target, &m_undo) ==
+                    ShadowApplyResult::OK &&
+                AdvanceGoldRushInventoryTip(*m_lookup_view, m_target),
+            "maximum synthetic marker-lookup fixture apply failed");
+        m_lookup_payouts = GetAppliedShadowClaimPayoutCoins(
+            *m_lookup_view, m_target->nHeight, m_target->GetBlockHash(),
+            m_target->GetBlockTime());
+        RequireSyntheticFixture(
+            m_lookup_payouts.size() == MAXIMUM_MAINNET_SYNTHETIC_CLAIMS,
+            "maximum synthetic marker-lookup claim count changed");
+        m_lookup_memory = m_lookup_view->DynamicMemoryUsage();
+        RequireSyntheticFixture(LookupMaximumSnapshotMarkers(),
+                                "maximum synthetic marker-lookup preflight failed");
+    }
+
+    bool LookupMaximumSnapshotMarkers() const
+    {
+        if (!m_lookup_view ||
+            m_lookup_payouts.size() != MAXIMUM_MAINNET_SYNTHETIC_CLAIMS) {
+            return false;
+        }
+        std::unique_ptr<CCoinsViewCursor> marker_cursor =
+            m_lookup_view->Cursor();
+        if (!marker_cursor) return false;
+        for (const ShadowSyntheticPayoutCoin& payout : m_lookup_payouts) {
+            GoldRushPayoutMarkerInfo info;
+            if (LookupAuthenticatedGoldRushPayoutMarker(
+                    *marker_cursor, payout.outpoint, m_target, info) !=
+                    GoldRushPayoutMarkerLookupResult::AUTHENTICATED ||
+                info.payout_outpoint != payout.outpoint ||
+                info.payout_script != payout.txout.scriptPubKey ||
+                info.nominal_amount != payout.txout.nValue ||
+                info.origin_height != payout.height ||
+                info.origin_block_time != payout.time) {
+                return false;
+            }
+        }
+        return m_lookup_view->DynamicMemoryUsage() == m_lookup_memory;
+    }
+
 private:
     bool ApplyAndUndo(CCoinsViewCache& view) const
     {
@@ -549,6 +593,9 @@ private:
     uint256 m_parent_identity;
     unsigned int m_parent_cache_size{0};
     size_t m_parent_cache_memory{0};
+    std::unique_ptr<CCoinsViewCache> m_lookup_view;
+    std::vector<ShadowSyntheticPayoutCoin> m_lookup_payouts;
+    size_t m_lookup_memory{0};
 };
 
 MaximumQuantumBlock BuildMaximumQuantumBlock(
@@ -792,10 +839,31 @@ static void QuantumSyntheticStateApplyUndoMaxMarkers(benchmark::Bench& bench)
     fixture.VerifyFinalIdentity();
 }
 
+static void QuantumSyntheticSnapshotPayoutLookupMaxMarkers(
+    benchmark::Bench& bench)
+{
+    const auto testing_setup =
+        MakeNoLogFileContext<const TestingSetup>(ChainType::REGTEST);
+    MaximumSyntheticStateFixture fixture;
+    fixture.VerifyMaximumTransition();
+    fixture.PrepareSnapshotLookupBenchmark();
+    bench.batch(MAXIMUM_MAINNET_SYNTHETIC_CLAIMS).unit("marker").run([&] {
+        const bool success = fixture.LookupMaximumSnapshotMarkers();
+        if (!success) {
+            throw std::runtime_error(
+                "maximum synthetic snapshot marker lookup failed");
+        }
+        ankerl::nanobench::doNotOptimizeAway(success);
+    });
+    fixture.VerifyFinalIdentity();
+}
+
 BENCHMARK(QuantumArgon2id1MiB, benchmark::PriorityLevel::HIGH);
 BENCHMARK(QuantumArgon2id64ClaimBlock, benchmark::PriorityLevel::HIGH);
 BENCHMARK(QuantumMLDSA44Verify, benchmark::PriorityLevel::HIGH);
 BENCHMARK(QuantumMLDSA44MaxWeightBlock, benchmark::PriorityLevel::HIGH);
 BENCHMARK(QuantumLargeBlockValidation32MiB, benchmark::PriorityLevel::HIGH);
 BENCHMARK(QuantumSyntheticStateApplyUndoMaxMarkers,
+          benchmark::PriorityLevel::HIGH);
+BENCHMARK(QuantumSyntheticSnapshotPayoutLookupMaxMarkers,
           benchmark::PriorityLevel::HIGH);

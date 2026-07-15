@@ -20,6 +20,7 @@ class CBlockIndex;
 class CBlockUndo;
 class CCoinsView;
 class CCoinsViewCache;
+class CCoinsViewCursor;
 struct Coin;
 namespace Consensus {
 struct Params;
@@ -65,6 +66,12 @@ struct GoldRushPayoutMarkerInfo {
     uint32_t origin_height{0};
     uint256 origin_block_hash;
     uint32_t origin_block_time{0};
+};
+
+enum class GoldRushPayoutMarkerLookupResult : uint8_t {
+    MISSING,
+    AUTHENTICATED,
+    CORRUPT,
 };
 
 /** Authenticated rolling issuance/spend totals at an exact active tip. */
@@ -636,6 +643,14 @@ bool DecodeAuthenticatedGoldRushPayoutMarker(const COutPoint& marker_outpoint,
                                              const Coin& marker_coin,
                                              const CBlockIndex* pindex_tip,
                                              GoldRushPayoutMarkerInfo& info);
+/** Perform an exact point lookup against a dedicated immutable chainstate
+ * cursor. This keeps payout provenance authentication constant-memory even
+ * when the completed Gold Rush contains hundreds of millions of records. */
+GoldRushPayoutMarkerLookupResult LookupAuthenticatedGoldRushPayoutMarker(
+    CCoinsViewCursor& marker_cursor,
+    const COutPoint& payout_outpoint,
+    const CBlockIndex* pindex_tip,
+    GoldRushPayoutMarkerInfo& info);
 /** Decode the authenticated rolling Gold Rush inventory from one immutable
  * UTXO snapshot entry. */
 bool DecodeAuthenticatedGoldRushInventory(const COutPoint& inventory_outpoint,
@@ -650,6 +665,9 @@ bool DecodeAuthenticatedShadowPool(const COutPoint& pool_outpoint,
                                    ShadowGoldRushInfo& info);
 bool IsShadowPoolMarkerOutpoint(const COutPoint& outpoint);
 bool IsGoldRushInventoryMarkerOutpoint(const COutPoint& outpoint);
+/** True for every possible direct synthetic payout shape, including test
+ * schedules where the Gold Rush overlaps the ordinary PoW height range. */
+bool HasGoldRushPayoutShape(const Coin& coin);
 /** True only for the strict positive coin shape that consensus requires to
  * have authenticated synthetic provenance. */
 bool IsGoldRushPayoutCandidateCoin(const Coin& coin, const Consensus::Params& consensus);

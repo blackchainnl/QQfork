@@ -1151,4 +1151,49 @@ BOOST_AUTO_TEST_CASE(coins_resource_is_used)
     PoolResourceTester::CheckAllDataAccountedFor(resource);
 }
 
+BOOST_AUTO_TEST_CASE(cursor_exact_lookup_preserves_immutable_snapshot)
+{
+    CCoinsViewDB base{{.path = "snapshot-seek", .cache_bytes = 1 << 23,
+                       .memory_only = true}, {}};
+    const COutPoint first{uint256{1}, 0};
+    const COutPoint second{uint256{2}, 0};
+    const COutPoint later{uint256{3}, 0};
+    const Coin first_coin{CTxOut{11, CScript{} << OP_1}, 10, false, false, 100};
+    const Coin second_coin{CTxOut{22, CScript{} << OP_2}, 11, false, false, 101};
+    const Coin later_coin{CTxOut{33, CScript{} << OP_3}, 12, false, false, 102};
+
+    {
+        CCoinsViewCache initial{&base, true};
+        initial.AddCoin(first, Coin{first_coin}, false);
+        initial.AddCoin(second, Coin{second_coin}, false);
+        initial.SetBestBlock(uint256::ONE);
+        BOOST_REQUIRE(initial.Flush());
+    }
+
+    std::unique_ptr<CCoinsViewCursor> snapshot = base.Cursor();
+    BOOST_REQUIRE(snapshot);
+    BOOST_CHECK(snapshot->GetBestBlock() == uint256::ONE);
+
+    {
+        CCoinsViewCache mutation{&base, true};
+        BOOST_REQUIRE(mutation.SpendCoin(first));
+        mutation.AddCoin(later, Coin{later_coin}, false);
+        mutation.SetBestBlock(uint256{2});
+        BOOST_REQUIRE(mutation.Flush());
+    }
+
+    Coin found;
+    BOOST_REQUIRE(snapshot->GetValueAt(first, found));
+    BOOST_CHECK(found.out == first_coin.out);
+    BOOST_REQUIRE(snapshot->GetValueAt(second, found));
+    BOOST_CHECK(found.out == second_coin.out);
+    BOOST_CHECK(!snapshot->GetValueAt(later, found));
+
+    std::unique_ptr<CCoinsViewCursor> current = base.Cursor();
+    BOOST_REQUIRE(current);
+    BOOST_CHECK(!current->GetValueAt(first, found));
+    BOOST_REQUIRE(current->GetValueAt(later, found));
+    BOOST_CHECK(found.out == later_coin.out);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

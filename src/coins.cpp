@@ -103,6 +103,17 @@ public:
         return true;
     }
 
+    bool GetValueAt(const COutPoint& key, Coin& coin) override
+    {
+        const auto cache_it = m_cache.find(key);
+        if (cache_it != m_cache.end()) {
+            if (cache_it->second.coin.IsSpent()) return false;
+            coin = cache_it->second.coin;
+            return true;
+        }
+        return m_base_cursor && m_base_cursor->GetValueAt(key, coin);
+    }
+
     bool Valid() const override { return m_valid; }
 
     void Next() override

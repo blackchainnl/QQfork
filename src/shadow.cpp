@@ -6154,6 +6154,29 @@ bool DecodeAuthenticatedGoldRushPayoutMarker(const COutPoint& marker_outpoint,
     return true;
 }
 
+GoldRushPayoutMarkerLookupResult LookupAuthenticatedGoldRushPayoutMarker(
+    CCoinsViewCursor& marker_cursor,
+    const COutPoint& payout_outpoint,
+    const CBlockIndex* pindex_tip,
+    GoldRushPayoutMarkerInfo& info)
+{
+    info = {};
+    const COutPoint marker_outpoint =
+        GetGoldRushPayoutMarkerOutpoint(payout_outpoint);
+    Coin marker_coin;
+    if (!marker_cursor.GetValueAt(marker_outpoint, marker_coin)) {
+        return GoldRushPayoutMarkerLookupResult::MISSING;
+    }
+    if (marker_coin.IsSpent() ||
+        !DecodeAuthenticatedGoldRushPayoutMarker(
+            marker_outpoint, marker_coin, pindex_tip, info) ||
+        info.payout_outpoint != payout_outpoint) {
+        info = {};
+        return GoldRushPayoutMarkerLookupResult::CORRUPT;
+    }
+    return GoldRushPayoutMarkerLookupResult::AUTHENTICATED;
+}
+
 bool DecodeAuthenticatedGoldRushInventory(const COutPoint& inventory_outpoint,
                                           const Coin& inventory_coin,
                                           const CBlockIndex* pindex_tip,
@@ -6215,7 +6238,7 @@ bool IsGoldRushInventoryMarkerOutpoint(const COutPoint& outpoint)
     return outpoint == GoldRushInventoryOutpoint();
 }
 
-bool IsGoldRushPayoutCandidateCoin(const Coin& coin, const Consensus::Params& consensus)
+bool HasGoldRushPayoutShape(const Coin& coin)
 {
     if (SHADOW_REWARD_START_HEIGHT < 0 ||
         SHADOW_REWARD_END_HEIGHT < SHADOW_REWARD_START_HEIGHT) {
@@ -6225,8 +6248,13 @@ bool IsGoldRushPayoutCandidateCoin(const Coin& coin, const Consensus::Params& co
     return coin.fCoinBase && !coin.fCoinStake && coin.out.nValue > 0 &&
         static_cast<int64_t>(coin.nHeight) >= SHADOW_REWARD_START_HEIGHT &&
         static_cast<int64_t>(coin.nHeight) <= SHADOW_REWARD_END_HEIGHT &&
-        static_cast<int64_t>(coin.nHeight) > consensus.nLastPOWBlock &&
         tier && !tier->tiered && !tier->cold_stake;
+}
+
+bool IsGoldRushPayoutCandidateCoin(const Coin& coin, const Consensus::Params& consensus)
+{
+    return HasGoldRushPayoutShape(coin) &&
+        static_cast<int64_t>(coin.nHeight) > consensus.nLastPOWBlock;
 }
 
 const char* ValueLifecycleCategoryName(ValueLifecycleCategory category)

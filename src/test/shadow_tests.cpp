@@ -3646,6 +3646,32 @@ BOOST_AUTO_TEST_CASE(pow_shadow_target_relaxes_after_missed_claims_and_resets_on
     CScript marked_payout;
     BOOST_CHECK(IsGoldRushDirectPayoutOutput(view, payouts[0].outpoint, &marked_payout));
     BOOST_CHECK(marked_payout == quantum_payout);
+
+    // Snapshot provenance lookups must remain constant-memory. The completed
+    // mainnet epoch can contain 179,771,400 payout records, so rebuilding an
+    // in-memory outpoint map here is not an acceptable implementation.
+    const size_t memory_before = view.DynamicMemoryUsage();
+    std::unique_ptr<CCoinsViewCursor> marker_cursor = view.Cursor();
+    BOOST_REQUIRE(marker_cursor);
+    for (int attempt = 0; attempt < 10'000; ++attempt) {
+        GoldRushPayoutMarkerInfo payout_info;
+        BOOST_REQUIRE(
+            LookupAuthenticatedGoldRushPayoutMarker(
+                *marker_cursor, payouts[0].outpoint, &claim_index,
+                payout_info) ==
+            GoldRushPayoutMarkerLookupResult::AUTHENTICATED);
+        BOOST_CHECK(payout_info.payout_outpoint == payouts[0].outpoint);
+        BOOST_CHECK(payout_info.payout_script == payouts[0].txout.scriptPubKey);
+        BOOST_CHECK_EQUAL(payout_info.nominal_amount, payouts[0].txout.nValue);
+        BOOST_CHECK_EQUAL(payout_info.origin_height, payouts[0].height);
+        BOOST_CHECK_EQUAL(payout_info.origin_block_time, payouts[0].time);
+    }
+    BOOST_CHECK_EQUAL(view.DynamicMemoryUsage(), memory_before);
+    GoldRushPayoutMarkerInfo missing_info;
+    BOOST_CHECK(
+        LookupAuthenticatedGoldRushPayoutMarker(
+            *marker_cursor, COutPoint{uint256{123}, 9}, &claim_index,
+            missing_info) == GoldRushPayoutMarkerLookupResult::MISSING);
 }
 
 BOOST_AUTO_TEST_CASE(pow_shadow_ignores_claims_over_proof_evaluation_cap)

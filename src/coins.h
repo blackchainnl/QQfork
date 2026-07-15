@@ -178,6 +178,15 @@ public:
     virtual bool GetKey(COutPoint &key) const = 0;
     virtual bool GetValue(Coin &coin) const = 0;
 
+    /** Retrieve one exact coin from this cursor's immutable snapshot.
+     *
+     * This operation may reposition the underlying iterator. Callers that
+     * also need an ordered scan must use a dedicated cursor for point
+     * lookups. The returned view is nevertheless the same snapshot captured
+     * when this cursor was created, rather than a later live database read.
+     */
+    virtual bool GetValueAt(const COutPoint& key, Coin& coin) = 0;
+
     virtual bool Valid() const = 0;
     virtual void Next() = 0;
 

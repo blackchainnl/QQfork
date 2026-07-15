@@ -31,7 +31,6 @@
 #include <limits>
 #include <map>
 #include <optional>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -1063,29 +1062,10 @@ RPCHelpMan getquantumwitnessinventory()
             }
             if (!snapshot_tip) throw JSONRPCError(RPC_CLIENT_NOT_CONNECTED, "Chain is not initialized");
 
-            // The two LevelDB cursors own immutable snapshots from the same
-            // flushed chainstate tip. Authenticate every payout-provenance
-            // marker first; a value-bearing coin is excluded as synthetic only
-            // when its deterministic marker exists in that exact snapshot.
-            std::set<COutPoint> authenticated_payout_markers;
-            COutPoint marker_outpoint;
-            Coin marker_coin;
-            while (marker_cursor->Valid()) {
-                node.rpc_interruption_point();
-                if (!marker_cursor->GetKey(marker_outpoint) ||
-                    !marker_cursor->GetValue(marker_coin)) {
-                    throw JSONRPCError(
-                        RPC_INTERNAL_ERROR,
-                        "Unable to read the immutable witness-inventory marker snapshot");
-                }
-                if (!marker_coin.IsSpent() &&
-                    marker_coin.out.nValue == 0 &&
-                    IsGoldRushPayoutMarkerScript(marker_coin.out.scriptPubKey) &&
-                    IsAuthenticatedShadowMarkerOutpoint(marker_outpoint, marker_coin, snapshot_tip)) {
-                    authenticated_payout_markers.insert(marker_outpoint);
-                }
-                marker_cursor->Next();
-            }
+            // The second LevelDB cursor is a point-lookup view of the same
+            // immutable flushed tip. Never retain one in-memory set entry per
+            // Gold Rush payout: the completed epoch can contain 179,771,400
+            // authenticated claims.
 
             WitnessInventoryBucket current_total;
             WitnessInventoryBucket excluded_synthetic;
@@ -1131,8 +1111,33 @@ RPCHelpMan getquantumwitnessinventory()
                             coin.nHeight <= static_cast<uint32_t>(SHADOW_REWARD_END_HEIGHT) &&
                             coin.nHeight > static_cast<uint32_t>(consensus.nLastPOWBlock) &&
                             IsQuantumMigrationScript(coin.out.scriptPubKey);
-                        const bool synthetic_shadow = authenticated_payout_markers.count(
-                            GetGoldRushPayoutMarkerOutpoint(outpoint)) != 0;
+                        GoldRushPayoutMarkerInfo payout_info;
+                        GoldRushPayoutMarkerLookupResult payout_lookup{
+                            GoldRushPayoutMarkerLookupResult::MISSING};
+                        if (HasGoldRushPayoutShape(coin)) {
+                            payout_lookup = LookupAuthenticatedGoldRushPayoutMarker(
+                                *marker_cursor, outpoint, snapshot_tip,
+                                payout_info);
+                        }
+                        if (payout_lookup ==
+                                GoldRushPayoutMarkerLookupResult::CORRUPT) {
+                            throw JSONRPCError(
+                                RPC_INTERNAL_ERROR,
+                                strprintf("Gold Rush payout provenance is corrupt for %s; chainstate audit required",
+                                          outpoint.ToString()));
+                        }
+                        const bool synthetic_shadow = payout_lookup ==
+                            GoldRushPayoutMarkerLookupResult::AUTHENTICATED;
+                        if (synthetic_shadow &&
+                            (payout_info.nominal_amount != coin.out.nValue ||
+                             payout_info.payout_script != coin.out.scriptPubKey ||
+                             payout_info.origin_height != coin.nHeight ||
+                             payout_info.origin_block_time != coin.nTime)) {
+                            throw JSONRPCError(
+                                RPC_INTERNAL_ERROR,
+                                strprintf("Gold Rush payout disagrees with authenticated provenance for %s; chainstate audit required",
+                                          outpoint.ToString()));
+                        }
                         // On regtest-style schedules Gold Rush can overlap the
                         // ordinary PoW range, so an authenticated synthetic
                         // payout need not have the production-only
