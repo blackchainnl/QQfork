@@ -2582,6 +2582,9 @@ static RPCHelpMan getdemurragewalletinfo()
 
         const auto coin_it = chain_coins.find(out.outpoint);
         const bool chainstate_backed = coin_it != chain_coins.end() && !coin_it->second.IsSpent();
+        if (!chainstate_backed) {
+            CHECK_NONFATAL(out.time >= 0 && out.time <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()));
+        }
         Coin coin = chainstate_backed ? coin_it->second : Coin{out.txout, out.depth > 0 ? tip_height - out.depth + 1 : evaluation_height, false, false, static_cast<uint32_t>(out.time)};
         const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
             Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);

@@ -3529,7 +3529,7 @@ DisconnectResult Chainstate::DisconnectBlock(const CBlock& block, const CBlockIn
         uint256 hash = tx.GetHash();
         bool is_coinbase = tx.IsCoinBase();
         bool is_coinstake = tx.IsCoinStake();
-        const uint32_t coin_time = GetCoinTime(tx, pindex->GetBlockTime());
+        const uint32_t coin_time = GetCoinTime(tx, pindex->nTime);
 
         // Check that all outputs are available and match the outputs in the block itself
         // exactly.
@@ -4139,7 +4139,7 @@ bool Chainstate::ConnectBlock(const CBlock& block, BlockValidationState& state, 
         // block time exactly as v30.1.0 does so the block producer and peers
         // derive the same stake-kernel timestamp from an identical UTXO.
         UpdateCoins(tx, view, i == 0 ? undoDummy : blockundo.vtxundo.back(),
-                    pindex->nHeight, pindex->GetBlockTime());
+                    pindex->nHeight, pindex->nTime);
     }
     const auto time_3{SteadyClock::now()};
     time_connect += time_3 - time_2;
@@ -6666,7 +6666,7 @@ bool Chainstate::RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& in
         // Replay must reproduce the same v30.1.0 coin-time provenance as the
         // normal connection path. A local v2 transaction object can retain a
         // nonserialized construction time that a peer never receives.
-        AddCoins(inputs, *tx, pindex->nHeight, true, pindex->GetBlockTime());
+        AddCoins(inputs, *tx, pindex->nHeight, true, pindex->nTime);
     }
     if (apply_auxiliary_state) {
         if (pindex->nHeight == SHADOW_WHITELIST_HEIGHT) {

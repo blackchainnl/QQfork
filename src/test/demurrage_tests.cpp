@@ -442,23 +442,23 @@ BOOST_AUTO_TEST_CASE(purge_recognizes_only_authenticated_obsolete_reserved_state
     const COutPoint ordinary_user_outpoint{uint256S("0e"), 1};
     view.AddCoin(obsolete_latest,
                  TestMarkerCoin(0, TestMarkerScript(TEST_TAG_LATEST, latest_payload),
-                                tip.nHeight, tip.GetBlockTime()),
+                                tip.nHeight, tip.nTime),
                  /*possible_overwrite=*/false);
     view.AddCoin(obsolete_legacy_latest,
                  TestMarkerCoin(0, TestMarkerScript(
                      TEST_TAG_LATEST, legacy_latest_payload),
-                     tip.nHeight, tip.GetBlockTime()),
+                     tip.nHeight, tip.nTime),
                  /*possible_overwrite=*/false);
     view.AddCoin(obsolete_inventory,
                  TestMarkerCoin(0, TestMarkerScript(
                      TEST_TAG_INVENTORY, PrereleaseEmptyInventoryPayload(tip)),
-                     tip.nHeight, tip.GetBlockTime()),
+                     tip.nHeight, tip.nTime),
                  /*possible_overwrite=*/false);
     // An exact marker payload at a normal transaction outpoint is user state,
     // not an auxiliary record, and must never be removed by cleanup.
     view.AddCoin(ordinary_user_outpoint,
                  TestMarkerCoin(0, TestMarkerScript(TEST_TAG_LATEST, latest_payload),
-                                tip.nHeight, tip.GetBlockTime()),
+                                tip.nHeight, tip.nTime),
                  /*possible_overwrite=*/false);
 
     uint64_t removed{999};
@@ -473,7 +473,7 @@ BOOST_AUTO_TEST_CASE(purge_recognizes_only_authenticated_obsolete_reserved_state
     // is not authenticated as internal state.
     view.AddCoin(obsolete_latest,
                  TestMarkerCoin(1, TestMarkerScript(TEST_TAG_LATEST, latest_payload),
-                                tip.nHeight, tip.GetBlockTime()),
+                                tip.nHeight, tip.nTime),
                  /*possible_overwrite=*/false);
     removed = 999;
     BOOST_REQUIRE(PurgeAuthenticatedDemurrageState(view, &tip, removed));

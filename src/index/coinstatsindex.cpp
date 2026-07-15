@@ -18,6 +18,7 @@
 #include <undo.h>
 #include <validation.h>
 
+#include <limits>
 #include <stdexcept>
 
 using kernel::ApplyCoinHash;
@@ -268,7 +269,7 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
 
             for (uint32_t j = 0; j < tx->vout.size(); ++j) {
                 const CTxOut& out{tx->vout[j]};
-                const unsigned int coin_time = (tx->nVersion < 2) ? tx->nTime : block.data->GetBlockTime();
+                const uint32_t coin_time = GetCoinTime(*tx, block.data->nTime);
                 Coin coin{out, block.height, tx->IsCoinBase(), tx->IsCoinStake(), coin_time};
                 COutPoint outpoint{tx->GetHash(), j};
 
@@ -296,6 +297,9 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
         {
             LOCK(cs_main);
             for (const ShadowSyntheticPayoutCoin& payout : GetAppliedShadowClaimPayoutCoins(m_chainstate->CoinsTip(), block.height, block.hash, block.data->GetBlockTime())) {
+                if (payout.time < 0 || payout.time > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+                    return error("%s: synthetic payout time is outside the serialized block-time range", __func__);
+                }
                 Coin coin{payout.txout, static_cast<int>(payout.height), /*fCoinBaseIn=*/true, /*fCoinStakeIn=*/false, static_cast<uint32_t>(payout.time)};
                 shadow_payouts.emplace_back(payout.outpoint, coin);
                 AddCreatedCoin(payout.outpoint, coin);
@@ -545,7 +549,7 @@ bool CoinStatsIndex::ReverseBlock(const CBlock& block, const CBlockIndex* pindex
         for (uint32_t j = 0; j < tx->vout.size(); ++j) {
             const CTxOut& out{tx->vout[j]};
             COutPoint outpoint{tx->GetHash(), j};
-            const unsigned int coin_time = (tx->nVersion < 2) ? tx->nTime : block.GetBlockTime();
+            const uint32_t coin_time = GetCoinTime(*tx, block.nTime);
             Coin coin{out, pindex->nHeight, tx->IsCoinBase(), tx->IsCoinStake(), coin_time};
 
             // Skip unspendable coins

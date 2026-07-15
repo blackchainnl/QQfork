@@ -822,7 +822,7 @@ BOOST_FIXTURE_TEST_CASE(script_queue_internal_failure_is_fail_stop_retryable_and
             spend.transaction.vin[0].prevout,
             Coin{spend.spent_output, parent->nHeight,
                  /*coinbase=*/false, /*coinstake=*/false,
-                 static_cast<uint32_t>(parent->GetBlockTime())},
+                 parent->nTime},
             /*possible_overwrite=*/false);
         return view;
     };

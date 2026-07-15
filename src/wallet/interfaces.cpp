@@ -46,6 +46,7 @@
 #include <wallet/wallet.h>
 
 #include <algorithm>
+#include <limits>
 #include <map>
 #include <memory>
 #include <optional>
@@ -1356,6 +1357,19 @@ WalletDemurrageInfo GetWalletDemurrageInfo(CWallet& wallet)
         quantum_outputs.push_back(out);
     }
     wallet.chain().findCoins(chain_coins);
+
+    // Wallet records can outlive a chainstate entry. Do not narrow an
+    // untrusted local timestamp when reconstructing the temporary Coin used
+    // for lifecycle reporting: UTXO provenance is a uint32_t block field.
+    for (const COutput& out : quantum_outputs) {
+        const auto coin_it = chain_coins.find(out.outpoint);
+        const bool chainstate_backed = coin_it != chain_coins.end() && !coin_it->second.IsSpent();
+        if (!chainstate_backed &&
+            (out.time < 0 || out.time > static_cast<int64_t>(std::numeric_limits<uint32_t>::max()))) {
+            info.available = false;
+            return info;
+        }
+    }
 
     const CCoinsViewCache& view = wallet.chain().getCoinsTip();
     info.quantum_outputs = static_cast<int>(quantum_outputs.size());

@@ -866,7 +866,7 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
             }
             for (const auto& input: tx.vin) mempoolDuplicate.SpendCoin(input.prevout);
             AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max(),
-                     /*check=*/false, check_spend_time);
+                     /*check=*/false, static_cast<uint32_t>(check_spend_time));
         } else {
             for (size_t output_index = 0; output_index < tx.vout.size(); ++output_index) {
                 if (!tx.vout[output_index].scriptPubKey.IsUnspendable()) {
