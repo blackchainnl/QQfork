@@ -12,10 +12,42 @@
 #include <util/check.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <numeric>
 #include <utility>
 
 namespace node {
+
+namespace {
+
+// Multiply a fee by a transaction size without overflowing CAmount. The
+// portable fallback matches the 96-bit representation used by upstream
+// FeeFrac; MiniMiner clusters are limited to 500 standard mempool entries, so
+// their aggregate virtual size is representable by int32_t.
+#ifdef __SIZEOF_INT128__
+__int128 MultiplyFeeBySize(CAmount fee, int64_t size)
+{
+    Assert(size > 0);
+    return static_cast<__int128>(fee) * size;
+}
+#else
+std::pair<int64_t, uint32_t> MultiplyFeeBySize(CAmount fee, int64_t size)
+{
+    Assert(size > 0 && size <= std::numeric_limits<int32_t>::max());
+    const int32_t factor{static_cast<int32_t>(size)};
+    const int64_t low{int64_t{static_cast<uint32_t>(fee)} * factor};
+    const int64_t high{(fee >> 32) * factor};
+    return {high + (low >> 32), static_cast<uint32_t>(low)};
+}
+#endif
+
+bool FeeRateLess(CAmount fee_a, int64_t size_a, CAmount fee_b, int64_t size_b)
+{
+    return MultiplyFeeBySize(fee_a, size_b) < MultiplyFeeBySize(fee_b, size_a);
+}
+
+} // namespace
 
 MiniMiner::MiniMiner(const CTxMemPool& mempool, const std::vector<COutPoint>& outpoints)
 {
@@ -140,9 +172,9 @@ struct AncestorFeerateComparator
             const int64_t tx_size{e.GetTxSize()};
             // Comparing ancestor feerate with individual feerate:
             //     ancestor_fee / ancestor_size <= tx_fee / tx_size
-            // Avoid division and possible loss of precision by
-            // multiplying both sides by the sizes:
-            return ancestor_fee * tx_size < tx_fee * ancestor_size ?
+            // Avoid division and possible loss of precision by comparing the
+            // cross-products in a representation wide enough not to overflow.
+            return FeeRateLess(ancestor_fee, ancestor_size, tx_fee, tx_size) ?
                        CFeeRate(ancestor_fee, ancestor_size) :
                        CFeeRate(tx_fee, tx_size);
         };

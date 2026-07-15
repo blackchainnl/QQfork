@@ -10,7 +10,6 @@
 #include <policy/feerate.h>
 #include <tinyformat.h>
 
-#include <cmath>
 #include <limits>
 
 CFeeRate::CFeeRate(const CAmount& nFeePaid, uint32_t num_bytes)
@@ -51,9 +50,33 @@ CAmount CFeeRate::GetFee(uint32_t num_bytes) const
 {
     const int64_t nSize{num_bytes};
 
-    // Be explicit that we're converting from a double to int64_t (CAmount) here.
-    // We've previously had issues with the silent double->int64_t conversion.
-    CAmount nFee{static_cast<CAmount>(std::ceil(nSatoshisPerK * nSize / 1000.0))};
+    if (nSize == 0 || nSatoshisPerK == 0) return 0;
+
+    // Split before multiplying so the intermediate product cannot overflow
+    // when the final fee is representable. Preserve the historical rounding:
+    // positive fractional satoshis round up, while negative values truncate
+    // toward zero. Saturate only if the mathematical fee itself is outside
+    // the range representable by CAmount.
+    constexpr CAmount SCALE{1000};
+    const CAmount quotient{nSatoshisPerK / SCALE};
+    const CAmount remainder{nSatoshisPerK % SCALE};
+    const CAmount max{std::numeric_limits<CAmount>::max()};
+    const CAmount min{std::numeric_limits<CAmount>::min()};
+
+    if (quotient > max / nSize) return max;
+    if (quotient < min / nSize) return min;
+
+    const CAmount whole{quotient * nSize};
+    const CAmount remainder_product{remainder * nSize};
+    CAmount fractional{remainder_product / SCALE};
+    if (remainder_product > 0 && remainder_product % SCALE != 0) {
+        ++fractional;
+    }
+
+    if (fractional > 0 && whole > max - fractional) return max;
+    if (fractional < 0 && whole < min - fractional) return min;
+
+    CAmount nFee{whole + fractional};
 
     if (nFee == 0 && nSize != 0) {
         if (nSatoshisPerK > 0) nFee = CAmount(1);
