@@ -176,7 +176,9 @@ Choice PromptForRebuild(QWidget* parent)
         "succeeds; a failure or interruption preserves it for recovery."));
     QPushButton* automatic = box.addButton(QObject::tr("Rebuild automatically"), QMessageBox::AcceptRole);
     QPushButton* manual = box.addButton(QObject::tr("Exit and rebuild manually"), QMessageBox::RejectRole);
-    box.setDefaultButton(automatic);
+    // Pressing Enter must not authorize a rebuild. Automatic mode requires an
+    // affirmative click; Enter, Esc, and window close all take the safe exit.
+    box.setDefaultButton(manual);
     box.setEscapeButton(manual);
     box.exec();
     return box.clickedButton() == automatic ? Choice::AUTOMATIC :

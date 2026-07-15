@@ -413,7 +413,9 @@ class QuantumDemurrageTest(BitcoinTestFramework):
         assert_equal(output["exemption"], "inactive")
         assert_equal(Decimal(output["effective_amount"]), Decimal(output["nominal_amount"]))
         assert_equal(Decimal(output["burned_if_spent_amount"]), Decimal("0E-8"))
-        assert_raises_rpc_error(-4, "demurrage is not active for the next block", wallet.sweepdemurragedecay)
+        assert_raises_rpc_error(
+            -4, "demurrage is not active for the next block",
+            wallet.sweepdemurragedecay, {"allow_new_quantum_key": True})
 
         self.log.info("Connect the last Migration block; next-block state activates demurrage atomically with Final lockout")
         supply = self._mine_until_demurrage_active(mining_quantum_address)
@@ -579,7 +581,15 @@ class QuantumDemurrageTest(BitcoinTestFramework):
         wallet.walletpassphrase("demurrage-passphrase", 600)
 
         self.log.info("Broadcast and mine the demurrage sweep through consensus")
-        sweep_tx = wallet.sweepdemurragedecay({"source_address": quantum_address})
+        quantum_count_before = len(wallet.listquantumaddresses())
+        assert_raises_rpc_error(
+            -8, "allow_new_quantum_key", wallet.sweepdemurragedecay,
+            {"source_address": quantum_address})
+        assert_equal(len(wallet.listquantumaddresses()), quantum_count_before)
+        sweep_tx = wallet.sweepdemurragedecay({
+            "source_address": quantum_address,
+            "allow_new_quantum_key": True,
+        })
         assert_equal(sweep_tx["selected_inputs"], 1)
         assert_equal(sweep_tx["txid"] in node.getrawmempool(), True)
         self._generate(1, mining_quantum_address)
@@ -592,7 +602,10 @@ class QuantumDemurrageTest(BitcoinTestFramework):
         assert_equal(locked_output["locked"], True)
         assert_equal(locked_output["remaining_ppm"], 0)
         assert_equal(Decimal(locked_output["effective_amount"]), Decimal("0E-8"))
-        assert_raises_rpc_error(-6, "No spendable wallet-owned quantum outputs are currently decaying", wallet.sweepdemurragedecay, {"source_address": lock_address})
+        assert_raises_rpc_error(
+            -6, "No spendable wallet-owned quantum outputs are currently decaying",
+            wallet.sweepdemurragedecay,
+            {"source_address": lock_address, "allow_new_quantum_key": True})
 
         locked_utxo = self._one_output(wallet, lock_address)
         assert_equal(locked_utxo["spendability_state"], "demurrage_locked")

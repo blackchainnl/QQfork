@@ -140,7 +140,8 @@ class GoldRushColdStakeAutoMigrationTest(BitcoinTestFramework):
         self.log.info("Cold-stake funding directly spends the mature Gold Rush reward")
         staker_key = wallet.dumpquantumkey(wallet.getnewquantumaddress()["address"])
         coldstake_address = wallet.getnewquantumcoldstakingaddress(staker_key["public_key"], "auto-coldstake")["address"]
-        result = wallet.fundquantumcoldstakeaddress(coldstake_address, Decimal("1"))
+        result = wallet.fundquantumcoldstakeaddress(
+            coldstake_address, Decimal("1"), {"allow_new_quantum_key": True})
         assert_equal(result["created_goldrush_migration"], False)
         assert_equal(result["completed_delegation"], True)
         assert result["txid"] in node.getrawmempool()

@@ -45,6 +45,7 @@
 #include <validationinterface.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
+#include <wallet/quantum_stake_ops.h>
 #include <wallet/receive.h>
 #include <wallet/scriptpubkeyman.h>
 #include <wallet/spend.h>
@@ -115,6 +116,74 @@ static_assert(DEFAULT_TRANSACTION_MINFEE >= DEFAULT_MIN_RELAY_TX_FEE, "wallet mi
 */
 
 BOOST_FIXTURE_TEST_SUITE(wallet_tests, WalletTestingSetup)
+
+BOOST_AUTO_TEST_CASE(staking_autostart_requires_and_preserves_explicit_consent)
+{
+    ScopedArgsSettings args_guard;
+    args_guard.Unset("-staking");
+    args_guard.Unset("-autostartstaking");
+    BOOST_CHECK(!IsStakingAutostartEnabled());
+
+    args_guard.Force("-staking", "1");
+    BOOST_CHECK(IsStakingAutostartEnabled());
+
+    args_guard.Force("-autostartstaking", "0");
+    BOOST_CHECK(!IsStakingAutostartEnabled());
+
+    args_guard.Force("-autostartstaking", "1");
+    BOOST_CHECK(IsStakingAutostartEnabled());
+
+    args_guard.Unset("-autostartstaking");
+    args_guard.Force("-staking", "0");
+    BOOST_CHECK(!IsStakingAutostartEnabled());
+}
+
+BOOST_AUTO_TEST_CASE(hidden_quantum_key_actions_require_consent_without_wallet_delta)
+{
+    const auto key_count = [&] {
+        return WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size());
+    };
+    const auto tx_count = [&] {
+        return WITH_LOCK(m_wallet.cs_wallet, return m_wallet.mapWallet.size());
+    };
+    const size_t keys_before = key_count();
+    const size_t txs_before = tx_count();
+    const auto check_rejected_without_delta = [&](const auto& result) {
+        BOOST_CHECK(!result);
+        BOOST_CHECK(util::ErrorString(result).original.find("allow_new_quantum_key=true") != std::string::npos);
+        BOOST_CHECK_EQUAL(key_count(), keys_before);
+        BOOST_CHECK_EQUAL(tx_count(), txs_before);
+    };
+
+    check_rejected_without_delta(FundTieredStakeAddress(
+        m_wallet, "unused", 1, /*require_operator_lock=*/false,
+        "test", /*allow_new_quantum_key=*/false));
+    check_rejected_without_delta(WithdrawTieredStakeAddress(
+        m_wallet, "unused", /*require_operator_lock=*/false,
+        "unbond", "withdraw", "test", "test", std::nullopt,
+        /*allow_all_outputs=*/false, /*allow_new_quantum_key=*/false));
+    check_rejected_without_delta(FundColdStakeDelegationAddress(
+        m_wallet, "unused", 1, /*allow_goldrush_migration=*/true,
+        /*allow_new_quantum_key=*/false));
+    check_rejected_without_delta(WithdrawColdStakeDelegationAddress(
+        m_wallet, "unused", std::nullopt, /*allow_all_outputs=*/false,
+        /*allow_new_quantum_key=*/false));
+    check_rejected_without_delta(CreateQuantumMigrationSweep(
+        m_wallet, /*goldrush_rewards_only=*/false,
+        /*allow_goldrush_epoch=*/false, /*destination_label=*/"",
+        /*comment_override=*/"", /*allow_new_quantum_key=*/false));
+
+    QuantumColdStakeRedelegationOptions options;
+    options.dry_run = false;
+    options.allow_new_quantum_key = false;
+    QuantumColdStakeRedelegationResult redelegation;
+    bilingual_str error;
+    BOOST_CHECK(!CreateQuantumColdStakeRedelegationTransaction(
+        m_wallet, CNoDestination{}, {}, options, redelegation, error));
+    BOOST_CHECK(error.original.find("allow_new_quantum_key=true") != std::string::npos);
+    BOOST_CHECK_EQUAL(key_count(), keys_before);
+    BOOST_CHECK_EQUAL(tx_count(), txs_before);
+}
 
 BOOST_AUTO_TEST_CASE(abandon_unknown_transaction_is_safe)
 {
@@ -1976,8 +2045,9 @@ BOOST_FIXTURE_TEST_CASE(ExplicitQuantumAutomationBindingsFailClosed, WalletTesti
     args_guard.Unset("-qqdemurragechangeaddress");
     CCoinControl coin_control;
     error.clear();
-    BOOST_CHECK(!m_wallet.PrepareAutomaticDemurrageChangeAddress(coin_control, error));
-    BOOST_CHECK(error.original.find("-qqdemurragechangeaddress") != std::string::npos);
+    BOOST_CHECK(m_wallet.PrepareAutomaticDemurrageChangeAddress(coin_control, error));
+    BOOST_CHECK(std::holds_alternative<CNoDestination>(coin_control.destChange));
+    BOOST_CHECK(!coin_control.m_allow_new_quantum_key);
     BOOST_CHECK_EQUAL(WITH_LOCK(m_wallet.cs_wallet, return m_wallet.ListQuantumKeyInfos().size()), tiered_key_count);
 
     args_guard.Force("-qqautodemurrageattest", "0");

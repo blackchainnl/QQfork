@@ -225,11 +225,27 @@ class QuantumRedelegationTest(BitcoinTestFramework):
         )
 
         self.log.info("Broadcasting and mining the explicit owner-spend redelegation")
+        before_broadcast_addresses = {
+            entry["address"] for entry in owner_a.listquantumcoldstakingdelegations()
+        }
+        assert_raises_rpc_error(
+            -8,
+            "allow_new_quantum_key",
+            owner_a.redelegatequantumcoldstake,
+            current["address"],
+            small["staking_pubkey"],
+            {"dry_run": False, "enforce_pool_cap": False},
+        )
+        assert_equal(
+            {entry["address"] for entry in owner_a.listquantumcoldstakingdelegations()},
+            before_broadcast_addresses,
+        )
         sent = owner_a.redelegatequantumcoldstake(
             current["address"],
             small["staking_pubkey"],
             {
                 "dry_run": False,
+                "allow_new_quantum_key": True,
                 "enforce_pool_cap": False,
                 "label": "executed-redelegated",
             },

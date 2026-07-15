@@ -45,6 +45,9 @@ struct DemurrageAttestationTxResult
 struct QuantumColdStakeRedelegationOptions
 {
     bool dry_run{true};
+    //! Required for a broadcast redelegation because it creates a new
+    //! non-HD ML-DSA owner key. Dry runs never create wallet metadata.
+    bool allow_new_quantum_key{false};
     bool enforce_pool_cap{true};
     bool require_verified_operator{true};
     std::optional<CFeeRate> fee_rate;

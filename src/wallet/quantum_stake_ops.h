@@ -29,7 +29,8 @@ util::Result<interfaces::WalletQuantumOperatorBondTx> FundTieredStakeAddress(
     const std::string& address,
     CAmount amount,
     bool require_operator_lock,
-    std::string comment);
+    std::string comment,
+    bool allow_new_quantum_key);
 
 util::Result<interfaces::WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
     CWallet& wallet,
@@ -40,25 +41,29 @@ util::Result<interfaces::WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress
     std::string unbonding_comment,
     std::string withdrawal_comment,
     std::optional<COutPoint> selected_outpoint = std::nullopt,
-    bool allow_all_outputs = true);
+    bool allow_all_outputs = true,
+    bool allow_new_quantum_key = false);
 
 util::Result<interfaces::WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
     CWallet& wallet,
     const std::string& address,
     CAmount amount,
-    bool allow_goldrush_migration);
+    bool allow_goldrush_migration,
+    bool allow_new_quantum_key);
 util::Result<interfaces::WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
     CWallet& wallet,
     const std::string& address,
     std::optional<COutPoint> selected_outpoint = std::nullopt,
-    bool allow_all_outputs = true);
+    bool allow_all_outputs = true,
+    bool allow_new_quantum_key = false);
 
 util::Result<interfaces::WalletQuantumActionTx> CreateQuantumMigrationSweep(
     CWallet& wallet,
     bool goldrush_rewards_only,
     bool allow_goldrush_epoch = false,
     const std::string& destination_label = "",
-    const std::string& comment_override = "");
+    const std::string& comment_override = "",
+    bool allow_new_quantum_key = false);
 
 } // namespace wallet
 

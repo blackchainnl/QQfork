@@ -160,6 +160,18 @@ util::Result<void> CommitWalletTransactionOrError(CWallet& wallet, const CTransa
     return {};
 }
 
+bilingual_str DurableQuantumKeyFailure(
+    const CTxDestination& created_destination,
+    const std::string& action,
+    const bilingual_str& failure)
+{
+    return Untranslated(strprintf(
+        "%s failed after creating durable non-HD ML-DSA key %s. The key remains in this wallet even though no successful action was reported. Back up the wallet now; an older backup cannot recover it. Original error: %s",
+        action,
+        EncodeDestination(created_destination),
+        failure.original));
+}
+
 WalletQuantumAddressInfo MakeWalletQuantumAddressInfo(const CWallet& wallet, const QuantumKeyInfo& info)
     EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
@@ -795,8 +807,12 @@ util::Result<WalletQuantumOperatorBondTx> FundTieredStakeAddress(
     const std::string& address,
     CAmount amount,
     bool require_operator_lock,
-    std::string comment)
+    std::string comment,
+    bool allow_new_quantum_key)
 {
+    if (!allow_new_quantum_key) {
+        return util::Error{_("Explicit allow_new_quantum_key=true consent is required because funding creates a new non-HD ML-DSA change key. No key or transaction was created. Back up the wallet after retrying.")};
+    }
     if (!MoneyRange(amount) || amount <= 0) {
         return util::Error{_("Error: Funding amount must be positive")};
     }
@@ -807,6 +823,7 @@ util::Result<WalletQuantumOperatorBondTx> FundTieredStakeAddress(
 
     CTransactionRef tx;
     CAmount fee{0};
+    std::optional<CTxDestination> created_key;
     {
         LOCK2(::cs_main, wallet.cs_wallet);
         bilingual_str spend_error;
@@ -829,10 +846,11 @@ util::Result<WalletQuantumOperatorBondTx> FundTieredStakeAddress(
         coin_control.m_allow_other_inputs = true;
         auto change_dest = wallet.GetNewQuantumChangeDestination();
         if (!change_dest) return util::Error{util::ErrorString(change_dest)};
+        created_key = *change_dest;
         coin_control.destChange = *change_dest;
         int change_pos = RANDOM_CHANGE_POSITION;
         auto res = CreateTransaction(wallet, recipients, change_pos, coin_control, /*sign=*/true);
-        if (!res) return util::Error{util::ErrorString(res)};
+        if (!res) return util::Error{DurableQuantumKeyFailure(*created_key, "Staking address funding", util::ErrorString(res))};
         tx = res->tx;
         fee = res->fee;
     }
@@ -840,7 +858,7 @@ util::Result<WalletQuantumOperatorBondTx> FundTieredStakeAddress(
     mapValue_t map_value;
     map_value["comment"] = std::move(comment);
     if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), "staking address funding"); !committed) {
-        return util::Error{util::ErrorString(committed)};
+        return util::Error{DurableQuantumKeyFailure(*created_key, "Staking address funding", util::ErrorString(committed))};
     }
 
     WalletQuantumOperatorBondTx result;
@@ -848,6 +866,7 @@ util::Result<WalletQuantumOperatorBondTx> FundTieredStakeAddress(
     result.address = address;
     result.amount = amount;
     result.fee = fee;
+    result.warning = "A new non-HD ML-DSA quantum change key was created during transaction construction. Back up this wallet now; an older backup cannot recover it.";
     return result;
 }
 
@@ -860,8 +879,12 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
     std::string unbonding_comment,
     std::string withdrawal_comment,
     std::optional<COutPoint> selected_outpoint,
-    bool allow_all_outputs)
+    bool allow_all_outputs,
+    bool allow_new_quantum_key)
 {
+    if (!allow_new_quantum_key) {
+        return util::Error{_("Explicit allow_new_quantum_key=true consent is required because unbonding or withdrawal creates a new non-HD ML-DSA change or destination key. No key or transaction was created. Back up the wallet after retrying.")};
+    }
     CTxDestination dest;
     const auto tier = DecodeTieredStakeAddress(address, dest, require_operator_lock);
     if (!tier) return util::Error{util::ErrorString(tier)};
@@ -874,6 +897,7 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
     std::string comment;
     bool started_unbonding{false};
     bool completed_withdrawal{false};
+    std::optional<CTxDestination> created_key;
     {
         LOCK2(::cs_main, wallet.cs_wallet);
         bilingual_str spend_error;
@@ -936,6 +960,7 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
 
             auto change_dest = wallet.GetNewQuantumChangeDestination();
             if (!change_dest) return util::Error{util::ErrorString(change_dest)};
+            created_key = *change_dest;
             coin_control.destChange = *change_dest;
 
             unlock_height = static_cast<uint32_t>(std::max(0, spend_height + int{tier->unbonding_blocks}));
@@ -962,6 +987,8 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
 
             auto withdraw_dest = wallet.GetNewQuantumDestination(withdrawal_label);
             if (!withdraw_dest) return util::Error{util::ErrorString(withdraw_dest)};
+            created_key = *withdraw_dest;
+            coin_control.destChange = *withdraw_dest;
 
             amount = outputs.withdrawable_amount;
             destination_address = EncodeDestination(*withdraw_dest);
@@ -975,7 +1002,7 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
         }
 
         auto res = CreateTransaction(wallet, recipients, change_pos, coin_control, /*sign=*/true);
-        if (!res) return util::Error{util::ErrorString(res)};
+        if (!res) return util::Error{DurableQuantumKeyFailure(*created_key, "Staking address withdrawal", util::ErrorString(res))};
         tx = res->tx;
         fee = res->fee;
     }
@@ -983,7 +1010,7 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
     mapValue_t map_value;
     map_value["comment"] = std::move(comment);
     if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), "staking address withdrawal"); !committed) {
-        return util::Error{util::ErrorString(committed)};
+        return util::Error{DurableQuantumKeyFailure(*created_key, "Staking address withdrawal", util::ErrorString(committed))};
     }
 
     WalletQuantumOperatorBondTx result;
@@ -994,6 +1021,9 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawTieredStakeAddress(
     result.unlock_height = unlock_height;
     result.started_unbonding = started_unbonding;
     result.completed_withdrawal = completed_withdrawal;
+    result.warning = started_unbonding
+        ? "A new non-HD ML-DSA quantum change key was created while starting unbonding. Back up this wallet now; an older backup cannot recover it."
+        : "A new non-HD ML-DSA quantum withdrawal key was created. Back up this wallet now; an older backup cannot recover it.";
     return result;
 }
 
@@ -1001,8 +1031,12 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
     CWallet& wallet,
     const std::string& address,
     CAmount amount,
-    bool allow_goldrush_migration)
+    bool allow_goldrush_migration,
+    bool allow_new_quantum_key)
 {
+    if (!allow_new_quantum_key) {
+        return util::Error{_("Explicit allow_new_quantum_key=true consent is required because delegation funding creates a new non-HD ML-DSA change key. No key or transaction was created. Back up the wallet after retrying.")};
+    }
     (void)allow_goldrush_migration; // Retained for RPC/API compatibility; no forced first-move workflow exists.
     if (!MoneyRange(amount) || amount <= 0) {
         return util::Error{_("Error: Delegation funding amount must be positive")};
@@ -1010,6 +1044,7 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
 
     CTransactionRef tx;
     CAmount fee{0};
+    std::optional<CTxDestination> created_key;
     {
         LOCK2(::cs_main, wallet.cs_wallet);
         bilingual_str spend_error;
@@ -1067,6 +1102,7 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
 
         auto change_dest = wallet.GetNewQuantumChangeDestination();
         if (!change_dest) return util::Error{util::ErrorString(change_dest)};
+        created_key = *change_dest;
 
         std::vector<CRecipient> recipients{{dest, amount, /*fSubtractFeeFromAmount=*/false}};
         coin_control.destChange = *change_dest;
@@ -1076,7 +1112,7 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
             bilingual_str error = strprintf(
                 _("Error: Unable to fund cold-stake delegation from direct quantum outputs. %s"),
                 util::ErrorString(res).original);
-            return util::Error{error};
+            return util::Error{DurableQuantumKeyFailure(*created_key, "Cold-stake delegation funding", error)};
         }
         tx = res->tx;
         fee = res->fee;
@@ -1085,7 +1121,7 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
     mapValue_t map_value;
     map_value["comment"] = "Blackcoin quantum cold-stake delegation funding";
     if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), "cold-stake delegation funding"); !committed) {
-        return util::Error{util::ErrorString(committed)};
+        return util::Error{DurableQuantumKeyFailure(*created_key, "Cold-stake delegation funding", util::ErrorString(committed))};
     }
 
     WalletQuantumOperatorBondTx result;
@@ -1093,6 +1129,7 @@ util::Result<WalletQuantumOperatorBondTx> FundColdStakeDelegationAddress(
     result.address = address;
     result.amount = amount;
     result.fee = fee;
+    result.warning = "A new non-HD ML-DSA quantum change key was created during delegation funding. Back up this wallet now; an older backup cannot recover it.";
     return result;
 }
 
@@ -1100,8 +1137,12 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
     CWallet& wallet,
     const std::string& address,
     std::optional<COutPoint> selected_outpoint,
-    bool allow_all_outputs)
+    bool allow_all_outputs,
+    bool allow_new_quantum_key)
 {
+    if (!allow_new_quantum_key) {
+        return util::Error{_("Explicit allow_new_quantum_key=true consent is required because delegation unbonding or withdrawal creates a new non-HD ML-DSA change or destination key. No key or transaction was created. Back up the wallet after retrying.")};
+    }
     CTransactionRef tx;
     CAmount amount{0};
     CAmount fee{0};
@@ -1109,6 +1150,7 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
     std::string destination_address;
     bool started_unbonding{false};
     bool completed_withdrawal{false};
+    std::optional<CTxDestination> created_key;
     {
         LOCK2(::cs_main, wallet.cs_wallet);
         bilingual_str spend_error;
@@ -1171,6 +1213,7 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
             }
             auto change_dest = wallet.GetNewQuantumChangeDestination();
             if (!change_dest) return util::Error{util::ErrorString(change_dest)};
+            created_key = *change_dest;
             coin_control.destChange = *change_dest;
 
             unlock_height = static_cast<uint32_t>(std::max(0, spend_height + int{delegation->unbonding_blocks}));
@@ -1182,7 +1225,12 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
                 delegation->unbonding_blocks,
                 unlock_height,
                 QUANTUM_TIERED_STATE_UNBONDING);
-            if (!unbonding_dest) return util::Error{util::ErrorString(unbonding_dest)};
+            if (!unbonding_dest) {
+                return util::Error{DurableQuantumKeyFailure(
+                    *created_key,
+                    "Cold-stake delegation withdrawal",
+                    util::ErrorString(unbonding_dest))};
+            }
 
             destination_address = EncodeDestination(*unbonding_dest);
             recipients.push_back({*unbonding_dest, amount, /*fSubtractFeeFromAmount=*/false});
@@ -1196,13 +1244,15 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
 
             auto withdraw_dest = wallet.GetNewQuantumDestination("coldstake-delegation-withdrawal");
             if (!withdraw_dest) return util::Error{util::ErrorString(withdraw_dest)};
+            created_key = *withdraw_dest;
+            coin_control.destChange = *withdraw_dest;
 
             destination_address = EncodeDestination(*withdraw_dest);
             recipients.push_back({*withdraw_dest, amount, /*fSubtractFeeFromAmount=*/true});
             completed_withdrawal = true;
         }
         auto res = CreateTransaction(wallet, recipients, change_pos, coin_control, /*sign=*/true);
-        if (!res) return util::Error{util::ErrorString(res)};
+        if (!res) return util::Error{DurableQuantumKeyFailure(*created_key, "Cold-stake delegation withdrawal", util::ErrorString(res))};
         tx = res->tx;
         fee = res->fee;
     }
@@ -1210,7 +1260,7 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
     mapValue_t map_value;
     map_value["comment"] = "Blackcoin quantum cold-stake delegation withdrawal";
     if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), "cold-stake delegation withdrawal"); !committed) {
-        return util::Error{util::ErrorString(committed)};
+        return util::Error{DurableQuantumKeyFailure(*created_key, "Cold-stake delegation withdrawal", util::ErrorString(committed))};
     }
 
     WalletQuantumOperatorBondTx result;
@@ -1221,6 +1271,9 @@ util::Result<WalletQuantumOperatorBondTx> WithdrawColdStakeDelegationAddress(
     result.unlock_height = unlock_height;
     result.started_unbonding = started_unbonding;
     result.completed_withdrawal = completed_withdrawal;
+    result.warning = started_unbonding
+        ? "A new non-HD ML-DSA quantum change key was created while starting delegation unbonding. Back up this wallet now; an older backup cannot recover it."
+        : "A new non-HD ML-DSA quantum withdrawal key was created. Back up this wallet now; an older backup cannot recover it.";
     return result;
 }
 
@@ -1445,8 +1498,12 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     bool goldrush_rewards_only,
     bool allow_goldrush_epoch,
     const std::string& destination_label,
-    const std::string& comment_override)
+    const std::string& comment_override,
+    bool allow_new_quantum_key)
 {
+    if (!allow_new_quantum_key) {
+        return util::Error{_("This action creates a new non-HD ML-DSA destination key. Retry with allow_new_quantum_key=true only after authorizing key creation, then back up the wallet. No key or transaction was created.")};
+    }
     // Check the current lifecycle before reserving a new destination. Repeat
     // the check under the transaction-creation locks below to close the race
     // if the active tip changes while the key is being generated.
@@ -1465,6 +1522,9 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     const CTxDestination destination = *destination_result;
     const CScript destination_script = GetScriptForDestination(destination);
     const std::string destination_address = EncodeDestination(destination);
+    const std::string action_name = goldrush_rewards_only
+        ? "Gold Rush reward consolidation"
+        : "Quantum migration";
 
     CTransactionRef tx;
     CAmount eligible_amount{0};
@@ -1476,13 +1536,18 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
     {
         LOCK2(::cs_main, wallet.cs_wallet);
         bilingual_str spend_error;
-        if (!CanCreateSignedSpend(wallet, spend_error)) return util::Error{spend_error};
+        if (!CanCreateSignedSpend(wallet, spend_error)) {
+            return util::Error{DurableQuantumKeyFailure(destination, action_name, spend_error)};
+        }
         if (wallet.IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
-            return util::Error{_("Error: Private keys are disabled for this wallet")};
+            return util::Error{DurableQuantumKeyFailure(
+                destination,
+                action_name,
+                _("Error: Private keys are disabled for this wallet"))};
         }
 
         if (const auto error = QuantumMigrationSweepPhaseError(wallet, goldrush_rewards_only)) {
-            return util::Error{*error};
+            return util::Error{DurableQuantumKeyFailure(destination, action_name, *error)};
         }
         const Consensus::Params& consensus = Params().GetConsensus();
         const CBlockIndex* tip = wallet.chain().getTip();
@@ -1491,13 +1556,18 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
         const int next_height = tip->nHeight + 1;
 
         if (!wallet.GetQuantumKeyInfo(destination).has_value()) {
-            return util::Error{_("Refusing to migrate: destination ML-DSA key is not confirmed stored in the wallet.")};
+            return util::Error{DurableQuantumKeyFailure(
+                destination,
+                action_name,
+                _("Refusing to continue: destination ML-DSA key is not confirmed stored in the wallet."))};
         }
 
         CCoinControl coin_control;
         coin_control.m_allow_other_inputs = false;
         coin_control.m_include_unsafe_inputs = false;
-        coin_control.destChange = CNoDestination{};
+        // Reuse the expressly authorized sweep destination for any unexpected
+        // change instead of silently creating a second non-HD key.
+        coin_control.destChange = destination;
         coin_control.m_include_generated_quantum_inputs = goldrush_rewards_only;
 
         CoinFilterParams filter;
@@ -1540,25 +1610,32 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
             ++eligible_inputs;
         }
         if (eligible_inputs == 0) {
-            return util::Error{goldrush_rewards_only
+            const bilingual_str failure = goldrush_rewards_only
                 ? _("No spendable wallet-owned Gold Rush reward outputs are available to consolidate.")
-                : _("No spendable legacy coins to migrate.")};
+                : _("No spendable legacy coins to migrate.");
+            return util::Error{DurableQuantumKeyFailure(destination, action_name, failure)};
         }
         if (!goldrush_rewards_only && IsQuantumWitnessSpendActive(consensus, mtp, next_height) &&
             migration_anchor_inputs == 0) {
-            return util::Error{_("This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction. Add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor; during Gold Rush, prepare that anchor before quantum spending activates.")};
+            return util::Error{DurableQuantumKeyFailure(
+                destination,
+                action_name,
+                _("This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction. Add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor; during Gold Rush, prepare that anchor before quantum spending activates."))};
         }
 
         std::vector<CRecipient> recipients{{destination, effective_eligible_amount, /*fSubtractFeeFromAmount=*/true}};
         int change_pos = RANDOM_CHANGE_POSITION;
         auto res = CreateTransaction(wallet, recipients, change_pos, coin_control, /*sign=*/true);
-        if (!res) return util::Error{util::ErrorString(res)};
+        if (!res) {
+            return util::Error{DurableQuantumKeyFailure(destination, action_name, util::ErrorString(res))};
+        }
         tx = res->tx;
         fee = res->fee;
         if (tx->vout.size() != 1 || IsDust(tx->vout[0], wallet.chain().relayDustFee())) {
-            return util::Error{goldrush_rewards_only
+            const bilingual_str failure = goldrush_rewards_only
                 ? _("Gold Rush reward consolidation would strand funds: selected value is below the dust threshold after fees.")
-                : _("Migration would strand funds: swept value is below the dust threshold after fees.")};
+                : _("Migration would strand funds: swept value is below the dust threshold after fees.");
+            return util::Error{DurableQuantumKeyFailure(destination, action_name, failure)};
         }
         comment = !comment_override.empty()
             ? comment_override
@@ -1569,8 +1646,8 @@ util::Result<WalletQuantumActionTx> CreateQuantumMigrationSweep(
 
     mapValue_t map_value;
     map_value["comment"] = std::move(comment);
-    if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), goldrush_rewards_only ? "Gold Rush reward consolidation" : "quantum migration"); !committed) {
-        return util::Error{util::ErrorString(committed)};
+    if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), action_name); !committed) {
+        return util::Error{DurableQuantumKeyFailure(destination, action_name, util::ErrorString(committed))};
     }
 
     WalletQuantumActionTx result;
@@ -1628,8 +1705,11 @@ util::Result<WalletQuantumActionTx> CreateWalletDemurrageAttestation(CWallet& wa
     return result;
 }
 
-util::Result<WalletQuantumActionTx> CreateWalletDemurrageSweep(CWallet& wallet)
+util::Result<WalletQuantumActionTx> CreateWalletDemurrageSweep(CWallet& wallet, bool allow_new_quantum_key)
 {
+    if (!allow_new_quantum_key) {
+        return util::Error{_("Demurrage sweep creates a new non-HD ML-DSA destination key. Retry with allow_new_quantum_key=true only after authorizing key creation, then back up the wallet. No key or transaction was created.")};
+    }
     LOCK2(::cs_main, wallet.cs_wallet);
     bilingual_str spend_error;
     if (!CanCreateSignedSpend(wallet, spend_error)) return util::Error{spend_error};
@@ -1645,14 +1725,20 @@ util::Result<WalletQuantumActionTx> CreateWalletDemurrageSweep(CWallet& wallet)
 
     auto op_dest = wallet.GetNewQuantumDestination("demurrage-sweep");
     if (!op_dest) return util::Error{util::ErrorString(op_dest)};
+    const CTxDestination created_destination = *op_dest;
     if (!wallet.GetQuantumKeyInfo(*op_dest).has_value()) {
-        return util::Error{_("Error: Refusing to sweep: destination ML-DSA key is not confirmed stored in the wallet")};
+        return util::Error{DurableQuantumKeyFailure(
+            created_destination,
+            "Demurrage sweep",
+            _("Error: Refusing to sweep: destination ML-DSA key is not confirmed stored in the wallet"))};
     }
 
     CCoinControl coin_control;
     coin_control.m_allow_other_inputs = false;
     coin_control.m_include_unsafe_inputs = false;
-    coin_control.destChange = CNoDestination{};
+    // The newly authorized sweep destination is also the change destination;
+    // never create a second hidden non-HD key.
+    coin_control.destChange = *op_dest;
 
     CoinFilterParams filter;
     filter.only_spendable = true;
@@ -1701,10 +1787,16 @@ util::Result<WalletQuantumActionTx> CreateWalletDemurrageSweep(CWallet& wallet)
         ++selected_inputs;
     }
     if (selected_inputs == 0) {
-        return util::Error{_("Error: No spendable wallet-owned quantum outputs are currently decaying")};
+        return util::Error{DurableQuantumKeyFailure(
+            created_destination,
+            "Demurrage sweep",
+            _("Error: No spendable wallet-owned quantum outputs are currently decaying"))};
     }
     if (effective_amount <= 0) {
-        return util::Error{_("Error: Selected decaying outputs have no spendable effective value")};
+        return util::Error{DurableQuantumKeyFailure(
+            created_destination,
+            "Demurrage sweep",
+            _("Error: Selected decaying outputs have no spendable effective value"))};
     }
 
     const int64_t current_time = GetAdjustedTimeSeconds();
@@ -1721,34 +1813,55 @@ util::Result<WalletQuantumActionTx> CreateWalletDemurrageSweep(CWallet& wallet)
 
     const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(sweep_tx), &wallet, &coin_control);
     if (tx_size.vsize <= 0) {
-        return util::Error{_("Error: Unable to estimate demurrage sweep transaction size")};
+        return util::Error{DurableQuantumKeyFailure(
+            created_destination,
+            "Demurrage sweep",
+            _("Error: Unable to estimate demurrage sweep transaction size"))};
     }
     const CAmount fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
     if (fee > wallet.m_default_max_tx_fee) {
-        return util::Error{strprintf(_("Error: Demurrage sweep fee exceeds wallet max transaction fee (%s)"), FormatMoney(wallet.m_default_max_tx_fee))};
+        return util::Error{DurableQuantumKeyFailure(
+            created_destination,
+            "Demurrage sweep",
+            strprintf(_("Error: Demurrage sweep fee exceeds wallet max transaction fee (%s)"), FormatMoney(wallet.m_default_max_tx_fee)))};
     }
     const CAmount output_amount = effective_amount - fee;
     if (!MoneyRange(output_amount) || output_amount <= 0) {
-        return util::Error{_("Error: Selected decaying outputs cannot pay the sweep fee")};
+        return util::Error{DurableQuantumKeyFailure(
+            created_destination,
+            "Demurrage sweep",
+            _("Error: Selected decaying outputs cannot pay the sweep fee"))};
     }
     sweep_tx.vout[0].nValue = output_amount;
     if (IsDust(sweep_tx.vout[0], wallet.chain().relayDustFee())) {
-        return util::Error{_("Error: Demurrage sweep would strand the effective value below dust after fees")};
+        return util::Error{DurableQuantumKeyFailure(
+            created_destination,
+            "Demurrage sweep",
+            _("Error: Demurrage sweep would strand the effective value below dust after fees"))};
     }
 
     std::map<int, bilingual_str> input_errors;
     if (!wallet.SignTransaction(sweep_tx, input_errors)) {
         if (!input_errors.empty()) {
-            return util::Error{strprintf(_("Error: Signing demurrage sweep failed: %s"), input_errors.begin()->second.original)};
+            return util::Error{DurableQuantumKeyFailure(
+                created_destination,
+                "Demurrage sweep",
+                strprintf(_("Error: Signing demurrage sweep failed: %s"), input_errors.begin()->second.original))};
         }
-        return util::Error{_("Error: Signing demurrage sweep failed")};
+        return util::Error{DurableQuantumKeyFailure(
+            created_destination,
+            "Demurrage sweep",
+            _("Error: Signing demurrage sweep failed"))};
     }
 
     CTransactionRef tx = MakeTransactionRef(std::move(sweep_tx));
     mapValue_t map_value;
     map_value["comment"] = "Blackcoin demurrage sweep";
     if (auto committed = CommitWalletTransactionOrError(wallet, tx, std::move(map_value), "demurrage sweep"); !committed) {
-        return util::Error{util::ErrorString(committed)};
+        return util::Error{DurableQuantumKeyFailure(
+            created_destination,
+            "Demurrage sweep",
+            util::ErrorString(committed))};
     }
 
     WalletQuantumActionTx result;
@@ -2323,18 +2436,28 @@ public:
     }
     void setEnabledStaking(bool enabled) override
     {
-        m_wallet->m_enabled_staking = enabled;
+        if (enabled) {
+            // The GUI runtime switch must have the same effect as the
+            // `staking true` RPC: create the worker when this wallet was not
+            // autostarted, and resume the existing worker idempotently.
+            m_wallet->StartStake();
+        } else {
+            // Disabling is intentionally non-blocking for the GUI. The live
+            // worker observes this atomic state and idles; wallet unload owns
+            // the final stop/join. A later enable reuses the worker.
+            m_wallet->m_enabled_staking = false;
+        }
     }
     bool getEnabledStaking() override
     {
         return m_wallet->m_enabled_staking;
     }
     bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
-                      bool allow_new_payout_key) override
+                      bool allow_new_payout_key, bool* created_payout_key) override
     {
         bilingual_str werror;
         const bool ok = m_wallet->SetPowMining(
-            enabled, threads, cpu_percent, werror, /*created_payout=*/nullptr,
+            enabled, threads, cpu_percent, werror, created_payout_key,
             allow_new_payout_key);
         if (!ok) {
             error = werror.original;
@@ -2384,6 +2507,7 @@ public:
             const CBlockIndex* tip = active.m_chain.Tip();
             if (tip) {
                 const Consensus::Params& consensus = Params().GetConsensus();
+                info.current_height = tip->nHeight;
                 const int next_height = tip->nHeight + 1;
                 info.epoch_active = IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), next_height);
                 info.blocks_remaining = info.epoch_active ? std::max(0, SHADOW_REWARD_END_HEIGHT - next_height + 1) : 0;
@@ -2532,16 +2656,17 @@ public:
     {
         return MakeWalletOperatorBondInfo(*m_wallet, operator_address);
     }
-    util::Result<WalletQuantumOperatorBondTx> fundQuantumOperatorBond(const std::string& operator_address, CAmount amount) override
+    util::Result<WalletQuantumOperatorBondTx> fundQuantumOperatorBond(const std::string& operator_address, CAmount amount, bool allow_new_quantum_key) override
     {
         return FundTieredStakeAddress(
             *m_wallet,
             operator_address,
             amount,
             /*require_operator_lock=*/true,
-            "Blackcoin cold-stake operator bond");
+            "Blackcoin cold-stake operator bond",
+            allow_new_quantum_key);
     }
-    util::Result<WalletQuantumOperatorBondTx> withdrawQuantumOperatorBond(const std::string& operator_address) override
+    util::Result<WalletQuantumOperatorBondTx> withdrawQuantumOperatorBond(const std::string& operator_address, bool allow_new_quantum_key) override
     {
         return WithdrawTieredStakeAddress(
             *m_wallet,
@@ -2552,7 +2677,8 @@ public:
             "Blackcoin cold-stake operator unbond",
             "Blackcoin cold-stake operator withdrawal",
             std::nullopt,
-            /*allow_all_outputs=*/true);
+            /*allow_all_outputs=*/true,
+            allow_new_quantum_key);
     }
     WalletQuantumOperatorBondInfo getQuantumStakeAddressBondInfo(const std::string& stake_address) override
     {
@@ -2562,16 +2688,17 @@ public:
     {
         return ListTieredStakeOutputs(*m_wallet, stake_address, /*require_operator_lock=*/false);
     }
-    util::Result<WalletQuantumOperatorBondTx> fundQuantumStakeAddress(const std::string& stake_address, CAmount amount) override
+    util::Result<WalletQuantumOperatorBondTx> fundQuantumStakeAddress(const std::string& stake_address, CAmount amount, bool allow_new_quantum_key) override
     {
         return FundTieredStakeAddress(
             *m_wallet,
             stake_address,
             amount,
             /*require_operator_lock=*/false,
-            "Blackcoin quantum staking address funding");
+            "Blackcoin quantum staking address funding",
+            allow_new_quantum_key);
     }
-    util::Result<WalletQuantumOperatorBondTx> withdrawQuantumStakeAddress(const std::string& stake_address) override
+    util::Result<WalletQuantumOperatorBondTx> withdrawQuantumStakeAddress(const std::string& stake_address, bool allow_new_quantum_key) override
     {
         return WithdrawTieredStakeAddress(
             *m_wallet,
@@ -2582,9 +2709,10 @@ public:
             "Blackcoin quantum staking address unbond",
             "Blackcoin quantum staking address withdrawal",
             std::nullopt,
-            /*allow_all_outputs=*/true);
+            /*allow_all_outputs=*/true,
+            allow_new_quantum_key);
     }
-    util::Result<WalletQuantumOperatorBondTx> withdrawQuantumStakeOutput(const std::string& stake_address, const COutPoint& outpoint) override
+    util::Result<WalletQuantumOperatorBondTx> withdrawQuantumStakeOutput(const std::string& stake_address, const COutPoint& outpoint, bool allow_new_quantum_key) override
     {
         return WithdrawTieredStakeAddress(
             *m_wallet,
@@ -2595,7 +2723,8 @@ public:
             "Blackcoin quantum staking output unbond",
             "Blackcoin quantum staking output withdrawal",
             outpoint,
-            /*allow_all_outputs=*/false);
+            /*allow_all_outputs=*/false,
+            allow_new_quantum_key);
     }
     util::Result<WalletQuantumColdStakeInfo> createQuantumColdStakeAddress(const std::string& staking_pubkey_hex, const std::string& label, uint16_t unbonding_blocks) override
     {
@@ -2626,15 +2755,15 @@ public:
     {
         return MakeWalletColdStakeBalanceInfo(*m_wallet, coldstake_address);
     }
-    util::Result<WalletQuantumOperatorBondTx> fundQuantumColdStakeAddress(const std::string& coldstake_address, CAmount amount) override
+    util::Result<WalletQuantumOperatorBondTx> fundQuantumColdStakeAddress(const std::string& coldstake_address, CAmount amount, bool allow_new_quantum_key) override
     {
-        return FundColdStakeDelegationAddress(*m_wallet, coldstake_address, amount, /*allow_goldrush_migration=*/true);
+        return FundColdStakeDelegationAddress(*m_wallet, coldstake_address, amount, /*allow_goldrush_migration=*/true, allow_new_quantum_key);
     }
-    util::Result<WalletQuantumOperatorBondTx> withdrawQuantumColdStakeAddress(const std::string& coldstake_address) override
+    util::Result<WalletQuantumOperatorBondTx> withdrawQuantumColdStakeAddress(const std::string& coldstake_address, bool allow_new_quantum_key) override
     {
-        return WithdrawColdStakeDelegationAddress(*m_wallet, coldstake_address, std::nullopt, /*allow_all_outputs=*/true);
+        return WithdrawColdStakeDelegationAddress(*m_wallet, coldstake_address, std::nullopt, /*allow_all_outputs=*/true, allow_new_quantum_key);
     }
-    util::Result<WalletQuantumRedelegationInfo> redelegateQuantumColdStake(const std::string& source_coldstake_address, const std::string& target_staking_pubkey_hex, bool dry_run, const std::string& label) override
+    util::Result<WalletQuantumRedelegationInfo> redelegateQuantumColdStake(const std::string& source_coldstake_address, const std::string& target_staking_pubkey_hex, bool dry_run, const std::string& label, bool allow_new_quantum_key) override
     {
         const CTxDestination source_dest = DecodeDestination(source_coldstake_address);
         if (!IsValidDestination(source_dest) || !IsQuantumColdStakeDestination(source_dest)) {
@@ -2650,6 +2779,7 @@ public:
 
         QuantumColdStakeRedelegationOptions options;
         options.dry_run = dry_run;
+        options.allow_new_quantum_key = allow_new_quantum_key;
         if (!label.empty()) options.label = label;
 
         QuantumColdStakeRedelegationResult result;
@@ -2813,13 +2943,13 @@ public:
         status.stake_tiers_active = IsQuantumStakeTiersActive(consensus, mtp, next_height);
         return status;
     }
-    util::Result<WalletQuantumActionTx> migrateLegacyToQuantum() override
+    util::Result<WalletQuantumActionTx> migrateLegacyToQuantum(bool allow_new_quantum_key) override
     {
-        return CreateQuantumMigrationSweep(*m_wallet, /*goldrush_rewards_only=*/false);
+        return CreateQuantumMigrationSweep(*m_wallet, /*goldrush_rewards_only=*/false, /*allow_goldrush_epoch=*/false, /*destination_label=*/"", /*comment_override=*/"", allow_new_quantum_key);
     }
-    util::Result<WalletQuantumActionTx> migrateGoldRushRewards() override
+    util::Result<WalletQuantumActionTx> migrateGoldRushRewards(bool allow_new_quantum_key) override
     {
-        return CreateQuantumMigrationSweep(*m_wallet, /*goldrush_rewards_only=*/true, /*allow_goldrush_epoch=*/true);
+        return CreateQuantumMigrationSweep(*m_wallet, /*goldrush_rewards_only=*/true, /*allow_goldrush_epoch=*/true, /*destination_label=*/"", /*comment_override=*/"", allow_new_quantum_key);
     }
     std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false) override
     {
@@ -2837,9 +2967,9 @@ public:
     {
         return CreateWalletDemurrageAttestation(*m_wallet, address);
     }
-    util::Result<WalletQuantumActionTx> sweepDemurrageDecay() override
+    util::Result<WalletQuantumActionTx> sweepDemurrageDecay(bool allow_new_quantum_key) override
     {
-        return CreateWalletDemurrageSweep(*m_wallet);
+        return CreateWalletDemurrageSweep(*m_wallet, allow_new_quantum_key);
     }
     bool isLegacy() override { return m_wallet->IsLegacy(); }
     std::unique_ptr<Handler> handleUnload(UnloadFn fn) override

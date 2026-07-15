@@ -6840,7 +6840,7 @@ void CWallet::postInitProcess()
     // Staking and PoW autostart are independent consent decisions. Starting
     // runtime staking must never implicitly start a fee-paying PoW miner, and
     // disabling staking autostart must not suppress an explicit -powmining=1.
-    if (gArgs.GetBoolArg("-autostartstaking", DEFAULT_AUTOSTART_STAKING)) {
+    if (IsStakingAutostartEnabled()) {
         StartStake();
     }
     if (gArgs.GetBoolArg("-powmining", false)) {
@@ -6851,6 +6851,17 @@ void CWallet::postInitProcess()
             WalletLogPrintf("Gold Rush PoW mining not auto-started: %s\n", pow_error.original);
         }
     }
+}
+
+bool IsStakingAutostartEnabled()
+{
+    if (gArgs.IsArgSet("-autostartstaking")) {
+        return gArgs.GetBoolArg("-autostartstaking", DEFAULT_AUTOSTART_STAKING);
+    }
+    if (gArgs.IsArgSet("-staking")) {
+        return gArgs.GetBoolArg("-staking", node::DEFAULT_STAKE);
+    }
+    return DEFAULT_AUTOSTART_STAKING;
 }
 
 bool CWallet::VerifyQuantumBackup(const fs::path& backup_path, const QuantumKeySnapshot& expected_keys,
@@ -8894,10 +8905,8 @@ bool CWallet::PrepareAutomaticDemurrageChangeAddress(CCoinControl& coin_control,
         break;
     }
 
-    if (!gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)) {
-        error = _("Automatic demurrage-attestation change is not configured. Set -qqdemurragechangeaddress=<existing wallet-owned quantum address>, or explicitly allow automatic key creation with -qqallowautokeycreation=1.");
-        return false;
-    }
+    // The attestation builder reuses the selected wallet-owned direct quantum
+    // fee-input address for change. It never needs to create a hidden key.
     return true;
 }
 

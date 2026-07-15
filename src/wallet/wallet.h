@@ -219,6 +219,15 @@ static constexpr bool DEFAULT_AUTO_SHADOW_SIGNAL{false};
 static constexpr bool DEFAULT_AUTO_DEMURRAGE_ATTEST{false};
 static constexpr bool DEFAULT_AUTO_REDELEGATE{false};
 static constexpr bool DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION{false};
+
+/**
+ * Return the effective process-wide staking autostart consent.
+ *
+ * New installations fail closed unless -autostartstaking is enabled. An
+ * explicitly configured legacy -staking=1 is retained as upgrade-compatible
+ * consent, while -autostartstaking always takes precedence when both exist.
+ */
+bool IsStakingAutostartEnabled();
 //! -donatetodevfund default
 static const unsigned int DEFAULT_DONATION_PERCENTAGE = 0;
 static const unsigned int DEFAULT_DONATION_SUGGESTED_PERCENTAGE = 1;

@@ -27,6 +27,7 @@
 #include <qt/stakingminingpage.h>
 #include <qt/transactiontablemodel.h>
 #include <qt/transactionview.h>
+#include <qt/utilitydialog.h>
 #include <qt/walletview.h>
 #include <qt/walletmodel.h>
 #include <script/solver.h>
@@ -37,6 +38,8 @@
 #include <wallet/test/util.h>
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
+
+#include <clientversion.h>
 
 #include <algorithm>
 #include <chrono>
@@ -311,6 +314,26 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     std::string error;
     QVERIFY(walletModel.wallet().setPowMining(false, 1, 10, error));
+    core_wallet->StopStake();
+    const auto staking_thread_count = [&] {
+        LOCK(core_wallet->m_staking_thread_mutex);
+        return core_wallet->threadStakeMinerGroup
+            ? core_wallet->threadStakeMinerGroup->size()
+            : size_t{0};
+    };
+    QCOMPARE(staking_thread_count(), size_t{0});
+
+    walletModel.wallet().setEnabledStaking(true);
+    QTRY_COMPARE_WITH_TIMEOUT(staking_thread_count(), size_t{1}, 5000);
+    QVERIFY(walletModel.wallet().getEnabledStaking());
+
+    walletModel.wallet().setEnabledStaking(false);
+    QVERIFY(!walletModel.wallet().getEnabledStaking());
+    QCOMPARE(staking_thread_count(), size_t{1});
+
+    walletModel.wallet().setEnabledStaking(true);
+    QVERIFY(walletModel.wallet().getEnabledStaking());
+    QCOMPARE(staking_thread_count(), size_t{1});
     walletModel.wallet().setEnabledStaking(false);
     walletModel.wallet().setDonationPercentage(0);
 
@@ -536,6 +559,12 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QVERIFY(!coldstake_fund->isEnabled());
     QVERIFY(!coldstake_withdraw->isEnabled());
 
+    ConfirmMessageBox(QMessageBox::No);
+    quantum_new->click();
+    qApp->processEvents();
+    QCOMPARE(quantum_address_count->text(), QString("0"));
+
+    ConfirmMessageBox(QMessageBox::Yes);
     quantum_new->click();
     QTRY_COMPARE_WITH_TIMEOUT(quantum_address_count->text(), QString("1"), 10000);
     const CTxDestination gui_quantum_dest = DecodeDestination(quantum_address->text().toStdString());
@@ -553,6 +582,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     QCOMPARE(QApplication::clipboard()->text(), quantum_pubkey->text());
 
     selfstake_lock_period->setCurrentIndex(5);
+    ConfirmMessageBox(QMessageBox::Yes);
     selfstake_new->click();
     QTRY_VERIFY_WITH_TIMEOUT(selfstake_selector->findData(selfstake_address->text()) >= 0, 10000);
     const CTxDestination gui_selfstake_dest = DecodeDestination(selfstake_address->text().toStdString());
@@ -570,6 +600,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
     selfstake_copy->click();
     QCOMPARE(QApplication::clipboard()->text(), selfstake_address->text());
 
+    ConfirmMessageBox(QMessageBox::Yes);
     coldstake_operator_new->click();
     QTRY_VERIFY_WITH_TIMEOUT(coldstake_operator_address_selector->findData(coldstake_operator_address->text()) >= 0, 10000);
     const CTxDestination gui_operator_dest = DecodeDestination(coldstake_operator_address->text().toStdString());
@@ -594,6 +625,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWal
 
     coldstake_lock_period->setCurrentIndex(5);
     QVERIFY(coldstake_new->isEnabled());
+    ConfirmMessageBox(QMessageBox::Yes);
     coldstake_new->click();
     QTRY_COMPARE_WITH_TIMEOUT(quantum_coldstake_count->text(), QString("1"), 10000);
 
@@ -988,6 +1020,16 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
 {
     // Create widgets for sending coins and listing transactions.
     std::unique_ptr<const PlatformStyle> platformStyle(PlatformStyle::instantiate("other"));
+    HelpMessageDialog about_dialog(/*parent=*/nullptr, /*about=*/true);
+    QLabel* about_message = about_dialog.findChild<QLabel*>("aboutMessage");
+    QVERIFY(about_message);
+    const QString expected_source_identity = QString::fromStdString(FormatSourceIdentity());
+    QVERIFY(about_message->text().contains(GUIUtil::HtmlEscape(expected_source_identity)));
+    QVERIFY(expected_source_identity.startsWith(QStringLiteral("Source commit: ")));
+    if (IsSourceTreeDirty() || FormatSourceCommit().empty()) {
+        QVERIFY(about_message->text().contains(QStringLiteral("color:#b00020")));
+    }
+
     MiniGUI mini_gui(node, platformStyle.get());
     mini_gui.initModelForWallet(node, wallet, platformStyle.get());
     WalletModel& walletModel = *mini_gui.walletModel;
@@ -1345,7 +1387,7 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     // and the backend reject migration without allocating an unused address.
     expect_controls(105, /*quantum_active=*/false, /*legacy_active=*/false, /*tiers_active=*/false);
     const size_t goldrush_address_count = wallet_interface.listQuantumAddresses().size();
-    QVERIFY(!wallet_interface.migrateLegacyToQuantum());
+    QVERIFY(!wallet_interface.migrateLegacyToQuantum(/*allow_new_quantum_key=*/true));
     QCOMPARE(wallet_interface.listQuantumAddresses().size(), goldrush_address_count);
 
     // Candidate 107 is Migration but precedes the tier activation at 108.
@@ -1362,7 +1404,7 @@ void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
     // available, but legacy migration closes. Failure must not reserve a key.
     expect_controls(109, /*quantum_active=*/true, /*legacy_active=*/false, /*tiers_active=*/true);
     const size_t final_address_count = wallet_interface.listQuantumAddresses().size();
-    QVERIFY(!wallet_interface.migrateLegacyToQuantum());
+    QVERIFY(!wallet_interface.migrateLegacyToQuantum(/*allow_new_quantum_key=*/true));
     QCOMPARE(wallet_interface.listQuantumAddresses().size(), final_address_count);
 
     // Reorg backward across Final, tier activation, and Gold Rush. Every

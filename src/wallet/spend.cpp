@@ -15,6 +15,7 @@
 #include <consensus/validation.h>
 #include <crypto/mldsa.h>
 #include <interfaces/chain.h>
+#include <key_io.h>
 #include <numeric>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
@@ -1478,10 +1479,12 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
         int change_pos,
         const CCoinControl& coin_control,
         bool sign,
-        const QuantumFundingPhase& quantum_phase) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
+        const QuantumFundingPhase& quantum_phase,
+        std::optional<CTxDestination>& created_quantum_change) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet)
 {
     AssertLockHeld(::cs_main);
     AssertLockHeld(wallet.cs_wallet);
+    created_quantum_change.reset();
 
     // out variables, to be packed into returned result structure
     int nChangePosInOut = change_pos;
@@ -1558,6 +1561,8 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     // Create change script that will be used if we need change
     CScript scriptChange;
     bilingual_str error; // possible error str
+    bool missing_quantum_change_authorization{false};
+    bool deferred_quantum_change_creation{false};
     const bool quantum_input_family = coin_control.m_input_family &&
         (*coin_control.m_input_family == CCoinControl::InputFamily::QUANTUM ||
          *coin_control.m_input_family == CCoinControl::InputFamily::QUANTUM_MIGRATION);
@@ -1576,25 +1581,53 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
             !IsQuantumMigrationScript(scriptChange) && !IsQuantumColdStakeScript(scriptChange)) {
             return util::Error{_("Quantum-funded transactions require a Quantum Quasar ML-DSA change address")};
         }
-    } else { // no coin control: send change to newly generated address
-        // Note: We use a new key here to keep it from being obvious which side is the change.
-        //  The drawback is that by not reusing a previous key, the change may be lost if a
-        //  backup is restored, if the backup doesn't have the new private key for the change.
-        //  If we reused the old key, it would be possible to add code to look for and
-        //  rediscover unknown transactions that were written with keys of ours to recover
-        //  post-backup change.
-
-        // Reserve a new key pair from key pool. If it fails, provide a dummy
-        // destination in case we don't need change.
+        if (final_quantum_lockout || quantum_input_family) {
+            const bool wallet_owned_direct = IsQuantumMigrationScript(scriptChange) &&
+                                             wallet.GetQuantumKeyInfo(coin_control.destChange).has_value();
+            const auto coldstake_info = IsQuantumColdStakeScript(scriptChange)
+                ? wallet.GetQuantumColdStakeDelegationInfo(coin_control.destChange)
+                : std::nullopt;
+            const bool wallet_owned_coldstake = coldstake_info && coldstake_info->has_owner_key;
+            if (!wallet_owned_direct && !wallet_owned_coldstake) {
+                return util::Error{_("Quantum-funded transactions require an existing wallet-owned quantum change_address. A foreign or watch-only address is not accepted as implicit change authorization.")};
+            }
+        }
+    } else { // no coin control: derive or create change only if selection needs it
         CTxDestination dest;
-        util::Result<CTxDestination> op_dest = (final_quantum_lockout || quantum_input_family)
-            ? wallet.GetNewQuantumChangeDestination()
-            : reservedest.GetReservedDestination(true);
-        if (!op_dest) {
-            error = _("Transaction needs a change address, but we can't generate it.") + Untranslated(" ") + util::ErrorString(op_dest);
+        if (final_quantum_lockout || quantum_input_family) {
+            // Coin selection needs a prospective change output before it can
+            // know whether positive change exists. Do not create a non-HD key
+            // merely to estimate that transaction. A wallet-owned direct
+            // quantum script (or a same-size inert witness program) is used
+            // only as a prototype and is never inserted implicitly.
+            for (const QuantumKeyInfo& info : wallet.ListQuantumKeyInfos()) {
+                const CScript candidate = GetScriptForDestination(info.destination);
+                if (!IsDirectQuantumMigrationInputScript(candidate)) continue;
+                dest = info.destination;
+                scriptChange = candidate;
+                break;
+            }
+            if (scriptChange.empty()) {
+                dest = WitnessUnknown{
+                    QUANTUM_MIGRATION_WITNESS_VERSION,
+                    std::vector<unsigned char>(QUANTUM_MIGRATION_PROGRAM_SIZE, 0)};
+                scriptChange = GetScriptForDestination(dest);
+            }
+
+            if (coin_control.m_allow_new_quantum_key) {
+                deferred_quantum_change_creation = true;
+            } else {
+                missing_quantum_change_authorization = true;
+                error = _("Transaction requires a new non-HD ML-DSA quantum change key because coin selection produced positive quantum change, but key creation was not authorized. Supply an existing wallet-owned quantum change_address, or use the final signed send RPC with allow_new_quantum_key=true and back up the wallet whenever the result or an error reports the created address. The legacy sendtoaddress, sendmany, and burn RPCs accept an existing change_address but never create this key. Dry-run and unsigned-only commands never create it.");
+            }
         } else {
-            dest = *op_dest;
-            scriptChange = GetScriptForDestination(dest);
+            const auto op_dest = reservedest.GetReservedDestination(true);
+            if (!op_dest) {
+                error = _("Transaction needs a change address, but we can't generate it.") + Untranslated(" ") + util::ErrorString(op_dest);
+            } else {
+                dest = *op_dest;
+                scriptChange = GetScriptForDestination(dest);
+            }
         }
         // A valid destination implies a change script (and
         // vice-versa). An empty change script will abort later, if the
@@ -1699,6 +1732,17 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
 
     const CAmount change_amount = result.GetChange(coin_selection_params.min_viable_change, coin_selection_params.m_change_fee);
     if (change_amount > 0) {
+        if (missing_quantum_change_authorization) {
+            return util::Error{error};
+        }
+        if (deferred_quantum_change_creation) {
+            auto destination = wallet.GetNewQuantumChangeDestination();
+            if (!destination) {
+                return util::Error{_("Transaction needs positive quantum change, but the authorized non-HD ML-DSA change key could not be created.") + Untranslated(" ") + util::ErrorString(destination)};
+            }
+            created_quantum_change = *destination;
+            scriptChange = GetScriptForDestination(*destination);
+        }
         CTxOut newTxOut(change_amount, scriptChange);
         if (nChangePosInOut == -1) {
             // Insert change txn at random position:
@@ -1909,7 +1953,7 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
     reservedest.KeepDestination();
 
     wallet.WalletLogPrintf("Fee Calculation: Fee:%d Bytes:%u Needed:%d\n", current_fee, nBytes, fee_needed);
-    return CreatedTransactionResult(tx, current_fee, nChangePosInOut);
+    return CreatedTransactionResult(tx, current_fee, nChangePosInOut, created_quantum_change);
 }
 
 util::Result<CreatedTransactionResult> CreateTransaction(
@@ -1934,10 +1978,21 @@ util::Result<CreatedTransactionResult> CreateTransaction(
     LOCK2(::cs_main, wallet.cs_wallet);
     const QuantumFundingPhase quantum_phase = GetQuantumFundingPhase(wallet);
 
-    auto res = CreateTransactionInternal(wallet, vecSend, change_pos, coin_control, sign, quantum_phase);
+    std::optional<CTxDestination> created_quantum_change;
+    auto res = CreateTransactionInternal(
+        wallet, vecSend, change_pos, coin_control, sign, quantum_phase,
+        created_quantum_change);
     TRACE4(coin_selection, normal_create_tx_internal, wallet.GetName().c_str(), bool(res),
            res ? res->fee : 0, res ? res->change_pos : 0);
-    if (!res) return res;
+    if (!res) {
+        if (created_quantum_change) {
+            return util::Error{Untranslated(strprintf(
+                "Transaction construction failed after creating durable non-HD ML-DSA change key %s. The key remains in this wallet even though no transaction was created. Back up the wallet now; an older backup cannot recover it. Original error: %s",
+                EncodeDestination(*created_quantum_change),
+                util::ErrorString(res).original))};
+        }
+        return res;
+    }
     const auto& txr_ungrouped = *res;
     // try with avoidpartialspends unless it's enabled already
     if (txr_ungrouped.fee > 0 /* 0 means non-functional fee rate estimation */ && wallet.m_max_aps_fee > -1 && !coin_control.m_avoid_partial_spends) {
@@ -1945,13 +2000,25 @@ util::Result<CreatedTransactionResult> CreateTransaction(
         CCoinControl tmp_cc = coin_control;
         tmp_cc.m_avoid_partial_spends = true;
 
-        // Re-use the change destination from the first creation attempt to avoid skipping BIP44 indexes
+        // Re-use the change destination from the first creation attempt. This
+        // avoids skipping BIP44 indexes and, for non-HD quantum change,
+        // guarantees the alternative APS attempt cannot create a second key.
         const int ungrouped_change_pos = txr_ungrouped.change_pos;
-        if (ungrouped_change_pos != -1) {
+        if (created_quantum_change) {
+            tmp_cc.destChange = *created_quantum_change;
+        } else if (ungrouped_change_pos != -1) {
             ExtractDestination(txr_ungrouped.tx->vout[ungrouped_change_pos].scriptPubKey, tmp_cc.destChange);
+        } else if (coin_control.m_allow_new_quantum_key) {
+            // The selected transaction needed no change and therefore created
+            // no key. Do not let a speculative APS alternative create a
+            // durable non-HD key that may be discarded with that alternative.
+            tmp_cc.m_allow_new_quantum_key = false;
         }
 
-        auto txr_grouped = CreateTransactionInternal(wallet, vecSend, change_pos, tmp_cc, sign, quantum_phase);
+        std::optional<CTxDestination> grouped_created_quantum_change;
+        auto txr_grouped = CreateTransactionInternal(
+            wallet, vecSend, change_pos, tmp_cc, sign, quantum_phase,
+            grouped_created_quantum_change);
         // if fee of this alternative one is within the range of the max fee, we use this one
         const bool use_aps{txr_grouped.has_value() ? (txr_grouped->fee <= txr_ungrouped.fee + wallet.m_max_aps_fee) : false};
         TRACE5(coin_selection, aps_create_tx_internal, wallet.GetName().c_str(), use_aps, txr_grouped.has_value(),
@@ -1959,7 +2026,12 @@ util::Result<CreatedTransactionResult> CreateTransaction(
         if (txr_grouped) {
             wallet.WalletLogPrintf("Fee non-grouped = %lld, grouped = %lld, using %s\n",
                 txr_ungrouped.fee, txr_grouped->fee, use_aps ? "grouped" : "non-grouped");
-            if (use_aps) return txr_grouped;
+            if (use_aps) {
+                txr_grouped->created_quantum_change = created_quantum_change
+                    ? created_quantum_change
+                    : grouped_created_quantum_change;
+                return txr_grouped;
+            }
         }
     }
     return res;
@@ -2027,7 +2099,16 @@ util::Result<CreatedTransactionResult> CreateUTXOOptimizationTransaction(CWallet
     return CreateTransaction(wallet, recipients, RANDOM_CHANGE_POSITION, coin_control, /*sign=*/true);
 }
 
-bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, bool lockUnspents, const std::set<int>& setSubtractFeeFromOutputs, CCoinControl coinControl)
+bool FundTransaction(
+    CWallet& wallet,
+    CMutableTransaction& tx,
+    CAmount& nFeeRet,
+    int& nChangePosInOut,
+    bilingual_str& error,
+    bool lockUnspents,
+    const std::set<int>& setSubtractFeeFromOutputs,
+    CCoinControl coinControl,
+    std::optional<CTxDestination>* created_quantum_change)
 {
     std::vector<CRecipient> vecSend;
 
@@ -2074,6 +2155,9 @@ bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet,
     if (!res) {
         error = util::ErrorString(res);
         return false;
+    }
+    if (created_quantum_change) {
+        *created_quantum_change = res->created_quantum_change;
     }
     const auto& txr = *res;
     CTransactionRef tx_new = txr.tx;

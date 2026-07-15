@@ -190,7 +190,13 @@ class QuantumPoolCapTest(BitcoinTestFramework):
         funder.sendtoaddress(staker_c_quantum, Decimal("10"))
         self._generate(1, funder_address)
         stake_change_test = staker_c.getnewquantumstakeaddress("change-test", 0)
-        stake_fund = staker_c.fundquantumstakeaddress(stake_change_test["address"], Decimal("1"))
+        key_count_before = len(staker_c.listquantumaddresses())
+        assert_raises_rpc_error(
+            -8, "allow_new_quantum_key", staker_c.fundquantumstakeaddress,
+            stake_change_test["address"], Decimal("1"))
+        assert_equal(len(staker_c.listquantumaddresses()), key_count_before)
+        stake_fund = staker_c.fundquantumstakeaddress(
+            stake_change_test["address"], Decimal("1"), {"allow_new_quantum_key": True})
         stake_fund_tx = node.decoderawtransaction(node.getrawtransaction(stake_fund["txid"]))
         change_outputs = [
             vout for vout in stake_fund_tx["vout"]
@@ -215,15 +221,18 @@ class QuantumPoolCapTest(BitcoinTestFramework):
             owner_a.fundquantumcoldstakeaddress,
             over["address"],
             Decimal("1"),
+            {"allow_new_quantum_key": True},
         )
 
         minimal_delegation = owner_a.getnewquantumcoldstakingaddress(staker_c_key["public_key"], "minimal-direct")
-        minimal_fund = owner_a.fundquantumcoldstakeaddress(minimal_delegation["address"], Decimal("1"))
+        minimal_fund = owner_a.fundquantumcoldstakeaddress(
+            minimal_delegation["address"], Decimal("1"), {"allow_new_quantum_key": True})
         minimal_tx = node.decoderawtransaction(node.getrawtransaction(minimal_fund["txid"]))
         assert_equal(len(minimal_tx["vin"]), 1)
 
         self.log.info("Cold-stake withdrawal refuses ambiguous multi-output sweeps unless all=true")
-        owner_a.fundquantumcoldstakeaddress(minimal_delegation["address"], Decimal("1"))
+        owner_a.fundquantumcoldstakeaddress(
+            minimal_delegation["address"], Decimal("1"), {"allow_new_quantum_key": True})
         self._generate(1, funder_address)
         coldstake_utxos = owner_a.listunspent(1, 9999999, [minimal_delegation["address"]])
         assert_equal(len(coldstake_utxos), 2)
@@ -232,8 +241,12 @@ class QuantumPoolCapTest(BitcoinTestFramework):
             "Multiple spendable cold-stake delegation outputs",
             owner_a.withdrawquantumcoldstakeaddress,
             minimal_delegation["address"],
+            None,
+            {"allow_new_quantum_key": True},
         )
-        withdrawal = owner_a.withdrawquantumcoldstakeaddress(minimal_delegation["address"], None, {"all": True})
+        withdrawal = owner_a.withdrawquantumcoldstakeaddress(
+            minimal_delegation["address"], None,
+            {"all": True, "allow_new_quantum_key": True})
         assert_equal(withdrawal["completed_withdrawal"], True)
         assert_equal(withdrawal["started_unbonding"], False)
         assert_equal(Decimal(withdrawal["amount"]), Decimal("2.00000000"))

@@ -38,6 +38,9 @@ public:
 
     //! Custom change destination, if not set an address is generated
     CTxDestination destChange = CNoDestination();
+    //! Explicit one-transaction consent to create a new non-HD ML-DSA change key.
+    //! Prefer setting destChange to an existing wallet-owned quantum address.
+    bool m_allow_new_quantum_key{false};
     //! Override the default change type if set, ignored if destChange is set
     std::optional<OutputType> m_change_type;
     //! If false, only safe inputs will be used

@@ -990,6 +990,27 @@ bool CreateDemurrageAttestationTransaction(
     std::vector<CRecipient> placeholder_recipients;
     placeholder_recipients.push_back({placeholder_script, 0, /*subtract_fee=*/false});
 
+    const auto ensure_existing_change = [&](CCoinControl& attempt) -> bool {
+        if (IsValidDestination(attempt.destChange)) return true;
+        std::vector<COutPoint> selected = attempt.ListSelected();
+        std::sort(selected.begin(), selected.end());
+        LOCK(wallet.cs_wallet);
+        for (const COutPoint& outpoint : selected) {
+            const CWalletTx* wtx = wallet.GetWalletTx(outpoint.hash);
+            if (!wtx || outpoint.n >= wtx->tx->vout.size()) continue;
+            CTxDestination fee_dest;
+            if (!ExtractDestination(wtx->tx->vout[outpoint.n].scriptPubKey, fee_dest) ||
+                !IsQuantumMigrationScript(wtx->tx->vout[outpoint.n].scriptPubKey) ||
+                !wallet.GetQuantumKeyInfo(fee_dest).has_value()) {
+                continue;
+            }
+            attempt.destChange = fee_dest;
+            return true;
+        }
+        error = _("Demurrage attestation requires an existing wallet-owned direct quantum change address. Select a safe fee input from that address or configure -qqdemurragechangeaddress; no key or transaction was created.");
+        return false;
+    };
+
     std::vector<CCoinControl> attempts;
     if (coin_control.HasSelected()) {
         if (coin_control.IsSelected(target_outpoint)) {
@@ -1005,6 +1026,10 @@ bool CreateDemurrageAttestationTransaction(
         }
         CCoinControl selected_attempt = coin_control;
         selected_attempt.m_allow_other_inputs = false;
+        if (!ensure_existing_change(selected_attempt)) {
+            cleanse_private_key_bytes();
+            return false;
+        }
         attempts.push_back(std::move(selected_attempt));
     } else {
         std::vector<COutPoint> safe_outpoints = SafeDemurrageAttestationFeeOutpoints(
@@ -1020,8 +1045,14 @@ bool CreateDemurrageAttestationTransaction(
             CCoinControl attempt = coin_control;
             attempt.m_allow_other_inputs = false;
             attempt.Select(outpoint);
+            if (!ensure_existing_change(attempt)) continue;
             attempts.push_back(std::move(attempt));
         }
+        if (attempts.empty()) {
+            cleanse_private_key_bytes();
+            return false;
+        }
+        error.clear();
     }
 
     bilingual_str last_error;
@@ -1121,6 +1152,23 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     result.dry_run = options.dry_run;
     result.source_dest = source_dest;
     result.cap_enforced = options.enforce_pool_cap;
+    std::optional<CTxDestination> created_owner_key;
+    const auto fail_after_created_key = [&](const bilingual_str& failure) {
+        if (created_owner_key) {
+            error = Untranslated(strprintf(
+                "Cold-stake redelegation failed after creating durable non-HD ML-DSA owner key %s. The key remains in this wallet even though no successful redelegation was reported. Back up the wallet now; an older backup cannot recover it. Original error: %s",
+                EncodeDestination(*created_owner_key),
+                failure.original));
+        } else {
+            error = failure;
+        }
+        return false;
+    };
+
+    if (!options.dry_run && !options.allow_new_quantum_key) {
+        error = _("Broadcast redelegation creates a new non-HD ML-DSA owner key. Retry with allow_new_quantum_key=true only after authorizing that key creation, then back up the wallet. No key, transaction, or wallet metadata was created.");
+        return false;
+    }
 
     if (!IsValidDestination(source_dest) || !IsQuantumColdStakeDestination(source_dest)) {
         error = _("source_coldstake_address is not a Quantum Cold-Stake address");
@@ -1234,17 +1282,19 @@ bool CreateQuantumColdStakeRedelegationTransaction(
             error = util::ErrorString(owner_dest);
             return false;
         }
+        created_owner_key = *owner_dest;
         std::vector<unsigned char> owner_pubkey;
         {
             LOCK(wallet.cs_wallet);
             const auto owner_info = wallet.GetQuantumKeyInfo(*owner_dest);
-            CHECK_NONFATAL(owner_info.has_value());
+            if (!owner_info) {
+                return fail_after_created_key(_("New redelegation owner key is not confirmed stored in the wallet"));
+            }
             owner_pubkey = owner_info->public_key;
         }
         auto target_dest_result = wallet.AddQuantumColdStakeDelegation(target_staking_pubkey, owner_pubkey, label, GetTime());
         if (!target_dest_result) {
-            error = util::ErrorString(target_dest_result);
-            return false;
+            return fail_after_created_key(util::ErrorString(target_dest_result));
         }
         target_dest = *target_dest_result;
         target_wallet_backed = true;
@@ -1256,17 +1306,14 @@ bool CreateQuantumColdStakeRedelegationTransaction(
     constexpr int RANDOM_CHANGE_POSITION = -1;
     auto res = CreateTransaction(wallet, recipients, RANDOM_CHANGE_POSITION, coin_control, /*sign=*/!options.dry_run);
     if (!res) {
-        error = util::ErrorString(res);
-        return false;
+        return fail_after_created_key(util::ErrorString(res));
     }
     const CTransactionRef& tx = res->tx;
     if (tx->vout.empty() || IsDust(tx->vout[0], wallet.chain().relayDustFee())) {
-        error = _("Redelegation output would be dust after fees");
-        return false;
+        return fail_after_created_key(_("Redelegation output would be dust after fees"));
     }
     if (tx->vout.size() != 1 || tx->vout[0].scriptPubKey != GetScriptForDestination(target_dest)) {
-        error = _("Redelegation transaction unexpectedly produced change or a non-target output");
-        return false;
+        return fail_after_created_key(_("Redelegation transaction unexpectedly produced change or a non-target output"));
     }
 
     const CAmount output_amount = tx->vout[0].nValue;
@@ -1275,28 +1322,24 @@ bool CreateQuantumColdStakeRedelegationTransaction(
         const CCoinsViewCache& view = wallet.chain().getCoinsTip();
         const node::QuantumPoolShare share = node::ComputeQuantumPoolShare(view, target_staker_hash, node::GetQuantumPoolClaims(target_staker_hash));
         if (options.require_verified_operator && !share.operator_share.operator_commitment_verified) {
-            error = _("Target Quantum cold-stake operator commitment is not verified in the local registry");
-            return false;
+            return fail_after_created_key(_("Target Quantum cold-stake operator commitment is not verified in the local registry"));
         }
         if (share.total_coldstake < input_amount || !MoneyRange(share.total_coldstake - input_amount + output_amount)) {
-            error = _("Unable to project post-redelegation pool totals");
-            return false;
+            return fail_after_created_key(_("Unable to project post-redelegation pool totals"));
         }
         CAmount post_operator_value = share.operator_share.verified_value;
         if (source_staker_hash == target_staker_hash && post_operator_value >= input_amount) {
             post_operator_value -= input_amount;
         }
         if (!MoneyRange(post_operator_value + output_amount)) {
-            error = _("Unable to project post-redelegation operator total");
-            return false;
+            return fail_after_created_key(_("Unable to project post-redelegation operator total"));
         }
         post_operator_value += output_amount;
         const CAmount post_total_coldstake = share.total_coldstake - input_amount + output_amount;
         const bool would_exceed_cap = node::WouldQuantumPoolExceedCap(post_total_coldstake, post_operator_value, 0);
         const bool cap_filter_unlocked = would_exceed_cap && !HasUnderCapRedelegationAlternative(view, source_staker_hash, target_staker_hash, output_amount);
         if (would_exceed_cap && options.enforce_pool_cap && !cap_filter_unlocked) {
-            error = _("Target Quantum cold-stake pool cap would be exceeded by this redelegation");
-            return false;
+            return fail_after_created_key(_("Target Quantum cold-stake pool cap would be exceeded by this redelegation"));
         }
 
         result.operator_commitment_verified = share.operator_share.operator_commitment_verified;
@@ -1323,8 +1366,9 @@ bool CreateQuantumColdStakeRedelegationTransaction(
             if (!wallet.AbandonTransaction(tx->GetHash())) {
                 wallet.WalletLogPrintf("Cold-stake redelegation could not be abandoned after broadcast failure: txid=%s\n", tx->GetHash().ToString());
             }
-            error = strprintf(_("Broadcasting cold-stake redelegation failed: %s"), broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error);
-            return false;
+            return fail_after_created_key(strprintf(
+                _("Broadcasting cold-stake redelegation failed: %s"),
+                broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error));
         }
     }
     return true;
@@ -1820,6 +1864,7 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet)
 
         QuantumColdStakeRedelegationOptions options;
         options.dry_run = false;
+        options.allow_new_quantum_key = gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION);
         options.enforce_pool_cap = true;
         options.require_verified_operator = true;
         options.label = "auto-redelegated-coldstake";

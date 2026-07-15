@@ -270,9 +270,16 @@ struct CreatedTransactionResult
     CTransactionRef tx;
     CAmount fee;
     int change_pos;
+    //! Non-HD ML-DSA key durably created while preparing this transaction,
+    //! even when coin selection ultimately did not materialize change.
+    std::optional<CTxDestination> created_quantum_change;
 
-    CreatedTransactionResult(CTransactionRef _tx, CAmount _fee, int _change_pos)
-        : tx(_tx), fee(_fee), change_pos(_change_pos) {}
+    CreatedTransactionResult(
+        CTransactionRef _tx,
+        CAmount _fee,
+        int _change_pos,
+        std::optional<CTxDestination> _created_quantum_change = std::nullopt)
+        : tx(_tx), fee(_fee), change_pos(_change_pos), created_quantum_change(std::move(_created_quantum_change)) {}
 };
 
 /**
@@ -295,7 +302,16 @@ util::Result<CreatedTransactionResult> CreateUTXOOptimizationTransaction(CWallet
  * Insert additional inputs into the transaction by
  * calling CreateTransaction();
  */
-bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, bool lockUnspents, const std::set<int>& setSubtractFeeFromOutputs, CCoinControl);
+bool FundTransaction(
+    CWallet& wallet,
+    CMutableTransaction& tx,
+    CAmount& nFeeRet,
+    int& nChangePosInOut,
+    bilingual_str& error,
+    bool lockUnspents,
+    const std::set<int>& setSubtractFeeFromOutputs,
+    CCoinControl,
+    std::optional<CTxDestination>* created_quantum_change = nullptr);
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_SPEND_H

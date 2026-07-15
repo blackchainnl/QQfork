@@ -12,6 +12,7 @@ issues #11 (Gold Rush payout lifecycle), #14 (phase funding gates), and #16
 from decimal import Decimal
 import time
 
+from test_framework.authproxy import JSONRPCException
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
@@ -178,10 +179,17 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         assert_equal(len(wallet.listquantumaddresses()), quantum_count_before)
         wallet.walletpassphrase("test-passphrase", 600)
         assert_raises_rpc_error(
+            -8,
+            "allow_new_quantum_key",
+            wallet.migratetoquantum,
+            {},
+        )
+        assert_equal(len(wallet.listquantumaddresses()), quantum_count_before)
+        assert_raises_rpc_error(
             -4,
             "Quantum funding is disabled during Gold Rush",
             wallet.migratetoquantum,
-            {},
+            {"allow_new_quantum_key": True},
         )
         assert_equal(len(wallet.listquantumaddresses()), quantum_count_before)
 
@@ -208,7 +216,7 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
             wallet.fundquantumcoldstakeaddress,
             coldstake_address,
             Decimal("1"),
-            {"allow_goldrush_migration": False},
+            {"allow_goldrush_migration": False, "allow_new_quantum_key": True},
         )
         assert_equal(set(node.getrawmempool()), mempool_before)
         self._assert_one_reward_locked(wallet, payout_amount, phase="gold_rush")
@@ -252,10 +260,17 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         assert_equal(migration_status_before["migrated_quantum_outputs"], 0)
         quantum_keys_before = len(migration_wallet.listquantumaddresses())
         assert_raises_rpc_error(
+            -8,
+            "allow_new_quantum_key",
+            migration_wallet.migratetoquantum,
+            {},
+        )
+        assert_equal(len(migration_wallet.listquantumaddresses()), quantum_keys_before)
+        assert_raises_rpc_error(
             -4,
             "Quantum funding is disabled during Gold Rush",
             migration_wallet.migratetoquantum,
-            {},
+            {"allow_new_quantum_key": True},
         )
         assert_equal(len(migration_wallet.listquantumaddresses()), quantum_keys_before)
 
@@ -273,9 +288,41 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         assert_equal(boundary["phase"], "migration")
         assert_equal(boundary["quantum_spend_enforcement_active"], True)
 
+        self.log.info("An authorized key remains durable and produces an explicit backup warning if construction later fails")
+        failed_key_addresses_before = {
+            key["address"] for key in migration_wallet.listquantumaddresses()
+        }
+        mempool_before_failed_migration = set(node.getrawmempool())
+        try:
+            migration_wallet.migratetoquantum({
+                "label": "failed-migration-key",
+                "allow_new_quantum_key": True,
+                "fee_rate": Decimal("10000000"),
+            })
+        except JSONRPCException as failure:
+            assert_equal(failure.error["code"], -4)
+            assert "failed after creating durable non-HD ML-DSA key" in failure.error["message"]
+            assert "Back up the wallet now" in failure.error["message"]
+        else:
+            raise AssertionError("high-fee migration unexpectedly succeeded")
+        failed_keys = migration_wallet.listquantumaddresses()
+        assert_equal(len(failed_keys), len(failed_key_addresses_before) + 1)
+        durable_failure_keys = [
+            key for key in failed_keys
+            if key["address"] not in failed_key_addresses_before
+        ]
+        assert_equal(len(durable_failure_keys), 1)
+        assert_equal(durable_failure_keys[0]["label"], "failed-migration-key")
+        assert_equal(durable_failure_keys[0]["stored_in_wallet"], True)
+        assert_equal(durable_failure_keys[0]["encrypted"], True)
+        assert_equal(set(node.getrawmempool()), mempool_before_failed_migration)
+
         self.log.info("migratetoquantum sweeps the funded legacy anchor into one durable v16 output")
         quantum_keys_before = len(migration_wallet.listquantumaddresses())
-        migration = migration_wallet.migratetoquantum({"label": "lifecycle-migration"})
+        migration = migration_wallet.migratetoquantum({
+            "label": "lifecycle-migration",
+            "allow_new_quantum_key": True,
+        })
         migration_fee = Decimal(str(migration["fee"]))
         migration_amount = Decimal(str(migration["amount"]))
         assert_equal(migration["phase"], "migration")
@@ -291,11 +338,11 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         assert_equal(len(migration_wallet.listquantumaddresses()), quantum_keys_before + 1)
 
         migration_keys = migration_wallet.listquantumaddresses()
-        assert_equal(len(migration_keys), 1)
-        assert_equal(migration_keys[0]["address"], migration["destination"])
-        assert_equal(migration_keys[0]["stored_in_wallet"], True)
-        assert_equal(migration_keys[0]["encrypted"], True)
-        assert_equal(migration_keys[0]["label"], "lifecycle-migration")
+        assert_equal(len(migration_keys), quantum_keys_before + 1)
+        migrated_key = next(key for key in migration_keys if key["address"] == migration["destination"])
+        assert_equal(migrated_key["stored_in_wallet"], True)
+        assert_equal(migrated_key["encrypted"], True)
+        assert_equal(migrated_key["label"], "lifecycle-migration")
 
         decoded_migration = node.getrawtransaction(migration["txid"], True)
         assert_equal(len(decoded_migration["vin"]), 1)
@@ -339,6 +386,32 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         assert_equal(migration_status_confirmed["direct_quantum_outputs"], 1)
         assert_equal(Decimal(migration_status_confirmed["direct_quantum_amount"]), migration_amount)
 
+        self.log.info("Legacy send RPCs refuse hidden quantum change keys and identify the explicit retry path")
+        quantum_key_count_before_send = len(migration_wallet.listquantumaddresses())
+        mempool_before_send = set(node.getrawmempool())
+        assert_raises_rpc_error(
+            -6,
+            "legacy sendtoaddress, sendmany, and burn RPCs accept an existing change_address",
+            migration_wallet.sendtoaddress,
+            migration["destination"],
+            Decimal("1"),
+        )
+        assert_equal(len(migration_wallet.listquantumaddresses()), quantum_key_count_before_send)
+        assert_equal(set(node.getrawmempool()), mempool_before_send)
+
+        explicit_change_send = migration_wallet.send(
+            {migration["destination"]: Decimal("1")},
+            {
+                "inputs": [{"txid": migrated_utxo["txid"], "vout": migrated_utxo["vout"]}],
+                "add_to_wallet": False,
+                "change_address": migration["destination"],
+            },
+        )
+        assert_equal(explicit_change_send["complete"], True)
+        assert "hex" in explicit_change_send
+        assert_equal(len(migration_wallet.listquantumaddresses()), quantum_key_count_before_send)
+        assert_equal(set(node.getrawmempool()), mempool_before_send)
+
         self.log.info("Migration permits ML-DSA spends but forbids quantum-to-legacy downgrade")
         _, downgrade_signed = self._build_quantum_spend(
             migration_wallet,
@@ -370,9 +443,11 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         wallet.walletpassphrase("test-passphrase", 600)
         migration_wallet.walletpassphrase(MIGRATION_PASSPHRASE, 600)
         migration_keys = migration_wallet.listquantumaddresses()
-        assert_equal(len(migration_keys), 1)
-        assert_equal(migration_keys[0]["address"], migration["destination"])
-        assert_equal(migration_keys[0]["stored_in_wallet"], True)
+        assert_equal(len(migration_keys), quantum_keys_before + 1)
+        migrated_key = next(key for key in migration_keys if key["address"] == migration["destination"])
+        assert_equal(migrated_key["stored_in_wallet"], True)
+        failed_key = next(key for key in migration_keys if key["label"] == "failed-migration-key")
+        assert_equal(failed_key["stored_in_wallet"], True)
         migrated_utxo = self._wait_for_quantum_utxo(
             migration_wallet, migration["destination"], min_conf=1
         )
@@ -453,7 +528,17 @@ class GoldRushMigrationRpcTest(BitcoinTestFramework):
         self.log.info("sendtoaddress selects the payout directly and mines it without consolidation")
         ordinary_destination = wallet.getnewquantumaddress()["address"]
         try:
-            ordinary_txid = wallet.sendtoaddress(ordinary_destination, Decimal("1"))
+            ordinary_txid = wallet.sendtoaddress(
+                ordinary_destination,
+                Decimal("1"),
+                "",
+                "",
+                False,
+                False,
+                None,
+                False,
+                payout_address,
+            )
         finally:
             wallet.lockunspent(True, non_reward_locks)
         assert ordinary_txid in node.getrawmempool()

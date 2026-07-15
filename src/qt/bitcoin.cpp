@@ -232,8 +232,9 @@ static std::string PromptLegacyMigrationChoice(const std::string& blackcoin_data
         ? messagebox.addButton(QObject::tr("Import Blackmore wallet"), QMessageBox::ActionRole)
         : nullptr;
     QPushButton* exit_app = messagebox.addButton(QObject::tr("Exit / decide manually"), QMessageBox::RejectRole);
-    messagebox.setDefaultButton(keep_blackcoin ? keep_blackcoin : import_blackmore);
-    // Esc and the window close button also mean "exit without deciding".
+    // Fail closed on Enter, Esc, and window close. Importing or selecting a
+    // source requires an affirmative click on that specific choice.
+    messagebox.setDefaultButton(exit_app);
     messagebox.setEscapeButton(exit_app);
     messagebox.exec();
 

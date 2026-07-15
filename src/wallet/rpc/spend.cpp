@@ -94,6 +94,12 @@ static bool RecipientsAreQuantumOnly(const std::vector<CRecipient>& recipients)
     return found_spendable;
 }
 
+static bool RequiresExplicitQuantumChangeAuthorization(const util::Result<CreatedTransactionResult>& result)
+{
+    return !result &&
+           util::ErrorString(result).original.find("new non-HD ML-DSA quantum change key") != std::string::npos;
+}
+
 static bool LegacyToQuantumFallbackActive(const CWallet& wallet)
 {
     LOCK(::cs_main);
@@ -114,11 +120,51 @@ static void ApplyOutputInputFamily(CCoinControl& coin_control, const std::vector
     ApplyInferredInputFamily(coin_control, inferred);
 }
 
-static void CommitWalletTransactionOrThrow(CWallet& wallet, const CTransactionRef& tx, mapValue_t map_value, const std::string& action)
+static std::string DurableQuantumKeyFailureMessage(
+    const CTxDestination& created_destination,
+    const std::string& action,
+    const std::string& failure)
+{
+    return strprintf(
+        "%s failed after creating durable non-HD ML-DSA key %s. The key remains in this wallet even though no successful action was reported. Back up the wallet now; an older backup cannot recover it. Original error: %s",
+        action,
+        EncodeDestination(created_destination),
+        failure);
+}
+
+[[noreturn]] static void ThrowQuantumActionError(
+    int code,
+    const std::string& action,
+    const std::string& failure,
+    const std::optional<CTxDestination>& created_destination = std::nullopt)
+{
+    throw JSONRPCError(
+        code,
+        created_destination
+            ? DurableQuantumKeyFailureMessage(*created_destination, action, failure)
+            : failure);
+}
+
+static void CommitWalletTransactionOrThrow(
+    CWallet& wallet,
+    const CTransactionRef& tx,
+    mapValue_t map_value,
+    const std::string& action,
+    const std::optional<CTxDestination>& created_destination = std::nullopt)
 {
     std::string broadcast_error;
     WalletCommitStatus status;
-    if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error, &status)) {
+    bool committed{false};
+    try {
+        committed = wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error, &status);
+    } catch (const std::exception& e) {
+        ThrowQuantumActionError(
+            RPC_WALLET_ERROR,
+            action,
+            strprintf("transaction commit raised an exception: %s", e.what()),
+            created_destination);
+    }
+    if (!committed) {
         const std::string reason = broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error;
         // Preserve the established -walletrejectlongchains=0 behavior: a
         // transaction may be retained for later relay even when immediate
@@ -126,7 +172,11 @@ static void CommitWalletTransactionOrThrow(CWallet& wallet, const CTransactionRe
         // AddToWallet are hard commit errors. Terminal lifecycle failures are
         // persisted as abandoned audit records and must still be reported.
         if (status == WalletCommitStatus::PERSISTED_PENDING) return;
-        throw JSONRPCError(RPC_WALLET_ERROR, strprintf("%s transaction could not be committed: %s", action, reason));
+        ThrowQuantumActionError(
+            RPC_WALLET_ERROR,
+            action,
+            strprintf("transaction could not be committed: %s", reason),
+            created_destination);
     }
 }
 
@@ -201,7 +251,8 @@ UniValue SendMoneyToScript(CWallet& wallet, const CScript scriptPubKey, CAmount 
     // the ordinary migration path: a legacy input may fund quantum outputs
     // during Migration. Retry as a single legacy-family transaction rather
     // than mixing legacy and quantum inputs when quantum balance is short.
-    if (!res && coin_control.m_input_family == CCoinControl::InputFamily::QUANTUM &&
+    if (!res && !RequiresExplicitQuantumChangeAuthorization(res) &&
+        coin_control.m_input_family == CCoinControl::InputFamily::QUANTUM &&
         RecipientsAreQuantumOnly(recipients) && LegacyToQuantumFallbackActive(wallet)) {
         CCoinControl legacy_fallback{coin_control};
         legacy_fallback.m_input_family = CCoinControl::InputFamily::LEGACY;
@@ -217,7 +268,11 @@ UniValue SendMoneyToScript(CWallet& wallet, const CScript scriptPubKey, CAmount 
     return tx->GetHash().GetHex();
 }
 
-static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const UniValue& options, const CMutableTransaction& rawTx)
+static UniValue FinishTransaction(
+    const std::shared_ptr<CWallet> pwallet,
+    const UniValue& options,
+    const CMutableTransaction& rawTx,
+    const std::optional<CTxDestination>& created_quantum_change = std::nullopt)
 {
     // Make a blank psbt
     PartiallySignedTransaction psbtx(rawTx);
@@ -225,9 +280,24 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
     // First fill transaction with our data without signing,
     // so external signers are not asked to sign more than once.
     bool complete;
-    pwallet->FillPSBT(psbtx, complete, SIGHASH_DEFAULT, /*sign=*/false, /*bip32derivs=*/true);
+    const TransactionError fill_error{
+        pwallet->FillPSBT(psbtx, complete, SIGHASH_DEFAULT, /*sign=*/false, /*bip32derivs=*/true)};
+    if (fill_error != TransactionError::OK) {
+        ThrowQuantumActionError(
+            RPC_WALLET_ERROR,
+            "Blackcoin wallet transaction",
+            TransactionErrorString(fill_error).original,
+            created_quantum_change);
+    }
     const TransactionError err{pwallet->FillPSBT(psbtx, complete, SIGHASH_DEFAULT, /*sign=*/true, /*bip32derivs=*/false)};
     if (err != TransactionError::OK) {
+        if (created_quantum_change) {
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Blackcoin wallet transaction",
+                TransactionErrorString(err).original,
+                created_quantum_change);
+        }
         throw JSONRPCTransactionError(err);
     }
 
@@ -250,12 +320,21 @@ static UniValue FinishTransaction(const std::shared_ptr<CWallet> pwallet, const 
         CTransactionRef tx(MakeTransactionRef(std::move(mtx)));
         result.pushKV("txid", tx->GetHash().GetHex());
         if (add_to_wallet && !psbt_opt_in) {
-            CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Blackcoin wallet transaction");
+            CommitWalletTransactionOrThrow(
+                *pwallet, tx, {}, "Blackcoin wallet transaction",
+                created_quantum_change);
         } else {
             result.pushKV("hex", hex);
         }
     }
     result.pushKV("complete", complete);
+    if (created_quantum_change) {
+        result.pushKV(
+            "warning",
+            strprintf(
+                "A new non-HD ML-DSA quantum change key %s was created and remains in this wallet. An older backup cannot recover it; back up the wallet now.",
+                EncodeDestination(*created_quantum_change)));
+    }
 
     return result;
 }
@@ -282,6 +361,20 @@ static void PreventOutdatedOptions(const UniValue& options)
     }
 }
 
+static bool AllowsNewQuantumKey(const UniValue& options)
+{
+    return options.isObject() && options.exists("allow_new_quantum_key") &&
+           options["allow_new_quantum_key"].get_bool();
+}
+
+static void RejectNewQuantumKeyForUnsignedOnly(const UniValue& options, const std::string& rpc_name)
+{
+    if (!AllowsNewQuantumKey(options)) return;
+    throw JSONRPCError(
+        RPC_INVALID_PARAMETER,
+        strprintf("%s is an unsigned/dry-run construction command and never creates wallet metadata, even with consent. Remove allow_new_quantum_key and supply an existing wallet-owned quantum change_address.", rpc_name));
+}
+
 UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vector<CRecipient> &recipients, mapValue_t map_value, bool verbose)
 {
     {
@@ -304,7 +397,8 @@ UniValue SendMoney(CWallet& wallet, const CCoinControl &coin_control, std::vecto
     // Send
     constexpr int RANDOM_CHANGE_POSITION = -1;
     auto res = CreateTransaction(wallet, recipients, RANDOM_CHANGE_POSITION, coin_control, true);
-    if (!res && coin_control.m_input_family == CCoinControl::InputFamily::QUANTUM &&
+    if (!res && !RequiresExplicitQuantumChangeAuthorization(res) &&
+        coin_control.m_input_family == CCoinControl::InputFamily::QUANTUM &&
         RecipientsAreQuantumOnly(recipients) && LegacyToQuantumFallbackActive(wallet)) {
         CCoinControl legacy_fallback{coin_control};
         legacy_fallback.m_input_family = CCoinControl::InputFamily::LEGACY;
@@ -336,6 +430,7 @@ RPCHelpMan burn()
             {
                 {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The amount in " + CURRENCY_UNIT + " to burn. eg 0.1"},
                 {"hex_string", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, "The hex-encoded string."},
+                {"change_address", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Existing wallet-owned direct quantum address for change when quantum inputs are selected. This RPC never creates a non-HD change key."},
             },
             RPCResult{
                 RPCResult::Type::STR_HEX, "txid", "The transaction id."
@@ -370,6 +465,13 @@ RPCHelpMan burn()
     EnsureWalletIsUnlocked(*pwallet);
 
     CCoinControl coin_control;
+    if (!request.params[2].isNull()) {
+        const CTxDestination change_dest = DecodeDestination(request.params[2].get_str());
+        if (!IsValidDestination(change_dest)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "change_address must be a valid Blackcoin address");
+        }
+        coin_control.destChange = change_dest;
+    }
     mapValue_t mapValue;
 
     return SendMoneyToScript(*pwallet, scriptPubKey, nAmount, coin_control, std::move(mapValue));
@@ -462,11 +564,11 @@ RPCHelpMan burnwallet()
 RPCHelpMan optimizeutxoset()
 {
     return RPCHelpMan{"optimizeutxoset",
-                "\nOptimize the UTXO set in order to maximize the PoS yield. This is only valid for continuous minting. The accumulated coinage will be reset!" +
+                "\nOptimize the UTXO set in order to maximize the PoS yield. This is only valid for continuous minting. The accumulated coinage will be reset. The command uses the required address for every output and for change; it does not create a hidden quantum change key." +
         HELP_REQUIRING_PASSPHRASE,
                 {
-                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The Blackcoin address to recieve all the new UTXOs. If not provided, new UTOXs will be assigned to the address of the input UTXOs."},
-                    {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The " + CURRENCY_UNIT + " amount to set the value of new UTXOs, i.e. make new UTXOs with value of 1000. If amount is not provided, hardcoded value will be used."},
+                    {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Required Blackcoin address that receives every new UTXO and any change. For quantum inputs, this must be an existing wallet-owned quantum address."},
+                    {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "The " + CURRENCY_UNIT + " amount assigned to each new UTXO, for example 1000."},
                     {"transmit", RPCArg::Type::BOOL, RPCArg::Default{false}, "If true, transmit transaction after generating it."},
                     {"fromAddress", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "The Blackcoin address to split coins from. If not provided, all available coins will be used."},
                 },
@@ -558,6 +660,7 @@ RPCHelpMan sendtoaddress()
                                          "dirty if they have previously been used in a transaction. If true, this also activates avoidpartialspends, grouping outputs by their addresses."},
                     {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"not set, fall back to wallet fee estimation"}, "Specify a fee rate in " + CURRENCY_ATOM + "/vB."},
                     {"verbose", RPCArg::Type::BOOL, RPCArg::Default{false}, "If true, return extra information about the transaction."},
+                    {"change_address", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Existing wallet-owned direct quantum address for change when quantum inputs are selected. This legacy RPC never creates a non-HD change key; use send with allow_new_quantum_key=true if a new key is expressly authorized."},
                 },
                 {
                     RPCResult{"if verbose is not set or set to false",
@@ -612,6 +715,13 @@ RPCHelpMan sendtoaddress()
         coin_control.m_feerate = FeeRateFromSatVbValue(request.params[6]);
         coin_control.fOverrideFeeRate = true;
     }
+    if (!request.params[8].isNull()) {
+        const CTxDestination change_dest = DecodeDestination(request.params[8].get_str());
+        if (!IsValidDestination(change_dest)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "change_address must be a valid Blackcoin address");
+        }
+        coin_control.destChange = change_dest;
+    }
 
     EnsureWalletIsUnlocked(*pwallet);
 
@@ -660,6 +770,7 @@ RPCHelpMan sendmany()
                     },
                     {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"not set, fall back to wallet fee estimation"}, "Specify a fee rate in " + CURRENCY_ATOM + "/vB."},
                     {"verbose", RPCArg::Type::BOOL, RPCArg::Default{false}, "If true, return extra information about the transaction."},
+                    {"change_address", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Existing wallet-owned direct quantum address for change when quantum inputs are selected. This legacy RPC never creates a non-HD change key; use send with allow_new_quantum_key=true if a new key is expressly authorized."},
                 },
                 {
                     RPCResult{"if verbose is not set or set to false",
@@ -711,6 +822,13 @@ RPCHelpMan sendmany()
     if (!request.params[5].isNull()) {
         coin_control.m_feerate = FeeRateFromSatVbValue(request.params[5]);
         coin_control.fOverrideFeeRate = true;
+    }
+    if (!request.params[7].isNull()) {
+        const CTxDestination change_dest = DecodeDestination(request.params[7].get_str());
+        if (!IsValidDestination(change_dest)) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "change_address must be a valid Blackcoin address");
+        }
+        coin_control.destChange = change_dest;
     }
 
     std::vector<CRecipient> recipients;
@@ -767,6 +885,7 @@ RPCHelpMan settxfee()
 static std::vector<RPCArg> FundTxDoc(bool solving_data = true)
 {
     std::vector<RPCArg> args = {
+        {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "For a final signed quantum-funded transaction only, explicitly authorize one new non-HD ML-DSA change key when change_address is omitted. Back up the wallet immediately whenever the result or an error reports a created address; the durable key can remain after a later construction, signing, or broadcast failure. Unsigned and dry-run construction must supply an existing wallet-owned quantum change_address and never creates wallet metadata."},
     };
     if (solving_data) {
         args.push_back({"solving_data", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Keys and scripts needed for producing a final transaction with a dummy signature.\n"
@@ -796,7 +915,15 @@ static std::vector<RPCArg> FundTxDoc(bool solving_data = true)
     return args;
 }
 
-void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out, int& change_position, const UniValue& options, CCoinControl& coinControl, bool override_min_fee)
+void FundTransaction(
+    CWallet& wallet,
+    CMutableTransaction& tx,
+    CAmount& fee_out,
+    int& change_position,
+    const UniValue& options,
+    CCoinControl& coinControl,
+    bool override_min_fee,
+    std::optional<CTxDestination>* created_quantum_change = nullptr)
 {
     // Make sure the results are valid at least up to the most recent block
     // the user could have gotten from another RPC command prior to now
@@ -818,6 +945,7 @@ void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out,
                 {"add_inputs", UniValueType(UniValue::VBOOL)},
                 {"include_unsafe", UniValueType(UniValue::VBOOL)},
                 {"add_to_wallet", UniValueType(UniValue::VBOOL)},
+                {"allow_new_quantum_key", UniValueType(UniValue::VBOOL)},
                 {"changeAddress", UniValueType(UniValue::VSTR)},
                 {"change_address", UniValueType(UniValue::VSTR)},
                 {"changePosition", UniValueType(UniValue::VNUM)},
@@ -841,6 +969,10 @@ void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out,
 
         if (options.exists("add_inputs")) {
             coinControl.m_allow_other_inputs = options["add_inputs"].get_bool();
+        }
+
+        if (options.exists("allow_new_quantum_key")) {
+            coinControl.m_allow_new_quantum_key = options["allow_new_quantum_key"].get_bool();
         }
 
         if (options.exists("changeAddress") || options.exists("change_address")) {
@@ -1003,7 +1135,9 @@ void FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& fee_out,
 
     bilingual_str error;
 
-    if (!FundTransaction(wallet, tx, fee_out, change_position, error, lockUnspents, setSubtractFeeFromOutputs, coinControl)) {
+    if (!FundTransaction(
+            wallet, tx, fee_out, change_position, error, lockUnspents,
+            setSubtractFeeFromOutputs, coinControl, created_quantum_change)) {
         throw JSONRPCError(RPC_WALLET_ERROR, error.original);
     }
 }
@@ -1133,6 +1267,7 @@ RPCHelpMan fundrawtransaction()
     CCoinControl coin_control;
     // Automatically select (additional) coins. Can be overridden by options.add_inputs.
     coin_control.m_allow_other_inputs = true;
+    RejectNewQuantumKeyForUnsignedOnly(request.params[1], "fundrawtransaction");
     FundTransaction(*pwallet, tx, fee, change_position, request.params[1], coin_control, /*override_min_fee=*/true);
 
     UniValue result(UniValue::VOBJ);
@@ -1331,7 +1466,8 @@ RPCHelpMan send()
                     {RPCResult::Type::BOOL, "complete", "If the transaction has a complete set of signatures"},
                     {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "The transaction id for the send. Only 1 transaction is created regardless of the number of addresses."},
                     {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "If add_to_wallet is false, the hex-encoded raw transaction with signature(s)"},
-                    {RPCResult::Type::STR, "psbt", /*optional=*/true, "If more signatures are needed, or if add_to_wallet is false, the base64-encoded (partially) signed transaction"}
+                    {RPCResult::Type::STR, "psbt", /*optional=*/true, "If more signatures are needed, or if add_to_wallet is false, the base64-encoded (partially) signed transaction"},
+                    {RPCResult::Type::STR, "warning", /*optional=*/true, "Backup reminder when quantum change-key creation was authorized"}
                 }
         },
         RPCExamples{""
@@ -1354,6 +1490,14 @@ RPCHelpMan send()
             UniValue options{request.params[4].isNull() ? (request.params[1].isObject() ? request.params[1] : UniValue(UniValue::VOBJ)) : request.params[4]};
             PreventOutdatedOptions(options);
 
+            const bool psbt_only = options.exists("psbt") && options["psbt"].get_bool();
+            const bool add_to_wallet = !options.exists("add_to_wallet") || options["add_to_wallet"].get_bool();
+            if (AllowsNewQuantumKey(options) && (psbt_only || !add_to_wallet)) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "send with psbt=true or add_to_wallet=false is a dry-run/unsigned-only flow and never creates wallet metadata. Remove allow_new_quantum_key and supply an existing wallet-owned quantum change_address.");
+            }
+
 
             CAmount fee;
             int change_position;
@@ -1363,9 +1507,12 @@ RPCHelpMan send()
             // be overridden by options.add_inputs.
             coin_control.m_allow_other_inputs = rawTx.vin.size() == 0;
             SetOptionsInputWeights(options["inputs"], options);
-            FundTransaction(*pwallet, rawTx, fee, change_position, options, coin_control, /*override_min_fee=*/false);
+            std::optional<CTxDestination> created_quantum_change;
+            FundTransaction(
+                *pwallet, rawTx, fee, change_position, options, coin_control,
+                /*override_min_fee=*/false, &created_quantum_change);
 
-            return FinishTransaction(pwallet, options, rawTx);
+            return FinishTransaction(pwallet, options, rawTx, created_quantum_change);
         }
     };
 }
@@ -1452,6 +1599,9 @@ RPCHelpMan sendall()
 
             UniValue options{request.params[4].isNull() ? (request.params[1].isObject() ? request.params[1] : UniValue(UniValue::VOBJ)) : request.params[4]};
             PreventOutdatedOptions(options);
+            if (AllowsNewQuantumKey(options)) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "sendall spends the selected value without a change output and does not create a quantum change key. Remove allow_new_quantum_key.");
+            }
 
 
             std::set<std::string> addresses_without_amount;
@@ -1790,6 +1940,7 @@ RPCHelpMan walletcreatefundedpsbt()
     wallet.BlockUntilSyncedToCurrentChain();
 
     UniValue options{request.params[3].isNull() ? UniValue::VOBJ : request.params[3]};
+    RejectNewQuantumKeyForUnsignedOnly(options, "walletcreatefundedpsbt");
 
     CAmount fee;
     int change_position;
@@ -1854,6 +2005,7 @@ RPCHelpMan migratetoquantum()
                 {
                     {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{false}, "Estimate only; do not sign, broadcast, or create a new quantum key. Requires existing_address."},
                     {"existing_address", RPCArg::Type::STR, RPCArg::Default{""}, "Migrate into this already-owned wallet-backed quantum address instead of generating a new one. Required for dry_run."},
+                    {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "When existing_address is omitted, explicitly authorize one new non-HD ML-DSA destination key. Back up the wallet whenever the result or an error reports the created address; the durable key can remain after a later failure."},
                     {"label", RPCArg::Type::STR, RPCArg::Default{"migration"}, "Label for a newly generated migration address."},
                     {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"wallet default"}, "Fee rate in " + CURRENCY_ATOM + "/vB."},
                     {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include unconfirmed/unsafe legacy coins."},
@@ -1875,7 +2027,7 @@ RPCHelpMan migratetoquantum()
             {RPCResult::Type::STR, "warning", /*optional=*/true, "backup reminder"},
         }},
         RPCExamples{
-            HelpExampleCli("migratetoquantum", "")
+            HelpExampleCli("migratetoquantum", "'{\"allow_new_quantum_key\":true}'")
           + HelpExampleCli("migratetoquantum", "'{\"dry_run\":true,\"existing_address\":\"<addr>\"}'")
           + HelpExampleRpc("migratetoquantum", "{\"existing_address\":\"<addr>\"}")
         },
@@ -1889,8 +2041,17 @@ RPCHelpMan migratetoquantum()
         const bool include_unsafe = options.exists("include_unsafe") && options["include_unsafe"].get_bool();
         const std::string label = options.exists("label") ? options["label"].get_str() : "migration";
         const std::string existing = options.exists("existing_address") ? options["existing_address"].get_str() : "";
+        const std::optional<CFeeRate> requested_fee_rate = options.exists("fee_rate")
+            ? std::optional<CFeeRate>{FeeRateFromSatVbValue(options["fee_rate"])}
+            : std::nullopt;
         if (dry_run && existing.empty()) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "dry_run requires existing_address so the estimate does not create wallet metadata");
+        }
+        if (!dry_run && existing.empty() &&
+            (!options.exists("allow_new_quantum_key") || !options["allow_new_quantum_key"].get_bool())) {
+            throw JSONRPCError(
+                RPC_INVALID_PARAMETER,
+                "migratetoquantum without existing_address creates a new non-HD ML-DSA key that an older wallet backup cannot recover. Retry with {\"allow_new_quantum_key\":true}, or supply an existing wallet-owned direct quantum existing_address. Back up the wallet after key creation. No key, transaction, or wallet metadata was created.");
         }
 
         LOCK2(cs_main, pwallet->cs_wallet);
@@ -1937,17 +2098,23 @@ RPCHelpMan migratetoquantum()
             dest = *op_dest;
             newly_generated = true;
         }
+        const std::optional<CTxDestination> created_destination = newly_generated
+            ? std::optional<CTxDestination>{dest}
+            : std::nullopt;
         if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-            throw JSONRPCError(RPC_WALLET_ERROR,
-                "Refusing to migrate: destination ML-DSA key is not confirmed stored in the wallet.");
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Quantum migration",
+                "Refusing to migrate: destination ML-DSA key is not confirmed stored in the wallet.",
+                created_destination);
         }
 
         CCoinControl coin_control;
         coin_control.m_allow_other_inputs = false;
         coin_control.m_include_unsafe_inputs = include_unsafe;
-        coin_control.destChange = CNoDestination{};
-        if (options.exists("fee_rate")) {
-            coin_control.m_feerate = CFeeRate(AmountFromValue(options["fee_rate"]), COIN);
+        coin_control.destChange = dest;
+        if (requested_fee_rate) {
+            coin_control.m_feerate = *requested_fee_rate;
             coin_control.fOverrideFeeRate = true;
         }
         CoinFilterParams filter;
@@ -1975,11 +2142,18 @@ RPCHelpMan migratetoquantum()
             ++eligible_inputs;
         }
         if (eligible_inputs == 0) {
-            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable legacy coins to migrate.");
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Quantum migration",
+                "No spendable legacy coins to migrate.",
+                created_destination);
         }
         if (IsQuantumWitnessSpendActive(consensus, mtp, next_height) && migration_anchor_inputs == 0) {
-            throw JSONRPCError(RPC_WALLET_ERROR,
-                "This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction. Add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor. During Gold Rush, prepare that anchor before quantum spending activates.");
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Quantum migration",
+                "This wallet's spendable legacy coins are witness-only and cannot create a fork-unique migration transaction. Add a small P2PKH or non-witness P2SH wallet UTXO as a migration anchor. During Gold Rush, prepare that anchor before quantum spending activates.",
+                created_destination);
         }
 
         std::vector<CRecipient> recipients;
@@ -1987,12 +2161,21 @@ RPCHelpMan migratetoquantum()
 
         constexpr int RANDOM_CHANGE_POSITION = -1;
         auto res = CreateTransaction(*pwallet, recipients, RANDOM_CHANGE_POSITION, coin_control, /*sign=*/!dry_run);
-        if (!res) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(res).original);
+        if (!res) {
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Quantum migration",
+                util::ErrorString(res).original,
+                created_destination);
+        }
 
         const CTransactionRef& tx = res->tx;
         if (tx->vout.size() != 1 || IsDust(tx->vout[0], pwallet->chain().relayDustFee())) {
-            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS,
-                "Migration would strand funds: swept value is below the dust threshold after fees.");
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Quantum migration",
+                "Migration would strand funds: swept value is below the dust threshold after fees.",
+                created_destination);
         }
 
         UniValue result(UniValue::VOBJ);
@@ -2007,7 +2190,7 @@ RPCHelpMan migratetoquantum()
         result.pushKV("fee", ValueFromAmount(res->fee));
         result.pushKV("vsize", (int)GetVirtualTransactionSize(*tx, 0, 0));
         if (!dry_run) {
-            CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Blackcoin quantum migration");
+            CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Quantum migration", created_destination);
             result.pushKV("txid", tx->GetHash().GetHex());
         }
         if (newly_generated) {
@@ -2030,6 +2213,7 @@ RPCHelpMan migrategoldrushrewards()
                 {
                     {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{false}, "Estimate only; do not sign, broadcast, or create a new quantum key. Requires existing_address."},
                     {"existing_address", RPCArg::Type::STR, RPCArg::Default{""}, "Move into this already-owned wallet-backed quantum address instead of generating a fresh one. Required for dry_run."},
+                    {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "When existing_address is omitted, explicitly authorize one new non-HD ML-DSA destination key. Back up the wallet whenever the result or an error reports the created address; the durable key can remain after a later failure."},
                     {"label", RPCArg::Type::STR, RPCArg::Default{"goldrush-consolidation"}, "Label for a newly generated optional consolidation address."},
                     {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"wallet default"}, "Fee rate in " + CURRENCY_ATOM + "/vB."},
                     {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include unconfirmed/unsafe reward coins."},
@@ -2053,7 +2237,7 @@ RPCHelpMan migrategoldrushrewards()
             {RPCResult::Type::STR, "warning", /*optional=*/true, "backup reminder"},
         }},
         RPCExamples{
-            HelpExampleCli("migrategoldrushrewards", "")
+            HelpExampleCli("migrategoldrushrewards", "'{\"allow_new_quantum_key\":true}'")
           + HelpExampleCli("migrategoldrushrewards", "'{\"dry_run\":true,\"existing_address\":\"<addr>\"}'")
           + HelpExampleRpc("migrategoldrushrewards", "{\"existing_address\":\"<addr>\"}")
         },
@@ -2067,8 +2251,17 @@ RPCHelpMan migrategoldrushrewards()
         const bool include_unsafe = options.exists("include_unsafe") && options["include_unsafe"].get_bool();
         const std::string label = options.exists("label") ? options["label"].get_str() : "goldrush-consolidation";
         const std::string existing = options.exists("existing_address") ? options["existing_address"].get_str() : "";
+        const std::optional<CFeeRate> requested_fee_rate = options.exists("fee_rate")
+            ? std::optional<CFeeRate>{FeeRateFromSatVbValue(options["fee_rate"])}
+            : std::nullopt;
         if (dry_run && existing.empty()) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "dry_run requires existing_address so the estimate does not create wallet metadata");
+        }
+        if (!dry_run && existing.empty() &&
+            (!options.exists("allow_new_quantum_key") || !options["allow_new_quantum_key"].get_bool())) {
+            throw JSONRPCError(
+                RPC_INVALID_PARAMETER,
+                "migrategoldrushrewards without existing_address creates a new non-HD ML-DSA key that an older wallet backup cannot recover. Retry with {\"allow_new_quantum_key\":true}, or supply an existing wallet-owned direct quantum existing_address. Back up the wallet after key creation. No key, transaction, or wallet metadata was created.");
         }
 
         LOCK2(cs_main, pwallet->cs_wallet);
@@ -2112,19 +2305,25 @@ RPCHelpMan migrategoldrushrewards()
             dest = *op_dest;
             newly_generated = true;
         }
+        const std::optional<CTxDestination> created_destination = newly_generated
+            ? std::optional<CTxDestination>{dest}
+            : std::nullopt;
         if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-            throw JSONRPCError(RPC_WALLET_ERROR,
-                "Refusing to move Gold Rush reward outputs: destination ML-DSA key is not confirmed stored in the wallet.");
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Gold Rush reward consolidation",
+                "Refusing to move Gold Rush reward outputs: destination ML-DSA key is not confirmed stored in the wallet.",
+                created_destination);
         }
         const CScript destination_script = GetScriptForDestination(dest);
 
         CCoinControl coin_control;
         coin_control.m_allow_other_inputs = false;
         coin_control.m_include_unsafe_inputs = include_unsafe;
-        coin_control.destChange = CNoDestination{};
+        coin_control.destChange = dest;
         coin_control.m_include_generated_quantum_inputs = true;
-        if (options.exists("fee_rate")) {
-            coin_control.m_feerate = FeeRateFromSatVbValue(options["fee_rate"]);
+        if (requested_fee_rate) {
+            coin_control.m_feerate = *requested_fee_rate;
             coin_control.fOverrideFeeRate = true;
         }
         CoinFilterParams filter;
@@ -2160,7 +2359,11 @@ RPCHelpMan migrategoldrushrewards()
             ++eligible_inputs;
         }
         if (eligible_inputs == 0) {
-            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No mature wallet-owned Gold Rush reward outputs are available to consolidate.");
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Gold Rush reward consolidation",
+                "No mature wallet-owned Gold Rush reward outputs are available to consolidate.",
+                created_destination);
         }
 
         std::vector<CRecipient> recipients;
@@ -2168,12 +2371,21 @@ RPCHelpMan migrategoldrushrewards()
 
         constexpr int RANDOM_CHANGE_POSITION = -1;
         auto res = CreateTransaction(*pwallet, recipients, RANDOM_CHANGE_POSITION, coin_control, /*sign=*/!dry_run);
-        if (!res) throw JSONRPCError(RPC_WALLET_ERROR, util::ErrorString(res).original);
+        if (!res) {
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Gold Rush reward consolidation",
+                util::ErrorString(res).original,
+                created_destination);
+        }
 
         const CTransactionRef& tx = res->tx;
         if (tx->vout.size() != 1 || IsDust(tx->vout[0], pwallet->chain().relayDustFee())) {
-            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS,
-                "Gold Rush reward consolidation would strand funds: selected value is below the dust threshold after fees.");
+            ThrowQuantumActionError(
+                RPC_WALLET_INSUFFICIENT_FUNDS,
+                "Gold Rush reward consolidation",
+                "Gold Rush reward consolidation would strand funds: selected value is below the dust threshold after fees.",
+                created_destination);
         }
 
         UniValue result(UniValue::VOBJ);
@@ -2190,7 +2402,7 @@ RPCHelpMan migrategoldrushrewards()
         result.pushKV("fee", ValueFromAmount(res->fee));
         result.pushKV("vsize", (int)GetVirtualTransactionSize(*tx, 0, 0));
         if (!dry_run) {
-            CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Blackcoin Gold Rush reward consolidation");
+            CommitWalletTransactionOrThrow(*pwallet, tx, {}, "Gold Rush reward consolidation", created_destination);
             result.pushKV("txid", tx->GetHash().GetHex());
         }
         if (newly_generated) {
@@ -2975,7 +3187,7 @@ RPCHelpMan creatergbtransfer()
                  {"add_to_wallet", RPCArg::Type::BOOL, RPCArg::Default{true}, "Commit the signed anchor transaction and persist the RGB transition metadata."},
                  {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{false}, "Build and sign the anchor transaction without committing or changing wallet RGB metadata."},
                  {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false}, "Allow unsafe selected input seals."},
-                 {"change_address", RPCArg::Type::STR, RPCArg::DefaultHint{"automatic"}, "Address to receive BLK change from the anchor transaction."},
+                 {"change_address", RPCArg::Type::STR, RPCArg::Optional::OMITTED, "Existing address to receive BLK change from the anchor transaction. If a selected RGB anchor input is quantum and positive change is required, supply an existing wallet-owned direct quantum address. This RPC never creates a non-HD quantum change key."},
                  {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::DefaultHint{"not set, fall back to wallet fee estimation"}, "Fee rate in " + CURRENCY_ATOM + "/vB."},
              },
              RPCArgOptions{.skip_type_check = true, .oneline_description = "options"}},

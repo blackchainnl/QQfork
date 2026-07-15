@@ -36,6 +36,7 @@ HelpMessageDialog::HelpMessageDialog(QWidget *parent, bool about) :
     ui->setupUi(this);
 
     QString version = QString{PACKAGE_NAME} + " " + tr("version") + " " + QString::fromStdString(FormatFullVersion());
+    const QString source_identity = QString::fromStdString(FormatSourceIdentity());
 
     if (about)
     {
@@ -52,8 +53,13 @@ HelpMessageDialog::HelpMessageDialog(QWidget *parent, bool about) :
 
         ui->aboutMessage->setTextFormat(Qt::RichText);
         ui->scrollArea->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
-        text = version + "\n" + QString::fromStdString(FormatParagraph(licenseInfo));
-        ui->aboutMessage->setText(version + "<br><br>" + licenseInfoHTML);
+        text = version + "\n" + source_identity + "\n" + QString::fromStdString(FormatParagraph(licenseInfo));
+        const QString escaped_source_identity = GUIUtil::HtmlEscape(source_identity);
+        const bool source_warning = IsSourceTreeDirty() || FormatSourceCommit().empty();
+        const QString source_html = source_warning
+            ? QStringLiteral("<span style=\"color:#b00020\"><b>%1</b></span>").arg(escaped_source_identity)
+            : QStringLiteral("<b>%1</b>").arg(escaped_source_identity);
+        ui->aboutMessage->setText(version + "<br>" + source_html + "<br><br>" + licenseInfoHTML);
         ui->aboutMessage->setWordWrap(true);
         ui->helpMessage->setVisible(false);
     } else {

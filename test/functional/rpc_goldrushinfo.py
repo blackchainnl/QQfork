@@ -158,6 +158,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
         self.log.info("Optional wallet automation is visible and fail-closed by default")
         staking_info = wallet.getstakinginfo()
         assert_equal(staking_info["autostart_staking"], False)
+        assert_equal(staking_info["autostart_staking_source"], "autostartstaking")
         assert_equal(staking_info["automatic_qqsignal"], False)
         assert_equal(staking_info["automatic_demurrage_attestation"], False)
         assert_equal(staking_info["automatic_redelegation"], False)
@@ -166,6 +167,10 @@ class GoldRushInfoTest(BitcoinTestFramework):
         pow_info = wallet.getpowmininginfo()
         assert_equal(pow_info["autostart"], False)
         assert_equal(pow_info["allow_automatic_quantum_key_creation"], False)
+        assert_equal(pow_info["current_height"], node.getblockcount())
+        assert_equal(pow_info["shadow_reward_next_height"], node.getblockcount() + 1)
+        assert pow_info["shadow_reward_start_height"] <= pow_info["shadow_reward_next_height"]
+        assert pow_info["shadow_reward_next_height"] <= pow_info["shadow_reward_end_height"]
         pow_help = wallet.help("setpowmining")
         assert "allow_new_payout_key" in pow_help
         assert "Back up the wallet immediately" in pow_help
