@@ -123,6 +123,7 @@ def verify_epoch_source_contract(repo_root: Path) -> dict[str, str]:
             "static_assert(MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT == 5993200);",
             "static_assert(MAINNET_SHADOW_REWARD_END_HEIGHT == 6192999);",
             "static constexpr unsigned int MAX_SHADOW_POW_EVALS_PER_BLOCK = 64;",
+            "static constexpr uint32_t SHADOW_POW_LATE_ORIGIN_WINDOW = 64;",
             "static constexpr CAmount SHADOW_MAX_EMISSION = 51437700 * COIN;",
         ),
         "src/shadow.cpp": (
@@ -133,6 +134,15 @@ def verify_epoch_source_contract(repo_root: Path) -> dict[str, str]:
             "static constexpr size_t HEADER_SIZE = 1 + uint256::size() + 3 * sizeof(uint32_t);",
             "static constexpr size_t SIZE = 2 + 3 * sizeof(uint32_t) + 6 * uint256::size() + POOL_V2_SIZE;",
             "static_assert(2 + QUANTUM_MIGRATION_PROGRAM_SIZE == 34);",
+            "static const valtype MARKER_LOGICAL_PROOF_BUCKET{'Q', 'Q', 'P', 'R', 'O', 'O', 'F', 'S'};",
+            "stream << uint8_t{1} << bucket.height << bucket.block_hash",
+            "<< bucket.proof_ids;",
+            "coin.out.scriptPubKey = MarkerScript(MARKER_LOGICAL_PROOF_BUCKET, payload);",
+            "tip->nHeight, SHADOW_REWARD_END_HEIGHT);",
+            "static_cast<int>(SHADOW_POW_LATE_ORIGIN_WINDOW) + 1);",
+            "if (Params().GetConsensus().IsShadowCompetingClaimsActive(\n            pindex->nHeight) &&\n        !WriteLogicalProofBucket(view, pindex,",
+            "const bool logical_proof_bucket_active =\n        Params().GetConsensus().IsShadowCompetingClaimsActive(pindex->nHeight);",
+            "if (logical_proof_bucket_active &&\n        !view.SpendCoin(LogicalProofBucketOutpoint(pindex)))",
         ),
         "src/serialize.h": (
             "static constexpr uint64_t MAX_SIZE = 0x02000000;",
@@ -190,6 +200,14 @@ def verify_epoch_source_contract(repo_root: Path) -> dict[str, str]:
         ),
         "src/node/caches.cpp": (
             "sizes.coins_db = std::min(sizes.coins_db, nMaxCoinsDBCache << 20);",
+        ),
+        "src/test/shadow_tests.cpp": (
+            "BOOST_AUTO_TEST_CASE(logical_proof_bucket_serialized_resource_bounds)",
+            "constexpr std::array<size_t, 3> proof_counts{0, 1, 64};",
+            "constexpr std::array<size_t, 3> serialized_coin_bytes{61, 93, 2'112};",
+            "constexpr std::array<size_t, 3> batch_entry_bytes{98, 130, 2'150};",
+            "BOOST_CHECK_EQUAL(GetSerializeSize(coin), serialized_coin_bytes[index]);",
+            "BOOST_CHECK_EQUAL(batch.SizeEstimate(), batch_entry_bytes[index]);",
         ),
     }
     hashes = {}

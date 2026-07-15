@@ -521,13 +521,17 @@ class ReleaseToolTests(unittest.TestCase):
                     "src/consensus/consensus.h",
                     "src/consensus/quantum_witness.h",
                     "src/consensus/amount.h",
+                    "src/script/script.h",
                     "src/coins.h",
                     "src/txdb.cpp",
+                    "src/txdb.h",
                     "src/compressor.h",
                     "src/compressor.cpp",
                     "src/kernel/chainparams.cpp",
                     "src/bench/quantum_crypto.cpp",
                     "src/dbwrapper.cpp",
+                    "src/node/caches.cpp",
+                    "src/test/shadow_tests.cpp",
                 },
             )
 

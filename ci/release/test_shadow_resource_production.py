@@ -591,6 +591,24 @@ class ShadowResourceProductionTest(unittest.TestCase):
                     repo, {"source_files": hashes}, self.contract
                 )
 
+    def test_current_hashes_cannot_mask_logical_bucket_window_drift(self):
+        with tempfile.TemporaryDirectory() as temporary_raw:
+            temporary = Path(temporary_raw)
+            repo, _, _, hashes = self.make_repo(temporary)
+            shadow_header = repo / "src/shadow.h"
+            source = shadow_header.read_text(encoding="utf-8")
+            source = source.replace(
+                "static constexpr uint32_t SHADOW_POW_LATE_ORIGIN_WINDOW = 64;",
+                "static constexpr uint32_t SHADOW_POW_LATE_ORIGIN_WINDOW = 65;",
+            )
+            shadow_header.write_text(source, encoding="utf-8")
+            hashes["src/shadow.h"] = sha256(shadow_header)
+            with self.assertRaisesRegex(
+                    RuntimeError, "epoch-bound source contract changed"):
+                verifier.verify_sources(
+                    repo, {"source_files": hashes}, self.contract
+                )
+
     def exact_scan(self, phase_name: str) -> dict:
         fixture = self.contract["synthetic_fixture"]
         return {
