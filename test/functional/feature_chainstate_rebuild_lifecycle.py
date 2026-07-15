@@ -18,6 +18,7 @@ malformed journals fail closed.
 import errno
 import shlex
 import socket
+import sys
 import time
 from pathlib import Path
 
@@ -161,6 +162,62 @@ class ChainstateRebuildLifecycleTest(BitcoinTestFramework):
     @staticmethod
     def log_delta(node, offset):
         return node.debug_log_path.read_bytes()[offset:].decode("utf-8", errors="replace")
+
+    @staticmethod
+    def kill_node_process(node):
+        """Kill without RPC shutdown and reset the framework's process state."""
+        node.process.kill()
+        node.process.wait(timeout=node.rpc_timeout)
+        node.stdout.close()
+        node.stderr.close()
+        node.running = False
+        node.process = None
+        node.rpc_connected = False
+        node.rpc = None
+
+    def kill_after_durable_rebuild_transition(self, phase, *, reindex_chainstate):
+        """Use the production journal path, then send a real process kill."""
+        node = self.nodes[0]
+        marker = node.chain_path / "chainstate-rebuild-test-pause"
+        journal = node.chain_path / "chainstate-rebuild.journal"
+        marker.unlink(missing_ok=True)
+        extra_args = [f"-testchainstaterebuildpauseafter={phase}"]
+        if reindex_chainstate:
+            extra_args.append("-reindex-chainstate")
+        node.start(extra_args=extra_args)
+        self.wait_until(lambda: marker.exists(), timeout=60)
+        assert_equal(marker.read_text(encoding="utf-8"), f"{phase}\n")
+        assert self.journal_has_phase(journal, phase)
+        self.kill_node_process(node)
+        marker.unlink()
+
+    def verify_recovered_tip(self, expected_height, expected_tip):
+        node = self.nodes[0]
+        self.start_node(0)
+        assert_equal(node.getblockcount(), expected_height)
+        assert_equal(node.getbestblockhash(), expected_tip)
+        self.stop_node(0)
+
+    def exhaust_process_file_writes_during_reconstruction(self, expected_height, expected_tip):
+        """Apply a real POSIX file-size quota after BUILDING is durable."""
+        node = self.nodes[0]
+        journal = node.chain_path / "chainstate-rebuild.journal"
+        backup = node.chain_path / "chainstate.rebuild-backup"
+        node.start(extra_args=[
+            "-reindex-chainstate",
+            "-testchainstaterebuildfilesizelimit=1",
+        ])
+        return_code = node.process.wait(timeout=60)
+        assert return_code != 0, "reconstruction unexpectedly succeeded under a one-byte file quota"
+        node.stdout.close()
+        node.stderr.close()
+        node.running = False
+        node.process = None
+        node.rpc_connected = False
+        node.rpc = None
+        assert self.journal_has_phase(journal, "building")
+        assert backup.is_dir()
+        self.verify_recovered_tip(expected_height, expected_tip)
 
     def assert_log_before(self, text, first, second):
         first_offset = text.find(first)
@@ -383,6 +440,36 @@ class ChainstateRebuildLifecycleTest(BitcoinTestFramework):
         self.start_node(0, extra_args=self.service_args())
         assert_equal(node.getblockcount(), expected_height)
         assert_equal(node.getbestblockhash(), expected_tip)
+        self.stop_node(0)
+
+        for phase in ("prepared", "building"):
+            self.log.info(f"Kill the daemon after durable {phase.upper()} and recover the original chainstate")
+            self.kill_after_durable_rebuild_transition(
+                phase, reindex_chainstate=True)
+            self.verify_recovered_tip(expected_height, expected_tip)
+
+        self.log.info("Kill rollback itself after durable ROLLING_BACK, then resume it on another start")
+        self.kill_after_durable_rebuild_transition(
+            "building", reindex_chainstate=True)
+        self.kill_after_durable_rebuild_transition(
+            "rolling-back", reindex_chainstate=False)
+        self.verify_recovered_tip(expected_height, expected_tip)
+
+        self.log.info("Kill after durable COMMIT_READY, then verify and retire the backup on restart")
+        self.kill_after_durable_rebuild_transition(
+            "commit-ready", reindex_chainstate=True)
+        self.verify_recovered_tip(expected_height, expected_tip)
+
+        self.log.info("Kill after durable CLEANUP_READY, then finish retryable backup cleanup")
+        self.run_first_pass_with_reserved_services()
+        self.kill_after_durable_rebuild_transition(
+            "cleanup-ready", reindex_chainstate=False)
+        self.verify_recovered_tip(expected_height, expected_tip)
+
+        if sys.platform != "win32":
+            self.log.info("Exhaust real process file writes during reconstruction and recover the preserved source")
+            self.exhaust_process_file_writes_during_reconstruction(
+                expected_height, expected_tip)
 
 
 if __name__ == "__main__":

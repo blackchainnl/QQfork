@@ -47,6 +47,7 @@
 #include <set>
 #include <stdint.h>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -1064,6 +1065,11 @@ public:
     //! Set only after the committed replacement and its preserved backups have
     //! been durably retired in this process.
     std::atomic<bool> m_chainstate_rebuild_cleanup_completed_this_process{false};
+    //! Test-only observer installed by LoadChainstate for exact durable-phase
+    //! crash injection. Empty in production. It is stored on the manager
+    //! because COMMIT_READY and CLEANUP_READY are written by the asynchronous
+    //! import/finalization path after LoadChainstate returns.
+    std::function<void(std::string_view)> m_chainstate_rebuild_transition_cb;
     const Options m_options;
     std::thread m_thread_load;
     //! A single BlockManager instance is shared across each constructed

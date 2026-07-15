@@ -49,6 +49,54 @@ The V4 transition runs in phases.
 The full planned transition is approximately twenty-four months from the start
 of Gold Rush through final lockout.
 
+## Required two-start upgrade and rollback rehearsal
+
+Do not treat a successful in-place startup as rollback evidence. Before a beta
+artifact is used beyond an isolated canary, rehearse with a stopped v30.1.0
+datadir and three separate copies: an immutable cold source, a disposable
+v30.1.1 upgrade copy, and a rollback copy restored again from the cold source.
+Never start v30.1.0 on the upgraded copy.
+
+1. Verify the candidate artifact checksum and record its full source SHA. Stop
+   v30.1.0 cleanly. Copy the complete datadir while it is stopped, then hash
+   every wallet database. For every loaded wallet, record the public
+   `getquantumkeyinventory` rows (address, public key, creation time, and backup
+   state) and prove one existing legacy key with `signmessage`/`verifymessage`.
+2. Clone the cold source into the disposable upgrade directory. Disable all
+   networking, staking, mining, automatic signalling, redelegation, and
+   automatic key creation. Start the candidate once with
+   `-reindex-chainstate`. That isolated process must reach durable
+   `COMMIT_READY`, retain the source chainstate backup, open no RPC/P2P/wallet
+   services, and exit successfully.
+3. Start the same candidate artifact a second time without a reindex flag. It
+   must reopen and verify the replacement before deleting the source backup.
+   Compare every wallet's quantum address/public-key inventory with step 1 and
+   prove the same legacy key again. Run `backupwallet` to a new external path;
+   this operation reopens the staged backup and makes every contained ML-DSA
+   key sign and verify a fresh challenge before installation. Require
+   `all_durably_stored=true`, `all_backed_up=true`, an unchanged key count, and
+   the same address/public-key set. Stop cleanly and retain the upgraded copy
+   only as evidence.
+4. Create the rollback directory from the untouched cold source, not from any
+   v30.1.1 file. Before startup, require its wallet-file hashes to match step 1
+   byte for byte. Start the pinned v30.1.0 artifact with automation and
+   networking disabled. Require the exact pre-upgrade quantum inventory and a
+   fresh signature from the same legacy key, then stop cleanly.
+5. Preserve the artifact hashes, commands, process exit codes, journal phases,
+   pre/candidate/rollback inventories, wallet-file hashes, signature results,
+   and backup paths in the release record. Any missing key, changed public key,
+   unverified backup, service opened during the first start, source backup
+   removed before the second start, or rollback file not sourced from the cold
+   copy fails the rehearsal.
+
+The repository's regtest recovery suite injects real process termination at
+each durable migration and chainstate journal boundary. POSIX coverage also
+applies a real per-process file-write quota after `BUILDING` is durable so the
+replacement database fails during reconstruction and the next process must
+restore the preserved source. Those tests establish the recovery mechanism;
+they do not replace running this rehearsal with the exact release artifacts on
+each supported platform.
+
 ## Gold Rush Participation
 
 Gold Rush rewards are split between staking-based participation and Proof of Work

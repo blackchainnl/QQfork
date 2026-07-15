@@ -103,13 +103,16 @@
 #include <functional>
 #include <limits>
 #include <set>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #ifndef WIN32
 #include <cerrno>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #endif
 
@@ -627,6 +630,9 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-addrmantest", "Allows to test address relay on localhost", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-capturemessages", "Capture all P2P messages to disk", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mocktime=<n>", "Replace actual time with " + UNIX_EPOCH_TIME + " (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testchainstaterebuildpauseafter=<phase>", "Regtest-only recovery test hook: pause after the named chainstate rebuild journal phase is durably committed (prepared, building, rolling-back, commit-ready, or cleanup-ready). The process must be killed or the marker removed by the test harness.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testchainstaterebuildfilesizelimit=<n>", "Regtest-only POSIX recovery test hook: after the BUILDING journal phase is durable, apply an operating-system file-size limit of <n> bytes so reconstruction encounters a real write failure (default: 0, disabled).", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testdatadirmigrationpauseafter=<transition>", "Regtest-only recovery test hook: pause after the named first-run datadir migration transition is durably committed (staged-import-ready, recovery-record-ready, active-moved, or promoted). The process must be killed or the marker removed by the test harness.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-shadowindexmockobsoleteschema", "Regtest-only: treat the current shadowindex schema as obsolete and exercise its rebuild path", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-shadowrpcsnapshotdelaymillis=<n>", "Regtest-only shadow RPC snapshot race-test barrier delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-prematurewitness", "Allow witness transaction relay before witness activation (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
@@ -1665,6 +1671,80 @@ static bool AppInitMainImpl(NodeContext& node,
         options.check_level = args.GetIntArg("-checklevel", DEFAULT_CHECKLEVEL);
         options.require_full_verification = args.IsArgSet("-checkblocks") || args.IsArgSet("-checklevel");
         options.check_interrupt = ShutdownRequested;
+        const std::string rebuild_pause_phase =
+            args.GetArg("-testchainstaterebuildpauseafter", "");
+        const int64_t rebuild_file_size_limit =
+            args.GetIntArg("-testchainstaterebuildfilesizelimit", 0);
+        if (rebuild_file_size_limit < 0) {
+            return InitError(_("-testchainstaterebuildfilesizelimit cannot be negative"));
+        }
+        if (rebuild_file_size_limit > 0 &&
+            chainparams.GetChainType() != ChainType::REGTEST) {
+            return InitError(_("-testchainstaterebuildfilesizelimit is only supported on regtest"));
+        }
+#ifdef WIN32
+        if (rebuild_file_size_limit > 0) {
+            return InitError(_("-testchainstaterebuildfilesizelimit requires a POSIX file-size resource limit"));
+        }
+#endif
+        if (!rebuild_pause_phase.empty()) {
+            static const std::set<std::string> supported_rebuild_pause_phases{
+                "prepared", "building", "rolling-back", "commit-ready",
+                "cleanup-ready"};
+            if (chainparams.GetChainType() != ChainType::REGTEST) {
+                return InitError(_("-testchainstaterebuildpauseafter is only supported on regtest"));
+            }
+            if (!supported_rebuild_pause_phases.count(rebuild_pause_phase)) {
+                return InitError(strprintf(
+                    _("Unknown -testchainstaterebuildpauseafter phase: %s"),
+                    rebuild_pause_phase));
+            }
+        }
+        if (!rebuild_pause_phase.empty() || rebuild_file_size_limit > 0) {
+            const fs::path pause_marker =
+                chainman_opts.datadir / "chainstate-rebuild-test-pause";
+            options.rebuild_durable_transition_cb =
+                [rebuild_pause_phase, rebuild_file_size_limit, pause_marker](std::string_view phase) {
+                    if (!rebuild_pause_phase.empty() && phase == rebuild_pause_phase) {
+                        {
+                            std::ofstream marker{pause_marker};
+                            if (!marker.is_open()) {
+                                throw std::runtime_error(strprintf(
+                                    "unable to create chainstate rebuild test pause marker %s",
+                                    fs::PathToString(pause_marker)));
+                            }
+                            marker << phase << '\n';
+                            marker.flush();
+                            if (!marker.good()) {
+                                throw std::runtime_error(strprintf(
+                                    "unable to write chainstate rebuild test pause marker %s",
+                                    fs::PathToString(pause_marker)));
+                            }
+                        }
+                        DirectoryCommit(pause_marker.parent_path());
+                        LogPrintf("Regtest chainstate rebuild paused after durable %s transition; kill the process or remove %s to resume\n",
+                                  phase, fs::PathToString(pause_marker));
+                        while (fs::exists(pause_marker)) {
+                            UninterruptibleSleep(std::chrono::milliseconds{10});
+                        }
+                    }
+#ifndef WIN32
+                    if (phase == "building" && rebuild_file_size_limit > 0) {
+                        const struct rlimit limit{
+                            static_cast<rlim_t>(rebuild_file_size_limit),
+                            static_cast<rlim_t>(rebuild_file_size_limit)};
+                        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR ||
+                            setrlimit(RLIMIT_FSIZE, &limit) != 0) {
+                            throw std::runtime_error(strprintf(
+                                "unable to apply chainstate rebuild file-size limit: %s",
+                                SysErrorString(errno)));
+                        }
+                        LogPrintf("Regtest chainstate rebuild applied a %d-byte process file-size limit after durable BUILDING\n",
+                                  rebuild_file_size_limit);
+                    }
+#endif
+                };
+        }
         options.coins_error_cb = [] {
             uiInterface.ThreadSafeMessageBox(
                 _("Error reading from database, shutting down."),

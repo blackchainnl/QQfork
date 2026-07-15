@@ -751,6 +751,8 @@ jobs:
             wallet_backup.py \
             wallet_encryption.py \
             feature_dbcrash.py \
+            feature_chainstate_rebuild_lifecycle.py \
+            feature_config_args.py \
             feature_reindex.py \
             feature_shutdown.py
 

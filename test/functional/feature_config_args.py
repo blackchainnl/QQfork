@@ -450,6 +450,41 @@ class ConfArgsTest(BitcoinTestFramework):
             node.datadir_path = original_datadir
             node.bitcoinconf = original_bitcoinconf
 
+    def _kill_default_datadir_migration_after(self, node, env, default_datadir, transition):
+        """Pause at an exact durable migration boundary and kill the process."""
+        original_args = node.args
+        original_datadir = node.datadir_path
+        original_bitcoinconf = node.bitcoinconf
+        pause_marker = default_datadir.parent / f"{default_datadir.name}.migration-test-pause"
+        pause_marker.unlink(missing_ok=True)
+        try:
+            node.args = [arg for arg in node.args if not arg.startswith("-datadir=")]
+            node.datadir_path = default_datadir
+            node.bitcoinconf = default_datadir / "blackcoin.conf"
+            node.start(
+                extra_args=self._default_datadir_args(node) + [
+                    "-migratewallet=blackmore",
+                    f"-testdatadirmigrationpauseafter={transition}",
+                ],
+                env=env,
+            )
+            self.wait_until(lambda: pause_marker.exists(), timeout=60)
+            assert_equal(pause_marker.read_text(encoding="utf8"), f"{transition}\n")
+            node.process.kill()
+            node.process.wait(timeout=node.rpc_timeout)
+            node.stdout.close()
+            node.stderr.close()
+            node.running = False
+            node.process = None
+            node.rpc_connected = False
+            node.rpc = None
+        finally:
+            self._stop_node_if_started(node)
+            pause_marker.unlink(missing_ok=True)
+            node.args = original_args
+            node.datadir_path = original_datadir
+            node.bitcoinconf = original_bitcoinconf
+
     def _assert_default_datadir_start_error(self, node, env, default_datadir, expected_msg, extra_args=None):
         original_args = node.args
         original_datadir = node.datadir_path
@@ -536,6 +571,50 @@ class ConfArgsTest(BitcoinTestFramework):
         self._assert_backup_wallet(dual_default_datadir, "original-blackcoin", "dual original wallet\n")
         self._assert_backup_wallet(dual_default_datadir, "active-blackcoin", "dual original wallet\n")
         self._assert_backup_wallet(dual_default_datadir, "blackmore", "dual blackmore wallet\n")
+
+        for transition in (
+            "staged-import-ready",
+            "recovery-record-ready",
+            "active-moved",
+            "promoted",
+        ):
+            self.log.info(f"Kill first-run migration after durable {transition} and recover deterministically")
+            kill_env, kill_default_datadir = util.get_temp_default_datadir(
+                Path(self.options.tmpdir, f"legacy_migration_kill_{transition.replace('-', '_')}_home")
+            )
+            kill_blackmore_datadir = self._legacy_datadir_for_env(kill_env)
+            self._write_legacy_datadir(
+                kill_default_datadir,
+                conf_name="blackcoin.conf",
+                wallet_text=f"{transition} original wallet\n",
+            )
+            self._write_legacy_datadir(
+                kill_blackmore_datadir,
+                wallet_text=f"{transition} blackmore wallet\n",
+            )
+            self._kill_default_datadir_migration_after(
+                node, kill_env, kill_default_datadir, transition)
+            self._run_default_datadir_node_once(
+                node,
+                kill_env,
+                kill_default_datadir,
+                extra_args=["-migratewallet=blackmore"],
+            )
+            assert_equal(
+                (kill_default_datadir / "wallet.dat").read_text(encoding="utf8"),
+                f"{transition} blackmore wallet\n",
+            )
+            assert self._migration_marker(kill_default_datadir).exists()
+            self._assert_backup_wallet(
+                kill_default_datadir,
+                "blackmore",
+                f"{transition} blackmore wallet\n",
+            )
+            self._assert_backup_wallet(
+                kill_default_datadir,
+                "original-blackcoin",
+                f"{transition} original wallet\n",
+            )
 
         self.log.info("Test dual legacy datadirs with no flag keeps .blackcoin and preserves .blackmore")
         dual_auto_env, dual_auto_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_dual_auto_home"))

@@ -15,6 +15,7 @@
 #include <util/fs.h>
 #include <util/fs_helpers.h>
 #include <util/strencodings.h>
+#include <util/time.h>
 #include <util/translation.h>
 
 #include <algorithm>
@@ -31,6 +32,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <stdexcept>
 #include <system_error>
 #include <tuple>
@@ -45,6 +47,9 @@ constexpr const char* MIGRATION_RECOVERY_FILENAME = ".blackcoin-migration-recove
 constexpr const char* MIGRATION_LOCK_FILENAME = ".lock";
 constexpr const char* MIGRATION_OPERATION_LOCK_SUFFIX = ".migration.lock";
 constexpr std::array<const char*, 3> LEGACY_NETWORK_DIRS{"testnet", "signet", "regtest"};
+constexpr std::array<std::string_view, 4> MIGRATION_TEST_TRANSITIONS{
+    "staged-import-ready", "recovery-record-ready", "active-moved",
+    "promoted"};
 
 enum class MigrationChoice {
     AUTO,
@@ -67,6 +72,53 @@ common::MigrationProgressFn g_migration_progress_fn;
 void ReportMigrationProgress(const std::string& phase, int progress_percent)
 {
     if (g_migration_progress_fn) g_migration_progress_fn(phase, progress_percent);
+}
+
+bool IsSupportedMigrationTestTransition(std::string_view transition)
+{
+    return std::find(MIGRATION_TEST_TRANSITIONS.begin(),
+                     MIGRATION_TEST_TRANSITIONS.end(), transition) !=
+        MIGRATION_TEST_TRANSITIONS.end();
+}
+
+fs::path MigrationTestPauseMarker(const fs::path& destination)
+{
+    fs::path marker{destination.parent_path()};
+    marker /= fs::PathFromString(
+        fs::PathToString(destination.filename()) + ".migration-test-pause");
+    return marker;
+}
+
+void MaybePauseMigrationForTest(const ArgsManager& args,
+                                const fs::path& destination,
+                                std::string_view transition)
+{
+    const std::string selected =
+        args.GetArg("-testdatadirmigrationpauseafter", "");
+    if (selected != transition) return;
+
+    const fs::path marker = MigrationTestPauseMarker(destination);
+    {
+        std::ofstream stream{marker};
+        if (!stream.is_open()) {
+            throw std::runtime_error(strprintf(
+                "unable to create datadir migration test pause marker %s",
+                fs::PathToString(marker)));
+        }
+        stream << transition << '\n';
+        stream.flush();
+        if (!stream.good()) {
+            throw std::runtime_error(strprintf(
+                "unable to write datadir migration test pause marker %s",
+                fs::PathToString(marker)));
+        }
+    }
+    DirectoryCommit(marker.parent_path());
+    LogPrintf("Regtest datadir migration paused after durable %s transition; kill the process or remove %s to resume\n",
+              transition, fs::PathToString(marker));
+    while (fs::exists(marker)) {
+        UninterruptibleSleep(std::chrono::milliseconds{10});
+    }
 }
 
 bool PathExistsNoThrow(const fs::path& path)
@@ -1214,6 +1266,18 @@ struct MigrationOutcome {
 
 MigrationOutcome MaybeMigrateLegacyDataDir(ArgsManager& args, const common::LegacyMigrationPromptFn& legacy_migration_prompt_fn)
 {
+    const std::string migration_pause_transition =
+        args.GetArg("-testdatadirmigrationpauseafter", "");
+    if (!migration_pause_transition.empty()) {
+        if (args.GetChainType() != ChainType::REGTEST) {
+            return {.aborted = false, .error = "-testdatadirmigrationpauseafter is only supported on regtest"};
+        }
+        if (!IsSupportedMigrationTestTransition(migration_pause_transition)) {
+            return {.aborted = false, .error = strprintf(
+                "unknown -testdatadirmigrationpauseafter transition: %s",
+                migration_pause_transition)};
+        }
+    }
     if (args.IsArgSet("-datadir") || args.IsArgSet("-conf")) return {};
 
     const fs::path base_path = args.GetDataDirBase();
@@ -1346,6 +1410,7 @@ MigrationOutcome MaybeMigrateLegacyDataDir(ArgsManager& args, const common::Lega
             fs::remove_all(staged_import_path, ec);
             return {.aborted = false, .error = "failed to stage the durable migration completion marker"};
         }
+        MaybePauseMigrationForTest(args, base_path, "staged-import-ready");
 
         std::optional<fs::path> moved_active_path;
         if (has_blackcoin) {
@@ -1355,12 +1420,14 @@ MigrationOutcome MaybeMigrateLegacyDataDir(ArgsManager& args, const common::Lega
                 fs::remove_all(staged_import_path, ec);
                 return {.aborted = false, .error = "failed to write recovery record before replacing the active .blackcoin datadir"};
             }
+            MaybePauseMigrationForTest(args, base_path, "recovery-record-ready");
             if (!MoveActiveDestinationAside(base_path, moved_path, migration_locks)) {
                 std::error_code ec;
                 fs::remove_all(staged_import_path, ec);
                 return {.aborted = false, .error = "failed to move the active .blackcoin datadir aside before selected .blackmore import"};
             }
             moved_active_path = moved_path;
+            MaybePauseMigrationForTest(args, base_path, "active-moved");
         } else if (PathExistsNoThrow(base_path)) {
             // No populated .blackcoin datadir, but the destination directory
             // already exists — typically an empty datadir the GUI created
@@ -1384,6 +1451,7 @@ MigrationOutcome MaybeMigrateLegacyDataDir(ArgsManager& args, const common::Lega
                 throw std::runtime_error("promoted .blackmore import was not a real directory");
             }
             DirectoryCommit(base_path.parent_path());
+            MaybePauseMigrationForTest(args, base_path, "promoted");
             std::string promoted_lock_failure;
             if (!ResolveAndLockSourceRoot(base_path, migration_locks, promoted_lock_failure)) {
                 throw std::runtime_error(strprintf("promoted datadir could not be locked: %s", promoted_lock_failure));

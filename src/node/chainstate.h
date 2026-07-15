@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <functional>
 #include <optional>
+#include <string_view>
 #include <tuple>
 
 class CTxMemPool;
@@ -47,6 +48,11 @@ struct ChainstateLoadOptions {
     //! Override only for deterministic recovery failure-injection tests. The
     //! production path uses CheckDiskSpace() directly.
     std::function<bool(const fs::path&, uint64_t)> check_rebuild_disk_space;
+    //! Test-only observer invoked immediately after a rebuild journal phase is
+    //! durably committed. Production callers leave this empty. Functional
+    //! tests use it to pause at an exact crash boundary and then terminate the
+    //! daemon with the operating system rather than simulating a restart.
+    std::function<void(std::string_view)> rebuild_durable_transition_cb;
     std::function<void()> coins_error_cb;
 };
 

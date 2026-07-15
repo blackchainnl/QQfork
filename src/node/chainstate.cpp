@@ -171,6 +171,14 @@ bool WriteJournal(const fs::path& datadir, const RebuildJournal& journal)
     return true;
 }
 
+void NotifyDurableRebuildTransition(ChainstateManager& chainman,
+                                    RebuildPhase phase)
+{
+    if (chainman.m_chainstate_rebuild_transition_cb) {
+        chainman.m_chainstate_rebuild_transition_cb(PhaseName(phase));
+    }
+}
+
 std::optional<RebuildJournal> ReadJournal(const fs::path& datadir, std::string& error)
 {
     const fs::path path = JournalPath(datadir);
@@ -623,6 +631,7 @@ ChainstateLoadResult RecoverInterruptedRebuild(ChainstateManager& chainman)
             return {ChainstateLoadStatus::FAILURE_FATAL,
                     _("Unable to durably mark an interrupted chainstate rebuild for rollback. No chainstate was changed.")};
         }
+        NotifyDurableRebuildTransition(chainman, RebuildPhase::ROLLING_BACK);
     }
 
     std::string restore_error;
@@ -784,6 +793,7 @@ static ChainstateLoadResult BeginStagedChainstateRebuild(
         return {ChainstateLoadStatus::FAILURE_FATAL,
                 _("Unable to durably create the chainstate rebuild journal. No chainstate was moved or wiped.")};
     }
+    NotifyDurableRebuildTransition(chainman, RebuildPhase::PREPARED);
 
     if (journal.base_present) {
         if (options.check_interrupt && options.check_interrupt()) {
@@ -815,6 +825,7 @@ static ChainstateLoadResult BeginStagedChainstateRebuild(
         return {ChainstateLoadStatus::FAILURE_FATAL,
                 _("Unable to durably enter the chainstate rebuild phase. Preserved backups remain journaled and will be restored on next startup.")};
     }
+    NotifyDurableRebuildTransition(chainman, RebuildPhase::BUILDING);
     chainman.m_chainstate_rebuild_staged_this_process = true;
     LogPrintf("Staged chainstate rebuild: original databases preserved until rebuilt state commits\n");
     return {ChainstateLoadStatus::SUCCESS, {}};
@@ -1024,6 +1035,8 @@ ChainstateLoadResult LoadChainstate(ChainstateManager& chainman, const CacheSize
     chainman.m_chainstate_rebuild_reopened_committed_this_process = false;
     chainman.m_chainstate_rebuild_verified_this_process = false;
     chainman.m_chainstate_rebuild_cleanup_completed_this_process = false;
+    chainman.m_chainstate_rebuild_transition_cb =
+        options.rebuild_durable_transition_cb;
     if (!chainman.AssumedValidBlock().IsNull()) {
         LogPrintf("Assuming ancestors of block %s have valid signatures.\n", chainman.AssumedValidBlock().GetHex());
     } else {
@@ -1287,6 +1300,7 @@ bool FinalizeChainstateRebuild(ChainstateManager& chainman, bilingual_str& error
                 error = _("Cannot durably commit the rebuilt chainstate. Preserved backups were not removed and will be restored on restart.");
                 return false;
             }
+            NotifyDurableRebuildTransition(chainman, RebuildPhase::COMMIT_READY);
             chainman.m_chainstate_rebuild_committed_this_process = true;
             LogPrintf("Committed staged chainstate rebuild; preserved database will be retired only after a verified restart\n");
             return true;
@@ -1304,6 +1318,7 @@ bool FinalizeChainstateRebuild(ChainstateManager& chainman, bilingual_str& error
             error = _("The rebuilt chainstate was reopened and verified, but that state could not be committed for backup cleanup. The preserved backups were not removed.");
             return false;
         }
+        NotifyDurableRebuildTransition(chainman, RebuildPhase::CLEANUP_READY);
         if ((journal->base_present && !CleanupTree(BaseBackupPath(datadir))) ||
             (journal->snapshot_present && !CleanupTree(SnapshotBackupPath(datadir))) ||
             !DirectoryCommit(datadir) || !RemoveJournal(datadir)) {
