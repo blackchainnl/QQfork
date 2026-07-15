@@ -185,11 +185,15 @@ sanitizer or changing CRC32C results.
   QQP3 or its origin-bound accounting. QQP3 binds the origin height and parent
   hash and remains eligible for
   the bounded late-inclusion path. Current-origin losers and eligible late
-  claims recover their actual base fee up to 0.01 BLK from the fixed pool. Only
-  a current-origin claim can
-  win and reset the jackpot; a late-only block leaves the unreimbursed pool
-  accumulated. Authenticated shadow replay commits to this boundary under
-  schema 12.
+  claims recover their actual base fee up to 0.01 BLK from the fixed pool.
+  Multiple transaction carriers of the same canonical decoded proof share one
+  logical proof ID, one rank, and one Argon2 evaluation. They can receive at
+  most one credit, using the highest eligible capped-fee carrier with a
+  deterministic tie-break. Authenticated 64-block active-branch buckets stop
+  a previously paid winner or loser from claiming again. Only a current-origin
+  claim can win and reset the jackpot; a late-only block leaves the
+  unreimbursed pool accumulated. Authenticated shadow replay commits to this
+  boundary under schema 12.
 - QQP4 exact-input binding is staged behind a separate consensus activation.
   It is disabled on mainnet in this beta channel (`INT_MAX`), and no readiness
   or version bit can activate it. A future activation must publish its own
@@ -202,14 +206,15 @@ sanitizer or changing CRC32C results.
   post-boundary v30.1.1 wallet/datadir in v30.1.0; restore the cold pre-upgrade
   copy for rollback. Base-chain compatibility does not imply identical shadow
   state.
-- Optional shadowindex schema 10 and coinstatsindex schema 3 automatically
+- Optional shadowindex schema 11 and coinstatsindex schema 3 automatically
   invalidate and rebuild incompatible prerelease records derived with the
   superseded height-5,950,000 competing-claim boundary or incomplete
   proof-mode, spend-anchor, or claim-accounting classification. Shadowindex
-  schema 10 persists at most 64 evaluated claim rows per block plus fixed
-  disposition totals, origin/inclusion provenance, and (when QQP4 is
-  separately active) exact fee-input provenance, and a deterministic commitment
-  to the complete ordered note stream. The
+  schema 11 persists at most 64 selected logical-proof rows per block plus
+  fixed disposition totals, carrier-independent proof IDs,
+  duplicate/already-accounted counters, origin/inclusion provenance, and
+  (when QQP4 is separately active) exact fee-input provenance, and a
+  deterministic commitment to the complete ordered note stream. The
   corresponding explorer response is versioned as
   `blackcoin.shadow.block.v3`; v2's unbounded per-note detail contract is not
   reused with different semantics.

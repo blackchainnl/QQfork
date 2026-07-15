@@ -540,6 +540,10 @@ def check_pow_claim_documentation(root, failures, heights):
         "This is the new v30.1.1 QQP3/rank-v1",
         "A readiness bit, version bit, or other signalling state cannot",
         "still eligible for late inclusion",
+        "Quantum Quasar Logical POW Proof Identity v1",
+        "Quantum Quasar Canonical POW Logical Proof Rank v1",
+        "highest eligible capped-fee carrier",
+        "preceding 64 active-branch",
     ):
         require_fragment(
             failures,
@@ -547,6 +551,46 @@ def check_pow_claim_documentation(root, failures, heights):
             claim_rule,
             fragment,
             "QQP3/QQP4 activation separation",
+        )
+
+    shadow_source = read_text(root, "src/shadow.cpp")
+    for fragment in (
+        'MARKER_LOGICAL_PROOF_BUCKET{\'Q\', \'Q\', \'P\', \'R\', \'O\', \'O\', \'F\', \'S\'}',
+        '"Quantum Quasar Logical POW Proof Identity v1"',
+        '"Quantum Quasar Canonical POW Logical Proof Rank v1"',
+        "ReimbursementCarrierBetter",
+        "ReadRecentLogicalProofs",
+        "WriteLogicalProofBucket",
+        "SHADOW_POW_LATE_ORIGIN_WINDOW",
+    ):
+        require_fragment(
+            failures,
+            "src/shadow.cpp",
+            shadow_source,
+            fragment,
+            "logical-proof duplicate/replay implementation",
+        )
+
+    shadow_index_schema = source_integer(
+        root, "src/index/shadowindex.cpp", "SHADOW_INDEX_SCHEMA_VERSION",
+        braced=True,
+    )
+    if shadow_index_schema != 11:
+        failures.append(
+            "src/index/shadowindex.cpp: logical-proof provenance requires "
+            f"schema 11, found {shadow_index_schema}"
+        )
+    for relative in (
+        "doc/release-notes.md",
+        "doc/shadow-explorer-rpc.md",
+        "doc/v30.1.1-competing-pow-claims.md",
+    ):
+        require_fragment(
+            failures,
+            relative,
+            read_text(root, relative),
+            f"schema {shadow_index_schema}",
+            "source-bound shadowindex schema",
         )
     release_notes = read_text(root, "doc/release-notes.md")
     require_fragment(

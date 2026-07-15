@@ -40,13 +40,15 @@ support production-network pruning and rejects a nonzero `-prune` value on
 mainnet, testnet, and signet. Explorer operators must use `-prune=0`.
 `-reindex` wipes and deterministically rebuilds the index.
 
-v30.1.1 uses shadowindex schema 10. Schema 5 invalidated prerelease data built
+v30.1.1 uses shadowindex schema 11. Schema 5 invalidated prerelease data built
 with the superseded height-5,950,000 claim boundary, schema 6 added proof-mode
 classification, schema 7 added ordered spend anchors used by the bounded event
 transport, schema 8 replaced unbounded per-note claim rows with top-64 detail
 and fixed aggregates, schema 9 added origin/inclusion provenance and
-late-claim dispositions, and schema 10 adds proof-version and optional
-exact-fee-input-binding fields for a separately activated QQP4 rule. Any recognized older
+late-claim dispositions, schema 10 adds proof-version and optional
+exact-fee-input-binding fields for a separately activated QQP4 rule, and schema
+11 adds carrier-independent logical-proof IDs plus duplicate and
+already-accounted outcomes. Any recognized older
 shadowindex schema is discarded and rebuilt automatically. Coinstatsindex
 schema 3 likewise invalidates its
 prerelease schema-2 synthetic-payout statistics. These auxiliary-index rebuilds
@@ -75,11 +77,11 @@ input position. Disconnecting a block atomically restores the prior spend and
 attestation state; disconnecting the origin block removes the synthetic record.
 
 The index stores detailed rows only for the at most 64 canonically selected
-`QQSPROOF` candidates evaluated by the same engine used by chainstate. Each row
-identifies its source transaction/output, canonical rank, decoded payout
-destination, actual base fee when known, credited amount, exact disposition,
-and linked synthetic payout (if one exists). Every other note is represented
-by fixed disposition counts and `accounting_commitment`, which binds the exact
+`QQSPROOF` logical proofs classified by the same engine used by chainstate.
+Each row identifies its source transaction/output, logical-proof ID, canonical
+rank, decoded payout destination, actual base fee when known, credited amount,
+exact disposition, and linked synthetic payout (if one exists). Every other
+note is represented by fixed disposition counts and `accounting_commitment`, which binds the exact
 ordered note stream, accounting context, aggregates, and retained rows to the
 indexed base-block anchor. The index does not reimplement winner selection or
 fee arithmetic and never writes more than 64 claim-detail records for a block.
@@ -118,14 +120,16 @@ anchor hash is rejected or no longer matches `getblockhash(height)`.
 `pow_claim_accounting` reports `observed_count`, `evaluated_count`, winner,
 current-loser reimbursement, late reimbursement, total rejection counts, and a fixed breakdown for invalid
 location, malformed transaction, invalid proof, wrong/unknown mode, input
-mismatch, invalid base fee, origin mismatch, origin expiry, and evaluation-limit outcomes. It also reports
+mismatch, invalid base fee, origin mismatch, origin expiry, duplicate logical
+proof, already-accounted proof, and evaluation-limit outcomes. It also reports
 exact winner, reimbursement, and combined credited totals plus the non-null
 `accounting_commitment`. `total_records` is the pageable detail count and is
 always equal to `evaluated_count` and at most 64; aggregate-only structural and
 over-budget outcomes do not have invented detail rows. Stable detailed
 dispositions are `invalid_proof`, `input_mismatch`, `invalid_base_fee`,
-`origin_mismatch`, `origin_expired`, `winner`, `reimbursed_loser`, and
-`reimbursed_late`. Every row exposes `proof_version`, `origin_bound`,
+`origin_mismatch`, `origin_expired`, `already_accounted`, `winner`,
+`reimbursed_loser`, and `reimbursed_late`. Every row exposes
+`logical_proof_id`, `proof_version`, `origin_bound`,
 `origin_height`, `origin_previous_block_hash`, `inclusion_height`,
 `origin_age`, `input_bound`, and `claim_outpoint`. The last is null for QQP3
 and becomes an object containing the exact base-chain `txid` and `vout` only
@@ -160,6 +164,20 @@ No readiness or version-bit state activates QQP4. A future QQP4 schedule must
 publish its height and the tested treatment of already-eligible QQP3 late
 claims; explorers must not infer that a QQP4 boundary is the 5,993,200 QQP3
 boundary.
+
+Minimal and non-minimal outer `OP_RETURN` pushes of the same canonically
+decoded proof share one `logical_proof_id`, one rank, one Argon2 evaluation,
+and at most one credit. The representative source maximizes the eligible
+reimbursement capped at 0.01 BLK, then uses txid/vout as a deterministic tie.
+Additional same-block carriers are aggregate-only
+`duplicate_logical_proof_count` outcomes. A proof already credited on the
+active branch remains visible as one zero-credit `already_accounted` row if a
+base block carries it again; mempool policy rejects it earlier. Authenticated
+per-height buckets cover the exact 64-block late window and are included in the
+replay-state commitment. After Gold Rush, startup continues authenticating the
+final 64 reward buckets without expecting buckets in Migration or Final. The
+finite reward epoch retains its bucket history so an ordinary deep disconnect
+can undo each authenticated marker before the alternate branch is replayed.
 
 Index construction authenticates the historical pool context while holding the
 chain/view lock, then releases that lock before the shared Argon2 evaluator is
