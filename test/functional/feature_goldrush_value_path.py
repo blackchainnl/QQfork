@@ -18,7 +18,10 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
-GOLD_RUSH_END_TIME = 2_000_000_000
+SHADOW_WHITELIST_HEIGHT = 1
+SHADOW_GOLD_RUSH_BLOCKS = 500
+GOLD_RUSH_END_HEIGHT = SHADOW_WHITELIST_HEIGHT + SHADOW_GOLD_RUSH_BLOCKS
+MIGRATION_END_HEIGHT = GOLD_RUSH_END_HEIGHT + 10
 QUANTUM_SPEND_FEE = Decimal("0.01")
 WALLET_NAME = "goldrush_value"
 WATCH_WALLET_NAME = "goldrush_value_watch"
@@ -38,11 +41,12 @@ class GoldRushValuePathTest(BitcoinTestFramework):
             "-autostartstaking=0",
             "-txindex=1",
             "-staketimio=50",
-            "-shadowwhitelistheight=1",
+            f"-shadowwhitelistheight={SHADOW_WHITELIST_HEIGHT}",
             "-shadowcompetingclaimsheight=2",
             "-shadowqqp4height=2",
-            "-shadowgoldrushblocks=500",
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
+            f"-shadowgoldrushblocks={SHADOW_GOLD_RUSH_BLOCKS}",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
         ]]
 
     def skip_test_if_missing_module(self):
@@ -166,7 +170,6 @@ class GoldRushValuePathTest(BitcoinTestFramework):
 
     def _advance_to_migration_window(self):
         node = self.nodes[0]
-        self._set_mocktime(GOLD_RUSH_END_TIME + 16)
         generated = 0
         while node.getquantumquasarinfo()["phase"] != "migration":
             self.generatetoaddress(node, 1, node.get_deterministic_priv_key().address, sync_fun=self.no_op)
@@ -180,7 +183,9 @@ class GoldRushValuePathTest(BitcoinTestFramework):
             assert generated < 1000, "quantum spends should activate after the configured Gold Rush window"
         info = node.getquantumquasarinfo()
         assert_equal(info["phase"], "migration")
+        assert_equal(info["height_boundaries_authoritative"], True)
         assert_equal(info["quantum_spend_enforcement_active"], True)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
 
     def _build_quantum_spend(self, wallet, utxo, destination):
         node = self.nodes[0]
@@ -329,6 +334,7 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         wallet.rescanblockchain(0)
         watch_wallet.rescanblockchain(0)
         node.syncwithvalidationinterfacequeue()
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         matured_utxo = self._wait_for_quantum_utxo(wallet, payout_address)
         watch_matured_utxo = self._wait_for_quantum_utxo(watch_wallet, payout_address)
         assert_equal(watch_matured_utxo["txid"], matured_utxo["txid"])
@@ -344,6 +350,7 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         wallet = node.get_wallet_rpc(WALLET_NAME)
         watch_wallet = node.get_wallet_rpc(WATCH_WALLET_NAME)
         node.syncwithvalidationinterfacequeue()
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         matured_utxo = self._wait_for_quantum_utxo(wallet, payout_address)
         watch_matured_utxo = self._wait_for_quantum_utxo(watch_wallet, payout_address)
         assert_equal(watch_matured_utxo["txid"], matured_utxo["txid"])
@@ -367,6 +374,7 @@ class GoldRushValuePathTest(BitcoinTestFramework):
 
         self.log.info("Disconnecting the spend block restores the matured synthetic payout coin")
         node.invalidateblock(spend_block_hash)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         restored = node.gettxout(matured_utxo["txid"], matured_utxo["vout"], False)
         assert restored is not None
         assert_equal(Decimal(str(restored["value"])), Decimal(str(matured_utxo["amount"])))
@@ -374,6 +382,7 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         self.log.info("Reconnecting the spend block consumes the synthetic payout again")
         node.reconsiderblock(spend_block_hash)
         self.wait_until(lambda: node.getbestblockhash() == spend_block_hash)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         assert node.gettxout(matured_utxo["txid"], matured_utxo["vout"], False) is None
         self._assert_no_quantum_utxo(watch_wallet, payout_address)
         migrated_utxo = self._wait_for_quantum_utxo(wallet, next_quantum)
@@ -392,6 +401,7 @@ class GoldRushValuePathTest(BitcoinTestFramework):
         wallet = node.get_wallet_rpc(WALLET_NAME)
         watch_wallet = node.get_wallet_rpc(WATCH_WALLET_NAME)
         node.syncwithvalidationinterfacequeue()
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         assert wallet.gettransaction(matured_utxo["txid"])["confirmations"] > 0
         assert watch_wallet.gettransaction(matured_utxo["txid"])["confirmations"] > 0
         self._assert_no_quantum_utxo(wallet, payout_address)

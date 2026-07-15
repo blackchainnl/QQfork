@@ -4,7 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Drive one node through the Blackcoin 24-month lifecycle.
 
-This test exercises the live MTP phase boundaries instead of booting separate
+This test exercises the live height-authoritative phase boundaries instead of booting separate
 phase-pinned nodes. It proves Gold Rush payouts stay locked through Gold Rush,
 become ordinary quantum UTXOs after normal maturity, and remain spendable at
 Final Lockout. It also proves legacy inputs are disabled after the deadline.
@@ -20,8 +20,10 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
-GOLD_RUSH_END_TIME = 2_000_000_000
-MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 40_000
+SHADOW_WHITELIST_HEIGHT = 1
+SHADOW_GOLD_RUSH_BLOCKS = 500
+GOLD_RUSH_END_HEIGHT = SHADOW_WHITELIST_HEIGHT + SHADOW_GOLD_RUSH_BLOCKS
+MIGRATION_END_HEIGHT = GOLD_RUSH_END_HEIGHT + 2
 QUANTUM_SPEND_FEE = Decimal("0.01")
 LEGACY_SPEND_FEE = Decimal("0.01")
 GOLD_RUSH_PAYOUT_MARKER_DOMAIN = b"Quantum Quasar Direct Gold Rush Payout"
@@ -38,10 +40,10 @@ class QuantumLifecycleTest(BitcoinTestFramework):
             "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
-            "-shadowwhitelistheight=1",
-            "-shadowgoldrushblocks=500",
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
-            f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
+            f"-shadowwhitelistheight={SHADOW_WHITELIST_HEIGHT}",
+            f"-shadowgoldrushblocks={SHADOW_GOLD_RUSH_BLOCKS}",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
         ]]
 
     def skip_test_if_missing_module(self):
@@ -100,9 +102,8 @@ class QuantumLifecycleTest(BitcoinTestFramework):
             self._bump_mocktime(16)
         raise last_error or AssertionError("failed to mine deterministic PoS block")
 
-    def _mine_until_phase(self, phase, target_time, address):
+    def _mine_until_phase(self, phase, address):
         node = self.nodes[0]
-        self._set_mocktime(target_time)
         for _ in range(1000):
             self.generatetoaddress(node, 1, address, sync_fun=self.no_op)
             self._bump_mocktime(16)
@@ -206,6 +207,7 @@ class QuantumLifecycleTest(BitcoinTestFramework):
         node = self.nodes[0]
         info = node.getquantumquasarinfo()
         status = wallet.getmigrationstatus()
+        assert_equal(info["height_boundaries_authoritative"], True)
         assert_equal(info["phase"], phase)
         assert_equal(status["phase"], phase)
         assert_equal(status["quantum_spends_active"], quantum_spends_active)
@@ -310,11 +312,11 @@ class QuantumLifecycleTest(BitcoinTestFramework):
         assert_equal(valid_goldrush_signed["complete"], False)
 
         self.log.info("Crossing the Gold Rush end boundary into the migration window")
-        # The bridge blocks retain Gold Rush output rules until prior-block MTP
-        # crosses the boundary; use a legacy coinbase destination for them.
+        # Use a legacy coinbase destination for the final Gold Rush blocks.
         migration_mining_address = wallet.getnewaddress("", "legacy")
-        self._mine_until_phase("migration", GOLD_RUSH_END_TIME + 16, migration_mining_address)
+        self._mine_until_phase("migration", migration_mining_address)
         self._assert_phase_status(wallet, "migration", quantum_spends_active=True, deadline_passed=False)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
 
         self.log.info("Gold Rush payouts are ordinary quantum UTXOs during migration")
         migration_payout_a = self._assert_output_lifecycle(
@@ -353,9 +355,10 @@ class QuantumLifecycleTest(BitcoinTestFramework):
 
         self.log.info("Crossing the migration deadline into final lockout")
         final_mining_address = wallet.getnewquantumaddress()["address"]
-        self._mine_until_phase("final_lockout", MIGRATION_DEADLINE_TIME + 16, final_mining_address)
+        self._mine_until_phase("final_lockout", final_mining_address)
         final_tip = node.getbestblockhash()
         self._assert_phase_status(wallet, "final_lockout", quantum_spends_active=True, deadline_passed=True)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         wallet.lockunspent(True, [{"txid": legacy_lockout_utxo["txid"], "vout": legacy_lockout_utxo["vout"]}])
         self._assert_output_lifecycle(
             wallet, legacy_lockout_utxo, "final_locked_legacy",
@@ -367,6 +370,7 @@ class QuantumLifecycleTest(BitcoinTestFramework):
         self.log.info("Reorging below the deadline preserves ordinary payout spendability")
         node.invalidateblock(final_tip)
         self._assert_phase_status(wallet, "migration", quantum_spends_active=True, deadline_passed=False)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         self._assert_output_lifecycle(
             wallet, legacy_lockout_utxo, "spendable_legacy",
             synthetic=False, merkle_included=True, mature=True, spendable=True,
@@ -379,6 +383,7 @@ class QuantumLifecycleTest(BitcoinTestFramework):
             raise AssertionError(f"ordinary payout spend rejected after deadline reorg: {reorg_migration_accept}")
         self._reconsider_tip(final_tip)
         self._assert_phase_status(wallet, "final_lockout", quantum_spends_active=True, deadline_passed=True)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         self._assert_output_lifecycle(
             wallet, legacy_lockout_utxo, "final_locked_legacy",
             synthetic=False, merkle_included=True, mature=True, spendable=False,
@@ -386,13 +391,14 @@ class QuantumLifecycleTest(BitcoinTestFramework):
         )
 
         self.log.info("Lifecycle classification survives wallet restart")
-        restart_time = MIGRATION_DEADLINE_TIME + 32
+        restart_time = self.mock_time + 32
         self.restart_node(0, extra_args=self.extra_args[0] + [f"-mocktime={restart_time}", "-staking=0"])
         node = self.nodes[0]
         node.loadwallet("quantum_lifecycle")
         wallet = node.get_wallet_rpc("quantum_lifecycle")
         self._set_mocktime(restart_time)
         self._assert_phase_status(wallet, "final_lockout", quantum_spends_active=True, deadline_passed=True)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         self._assert_output_lifecycle(
             wallet, legacy_lockout_utxo, "final_locked_legacy",
             synthetic=False, merkle_included=True, mature=True, spendable=False,

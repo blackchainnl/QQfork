@@ -20,7 +20,10 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, get_rpc_proxy
 
 
-GOLD_RUSH_END_TIME = 2_000_000_000
+SHADOW_WHITELIST_HEIGHT = 1
+SHADOW_GOLD_RUSH_BLOCKS = 500
+GOLD_RUSH_END_HEIGHT = SHADOW_WHITELIST_HEIGHT + SHADOW_GOLD_RUSH_BLOCKS
+MIGRATION_END_HEIGHT = GOLD_RUSH_END_HEIGHT + 10
 QUANTUM_SPEND_FEE = Decimal("0.01")
 WALLET_NAME = "goldrush_pos_signal"
 QQSIGNAL_HEX = "51515349474e414c"
@@ -39,9 +42,10 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
             "-txindex=1",
             "-staketimio=50",
             "-qqautoshadowsignal=1",
-            "-shadowwhitelistheight=1",
-            "-shadowgoldrushblocks=500",
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
+            f"-shadowwhitelistheight={SHADOW_WHITELIST_HEIGHT}",
+            f"-shadowgoldrushblocks={SHADOW_GOLD_RUSH_BLOCKS}",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
         ]]
 
     def skip_test_if_missing_module(self):
@@ -116,11 +120,13 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
 
     def _advance_to_quantum_spends_active(self):
         node = self.nodes[0]
-        self._set_mocktime(GOLD_RUSH_END_TIME + 16)
         for _ in range(700):
             self.generatetoaddress(node, 1, node.get_deterministic_priv_key().address, sync_fun=self.no_op)
             self._bump_mocktime(16)
-            if node.getquantumquasarinfo()["quantum_spend_enforcement_active"]:
+            info = node.getquantumquasarinfo()
+            assert_equal(info["height_boundaries_authoritative"], True)
+            if info["quantum_spend_enforcement_active"]:
+                assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
                 return
         raise AssertionError("timed out waiting for quantum spend activation")
 
@@ -170,14 +176,15 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
 
     def _advance_to_migration_window(self):
         node = self.nodes[0]
-        self._set_mocktime(GOLD_RUSH_END_TIME + 16)
         generated = 0
         while node.getquantumquasarinfo()["phase"] != "migration":
             self.generatetoaddress(node, 1, node.get_deterministic_priv_key().address, sync_fun=self.no_op)
             self._bump_mocktime(16)
             generated += 1
-            assert generated < COINBASE_MATURITY, "migration phase should activate before the synthetic payout matures"
+            assert generated <= GOLD_RUSH_END_HEIGHT, "migration phase should activate at the configured height"
         assert_equal(node.getquantumquasarinfo()["phase"], "migration")
+        assert_equal(node.getquantumquasarinfo()["height_boundaries_authoritative"], True)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
 
     def _build_quantum_spend(self, wallet, utxo, destination):
         node = self.nodes[0]
@@ -366,11 +373,13 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
 
         self.log.info("Disconnecting and reconnecting the spend block restores and consumes the QQSIGNAL payout")
         node.invalidateblock(spend_block_hash)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         restored = node.gettxout(matured_utxo["txid"], matured_utxo["vout"], False)
         assert restored is not None
         assert_equal(Decimal(str(restored["value"])), Decimal(str(matured_utxo["amount"])))
         node.reconsiderblock(spend_block_hash)
         self.wait_until(lambda: node.getbestblockhash() == spend_block_hash)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         assert node.gettxout(matured_utxo["txid"], matured_utxo["vout"], False) is None
         migrated_utxo = self._wait_for_quantum_utxo(wallet, next_quantum)
 
