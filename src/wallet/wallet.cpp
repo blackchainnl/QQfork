@@ -8374,9 +8374,11 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
     }
     if (!success) {
         // Migration failed, cleanup
-        // Copy the backup to the actual wallet dir
-        fs::path temp_backup_location = fsbridge::AbsPathJoin(GetWalletDir(), backup_filename);
-        fs::copy_file(backup_path, temp_backup_location, fs::copy_options::none);
+        // Migration backups already live in the top-level wallet directory,
+        // outside every database file and auxiliary wallet directory tracked
+        // below. Keep that durable copy in place for both restoration and the
+        // user instead of attempting to copy it onto itself for an unnamed
+        // wallet.
 
         // Make list of wallets to cleanup
         std::vector<std::shared_ptr<CWallet>> created_wallets;
@@ -8419,14 +8421,10 @@ util::Result<MigrationResult> MigrateLegacyToDescriptor(const std::string& walle
         // Restore the backup
         DatabaseStatus status;
         std::vector<bilingual_str> warnings;
-        if (!RestoreWallet(context, temp_backup_location, wallet_name, /*load_on_start=*/std::nullopt, status, error, warnings)) {
+        if (!RestoreWallet(context, backup_path, wallet_name, /*load_on_start=*/std::nullopt, status, error, warnings)) {
             error += _("\nUnable to restore backup of wallet.");
             return util::Error{error};
         }
-
-        // Move the backup to the wallet dir
-        fs::copy_file(temp_backup_location, backup_path, fs::copy_options::none);
-        fs::remove(temp_backup_location);
 
         return util::Error{error};
     }

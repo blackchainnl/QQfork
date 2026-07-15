@@ -544,21 +544,34 @@ class WalletMigrationTest(BitcoinTestFramework):
         node = self.nodes[0]
         master_wallet = node.get_wallet_rpc(self.default_wallet_name)
         wallet = self.create_legacy_wallet("")
-        wallet.importaddress(master_wallet.getnewaddress(address_type="legacy"))
+        watched_address = master_wallet.getnewaddress(address_type="legacy")
+        wallet.importaddress(watched_address)
 
         res = wallet.migratewallet()
+        assert_equal(res["wallet_name"], "")
         assert_equal(res["watchonly_name"], "default_wallet_watchonly")
-        wallet = self.nodes[0].get_wallet_rpc(res["watchonly_name"])
+        primary_wallet = node.get_wallet_rpc(res["wallet_name"])
+        watchonly_wallet = node.get_wallet_rpc(res["watchonly_name"])
 
-        info = wallet.getwalletinfo()
+        info = watchonly_wallet.getwalletinfo()
         assert_equal(info["descriptors"], True)
         assert_equal(info["format"], "sqlite")
         assert_equal(info["private_keys_enabled"], False)
         assert_equal(info["walletname"], "default_wallet_watchonly")
-        # Check the default wallet is not available anymore
-        assert not (node.wallets_path / "wallet.dat").exists()
+        assert_equal(watchonly_wallet.getaddressinfo(watched_address)["ismine"], True)
 
-        wallet.unloadwallet()
+        # Migration preserves the primary unnamed wallet and moves only the
+        # imported watch-only data into the auxiliary descriptor wallet.
+        primary_info = primary_wallet.getwalletinfo()
+        assert_equal(primary_info["walletname"], "")
+        assert_equal(primary_info["descriptors"], True)
+        assert_equal(primary_info["format"], "sqlite")
+        assert_equal(primary_wallet.getaddressinfo(watched_address)["ismine"], False)
+        assert (node.wallets_path / "wallet.dat").exists()
+        self.assert_is_sqlite("")
+
+        watchonly_wallet.unloadwallet()
+        primary_wallet.unloadwallet()
         self.clear_default_wallet(backup_file=Path(res["backup_path"]))
 
     def test_default_wallet_failure(self):
