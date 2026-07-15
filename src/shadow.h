@@ -255,15 +255,15 @@ struct ShadowPowAccountingContext {
      * parameters: reindex and unit callers can supply an explicit historical
      * schedule, and a future QQP4 activation must not reinterpret QQP3 rows.
      *
-     * A manually constructed canonical (QQP3) test context defaults to the
-     * already-active QQP3 rule.  QQP4 remains disabled unless its height is
-     * explicitly set.
+     * A manually constructed canonical (QQP3) test context defaults to an
+     * active QQP3 rule so focused tests need not recreate chainparams. QQP4
+     * remains disabled unless its height is explicitly set.
      */
     int competing_claims_activation_height{0};
     int qqp4_activation_height{std::numeric_limits<int>::max()};
     bool canonical_rule_active{false};
-    /** True only after the separately scheduled QQP4 hard fork. The existing
-     * canonical_rule_active field remains the v30.1.0 QQP3 boundary. */
+    /** True only after the separately scheduled QQP4 hard fork. The
+     * canonical_rule_active field follows the new v30.1.1 QQP3 boundary. */
     bool qqp4_rule_active{false};
     bool valid{false};
 };

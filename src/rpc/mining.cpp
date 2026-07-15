@@ -1323,7 +1323,7 @@ static RPCHelpMan getshadowpowwork()
             {RPCResult::Type::STR, "prefix", "ASCII OP_RETURN magic prefix for shadow proofs (\"QQSPROOF\")."},
             {RPCResult::Type::STR, "proof_mode", "Required fee-paying claim channel (pow)."},
             {RPCResult::Type::NUM, "proof_mode_byte", "Required serialized PoW mode byte (0)."},
-            {RPCResult::Type::NUM, "proof_version", "Required QQP payload version for this height (2 before the existing QQP3 boundary, 3 through the QQP3 era, and 4 only after separately scheduled QQP4 activation)."},
+            {RPCResult::Type::NUM, "proof_version", "Required QQP payload version for this height (2 before the new v30.1.1 QQP3 boundary, 3 through the QQP3 era, and 4 only after separately scheduled QQP4 activation)."},
             {RPCResult::Type::BOOL, "claim_outpoint_required", "Whether the separately activated QQP4 proof must commit an exact fee input."},
             {RPCResult::Type::BOOL, "qqp4_activation_disabled", "Whether QQP4 is disabled by consensus schedule; readiness signalling cannot enable it."},
             {RPCResult::Type::NUM, "qqp4_activation_height", "Separately scheduled QQP4 activation height, or 0 when disabled."},

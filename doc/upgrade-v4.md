@@ -115,7 +115,7 @@ address. If a staker includes a valid claim, the upgraded rules credit the
 claim's reward to that quantum address. Claim transactions pay ordinary network
 fees. Through height 5,993,199, replay preserves the v30.1.0 allocation rule so
 already-mined shadow history is not reassigned. From the first scheduled Gold
-Rush halving at height 5,993,200, the existing QQP3 rule authenticates an
+Rush halving at height 5,993,200, the new v30.1.1 QQP3 rule authenticates an
 origin height and parent hash and chooses a current-origin winner by the
 transaction-order-independent rank-v1 rule. Current losers and eligible claims
 included up to 64 blocks late receive their actual fee capped at 0.01 BLK. The

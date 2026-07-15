@@ -561,7 +561,7 @@ BOOST_AUTO_TEST_CASE(shadow_index_record_validation_respects_claim_boundary)
     BOOST_CHECK(IsValidShadowIndexRecord(record));
     record.pow_claim_source = valid_v3_source;
 
-    // QQP4 cannot be smuggled into the deployed QQP3 history.  Its own
+    // QQP4 cannot be smuggled into the scheduled v30.1.1 QQP3 era. Its own
     // schedule is disabled on mainnet in this alpha/beta.
     record.pow_claim_source.proof_version = 4;
     record.pow_claim_source.input_bound = true;
@@ -2210,7 +2210,7 @@ BOOST_AUTO_TEST_CASE(pow_shadow_qqp3_late_claims_are_bounded_and_emission_neutra
     BOOST_CHECK_EQUAL(reject_reason, "shadow-proof-origin-mismatch");
 }
 
-BOOST_AUTO_TEST_CASE(pow_shadow_qqp3_preserves_v30_1_0_qqp2_qqp3_and_rank_v1)
+BOOST_AUTO_TEST_CASE(pow_shadow_qqp3_prospective_boundary_preserves_qqp2_and_rank_v1)
 {
     CCoinsView base;
     CCoinsViewCache view{&base, true};
@@ -2361,8 +2361,8 @@ BOOST_AUTO_TEST_CASE(pow_shadow_qqp3_preserves_v30_1_0_qqp2_qqp3_and_rank_v1)
         BOOST_CHECK(!entry.input_bound);
     }
 
-    // Differential-vector check for the exact deployed QQP3 accounting
-    // stream.  In particular, proof_version/input_bound/outpoint are *not*
+    // Differential-vector check for the prospective v30.1.1 QQP3 accounting
+    // stream. In particular, proof_version/input_bound/outpoint are *not*
     // serialized under the v2 domain before QQP4 activation.
     CHashWriter observations;
     observations << std::string{"Quantum Quasar POW Claim Observations v1"}

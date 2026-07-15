@@ -2253,10 +2253,10 @@ ShadowProofValidationResult ValidateQQProofAtBits(const valtype& proof, int heig
     if (!DecodeProof(proof, decoded)) return ShadowProofValidationResult::INVALID;
     if (decoded.mode != ShadowProofMode::POW) return ShadowProofValidationResult::INVALID;
     if (!decoded.quantum_linked) return ShadowProofValidationResult::INVALID;
-    // The existing 5,993,200 canonical-accounting boundary is QQP3, not
-    // QQP4. Preserve v30.1.0's byte-exact QQP2/QQP3 admission and late-origin
-    // behavior through that boundary. QQP4 becomes mandatory only after its
-    // separately scheduled consensus activation.
+    // The new v30.1.1 canonical-accounting boundary at 5,993,200 is QQP3,
+    // not QQP4. Preserve v30.1.0's QQP2 behavior before that boundary; QQP3
+    // origin binding and late-origin accounting begin there. QQP4 becomes
+    // mandatory only after its separately scheduled consensus activation.
     if (require_qqp4) {
         if (decoded.version != 4 || !decoded.origin_bound ||
             !decoded.input_bound || decoded.origin_height == 0 ||
@@ -2904,8 +2904,8 @@ uint256 CanonicalPowCandidateRankV1(int height,
                                    const valtype& proof)
 {
     CHashWriter ss;
-    // This is the deployed v30.1.0 canonical rank. It must remain byte-for-
-    // byte stable at and after the existing QQP3 boundary.
+    // This is the v30.1.1 rank scheduled for the QQP3 boundary. It must remain
+    // byte-for-byte stable for every post-boundary replay.
     ss << std::string("Quantum Quasar Canonical POW Claim Rank v1")
        << height
        << previous_block_hash
@@ -3058,11 +3058,10 @@ bool FinalizePowClaimAggregate(ShadowPowClaimResult& result,
     if (classified != result.aggregate.observed_count) return false;
 
     CHashWriter commitment;
-    // QQP3 accounting is already deployed history.  Preserve its exact
-    // domain and byte stream through the existing 5,993,200 boundary.  QQP4
-    // provenance gets an independent v3 commitment only after its own hard
-    // fork; appending fields to the v2 stream would silently change v30.1.0
-    // replay/index commitments.
+    // QQP3 accounting begins at the new v30.1.1 boundary. Preserve its exact
+    // domain and byte stream from 5,993,200 onward. QQP4 provenance gets an
+    // independent v3 commitment only after its own hard fork; appending fields
+    // to the v2 stream would silently change v30.1.1 QQP3 replay commitments.
     commitment << std::string{context.qqp4_rule_active
                                   ? "Quantum Quasar Bounded POW Claim Accounting v3"
                                   : "Quantum Quasar Bounded POW Claim Accounting v2"}
@@ -3239,9 +3238,9 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
         accounting.canonical_rank = candidate.rank;
         accounting.inclusion_height = static_cast<uint32_t>(context.height);
 
-        // Preserve the deployed decoder boundary exactly.  Before the
-        // independently scheduled QQP4 fork, v30.1.0 could not decode this
-        // magic at all.  In particular, do not populate provenance or let a
+        // Preserve the pre-QQP4 decoder boundary exactly. v30.1.0 and
+        // pre-QQP4 v30.1.1 do not recognize this magic for accounting. In
+        // particular, do not populate provenance or let a
         // malformed future-format note reach fee/input classification: the
         // resulting INVALID_PROOF row is part of the v2 commitment stream.
         if (!context.qqp4_rule_active &&
@@ -3264,7 +3263,7 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
         accounting.claim_outpoint = decoded_shape.claim_outpoint;
 
         // QQP4's exact-input rule is a separate future hard fork. Until it
-        // activates, retain the deployed QQP2/QQP3 canonical accounting,
+        // activates, retain the scheduled v30.1.1 QQP2/QQP3 accounting,
         // including QQP3 late-origin reimbursement.
         if (context.qqp4_rule_active &&
             (decoded_shape.version != 4 || !decoded_shape.origin_bound ||
@@ -4718,8 +4717,8 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
                 continue;
             }
         } else {
-            // The v30.1.0 canonical boundary accepts QQP3 origins, exactly as
-            // deployed. QQP4 remains non-consensus data until its own fork.
+            // The new v30.1.1 canonical boundary accepts QQP3 origins. QQP4
+            // remains non-consensus data until its own fork.
             if (decoded.version != 3 || decoded.input_bound ||
                 !consensus.IsShadowCompetingClaimsActive(
                     static_cast<int>(decoded.origin_height))) {

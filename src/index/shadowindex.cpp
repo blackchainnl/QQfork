@@ -359,8 +359,8 @@ bool IsValidShadowPowClaimSource(const ShadowIndexPowClaimSource& source)
         return false;
     }
 
-    // QQP2 remains a valid credited source through the deployed QQP3
-    // canonical-accounting era.  Only origin-bound formats have a current
+    // QQP2 remains a valid credited source through the v30.1.1 QQP3
+    // canonical-accounting era. Only origin-bound formats have a current
     // origin that must equal the inclusion height for a winner/current loser.
     // Applying this condition globally would reject v30.1.0 QQP2 payouts on
     // index rebuild even though their provenance was intentionally unbound.
@@ -374,8 +374,8 @@ bool IsValidShadowPowClaimSource(const ShadowIndexPowClaimSource& source)
 
     // A synthetic payout after the separately scheduled QQP4 activation is
     // only legitimate when it came from the exact-input-bound QQP4 wire
-    // format. The existing QQP3 canonical-accounting boundary continues to
-    // index valid QQP2/QQP3 provenance exactly as v30.1.0 did.
+    // format. The new v30.1.1 QQP3 canonical-accounting boundary continues to
+    // index valid QQP2/QQP3 provenance under its prospective schedule.
     if (IsCreditedPowDisposition(source.disposition) &&
         Params().GetConsensus().IsShadowQQP4Active(
             static_cast<int>(source.inclusion_height)) &&

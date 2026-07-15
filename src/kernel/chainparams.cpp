@@ -170,7 +170,7 @@ public:
         consensus.nShadowCompetingClaimsActivationHeight =
             MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
         // QQP4 is intentionally not activated by this alpha/beta release.
-        // The established QQP3 boundary above remains the only mainnet
+        // The new v30.1.1 QQP3 boundary above is the only scheduled mainnet
         // competing-claim transition until a separately announced hard fork.
         consensus.nShadowQQP4ActivationHeight = std::numeric_limits<int>::max();
         consensus.nLastPOWBlock = 10000;

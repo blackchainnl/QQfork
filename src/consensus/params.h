@@ -152,10 +152,10 @@ struct Params {
     int nShadowCompetingClaimsActivationHeight{std::numeric_limits<int>::max()};
     /**
      * Height at which the *new* QQP4 wire format is required for Gold Rush
-     * PoW claims. This is deliberately independent of the existing QQP3
-     * canonical-accounting activation: QQP2/QQP3 behavior at that historical
-     * boundary is consensus history, not a readiness deployment. The max-int
-     * default leaves QQP4 disabled until a separately announced hard fork.
+     * PoW claims. This is deliberately independent of the new v30.1.1 QQP3
+     * canonical-accounting activation. Neither boundary is selected by
+     * readiness signalling.
+     * The max-int default leaves QQP4 disabled until a separately announced hard fork.
      */
     int nShadowQQP4ActivationHeight{std::numeric_limits<int>::max()};
     int nDemurrageActivationHeight{std::numeric_limits<int>::max()};

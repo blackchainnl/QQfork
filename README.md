@@ -64,9 +64,9 @@ phase table's quantum column refers only to the authenticated v14 and v16 paths.
 The 10,000 BLK Gold Rush whitelist snapshot is taken at height **5,945,000**. Full schedule
 and constants are in the [white paper](doc/whitepaper-quantum-quasar.md).
 
-Height **5,993,200** is also an operator upgrade boundary. It starts the
-existing canonical competing-claim rule (the QQP3, rank-v1 rule), not QQP4.
-v30.1.0 and v30.1.1 continue to accept the same Gold Rush base chain, but
+Height **5,993,200** is also an operator upgrade boundary. It starts the new
+v30.1.1 canonical competing-claim rule (the QQP3, rank-v1 rule), not QQP4.
+v30.1.0 and v30.1.1 continue to accept the same Gold Rush base chain, but only
 v30.1.1 applies the emission-neutral competing-claim reimbursement rule and
 therefore derives different shadow recipients and balances from that height.
 Wallets, staking and mining nodes, explorers, and indexers that consume the

@@ -47,6 +47,27 @@ that path, and it requires release-candidate zero, final release metadata,
 production signing credentials, platform signatures, notarization, signed
 checksums, an SPDX SBOM, and provenance attestations.
 
+Known Beta 1 limitations
+========================
+
+This is a test-only prerelease, not a production recommendation. The safe
+one-click first-launch rebuild assistant tracked in issue #30 is not included
+in Beta 1; follow the explicit command-line rebuild procedure below.
+
+A fee-paying Gold Rush PoW claim that leaves the local mempool remains
+quarantined because a peer can retain and later confirm the base-valid
+transaction. Its input is intentionally not released for spending or staking,
+and the wallet's built-in PoW miner pauses while any such claim remains
+unresolved. Automatic abandonment would create an unsafe double-spend race.
+Use isolated canary wallets and expect this limitation while issues #6 and #26
+remain open. A retained pre-QQP3 claim can still confirm late and pay a base fee
+without receiving shadow credit.
+
+Height 5,993,200 is a new v30.1.1 QQP3 shadow-ledger rule, not behavior deployed
+in v30.1.0. Both versions can continue accepting the same base chain, but their
+shadow allocations intentionally diverge from that height. Every miner,
+explorer, and indexer that consumes shadow state must upgrade before it.
+
 How to Upgrade
 ==============
 
@@ -131,7 +152,7 @@ sanitizer or changing CRC32C results.
   quantum addresses while preserving legacy-compatible base block rewards during
   the bridge period.
 - Already-mined Gold Rush blocks retain v30.1.0 PoW-claim allocation exactly.
-  From the first scheduled halving at height 5,993,200, the existing QQP3
+  From the first scheduled halving at height 5,993,200, the new v30.1.1 QQP3
   canonical rule ranks competing valid PoW claims independently of transaction
   order. QQP3 binds the origin height and parent hash and remains eligible for
   the bounded late-inclusion path. Current-origin losers and eligible late
@@ -208,10 +229,11 @@ sanitizer or changing CRC32C results.
 - PoW claim creation pauses during reindex, import, or initial sync and
   rechecks the exact tip through commit. A claim that leaves the local mempool
   remains persisted and keeps its input reserved because a peer may still
-  confirm it. The miner can use distinct inputs on later tips up to the bounded
-  64-claim limit. `abandontransaction` intentionally refuses a quarantined
-  Gold Rush PoW claim; its exact fee input remains reserved until the claim or
-  a conflicting cleanup transaction confirms on chain.
+  confirm it. In Beta 1, any unresolved quarantined claim pauses that wallet's
+  built-in miner; distinct inputs do not bypass this wallet-wide safety gate.
+  `abandontransaction` intentionally refuses a quarantined Gold Rush PoW claim,
+  and its exact fee input remains reserved until an on-chain claim or conflict
+  resolves the reservation.
 - Wallet backups reject destinations that resolve to the wallet root itself,
   and failed wallet-dump imports clean up incomplete databases without
   terminating the wallet tool.

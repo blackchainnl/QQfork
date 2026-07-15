@@ -168,7 +168,7 @@ def check_mainnet_source(root, failures):
 
     params = read_text(root, "src/consensus/params.h")
     for fragment in (
-        "QQP2/QQP3 behavior at that historical",
+        "new v30.1.1 QQP3",
         "default leaves QQP4 disabled until a separately announced hard fork",
         "bool IsShadowQQP4Active(int nHeight)",
     ):
@@ -213,8 +213,8 @@ def check_mainnet_source(root, failures):
     tx_verify = read_text(root, "src/consensus/tx_verify.cpp")
     check_inputs = source_region(
         tx_verify,
-        "bool Consensus::CheckTxInputs(",
-        "// Blackcoin: GetMinFee",
+        "bool CheckTxInputsImpl(",
+        "} // namespace",
         "src/consensus/tx_verify.cpp",
     )
     for fragment in (
@@ -504,7 +504,7 @@ def check_pow_claim_documentation(root, failures, heights):
         "doc/v30.1.1-cryptographic-hardening.md",
         hardening,
         r"at and after\s+(?:the\s+)?QQP3 boundary[^.]*`QQP3`",
-        "QQP3 rule at the existing competing-claim boundary",
+        "QQP3 rule at the new v30.1.1 competing-claim boundary",
     )
     require_regex(
         failures,
@@ -537,7 +537,7 @@ def check_pow_claim_documentation(root, failures, heights):
         "safe non-generic-abandon rule",
     )
     for fragment in (
-        "This is the existing QQP3/rank-v1",
+        "This is the new v30.1.1 QQP3/rank-v1",
         "A readiness bit, version bit, or other signalling state cannot",
         "still eligible for late inclusion",
     ):

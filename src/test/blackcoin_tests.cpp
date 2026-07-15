@@ -151,9 +151,9 @@ BOOST_AUTO_TEST_CASE(mainnet_lifecycle_is_height_coherent_and_demurrage_is_autom
         MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT - 1));
     BOOST_CHECK(consensus.IsShadowCompetingClaimsActive(
         MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT));
-    // QQP4 is intentionally not piggy-backed on the deployed QQP3 boundary.
-    // Alpha/beta mainnet must remain on the exact v30.1.0 QQP2/QQP3 wire
-    // rules throughout the whole Gold Rush window.
+    // QQP4 is intentionally not piggy-backed on the new v30.1.1 QQP3
+    // boundary. Alpha/beta mainnet must remain on the scheduled QQP2/QQP3
+    // wire rules throughout the whole Gold Rush window.
     BOOST_CHECK(!consensus.IsShadowQQP4Active(
         MAINNET_SHADOW_REWARD_END_HEIGHT));
     BOOST_CHECK_EQUAL(SHADOW_HALVING_INTERVAL_BLOCKS, MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS);

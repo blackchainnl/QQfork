@@ -1901,7 +1901,7 @@ static const std::vector<RPCResult> RPCHelpForQuantumQuasar{
     {RPCResult::Type::BOOL, "qqp4_activation_disabled", "whether QQP4 is disabled by the consensus schedule; readiness signalling cannot enable it"},
     {RPCResult::Type::NUM, "qqp4_activation_height", "separately scheduled QQP4 activation height, or 0 when disabled"},
     {RPCResult::Type::BOOL, "qqp4_active_at_tip", "whether the connected tip was validated after the separately scheduled QQP4 activation"},
-    {RPCResult::Type::BOOL, "qqp4_active_next_block", "whether the next block requires QQP4 rather than the established QQP2/QQP3 rules"},
+    {RPCResult::Type::BOOL, "qqp4_active_next_block", "whether the next block requires QQP4 rather than the scheduled v30.1.1 QQP2/QQP3 rules"},
     {RPCResult::Type::BOOL, "qqp4_exact_input_required_next_block", "whether the next block requires an exact fee-input-bound QQP4 proof"},
     {RPCResult::Type::BOOL, "new_network_stake_only", "whether staking has crossed the final quantum-only lockout cutover"},
     {RPCResult::Type::BOOL, "replay_protection_active", "whether post-Gold-Rush signature replay protection is active"},
