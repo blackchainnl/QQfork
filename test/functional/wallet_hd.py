@@ -159,6 +159,9 @@ class WalletHDTest(BitcoinTestFramework):
 
         # send a tx and make sure its using the internal chain for the changeoutput
         txid = self.nodes[1].sendtoaddress(self.nodes[0].getnewaddress(), 1)
+        # The next legacy-only phase mines on node 0. Explicitly synchronize
+        # the fixture first so that phase does not depend on relay timing.
+        self.sync_mempools()
         outs = self.nodes[1].gettransaction(txid=txid, verbose=True)['decoded']['vout']
         keypath = ""
         for out in outs:
