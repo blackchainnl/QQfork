@@ -391,7 +391,7 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
 
         boundary = self._load_wallet(BOUNDARY_WALLET)
         assert_equal(len(boundary.listunspent(1, 9999999, [boundary_address])), 2)
-        boundary_payout = boundary.getnewquantumaddress("boundary-payout")["address"]
+        boundary_payout = boundary.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
         boundary_claim = boundary.sendshadowpowclaim(
             boundary_address, boundary_payout, 500_000
         )
@@ -446,6 +446,8 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         assert_equal(self._claim_txids(boundary), before_second_claim)
 
         started = boundary.setpowmining(True, 1, 100)
+        assert_equal(started["created_payout_key"], False)
+        assert_equal(started["payout_address"], boundary_payout)
         try:
             self.wait_until(
                 lambda: boundary.getpowmininginfo()["state"] == "claim_quarantined",
