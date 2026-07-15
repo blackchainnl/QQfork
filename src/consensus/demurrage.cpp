@@ -563,6 +563,11 @@ uint256 DemurragePubKeyHash(const std::vector<unsigned char>& pubkey)
     return out;
 }
 
+COutPoint DemurrageLatestAttestationOutpoint(const uint256& pubkey_hash)
+{
+    return LatestAttestationOutpoint(pubkey_hash);
+}
+
 uint256 DemurrageAttestationMessageHash(const COutPoint& replay_anchor,
                                         const COutPoint& target_outpoint,
                                         std::optional<int> previous_height,
@@ -982,6 +987,27 @@ bool DecodeAuthenticatedDemurrageLatestState(const COutPoint& outpoint, const Co
     pubkey_hash = record.pubkey_hash;
     state = record.state;
     return true;
+}
+
+DemurrageLatestStateLookupResult LookupAuthenticatedDemurrageLatestState(
+    CCoinsViewCursor& cursor, const uint256& pubkey_hash,
+    const CBlockIndex* pindex_tip, DemurrageAttestationState& state)
+{
+    state = {};
+    const COutPoint outpoint = LatestAttestationOutpoint(pubkey_hash);
+    Coin coin;
+    if (!cursor.GetValueAt(outpoint, coin)) {
+        return DemurrageLatestStateLookupResult::MISSING;
+    }
+    uint256 decoded_hash;
+    if (coin.IsSpent() ||
+        !DecodeAuthenticatedDemurrageLatestState(
+            outpoint, coin, pindex_tip, decoded_hash, state) ||
+        decoded_hash != pubkey_hash) {
+        state = {};
+        return DemurrageLatestStateLookupResult::CORRUPT;
+    }
+    return DemurrageLatestStateLookupResult::AUTHENTICATED;
 }
 
 /**

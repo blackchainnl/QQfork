@@ -61,6 +61,13 @@ COutPoint PrereleaseInventoryOutpoint()
     return COutPoint{ss.GetHash(), 0};
 }
 
+uint256 IndexedTestHash(uint64_t index)
+{
+    CHashWriter stream;
+    stream << std::string{"demurrage high-cardinality lookup"} << index;
+    return stream.GetHash();
+}
+
 Coin TestMarkerCoin(CAmount value, const CScript& script, int height,
                     uint32_t time, bool coinbase = true)
 {
@@ -704,6 +711,59 @@ BOOST_AUTO_TEST_CASE(attestation_index_connect_disconnect)
     BOOST_CHECK(!LatestDemurrageAttestationHeight(view, pubkey_hash).has_value());
     BOOST_CHECK(!UndoDemurrageBlock(view, block, &index, params));
     BOOST_CHECK(SnapshotCoins(view) == before_first);
+}
+
+BOOST_AUTO_TEST_CASE(attestation_snapshot_lookup_is_high_cardinality_constant_memory)
+{
+    using namespace Consensus;
+
+    constexpr int height{1234};
+    constexpr size_t record_count{10'000};
+    const uint256 block_hash = uint256S("1234");
+    CBlockIndex tip;
+    InitTestIndex(tip, height, block_hash);
+
+    CCoinsView base;
+    CCoinsViewCache view(&base, /*deterministic=*/true);
+    std::vector<uint256> pubkey_hashes;
+    pubkey_hashes.reserve(record_count);
+    for (size_t index = 0; index < record_count; ++index) {
+        const uint256 pubkey_hash = IndexedTestHash(index + 1);
+        pubkey_hashes.push_back(pubkey_hash);
+        const std::vector<unsigned char> payload = PrereleaseLatestPayload(
+            pubkey_hash, tip, IndexedTestHash(index + record_count + 1));
+        view.AddCoin(
+            DemurrageLatestAttestationOutpoint(pubkey_hash),
+            TestMarkerCoin(
+                /*value=*/0, TestMarkerScript(TEST_TAG_LATEST, payload),
+                height, static_cast<uint32_t>(tip.GetBlockTime())),
+            /*possible_overwrite=*/false);
+    }
+
+    const size_t memory_before = view.DynamicMemoryUsage();
+    std::unique_ptr<CCoinsViewCursor> cursor = view.Cursor();
+    BOOST_REQUIRE(cursor);
+    for (const uint256& pubkey_hash : pubkey_hashes) {
+        DemurrageAttestationState state;
+        BOOST_REQUIRE(
+            LookupAuthenticatedDemurrageLatestState(
+                *cursor, pubkey_hash, &tip, state) ==
+            DemurrageLatestStateLookupResult::AUTHENTICATED);
+        BOOST_CHECK_EQUAL(state.height, height);
+        BOOST_CHECK_EQUAL(state.time, static_cast<uint32_t>(tip.GetBlockTime()));
+        BOOST_CHECK_EQUAL(state.coverage_start_height, height);
+    }
+    BOOST_CHECK_EQUAL(view.DynamicMemoryUsage(), memory_before);
+
+    for (size_t index = 0; index < record_count; ++index) {
+        DemurrageAttestationState missing;
+        BOOST_CHECK(
+            LookupAuthenticatedDemurrageLatestState(
+                *cursor, IndexedTestHash(record_count * 2 + index + 1),
+                &tip, missing) ==
+            DemurrageLatestStateLookupResult::MISSING);
+    }
+    BOOST_CHECK_EQUAL(view.DynamicMemoryUsage(), memory_before);
 }
 
 BOOST_AUTO_TEST_CASE(attestation_rejects_bad_signature_and_height)

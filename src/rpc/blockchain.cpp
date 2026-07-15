@@ -1136,6 +1136,7 @@ static RPCHelpMan getcirculatingsupply()
     const CBlockIndex* tip{nullptr};
     std::unique_ptr<CCoinsViewCursor> cursor;
     std::unique_ptr<CCoinsViewCursor> marker_cursor;
+    std::unique_ptr<CCoinsViewCursor> attestation_cursor;
     {
         LOCK(::cs_main);
         active_chainstate.ForceFlushStateToDisk();
@@ -1145,6 +1146,7 @@ static RPCHelpMan getcirculatingsupply()
         // marker classification and monetary UTXOs come from the same tip even
         // while the lengthy scan proceeds without blocking validation.
         marker_cursor = coins_db.Cursor();
+        attestation_cursor = coins_db.Cursor();
         cursor = coins_db.Cursor();
     }
 
@@ -1154,7 +1156,6 @@ static RPCHelpMan getcirculatingsupply()
     const int64_t tip_mtp = tip->GetMedianTimePast();
     const int evaluation_height = tip->nHeight + 1;
 
-    std::map<uint256, Consensus::DemurrageAttestationState> attestation_states;
     std::optional<GoldRushInventoryInfo> inventory;
     std::optional<ShadowGoldRushInfo> pool;
     uint64_t payout_marker_count{0};
@@ -1167,16 +1168,6 @@ static RPCHelpMan getcirculatingsupply()
             throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read lifecycle marker snapshot");
         }
         if (!marker_coin.IsSpent()) {
-            uint256 pubkey_hash;
-            Consensus::DemurrageAttestationState state;
-            if (Consensus::DecodeAuthenticatedDemurrageLatestState(
-                    marker_key, marker_coin, tip, pubkey_hash, state)) {
-                if (!attestation_states.emplace(pubkey_hash, state).second) {
-                    throw JSONRPCError(RPC_INTERNAL_ERROR,
-                                       "Duplicate authenticated demurrage state in snapshot");
-                }
-            }
-
             GoldRushPayoutMarkerInfo payout_info;
             if (DecodeAuthenticatedGoldRushPayoutMarker(
                     marker_key, marker_coin, tip, payout_info)) {
@@ -1279,8 +1270,18 @@ static RPCHelpMan getcirculatingsupply()
         std::optional<Consensus::DemurrageAttestationState> latest_attestation;
         if (const std::optional<uint256> controlling_key =
                 Consensus::DemurrageControllingKeyHashForScript(coin.out.scriptPubKey)) {
-            const auto state_it = attestation_states.find(*controlling_key);
-            if (state_it != attestation_states.end()) latest_attestation = state_it->second;
+            Consensus::DemurrageAttestationState state;
+            const Consensus::DemurrageLatestStateLookupResult result =
+                Consensus::LookupAuthenticatedDemurrageLatestState(
+                    *attestation_cursor, *controlling_key, tip, state);
+            if (result == Consensus::DemurrageLatestStateLookupResult::CORRUPT) {
+                throw JSONRPCError(
+                    RPC_INTERNAL_ERROR,
+                    "Quantum output has corrupt authenticated demurrage state");
+            }
+            if (result == Consensus::DemurrageLatestStateLookupResult::AUTHENTICATED) {
+                latest_attestation = state;
+            }
         }
         ValueLifecycleClassification classification;
         const ValueLifecycleResult classification_result = ClassifyValueLifecycle(

@@ -20,6 +20,7 @@ class CBlock;
 class CBlockIndex;
 class Coin;
 class CCoinsViewCache;
+class CCoinsViewCursor;
 class CScript;
 class CTransaction;
 
@@ -95,6 +96,12 @@ enum class DemurrageAttestationValidationResult {
     LOCAL_INTERNAL_ERROR,
 };
 
+enum class DemurrageLatestStateLookupResult {
+    MISSING,
+    AUTHENTICATED,
+    CORRUPT,
+};
+
 static constexpr size_t MAX_DEMURRAGE_ATTESTATIONS_PER_TX = 1;
 static constexpr size_t MAX_DEMURRAGE_ATTESTATIONS_PER_BLOCK = 16;
 
@@ -148,6 +155,10 @@ bool CheckDemurrageAttestations(const CTransaction& tx,
                                 size_t& attestation_count,
                                 std::string& reject_reason);
 std::optional<uint256> DemurrageControllingKeyHashForScript(const CScript& script_pub_key);
+COutPoint DemurrageLatestAttestationOutpoint(const uint256& pubkey_hash);
+DemurrageLatestStateLookupResult LookupAuthenticatedDemurrageLatestState(
+    CCoinsViewCursor& cursor, const uint256& pubkey_hash,
+    const CBlockIndex* pindex_tip, DemurrageAttestationState& state);
 std::optional<int> LatestDemurrageAttestationHeight(const CCoinsViewCache& view, const uint256& pubkey_hash);
 std::optional<DemurrageAttestationState> LatestDemurrageAttestationState(const CCoinsViewCache& view, const uint256& pubkey_hash);
 std::optional<DemurrageAttestationRecord> LatestDemurrageAttestationRecord(const CCoinsViewCache& view, const uint256& pubkey_hash);
