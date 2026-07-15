@@ -9,6 +9,8 @@
 
 #include <tinyformat.h>
 
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -30,8 +32,22 @@ const std::string CLIENT_NAME("Blackcoin");
 //   - "// No build information available", if proper git information is not available
 #endif
 
-//! git will put "#define GIT_COMMIT_ID ..." on the next line inside archives. 
-#define GIT_COMMIT_ID "0dfce6916e0543f531602ffc117c4ab483c8a5e3"
+//! git archive substitutes the full source commit on the next line.
+#define GIT_COMMIT_ID "$Format:%H$"
+
+#ifdef BUILD_SOURCE_COMMIT
+    #define SOURCE_COMMIT_ID BUILD_SOURCE_COMMIT
+#else
+    #define SOURCE_COMMIT_ID GIT_COMMIT_ID
+#endif
+
+#ifdef BUILD_SOURCE_DIRTY
+    #define SOURCE_TREE_DIRTY (BUILD_SOURCE_DIRTY != 0)
+#else
+    // A git archive is an immutable tree. A normal build with git metadata
+    // always receives BUILD_SOURCE_DIRTY from share/genbuild.sh.
+    #define SOURCE_TREE_DIRTY false
+#endif
 
 #ifdef BUILD_GIT_TAG
     #define BUILD_DESC BUILD_GIT_TAG
@@ -58,6 +74,32 @@ std::string FormatFullVersion()
 {
     static const std::string CLIENT_BUILD(BUILD_DESC BUILD_SUFFIX);
     return CLIENT_BUILD;
+}
+
+std::string FormatSourceCommit()
+{
+    static const std::string source_commit{SOURCE_COMMIT_ID};
+    if (source_commit.size() != 40 ||
+        !std::all_of(source_commit.begin(), source_commit.end(), [](unsigned char character) {
+            return std::isdigit(character) ||
+                   (character >= 'a' && character <= 'f');
+        })) {
+        return {};
+    }
+    return source_commit;
+}
+
+bool IsSourceTreeDirty()
+{
+    return SOURCE_TREE_DIRTY;
+}
+
+std::string FormatSourceIdentity()
+{
+    const std::string source_commit = FormatSourceCommit();
+    if (source_commit.empty()) return "Source commit: unavailable";
+    return strprintf("Source commit: %s%s", source_commit,
+                     IsSourceTreeDirty() ? " (dirty)" : "");
 }
 
 /**

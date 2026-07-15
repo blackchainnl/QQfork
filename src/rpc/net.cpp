@@ -605,6 +605,9 @@ static RPCHelpMan getnetworkinfo()
                     RPCResult::Type::OBJ, "", "",
                     {
                         {RPCResult::Type::NUM, "version", "the server version"},
+                        {RPCResult::Type::STR, "build", "the display build/version identifier; use source_commit for immutable source binding"},
+                        {RPCResult::Type::STR_HEX, "source_commit", "the immutable full source commit for this server binary"},
+                        {RPCResult::Type::BOOL, "source_dirty", "whether tracked source differed from source_commit at build time"},
                         {RPCResult::Type::STR, "subversion", "the server subversion string"},
                         {RPCResult::Type::NUM, "protocolversion", "the protocol version"},
                         {RPCResult::Type::STR_HEX, "localservices", "the services we offer to the network"},
@@ -651,6 +654,9 @@ static RPCHelpMan getnetworkinfo()
     LOCK(cs_main);
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("version",       CLIENT_VERSION);
+    obj.pushKV("build",         FormatFullVersion());
+    obj.pushKV("source_commit", FormatSourceCommit());
+    obj.pushKV("source_dirty",  IsSourceTreeDirty());
     obj.pushKV("subversion",    strSubVersion);
     obj.pushKV("protocolversion",PROTOCOL_VERSION);
     NodeContext& node = EnsureAnyNodeContext(request.context);

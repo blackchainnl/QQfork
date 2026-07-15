@@ -13,6 +13,7 @@ import re
 import struct
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest import mock
@@ -1749,6 +1750,163 @@ class ReleaseToolTests(unittest.TestCase):
                 verifier.verify(repository, mutated)
 
 
+class SourceBuildIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.root = TOOLS.parents[1]
+        self.genbuild = self.root / "share" / "genbuild.sh"
+
+    def make_repository(self, directory):
+        repository = directory / "source"
+        repository.mkdir()
+        subprocess.run(["git", "init", "-q", repository], check=True)
+        (repository / "tracked.txt").write_text("identity\n", encoding="utf-8")
+        subprocess.run(["git", "-C", repository, "add", "tracked.txt"], check=True)
+        subprocess.run([
+            "git", "-C", repository,
+            "-c", "user.name=Blackcoin-Dev",
+            "-c", "user.email=298119138+Blackcoin-Dev@users.noreply.github.com",
+            "commit", "-q", "-m", "identity fixture",
+        ], check=True)
+        source_sha = subprocess.check_output(
+            ["git", "-C", repository, "rev-parse", "HEAD"], text=True,
+        ).strip()
+        return repository, source_sha
+
+    def generate_header(self, repository, directory):
+        header = directory / "build.h"
+        subprocess.run([self.genbuild, header, repository], check=True)
+        return header.read_text(encoding="utf-8")
+
+    def test_untagged_beta_embeds_full_source_identity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repository, source_sha = self.make_repository(directory)
+            header = self.generate_header(repository, directory)
+            self.assertIn(f'#define BUILD_SOURCE_COMMIT "{source_sha}"', header)
+            self.assertIn("#define BUILD_SOURCE_DIRTY 0", header)
+            self.assertIn(f'#define BUILD_GIT_COMMIT "{source_sha[:12]}"', header)
+
+    def test_prerelease_and_final_tags_preserve_full_source_identity(self):
+        for tag in ("v30.1.1-beta1", "v30.1.1"):
+            with self.subTest(tag=tag), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                repository, source_sha = self.make_repository(directory)
+                subprocess.run(["git", "-C", repository, "tag", tag], check=True)
+                header = self.generate_header(repository, directory)
+                self.assertIn(f'#define BUILD_SOURCE_COMMIT "{source_sha}"', header)
+                self.assertIn("#define BUILD_SOURCE_DIRTY 0", header)
+                self.assertIn(f'#define BUILD_GIT_TAG "{tag}"', header)
+
+    def test_dirty_tree_keeps_commit_but_sets_fail_closed_dirty_bit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repository, source_sha = self.make_repository(directory)
+            (repository / "tracked.txt").write_text("changed\n", encoding="utf-8")
+            header = self.generate_header(repository, directory)
+            self.assertIn(f'#define BUILD_SOURCE_COMMIT "{source_sha}"', header)
+            self.assertIn("#define BUILD_SOURCE_DIRTY 1", header)
+            self.assertIn(f'#define BUILD_GIT_COMMIT "{source_sha[:12]}-dirty"', header)
+
+    def test_untracked_source_sets_fail_closed_dirty_bit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repository, source_sha = self.make_repository(directory)
+            (repository / "untracked-source.cpp").write_text(
+                "// could affect a wildcard build\n", encoding="utf-8",
+            )
+            header = self.generate_header(repository, directory)
+            self.assertIn(f'#define BUILD_SOURCE_COMMIT "{source_sha}"', header)
+            self.assertIn("#define BUILD_SOURCE_DIRTY 1", header)
+            self.assertIn(f'#define BUILD_GIT_COMMIT "{source_sha[:12]}-dirty"', header)
+
+    def test_git_archive_substitutes_full_commit_and_unsubstituted_source_fails(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            repository = directory / "source"
+            (repository / "src").mkdir(parents=True)
+            (repository / ".gitattributes").write_text(
+                "src/clientversion.cpp export-subst\n", encoding="utf-8",
+            )
+            clientversion = repository / "src" / "clientversion.cpp"
+            clientversion.write_text(
+                '#define GIT_COMMIT_ID "$Format:%H$"\n', encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q", repository], check=True)
+            subprocess.run(["git", "-C", repository, "add", "."], check=True)
+            subprocess.run([
+                "git", "-C", repository,
+                "-c", "user.name=Blackcoin-Dev",
+                "-c", "user.email=298119138+Blackcoin-Dev@users.noreply.github.com",
+                "commit", "-q", "-m", "archive fixture",
+            ], check=True)
+            source_sha = subprocess.check_output(
+                ["git", "-C", repository, "rev-parse", "HEAD"], text=True,
+            ).strip()
+            archive = directory / "source.tar"
+            subprocess.run([
+                "git", "-C", repository, "archive", "--format=tar",
+                f"--output={archive}", "HEAD",
+            ], check=True)
+            with tarfile.open(archive) as source:
+                archived = source.extractfile("src/clientversion.cpp").read().decode()
+            self.assertIn(f'#define GIT_COMMIT_ID "{source_sha}"', archived)
+
+            no_git = directory / "no-git"
+            no_git.mkdir()
+            header = directory / "no-git-build.h"
+            environment = os.environ.copy()
+            environment["BITCOIN_GENBUILD_NO_GIT"] = "1"
+            subprocess.run([self.genbuild, header, no_git], check=True, env=environment)
+            self.assertNotIn("BUILD_SOURCE_COMMIT", header.read_text(encoding="utf-8"))
+            self.assertIn("$Format:%H$", clientversion.read_text(encoding="utf-8"))
+
+    def test_release_verifier_accepts_tagged_display_with_exact_clean_source(self):
+        audit = load_path(
+            "quantum_witness_inventory_source_identity",
+            self.root / "contrib" / "devtools" /
+            "quantum_witness_inventory_audit.py",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            binary = Path(temporary) / "blackcoind"
+            binary.write_text(
+                "#!/bin/sh\n"
+                "printf '%s\\n' 'Blackcoin Core version v30.1.1' "
+                f"'Source commit: {SOURCE_SHA}'\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o755)
+            identity = audit.verify_binary(binary, SOURCE_SHA, "blackcoind")
+            self.assertEqual(identity["source_commit"], SOURCE_SHA)
+            self.assertFalse(identity["source_dirty"])
+            self.assertIn("version v30.1.1", identity["version"])
+
+    def test_release_verifier_rejects_dirty_or_unavailable_source_identity(self):
+        audit = load_path(
+            "quantum_witness_inventory_bad_source_identity",
+            self.root / "contrib" / "devtools" /
+            "quantum_witness_inventory_audit.py",
+        )
+        identities = (
+            f"Source commit: {SOURCE_SHA} (dirty)",
+            "Source commit: unavailable",
+        )
+        for source_identity in identities:
+            with self.subTest(source_identity=source_identity), \
+                    tempfile.TemporaryDirectory() as temporary:
+                binary = Path(temporary) / "blackcoind"
+                binary.write_text(
+                    "#!/bin/sh\n"
+                    "printf '%s\\n' 'Blackcoin Core version v30.1.1' "
+                    f"'{source_identity}'\n",
+                    encoding="utf-8",
+                )
+                binary.chmod(0o755)
+                with self.assertRaisesRegex(
+                    audit.AuditError, "full immutable source identity is absent or dirty"
+                ):
+                    audit.verify_binary(binary, SOURCE_SHA, "blackcoind")
+
+
 class WitnessInventoryAcceptanceTests(unittest.TestCase):
     def setUp(self):
         self.audit = load_path(
@@ -1759,7 +1917,8 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
         self.bestblock = "a" * 64
         self.muhash = "b" * 64
 
-    def record(self, number, version, handling):
+    def record(self, number, version, handling,
+               origin_group="pre_migration_window"):
         version_class = {14: "v14", 15: "v15", 16: "v16"}.get(
             version, "unknown"
         )
@@ -1767,56 +1926,132 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
             "txid": f"{number:064x}",
             "vout": number,
             "amount": "1.00000000",
-            "scriptPubKey": "5120" + "11" * 32,
+            "scriptPubKey": f"{0x50 + version:02x}20" + "11" * 32,
             "witness_version": version,
             "version_class": version_class,
             "bridge_handling": handling,
-            "origin_height": 100,
+            "origin_height": 5_950_100,
             "origin_blockhash": "c" * 64,
+            "origin_block_time": 2_000_000_000,
+            "coin_time": 2_000_000_000,
             "origin_phase": "gold_rush",
-            "origin_group": "pre_migration_window",
+            "origin_group": origin_group,
+            "coinbase": False,
+            "coinstake": False,
         }
 
     def rpc(self, records, *, moving_page=False, truncate=False):
+        def bucket(selected):
+            return {
+                "count": len(selected),
+                "amount": f"{len(selected)}.00000000",
+                "amount_atomic": str(len(selected) * 100_000_000),
+            }
+
+        def partition(field, cross_field=None):
+            keys = {
+                f"{record[field]}/{record[cross_field]}" if cross_field else record[field]
+                for record in records
+            }
+            return {
+                key: bucket([
+                    record for record in records
+                    if (f"{record[field]}/{record[cross_field]}" if cross_field
+                        else record[field]) == key
+                ])
+                for key in keys
+            }
+
         def call(method, *params):
             if method == "getblockchaininfo":
                 return {
-                    "chain": "regtest",
-                    "blocks": 120,
+                    "chain": "main",
+                    "blocks": 5_953_262,
+                    "headers": 5_953_262,
                     "bestblockhash": self.bestblock,
                     "initialblockdownload": False,
+                    "pruned": False,
                 }
             if method == "getnetworkinfo":
-                return {"protocolversion": 70016, "subversion": "/Blackcoin:30.1.1/"}
+                return {
+                    "build": "v30.1.1rc1-test",
+                    "source_commit": SOURCE_SHA,
+                    "source_dirty": False,
+                    "protocolversion": 70016,
+                    "subversion": "/Blackcoin:30.1.1/",
+                    "networkactive": False,
+                }
             if method == "getquantumquasarinfo":
                 return {
-                    "phase": "migration",
+                    "phase": "gold_rush",
+                    "phase_context": "next_block",
                     "active_tip_phase": "gold_rush",
-                    "next_block_phase": "migration",
-                    "active_tip_height": 120,
-                    "next_block_height": 121,
-                    "gold_rush_end_height": 120,
-                    "quantum_migration_end_height": 220,
+                    "next_block_phase": "gold_rush",
+                    "active_tip_height": 5_953_262,
+                    "next_block_height": 5_953_263,
+                    "lifecycle_schedule_valid": True,
+                    "v4_activation_height": 5_950_000,
+                    "gold_rush_end_height": 6_192_999,
+                    "quantum_migration_end_height": 6_921_999,
+                    "shadow_reward_start_height": 5_950_000,
+                    "shadow_reward_end_height": 6_192_999,
                     "height_boundaries_authoritative": True,
-                    "quantum_spend_enforcement_active": True,
+                    "time_boundaries_are_estimates": True,
+                    "shadow_merge_mining_active": True,
+                    "shadow_reward_height_active": True,
+                    "shadow_reward_next_height": 5_953_263,
+                    "quantum_spend_enforcement_active": False,
+                    "quantum_migration_outputs_fundable": False,
                     "legacy_addresses_accepted": True,
                     "quantum_address_required": False,
+                    "qqp4_activation_disabled": True,
+                    "qqp4_activation_height": 0,
+                    "qqp4_active_at_tip": False,
+                    "qqp4_active_next_block": False,
+                    "qqp4_exact_input_required_next_block": False,
                 }
             if method == "getblockhash":
-                return "d" * 64
+                return self.audit.MAINNET_GENESIS_HASH
             if method == "getblockheader":
                 return {
                     "hash": self.bestblock,
-                    "height": 120,
+                    "height": 5_953_262,
                     "time": 2_000_000_000,
                     "confirmations": 1,
                 }
             if method == "gettxoutsetinfo":
                 return {
-                    "height": 120,
+                    "height": 5_953_262,
                     "bestblock": self.bestblock,
                     "txouts": 50,
                     "muhash": self.muhash,
+                    "total_amount": "100.00000000",
+                }
+            if method == "getcirculatingsupply":
+                return {
+                    "schema": "blackcoin.supply.lifecycle.v2",
+                    "height": 5_953_262,
+                    "evaluation_height": 5_953_263,
+                    "bestblock": self.bestblock,
+                    "height_boundaries_authoritative": True,
+                    "nominal_amount": "100.00000000",
+                    "synthetic_non_merkle_nominal_amount": "3.00000000",
+                    "goldrush_synthetic_immature_amount": "1.00000000",
+                    "goldrush_locked_payout_amount": "2.00000000",
+                    "txouts": 50,
+                    "goldrush_synthetic_immature_txouts": 1,
+                    "goldrush_locked_payout_txouts": 2,
+                    "shadow": {
+                        "synthetic": True,
+                        "merkle_included": False,
+                        "issued_count": 3,
+                        "issued_nominal_amount": "3.00000000",
+                        "spent_count": 0,
+                        "spent_nominal_amount": "0.00000000",
+                        "unspent_count": 3,
+                        "unspent_nominal_amount": "3.00000000",
+                        "claimable_next_block": True,
+                    },
                 }
             if method != "getquantumwitnessinventory":
                 raise AssertionError(method)
@@ -1829,14 +2064,14 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
             page_bestblock = "e" * 64 if moving_page and offset else self.bestblock
             return {
                 "schema": "blackcoin.quantum.witness_inventory.v1",
-                "height": 120,
+                "height": 5_953_262,
                 "bestblock": page_bestblock,
                 "view": "utxos",
                 "offset": offset,
                 "count": len(page_records),
                 "total_records": len(records),
                 "next_offset": next_offset,
-                "classification": "native value-bearing witness versions >1",
+                "classification": self.audit.INVENTORY_CLASSIFICATION,
                 "utxo_snapshot": {
                     "algorithm": "muhash3072",
                     "commitment": self.muhash,
@@ -1844,27 +2079,69 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
                     "excludes_authenticated_zero_value_protocol_markers": True,
                 },
                 "current_utxos": {
-                    "total": {"count": len(records), "amount": "1.00000000", "amount_atomic": "100000000"},
+                    "total": {
+                        "count": len(records),
+                        "amount": f"{len(records)}.00000000",
+                        "amount_atomic": str(len(records) * 100_000_000),
+                    },
+                    "by_version": partition("version_class"),
+                    "by_origin_group": partition("origin_group"),
+                    "by_origin_phase": partition("origin_phase"),
+                    "by_version_and_origin": partition(
+                        "version_class", "origin_group",
+                    ),
+                    "by_bridge_handling": partition("bridge_handling"),
+                    "excluded_synthetic_shadow": {
+                        "count": 3,
+                        "amount": "3.00000000",
+                        "amount_atomic": "300000000",
+                    },
                 },
                 "coverage": {
                     "snapshot_current_utxos_exact": True,
                     "snapshot_tip_still_active": True,
                     "snapshot_utxo_commitment_exact": True,
                     "snapshot_includes_mempool": False,
+                    "snapshot_includes_synthetic_shadow_outputs": False,
                 },
                 "records": page_records,
             }
         return call
 
     def test_zero_result_is_explicit_and_source_bound(self):
-        records = [self.record(1, 16, "recognized_direct_quantum")]
+        records = []
+        server = {
+            "launched_by_acceptance_verifier": True,
+            "executable_sha256": "1" * 64,
+            "process_image_binding": {
+                "mechanism": "linux_proc_pid_exe",
+                "observed_path": "/candidate/blackcoind",
+                "sha256": "1" * 64,
+            },
+            "rpc_authentication": {
+                "mechanism": "verifier_owned_cookie",
+                "private_directory_mode": "0700",
+                "cookie_path": "/private/rpc-auth.cookie",
+                "secret_recorded": False,
+            },
+            "rpc_reported_build": "v30.1.1rc1-test",
+            "rpc_reported_source_commit": SOURCE_SHA,
+            "rpc_reported_source_dirty": False,
+        }
         evidence = self.audit.generate_evidence(
             self.rpc(records),
             source={"repository": "https://github.com/Blackcoin-Dev/Blackcoin.git",
                     "commit": SOURCE_SHA, "clean": True},
-            binaries={"blackcoind": {"sha256": "1" * 64},
+            binaries={"blackcoind": {
+                          "sha256": "1" * 64,
+                          "version": (
+                              "Blackcoin Core version v30.1.1rc1-test\n"
+                              f"Source commit: {SOURCE_SHA}"
+                          ),
+                      },
                       "blackcoin_cli": {"sha256": "2" * 64}},
             source_sha=SOURCE_SHA,
+            server=server,
             page_size=1,
         )
         self.assertEqual(evidence["source"]["commit"], SOURCE_SHA)
@@ -1872,7 +2149,10 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
         self.assertEqual(
             evidence["bridge_review"]["result"], "zero_relevant_outpoints"
         )
-        self.assertEqual(evidence["native_quantum_formats"]["count"], 1)
+        self.assertEqual(evidence["native_quantum_formats"]["count"], 0)
+        self.assertEqual(
+            evidence["live_shadow_reconciliation"]["unspent_count"], 3
+        )
         self.assertRegex(evidence["evidence_payload_sha256"], r"^[0-9a-f]{64}$")
 
     def test_every_relevant_outpoint_requires_snapshot_bound_disposition(self):
@@ -1892,9 +2172,9 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
         dispositions = {
             "schema": "blackcoin.quantum.witness_bridge_dispositions.v1",
             "source_commit": SOURCE_SHA,
-            "network": "regtest",
+            "network": "main",
             "snapshot": {
-                "height": 120,
+                "height": 5_953_262,
                 "bestblock": self.bestblock,
                 "utxo_muhash": self.muhash,
             },
@@ -1909,7 +2189,7 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
         }
         review, native = self.audit.apply_dispositions(
             inventory["records"], dispositions=dispositions,
-            source_sha=SOURCE_SHA, network="regtest",
+            source_sha=SOURCE_SHA, network="main",
             snapshot=inventory["snapshot"],
         )
         self.assertEqual(review["result"], "explicit_per_outpoint_dispositions")
@@ -1920,9 +2200,122 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
         with self.assertRaisesRegex(self.audit.AuditError, "stale"):
             self.audit.apply_dispositions(
                 inventory["records"], dispositions=dispositions,
-                source_sha=SOURCE_SHA, network="regtest",
+                source_sha=SOURCE_SHA, network="main",
                 snapshot=inventory["snapshot"],
             )
+
+    def test_pre_migration_native_outputs_require_disposition(self):
+        pre_migration = self.record(
+            1, 16, "recognized_direct_quantum",
+            origin_group="pre_migration_window",
+        )
+        self.assertEqual(self.audit.review_class(pre_migration), "pre_migration_v16")
+        after_migration = self.record(
+            2, 16, "recognized_direct_quantum",
+            origin_group="migration_or_later",
+        )
+        self.assertIsNone(self.audit.review_class(after_migration))
+
+    def test_release_evidence_rejects_non_mainnet_identity(self):
+        with self.assertRaisesRegex(self.audit.AuditError, "must be generated on mainnet"):
+            self.audit.validate_mainnet_identity(
+                "regtest",
+                {
+                    "build": "v30.1.1rc1-test",
+                    "source_commit": SOURCE_SHA,
+                    "source_dirty": False,
+                    "networkactive": False,
+                },
+                {},
+                self.audit.MAINNET_GENESIS_HASH,
+                {"height": 5_953_262},
+                SOURCE_SHA,
+            )
+
+    def test_verifier_rejects_direct_and_negated_identity_overrides(self):
+        controlled = self.audit.VerifierOwnedDaemon.CONTROLLED_ARGUMENTS
+        for argument in (
+            "-chain=regtest", "-regtest=1", "-noregtest=0",
+            "-networkactive=1", "-nonetworkactive=0", "-wallet=test.dat",
+            "-rpcuser=other", "-rpcpassword=other", "-rpcauth=other",
+            "-rpccookiefile=/other/cookie",
+        ):
+            with self.subTest(argument=argument):
+                self.assertIn(self.audit._argument_name(argument), controlled)
+
+    def test_verifier_daemon_and_cli_share_private_cookie(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            datadir = Path(temporary) / "datadir"
+            datadir.mkdir()
+            daemon = self.audit.VerifierOwnedDaemon(
+                "/candidate/blackcoind", "/candidate/blackcoin-cli",
+                datadir, [], startup_timeout=1,
+            )
+            process = mock.Mock()
+            process.poll.return_value = None
+            with mock.patch.object(
+                self.audit.subprocess, "Popen", return_value=process,
+            ) as popen, mock.patch.object(
+                self.audit, "_run", return_value="{}",
+            ):
+                daemon.__enter__()
+                command = popen.call_args.args[0]
+                daemon_cookie = next(
+                    item for item in command if item.startswith("-rpccookiefile=")
+                )
+                cli_cookie = next(
+                    item for item in daemon.cli_options
+                    if item.startswith("-rpccookiefile=")
+                )
+                self.assertEqual(daemon_cookie, cli_cookie)
+                cookie_path = Path(daemon_cookie.split("=", 1)[1])
+                self.assertEqual(cookie_path.parent, Path(daemon.temporary.name))
+                self.assertEqual(cookie_path.parent.stat().st_mode & 0o777, 0o700)
+                process.poll.return_value = 0
+                daemon.__exit__(None, None, None)
+
+    def test_linux_process_image_binding_hashes_the_running_inode(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "blackcoind"
+            binary.write_bytes(b"exact candidate image")
+            process = root / "123"
+            process.mkdir()
+            (process / "exe").symlink_to(binary)
+            expected = hashlib.sha256(binary.read_bytes()).hexdigest()
+            identity = self.audit._proc_process_image_identity(
+                123, expected, proc_root=root,
+            )
+            self.assertEqual(identity["mechanism"], "linux_proc_pid_exe")
+            self.assertEqual(identity["sha256"], expected)
+            with self.assertRaisesRegex(
+                self.audit.AuditError, "process image differs"
+            ):
+                self.audit._proc_process_image_identity(
+                    123, "0" * 64, proc_root=root,
+                )
+
+    def test_inventory_record_and_aggregate_mismatches_fail_closed(self):
+        record = self.record(1, 16, "recognized_direct_quantum")
+        malformed = dict(record)
+        malformed["scriptPubKey"] = "5f20" + "11" * 32
+        with self.assertRaisesRegex(
+            self.audit.AuditError, "declared witness version"
+        ):
+            self.audit.collect_inventory(self.rpc([malformed]), page_size=1)
+
+        original = self.rpc([record])
+
+        def inconsistent(method, *params):
+            response = original(method, *params)
+            if method == "getquantumwitnessinventory":
+                response["current_utxos"]["total"]["amount_atomic"] = "2"
+            return response
+
+        with self.assertRaisesRegex(
+            self.audit.AuditError, "display and atomic amounts disagree"
+        ):
+            self.audit.collect_inventory(inconsistent, page_size=1)
 
     def test_moving_tip_and_incomplete_pagination_fail_closed(self):
         records = [

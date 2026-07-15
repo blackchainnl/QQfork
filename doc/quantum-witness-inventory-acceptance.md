@@ -8,12 +8,16 @@ record an approved disposition for every such outpoint.
 
 The acceptance scope is every current, value-bearing native witness output with
 witness version greater than 1. Exact v14 quantum-cold-stake and exact v16
-direct-quantum programs are native formats. The review set is:
+direct-quantum programs are native formats only when their authenticated origin
+is Migration or later. A pre-Migration exact v14/v16 outpoint was accepted
+under the legacy unknown-witness rules and therefore needs an explicit bridge
+decision. The review set is:
 
 - every other witness version greater than 1;
 - every v15 output, including the reserved but disabled EUTXO shape;
 - every malformed v14 program; and
-- every malformed v16 program.
+- every malformed v16 program; and
+- every exact v14/v16 program created before Migration.
 
 The inventory does not infer ownership or spendability from a script shape.
 Each nonempty review-set disposition is therefore a release decision supported
@@ -22,11 +26,22 @@ by its own rationale and approval reference.
 ## Exact-beta mainnet procedure
 
 Use an unmodified checkout at the exact proposed beta commit and binaries built
-from that commit. The build version emitted by both binaries must contain the
-first 12 characters of the exact commit and must not contain `-dirty`. Run the
-tool against a fully synchronized, unpruned mainnet node. `-coinstatsindex=1` is
-recommended because the tool independently repeats the MuHash query. The UTXO
-inventory itself does not require `-shadowindex`.
+from that commit. Both binaries must emit the exact full 40-character source
+commit on a separate source-identity line and must report a clean source tree;
+the display version or release tag is not accepted as source identity. Prepare
+a cold or snapshotted datadir from a fully synchronized, unpruned mainnet node;
+no GUI, daemon, or other process may have that datadir open. The verifier starts
+the supplied exact `blackcoind` itself on Linux, without daemonizing, on a
+private random loopback RPC port. The daemon and CLI share a freshly generated
+cookie in a verifier-owned mode-0700 temporary directory; user-supplied RPC
+credentials cannot override it. The verifier binds the live PID's
+`/proc/<pid>/exe` image hash to the prelaunch binary hash, then disables wallets,
+staking, PoW mining, P2P, and listening while the immutable scans run. The
+RPC-reported full build must match the exact source and binary. Merely pointing
+an exact CLI at another resident node is not release evidence.
+
+`-coinstatsindex=1` is recommended because the tool independently repeats the
+MuHash query. The UTXO inventory itself does not require `-shadowindex`.
 
 Write the artifact outside the source checkout so the checkout remains clean:
 
@@ -35,34 +50,43 @@ SOURCE_ROOT="$PWD"
 SOURCE_SHA="$(git rev-parse HEAD)"
 CLI="$PWD/src/blackcoin-cli"
 DAEMON="$PWD/src/blackcoind"
-DATADIR="$HOME/.blackcoin"
+DATADIR="/cold/snapshot/of/.blackcoin"
 
 python3 contrib/devtools/quantum_witness_inventory_audit.py \
   --source-root "$SOURCE_ROOT" \
   --source-sha "$SOURCE_SHA" \
   --blackcoin-cli "$CLI" \
   --blackcoind "$DAEMON" \
-  --cli-arg="-datadir=$DATADIR" \
+  --datadir "$DATADIR" \
+  --daemon-arg=-dbcache=4096 \
   --page-size=1000 \
   --max-records=100000 \
   --output="/tmp/blackcoin-witness-inventory-$SOURCE_SHA.json"
 ```
 
-The command succeeds only when all pages report the same height, tip hash,
-MuHash3072 commitment, UTXO count, aggregates, and complete pagination. It then
-requires a separate `gettxoutsetinfo muhash` result to match that same snapshot
-and requires the active tip to remain unchanged through the final check. A new
-block or reorganization during any of those calls is a failed run, not evidence
-that may be repaired by hand. Retry the complete command.
+The command succeeds only on the immutable Blackcoin mainnet genesis, the exact
+height-authoritative production schedule, and the currently active Gold Rush.
+The cold snapshot must report fully synchronized, unpruned state with no header
+gap. Every page must report the same height, tip hash, MuHash3072 commitment,
+UTXO count, aggregates, and complete pagination. A separate
+`gettxoutsetinfo muhash` result must match that same snapshot. A separate
+`getcirculatingsupply` scan must also match the tip and UTXO count and must
+reconcile every witness-scan synthetic exclusion with the authenticated issued,
+spent, unspent, immature, and phase-locked shadow inventory. Any mismatch is a
+failed run, not evidence that may be repaired by hand.
 
 The successful artifact records:
 
 - the full 40-character source commit and clean-checkout state;
 - SHA-256 and version output for `blackcoind` and `blackcoin-cli`;
+- the verifier-owned daemon PID, prelaunch executable SHA-256, Linux
+  `/proc/<pid>/exe` image SHA-256, private authenticated RPC endpoint,
+  RPC-reported source build, and disabled wallet/mining/network state;
 - chain, genesis hash, protocol version, and subversion;
 - current height, block hash, block time, UTXO MuHash, and UTXO count;
 - the reported height-authoritative lifecycle schedule;
 - every paged witness outpoint and aggregate classification; and
+- the same-tip live synthetic shadow-ledger reconciliation; and
 - an explicit zero review result or a disposition for every review outpoint.
 
 The `evidence_payload_sha256` field hashes the canonical JSON object before that
@@ -107,9 +131,18 @@ fields.
 
 `feature_quantum_activation_boundary.py` is the deterministic executable gate.
 It verifies the final Gold Rush block and first Migration block for exact and
-malformed v14/v15/v16 and other unknown witness outputs. It checks both mempool
-policy and direct-block consensus, pages and independently reconciles the UTXO
-inventory, then verifies the final Migration block and first Final Lockout
-block. The live mainnet artifact remains a separate exact-SHA release
-requirement because regtest fixtures cannot prove that the current mainnet UTXO
-set has a zero review set.
+malformed v14/v15/v16 and other unknown witness outputs. v30.1.1 wallet,
+mempool, relay, normal template, GUI, and RPC funding paths exclude those
+ordinary outputs through the inclusive Gold Rush boundary. Base consensus must
+still accept a legacy-valid direct block through that boundary; rejecting it
+before G+1 would create the premature fork this release is intended to avoid.
+The test therefore also proves that any such custom-block outpoint appears in
+the immutable inventory and requires the appropriate bridge disposition.
+
+The test pages and independently reconciles the UTXO inventory, then verifies
+the final Migration block and first Final Lockout block. The live mainnet
+artifact remains a separate exact-SHA release requirement because regtest
+fixtures cannot prove the current mainnet UTXO set or the live shadow ledger.
+During the ongoing 243,000-block Gold Rush, that artifact is partial-epoch
+evidence only. It cannot be represented as evidence that the future epoch has
+completed.

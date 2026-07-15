@@ -135,8 +135,8 @@ class BlockchainTest(BitcoinTestFramework):
             'headers',
             'initialblockdownload',
             'mediantime',
+            'pruned',
             'quantumquasar',
-            # 'pruned',
             'size_on_disk',
             'time',
             'verificationprogress',
@@ -146,6 +146,7 @@ class BlockchainTest(BitcoinTestFramework):
 
         assert_equal(res['time'], TIME_RANGE_END - TIME_RANGE_STEP)
         assert_equal(res['mediantime'], TIME_RANGE_MTP)
+        assert_equal(res['pruned'], False)
 
         # result should have these additional pruning keys if manual pruning is enabled
         # assert_equal(sorted(res.keys()), sorted(['pruneheight', 'automatic_pruning'] + keys))
