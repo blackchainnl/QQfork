@@ -1305,6 +1305,7 @@ jobs:
     runs-on: ubuntu-22.04
     environment: production-release
     permissions:
+      actions: read
       attestations: write
       contents: write
       id-token: write
@@ -1323,6 +1324,70 @@ jobs:
         with:
           ref: ${{ needs.resolve-target.outputs.target_sha }}
           fetch-depth: 0
+
+      - name: Download and verify prior exact-SHA physical shadow evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="quantum-shadow-production-resources-$TARGET_SHA"
+          artifact=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=100" \
+            --jq ".artifacts[] | select(.expired == false and .workflow_run.head_sha == \"$TARGET_SHA\") | [.id, .workflow_run.id] | @tsv" |
+            sed -n '1p')
+          test -n "$artifact" || {
+            echo "::error::No unexpired exact-SHA physical shadow resource artifact exists"
+            exit 1
+          }
+          IFS=$'\t' read -r artifact_id run_id <<< "$artifact"
+          test -n "$artifact_id"
+          test -n "$run_id"
+          run_path=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.path')
+          run_result=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.conclusion')
+          run_sha=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run_id" --jq '.head_sha')
+          test "$run_path" = ".github/workflows/shadow-resource-production.yml"
+          test "$run_result" = success
+          test "$run_sha" = "$TARGET_SHA"
+          evidence_dir="$RUNNER_TEMP/shadow-production"
+          mkdir -p "$evidence_dir"
+          gh run download "$run_id" --repo "$GITHUB_REPOSITORY" \
+            --name "$name" --dir "$evidence_dir"
+          synthetic_evidence="$evidence_dir/shadow-resource-synthetic-$TARGET_SHA.json"
+          live_evidence="$evidence_dir/shadow-resource-live-$TARGET_SHA.json"
+          fixture="$evidence_dir/shadow-resource-live-fixture-$TARGET_SHA.json"
+          bundled_contract="$evidence_dir/ci/release/shadow_resource_production_contract.json"
+          synthetic_binary="$evidence_dir/shadow_resource_leveldb_fixture"
+          bundled_blackcoind="$evidence_dir/src/blackcoind"
+          bundled_cli="$evidence_dir/src/blackcoin-cli"
+          test -s "$synthetic_evidence"
+          test -s "$live_evidence"
+          test -s "$fixture"
+          test -s "$bundled_contract"
+          test -s "$synthetic_binary"
+          test -s "$bundled_blackcoind"
+          test -s "$bundled_cli"
+          cmp ci/release/shadow_resource_production_contract.json "$bundled_contract"
+          fixture_sha=$(sha256sum "$fixture" | awk '{print $1}')
+          chmod +x "$synthetic_binary" "$bundled_blackcoind" "$bundled_cli"
+          python3 ci/release/verify_shadow_resource_production_evidence.py \
+            --repo-root . \
+            --contract ci/release/shadow_resource_production_contract.json \
+            --synthetic-evidence "$synthetic_evidence" \
+            --synthetic-binary "$synthetic_binary" \
+            --live-evidence "$live_evidence" \
+            --live-manifest "$fixture" \
+            --live-manifest-sha256 "$fixture_sha" \
+            --blackcoind "$bundled_blackcoind" \
+            --blackcoin-cli "$bundled_cli" \
+            --target-sha "$TARGET_SHA"
+          jq -e \
+            '.production_release_authorization.scoped_pair_sufficient == true' \
+            ci/release/shadow_resource_production_contract.json >/dev/null || {
+            echo "::error::Scoped shadow evidence is not sufficient for final production publication; terminal production qualification remains open"
+            exit 1
+          }
+          echo "SHADOW_PRODUCTION_DIR=$evidence_dir" >> "$GITHUB_ENV"
 
       - name: Download only exact-SHA release assets
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
@@ -1411,6 +1476,12 @@ jobs:
           test "${#resource_evidence[@]}" -eq 5
           test "${#resource_raw[@]}" -eq 5
           cp "${resource_evidence[@]}" "${resource_raw[@]}" dist/
+          cp "$SHADOW_PRODUCTION_DIR/shadow-resource-synthetic-$TARGET_SHA.json" \
+            "dist/Blackcoin-$VERSION-shadow-resource-synthetic.json"
+          cp "$SHADOW_PRODUCTION_DIR/shadow-resource-live-$TARGET_SHA.json" \
+            "dist/Blackcoin-$VERSION-shadow-resource-live.json"
+          cp "$SHADOW_PRODUCTION_DIR/shadow-resource-live-fixture-$TARGET_SHA.json" \
+            "dist/Blackcoin-$VERSION-shadow-resource-live-fixture.json"
           printf '%s\n' "$TARGET_SHA" > dist/SOURCE_COMMIT.txt
           gpg --batch --armor --export "$RELEASE_GPG_FINGERPRINT" > \
             "dist/Blackcoin-$VERSION-RELEASE-KEY.asc"

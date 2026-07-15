@@ -1,0 +1,252 @@
+name: v30.1.1 paired scoped shadow resource gate
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Full 40-character candidate commit SHA
+        required: true
+        type: string
+      fixture_manifest_sha256:
+        description: Immutable SHA256 of the fresh protected tip-attestation manifest
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v30.1.1-shadow-resource-${{ inputs.target_sha }}
+  cancel-in-progress: false
+
+jobs:
+  paired-shadow-resource-production:
+    name: synthetic shadow envelope and current-live replay
+    runs-on: [self-hosted, linux, x64, blackcoin-shadow-resource]
+    environment: production-resource-evidence
+    # GitHub may stop a self-hosted job after five days. Completed phases are
+    # input-bound. An interrupted measured phase is restored to its
+    # authenticated predecessor and rerun in full.
+    timeout-minutes: 7200
+    env:
+      HOST: x86_64-pc-linux-gnu
+      MAKEJOBS: 2
+      TARGET_SHA: ${{ inputs.target_sha }}
+      FIXTURE_MANIFEST_SHA256: ${{ inputs.fixture_manifest_sha256 }}
+      FIXTURE_MANIFEST: ${{ vars.SHADOW_RESOURCE_FIXTURE_MANIFEST }}
+      FIXTURE_ARCHIVE: ${{ vars.SHADOW_RESOURCE_FIXTURE_ARCHIVE }}
+      STATE_ROOT: ${{ vars.SHADOW_RESOURCE_STATE_ROOT }}
+      LC_ALL: C
+      TZ: UTC
+    steps:
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ inputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Verify protected runner and current-live fixture paths
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$FIXTURE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          source_date_epoch=$(git show -s --format=%ct "$TARGET_SHA")
+          [[ "$source_date_epoch" =~ ^[0-9]+$ ]]
+          echo "SOURCE_DATE_EPOCH=$source_date_epoch" >> "$GITHUB_ENV"
+          test "$GITHUB_WORKFLOW_SHA" = "$TARGET_SHA" || {
+            echo "::error::Run this workflow from the candidate ref so gate code and target source are identical"
+            exit 1
+          }
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          [[ "$FIXTURE_MANIFEST" = /* ]]
+          [[ "$FIXTURE_ARCHIVE" = /* ]]
+          [[ "$STATE_ROOT" = /* ]]
+          test -f "$FIXTURE_MANIFEST"
+          test -f "$FIXTURE_ARCHIVE"
+          test -d "$STATE_ROOT"
+          test ! -L "$FIXTURE_MANIFEST"
+          test ! -L "$FIXTURE_ARCHIVE"
+          test ! -L "$STATE_ROOT"
+          test "$(sha256sum "$FIXTURE_MANIFEST" | awk '{print $1}')" = "$FIXTURE_MANIFEST_SHA256"
+          test -z "$(git status --porcelain)"
+          for tool in autoconf automake bison cmake g++ git jq make pkg-config python3; do
+            command -v "$tool" >/dev/null
+          done
+
+      - name: Build exact walletless node, CLI, and synthetic LevelDB fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -j "$MAKEJOBS" -C depends \
+            HOST="$HOST" NO_QT=1 NO_UPNP=1 NO_NATPMP=1 NO_BDB=1 NO_SQLITE=1
+          ./autogen.sh
+          ./configure \
+            --prefix="$PWD/depends/$HOST" \
+            --with-gui=no \
+            --disable-wallet \
+            --disable-tests \
+            --disable-bench \
+            --disable-zmq
+          make -j "$MAKEJOBS" src/blackcoind src/blackcoin-cli
+          test -x src/blackcoind
+          test -x src/blackcoin-cli
+
+          mapfile -t crc_libraries < <(
+            sed -n 's|^LIBCRC32C[^ ]*_INT = \(crc32c/.*[.]la\)$|src/\1|p' src/Makefile
+          )
+          test "${#crc_libraries[@]}" -ge 1
+          for library in src/leveldb/libleveldb.la "${crc_libraries[@]}"; do
+            test -f "$library"
+          done
+          cxx=$(sed -n 's/^CXX = //p' src/Makefile)
+          test -n "$cxx"
+          mkdir -p "$RUNNER_TEMP/shadow-resource-bin"
+          synthetic_binary="$RUNNER_TEMP/shadow-resource-bin/shadow_resource_leveldb_fixture"
+          ./libtool --tag=CXX --mode=link "$cxx" \
+            -std=c++17 -O2 -Wall -Wextra -Werror \
+            -Isrc/leveldb/include \
+            ci/release/shadow_resource_leveldb_fixture.cpp \
+            src/leveldb/libleveldb.la "${crc_libraries[@]}" \
+            -pthread -o "$synthetic_binary"
+          test -x "$synthetic_binary"
+          echo "SYNTHETIC_BINARY=$synthetic_binary" >> "$GITHUB_ENV"
+          test -z "$(git status --porcelain)"
+
+      - name: Smoke-test exact fixture contract and point lookups
+        shell: bash
+        run: |
+          set -euo pipefail
+          smoke="$RUNNER_TEMP/shadow-resource-smoke"
+          mkdir -p "$smoke"
+          "$SYNTHETIC_BINARY" contract > "$smoke/contract.json"
+          "$SYNTHETIC_BINARY" apply "$smoke/db" --limit-blocks=2 \
+            > "$smoke/apply.json"
+          printf '\n\n' | "$SYNTHETIC_BINARY" open "$smoke/db" \
+            --measurement-barriers > "$smoke/open.json"
+          "$SYNTHETIC_BINARY" scan "$smoke/db" > "$smoke/scan.json"
+          "$SYNTHETIC_BINARY" authenticate "$smoke/db" --limit-blocks=2 \
+            > "$smoke/authentication.json"
+          python3 - "$smoke" <<'PY'
+          import json
+          from pathlib import Path
+          import sys
+
+          root = Path(sys.argv[1])
+          checked = json.loads(Path("ci/release/shadow_resource_production_contract.json").read_text())
+          assert json.loads((root / "contract.json").read_text()) == checked["synthetic_fixture"]
+          expected_state = {
+              "schema": 1,
+              "phase": "applying",
+              "height": 5_950_001,
+          }
+          assert json.loads((root / "apply.json").read_text()) == expected_state
+          assert json.loads((root / "open.json").read_text()) == expected_state
+          assert json.loads((root / "scan.json").read_text()) == {
+              "schema": 1,
+              "contract_id": checked["contract_id"],
+              "phase": "applying",
+              "height": 5_950_001,
+              "records": 4_146,
+              "claims": 1_376,
+              "payouts": 1_376,
+              "provenance": 1_376,
+              "logical_proof_buckets": 0,
+              "logical_bytes": 796_592,
+          }
+          authentication = json.loads((root / "authentication.json").read_text())
+          assert authentication["phase"] == "applying"
+          assert authentication["sequential_records"] == 8_292
+          assert authentication["payout_authenticated"] == 1_376
+          assert authentication["attestation_lookup_hits"] == 1_376
+          assert authentication["logical_proof_bucket_lookups"] == 0
+          assert authentication["point_lookups"] == 2_752
+          PY
+
+      - name: Run restart-safe exact-synthetic and current-live gates
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          synthetic_work="$STATE_ROOT/$TARGET_SHA/synthetic-v3"
+          live_work="$STATE_ROOT/$TARGET_SHA/live-$FIXTURE_MANIFEST_SHA256"
+          synthetic_output="$synthetic_work/shadow-resource-synthetic-$TARGET_SHA.json"
+          live_output="$live_work/shadow-resource-live-$TARGET_SHA.json"
+          candidate_root="$STATE_ROOT/$TARGET_SHA"
+          for path in "$candidate_root" "$synthetic_work" "$live_work"; do
+            test ! -L "$path"
+          done
+          mkdir -p "$synthetic_work" "$live_work"
+          test "$(realpath "$candidate_root")" = \
+            "$(realpath "$STATE_ROOT")/$TARGET_SHA"
+
+          logical=$(jq -r \
+            '.synthetic_fixture.retained_logical_batch_payload_bytes' \
+            ci/release/shadow_resource_production_contract.json)
+          observed_ratio=$(jq -r \
+            '.budgets.maximum_observed_physical_to_logical_ratio' \
+            ci/release/shadow_resource_production_contract.json)
+          test "$observed_ratio" = 3
+          archive_bytes=$(stat -c %s "$FIXTURE_ARCHIVE")
+          available=$(df --output=avail -B1 "$STATE_ROOT" | tail -n 1 | tr -d ' ')
+          allocated=$(du -sb "$candidate_root" | awk '{print $1}')
+          reserve=$((64 * 1024 * 1024 * 1024))
+          required=$((logical * 3 + archive_bytes * 3 + reserve))
+          test $((available + allocated)) -ge "$required" || {
+            echo "::error::Insufficient protected-runner capacity for exact transient, fixture extraction, and reserve"
+            exit 1
+          }
+
+          python3 ci/release/run_shadow_resource_synthetic_gate.py \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --contract ci/release/shadow_resource_production_contract.json \
+            --work-dir "$synthetic_work" \
+            --fixture-binary "$SYNTHETIC_BINARY" \
+            --target-sha "$TARGET_SHA" \
+            --output "$synthetic_output"
+
+          python3 ci/release/run_shadow_resource_production_gate.py \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --contract ci/release/shadow_resource_production_contract.json \
+            --fixture-manifest "$FIXTURE_MANIFEST" \
+            --fixture-manifest-sha256 "$FIXTURE_MANIFEST_SHA256" \
+            --fixture-archive "$FIXTURE_ARCHIVE" \
+            --work-dir "$live_work" \
+            --blackcoind src/blackcoind \
+            --blackcoin-cli src/blackcoin-cli \
+            --target-sha "$TARGET_SHA" \
+            --output "$live_output"
+
+          python3 ci/release/verify_shadow_resource_production_evidence.py \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --contract ci/release/shadow_resource_production_contract.json \
+            --synthetic-evidence "$synthetic_output" \
+            --synthetic-binary "$SYNTHETIC_BINARY" \
+            --live-evidence "$live_output" \
+            --live-manifest "$FIXTURE_MANIFEST" \
+            --live-manifest-sha256 "$FIXTURE_MANIFEST_SHA256" \
+            --blackcoind src/blackcoind \
+            --blackcoin-cli src/blackcoin-cli \
+            --target-sha "$TARGET_SHA"
+
+          cp "$synthetic_output" "shadow-resource-synthetic-$TARGET_SHA.json"
+          cp "$live_output" "shadow-resource-live-$TARGET_SHA.json"
+          cp "$FIXTURE_MANIFEST" "shadow-resource-live-fixture-$TARGET_SHA.json"
+          cp "$SYNTHETIC_BINARY" shadow_resource_leveldb_fixture
+
+      - name: Upload exact-SHA paired physical evidence and verification inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: quantum-shadow-production-resources-${{ env.TARGET_SHA }}
+          path: |
+            shadow-resource-synthetic-${{ env.TARGET_SHA }}.json
+            shadow-resource-live-${{ env.TARGET_SHA }}.json
+            shadow-resource-live-fixture-${{ env.TARGET_SHA }}.json
+            shadow_resource_leveldb_fixture
+            ci/release/shadow_resource_production_contract.json
+            src/blackcoind
+            src/blackcoin-cli
+          if-no-files-found: error
+          retention-days: 90

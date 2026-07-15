@@ -148,6 +148,12 @@ def verify_epoch_source_contract(repo_root: Path) -> dict[str, str]:
         "src/consensus/amount.h": (
             "static constexpr CAmount COIN = 100000000;",
         ),
+        "src/script/script.h": (
+            "if (b.size() < OP_PUSHDATA1)",
+            "else if (b.size() <= 0xff)",
+            "else if (b.size() <= 0xffff)",
+            "insert(end(), b.begin(), b.end());",
+        ),
         "src/coins.h": (
             "uint32_t code = nHeight * uint32_t{4} + (fCoinBase ? 1 : 0) + (fCoinStake ? 2 : 0);",
             "::Serialize(s, VARINT(code));",
@@ -176,6 +182,14 @@ def verify_epoch_source_contract(repo_root: Path) -> dict[str, str]:
         ),
         "src/dbwrapper.cpp": (
             "options.compression = leveldb::kNoCompression;",
+            "options.block_cache = leveldb::NewLRUCache(nCacheSize / 2);",
+            "options.write_buffer_size = nCacheSize / 4;",
+        ),
+        "src/txdb.h": (
+            "static const int64_t nMaxCoinsDBCache = 8;",
+        ),
+        "src/node/caches.cpp": (
+            "sizes.coins_db = std::min(sizes.coins_db, nMaxCoinsDBCache << 20);",
         ),
     }
     hashes = {}
@@ -254,6 +268,28 @@ def leveldb_batch_put_size(value_bytes: int) -> int:
     # payload bytes, not an SSTable or compaction-amplification bound.
     key_bytes = 34
     return 3 + key_bytes + (1 if value_bytes > 127 else 0) + value_bytes
+
+
+def logical_proof_bucket_storage(proof_ids: int) -> dict:
+    """Return the exact QQP3 marker's serialized logical write footprint.
+
+    The vector count is a one-byte CompactSize for the protocol's 0..64
+    range. ``batch_payload_bytes`` is CDBBatch::SizeEstimate for the CoinEntry
+    put and excludes the WriteBatch's shared 12-byte header and all physical
+    LevelDB/WAL/SSTable amplification.
+    """
+    if proof_ids < 0 or proof_ids > MAX_SHADOW_POW_EVALS_PER_BLOCK:
+        raise RuntimeError("logical proof bucket exceeds the source bound")
+    payload_bytes = 1 + 4 + 32 + 1 + proof_ids * 32
+    script_bytes = marker_script_size(8, payload_bytes)
+    value_bytes = coin_value_size(script_bytes)
+    return {
+        "proof_ids": proof_ids,
+        "payload_bytes": payload_bytes,
+        "script_bytes": script_bytes,
+        "coin_value_bytes": value_bytes,
+        "batch_payload_bytes": leveldb_batch_put_size(value_bytes),
+    }
 
 
 def active_undo_batch_payload(blob_bytes: int) -> dict:
@@ -345,6 +381,25 @@ def calculate_full_epoch_bounds() -> dict:
     if (pool_undo_bytes, solver_bytes) != (316, 92):
         raise RuntimeError("fixed marker serialization arithmetic changed")
 
+    logical_proof_buckets = {
+        "empty": logical_proof_bucket_storage(0),
+        "one_id": logical_proof_bucket_storage(1),
+        "maximum_64_ids": logical_proof_bucket_storage(
+            MAX_SHADOW_POW_EVALS_PER_BLOCK
+        ),
+    }
+    if tuple(
+        logical_proof_buckets[name]["batch_payload_bytes"]
+        for name in ("empty", "one_id", "maximum_64_ids")
+    ) != (98, 130, 2_150):
+        raise RuntimeError(
+            "logical proof bucket serialization arithmetic changed"
+        )
+    maximum_logical_proof_bucket_epoch_bytes = (
+        canonical_blocks *
+        logical_proof_buckets["maximum_64_ids"]["batch_payload_bytes"]
+    )
+
     p2pkh_whitelist_blob = (
         1 + 4 + MAINNET_AUTHENTICATED_WHITELIST_ENTRIES *
         (2 + CANONICAL_P2PKH_SCRIPT_BYTES)
@@ -414,21 +469,39 @@ def calculate_full_epoch_bounds() -> dict:
             "claim_family_bytes": claim_family_bytes,
             "pool_undo_bytes_per_block": pool_undo_bytes,
             "solver_bytes_per_block": solver_bytes,
+            "logical_proof_bucket": {
+                "retained_blocks": canonical_blocks,
+                "empty": logical_proof_buckets["empty"],
+                "one_id": logical_proof_buckets["one_id"],
+                "maximum_64_ids": logical_proof_buckets[
+                    "maximum_64_ids"
+                ],
+                "maximum_full_epoch_batch_payload_bytes":
+                    maximum_logical_proof_bucket_epoch_bytes,
+                "scope": (
+                    "one retained QQPROOFS Coin marker for every height from "
+                    "the 5,993,200 boundary through 6,192,999; per-entry "
+                    "CDBBatch SizeEstimate excludes the shared 12-byte "
+                    "WriteBatch header and physical LevelDB amplification"
+                ),
+            },
             "canonical_p2pkh_fixture": {
                 "whitelist_blob_bytes": p2pkh_whitelist_blob,
                 "maximum_active_state_bytes": p2pkh_active_state,
                 "maximum_active_undo": p2pkh_undo_storage,
                 "full_epoch_retained_append_only_payload_bytes":
-                    p2pkh_retained_payload_bytes,
+                    p2pkh_retained_payload_bytes +
+                    maximum_logical_proof_bucket_epoch_bytes,
             },
             "protocol_source_envelope": {
                 "maximum_active_undo": protocol_undo_storage,
                 "full_epoch_retained_append_only_payload_bytes":
-                    protocol_retained_payload_bytes,
+                    protocol_retained_payload_bytes +
+                    maximum_logical_proof_bucket_epoch_bytes,
             },
             "scope": (
-                "serialized retained append-only claim-family, undo and solver "
-                "CoinEntry "
+                "serialized retained append-only claim-family, undo, solver "
+                "and logical-proof-bucket CoinEntry "
                 "payloads plus CDBBatch framing; excludes pre-existing base "
                 "UTXOs, rolling checkpoint puts/deletes, SSTable/index/filter/"
                 "WAL overhead, obsolete files and compaction amplification"

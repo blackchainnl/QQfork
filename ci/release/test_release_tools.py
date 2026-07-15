@@ -476,15 +476,31 @@ class ReleaseToolTests(unittest.TestCase):
             )
             footprint = epoch["serialized_chainstate_batch_payload"]
             self.assertEqual(footprint["claim_family_bytes"], 509)
+            logical_buckets = footprint["logical_proof_bucket"]
+            self.assertEqual(logical_buckets["retained_blocks"], 199_800)
+            self.assertEqual(
+                logical_buckets["empty"]["batch_payload_bytes"], 98
+            )
+            self.assertEqual(
+                logical_buckets["one_id"]["batch_payload_bytes"], 130
+            )
+            self.assertEqual(
+                logical_buckets["maximum_64_ids"]["batch_payload_bytes"],
+                2_150,
+            )
+            self.assertEqual(
+                logical_buckets["maximum_full_epoch_batch_payload_bytes"],
+                429_570_000,
+            )
             self.assertEqual(
                 footprint["canonical_p2pkh_fixture"]
                 ["full_epoch_retained_append_only_payload_bytes"],
-                103_192_914_600,
+                103_622_484_600,
             )
             self.assertEqual(
                 footprint["protocol_source_envelope"]
                 ["full_epoch_retained_append_only_payload_bytes"],
-                24_754_497_480_000,
+                24_754_927_050_000,
             )
             self.assertFalse(footprint["physical_leveldb_disk_bound_established"])
             self.assertFalse(
