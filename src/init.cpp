@@ -57,6 +57,7 @@
 #include <node/mempool_persist_args.h>
 #include <node/miner.h>
 #include <node/peerman_args.h>
+#include <node/shadow_resource_monitor.h>
 #include <node/validation_cache_args.h>
 #include <policy/feerate.h>
 #include <policy/fees.h>
@@ -1316,6 +1317,14 @@ static bool AppInitMainImpl(NodeContext& node,
         }
     }, std::chrono::minutes{5});
 
+    // Advisory and diagnostic-only. Crossing this reviewed operating envelope
+    // never rejects a block, disables P2P/staking/mining, or initiates shutdown.
+    // The ordinary 50 MiB corruption guard above remains the only automatic
+    // disk-space action here.
+    node.scheduler->scheduleEvery([&node]{
+        if (!ShutdownRequested()) node::RefreshShadowResourceWarning(node);
+    }, std::chrono::minutes{5});
+
     GetMainSignals().RegisterBackgroundSignalScheduler(*node.scheduler);
 
     // All normal service setup is deliberately deferred until chainstate
@@ -2275,6 +2284,10 @@ static bool AppInitMainImpl(NodeContext& node,
     SetRPCWarmupFinished();
 
     uiInterface.InitMessage(_("Done loading").translated);
+
+    // Publish an initial result instead of waiting for the first monitor
+    // interval. GUI, CLI/RPC, and daemon users share this warning registry.
+    node::RefreshShadowResourceWarning(node);
 
     for (const auto& client : node.chain_clients) {
         client->start(*node.scheduler);

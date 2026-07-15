@@ -185,6 +185,49 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
             + self._amount(shadow["pos_outstanding_amount"]),
             self._amount(shadow["outstanding_amount"]),
         )
+        operational = supply["operational_resource"]
+        assert_equal(operational["explicit_override"], False)
+        assert_equal(operational["consensus_behavior_changed"], False)
+        assert_equal(
+            operational["marker_records_scanned"],
+            operational["utxo_records_scanned"],
+        )
+        assert operational["marker_records_scanned"] > 0
+        assert operational["active_coin_batch_payload_bytes_scanned"] > 0
+        assert operational["authenticated_shadow_records_scanned"] > 0
+        assert (
+            operational[
+                "authenticated_shadow_batch_payload_bytes_scanned"
+            ] > 0
+        )
+        assert (
+            operational["authenticated_shadow_records_scanned"]
+            <= operational["utxo_records_scanned"]
+        )
+        assert (
+            operational[
+                "authenticated_shadow_batch_payload_bytes_scanned"
+            ]
+            <= operational["active_coin_batch_payload_bytes_scanned"]
+        )
+        assert (
+            operational["provenance_point_seeks"]
+            + operational["demurrage_point_seeks"]
+            <= operational["maximum_point_seeks"]
+        )
+
+        # GUI warnings, blackcoind RPC, and blackcoin-cli all read this same
+        # source. Regtest is intentionally outside the mainnet-only model, but
+        # single-flight progress and completion still remain observable.
+        resource = node.getshadowresourceinfo()
+        assert_equal(resource["model_class"], "scoped_operational")
+        assert_equal(resource["universal_consensus_bound"], False)
+        assert_equal(resource["applicable"], False)
+        assert_equal(resource["supply_scan"]["active"], False)
+        assert_equal(resource["supply_scan"]["scan_id"], operational["scan_id"])
+        assert_equal(resource["supply_scan"]["last_outcome"], "complete")
+        assert_equal(resource["supply_scan"]["abort_requested"], False)
+        assert_equal(node.abortcirculatingsupplyscan(), False)
         return supply
 
     def _ingest_shadow_reward_window(self):

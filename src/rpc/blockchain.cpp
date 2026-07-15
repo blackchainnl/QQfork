@@ -31,6 +31,7 @@
 #include <node/blockstorage.h>
 #include <node/context.h>
 #include <node/quantum_pool.h>
+#include <node/shadow_resource_monitor.h>
 #include <node/transaction.h>
 #include <node/utxo_snapshot.h>
 #include <primitives/transaction.h>
@@ -38,6 +39,7 @@
 #include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
+#include <serialize.h>
 #include <streams.h>
 #include <sync.h>
 #include <txdb.h>
@@ -1026,6 +1028,37 @@ static bool AddCirculatingSupplyCount(uint64_t& total, uint64_t count = 1)
     return true;
 }
 
+static uint64_t LevelDbVarintSize(uint64_t value)
+{
+    uint64_t bytes{1};
+    while (value >= 128) {
+        value >>= 7;
+        ++bytes;
+    }
+    return bytes;
+}
+
+static std::optional<uint64_t> ActiveCoinBatchPayloadBytes(
+    const COutPoint& key, const Coin& coin)
+{
+    // Match the logical WriteBatch payload measured by the exact fixture:
+    // one value tag, LevelDB varint lengths, serialized CoinEntry key, and
+    // serialized Coin value. This active logical metric is stable across
+    // compaction and tombstone history; it is not a physical-byte claim.
+    const uint64_t key_bytes = 1 + uint256::size() +
+        ::GetSerializeSize(VARINT(key.n));
+    const uint64_t value_bytes = ::GetSerializeSize(coin);
+    uint64_t record_bytes{1};
+    for (const uint64_t component : {
+             LevelDbVarintSize(key_bytes), key_bytes,
+             LevelDbVarintSize(value_bytes), value_bytes}) {
+        if (!AddCirculatingSupplyCount(record_bytes, component)) {
+            return std::nullopt;
+        }
+    }
+    return record_bytes;
+}
+
 static bool AddCirculatingSupplyBucket(CirculatingSupplyBucket& bucket,
                                        const ValueLifecycleClassification& classification)
 {
@@ -1045,13 +1078,270 @@ static UniValue CirculatingSupplyBucketToJSON(const CirculatingSupplyBucket& buc
     return result;
 }
 
+static UniValue ShadowResourceStatusToJSON(
+    const node::ShadowResourceStatus& status)
+{
+    const node::ShadowSupplyScanProgress scan =
+        node::GetShadowSupplyScanProgress();
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("schema", "blackcoin.shadow.resource_operational.v1");
+    result.pushKV("scope", "scoped_mainnet_operating_envelope_not_consensus_bound");
+    result.pushKV("model_class", "scoped_operational");
+    result.pushKV("universal_consensus_bound", false);
+    result.pushKV("production_evidence_authorization", "external_exact_sha_report_required");
+    result.pushKV("applicable", status.applicable);
+    result.pushKV("measurements_available", status.measurements_available);
+    result.pushKV("status", node::ShadowResourceStatusName(status.level));
+    result.pushKV("height", status.height >= 0 ? UniValue(status.height) : UniValue{});
+    result.pushKV("bestblock", status.best_block.empty()
+        ? UniValue{} : UniValue(status.best_block));
+    result.pushKV("chainstate_estimated_bytes", status.estimated_chainstate_bytes);
+    result.pushKV("filesystem_available_bytes", status.filesystem_available_bytes);
+    result.pushKV("modeled_shadow_logical_bytes",
+                  node::SHADOW_RESOURCE_MODELED_SHADOW_LOGICAL_BYTES);
+    result.pushKV("policy_disk_amplification_factor",
+                  node::SHADOW_RESOURCE_POLICY_DISK_AMPLIFICATION_FACTOR);
+    result.pushKV("modeled_shadow_physical_reserve_bytes",
+                  node::SHADOW_RESOURCE_MODELED_SHADOW_PHYSICAL_RESERVE_BYTES);
+    result.pushKV("current_chainstate_estimate_allowance_bytes",
+                  node::SHADOW_RESOURCE_CURRENT_CHAINSTATE_ESTIMATE_ALLOWANCE_BYTES);
+    result.pushKV("background_physical_reserve_bytes_per_block",
+                  node::SHADOW_RESOURCE_BACKGROUND_PHYSICAL_RESERVE_BYTES_PER_BLOCK);
+    result.pushKV("background_growth_records_per_block",
+                  node::SHADOW_RESOURCE_BACKGROUND_GROWTH_RECORDS_PER_BLOCK);
+    result.pushKV("maximum_synthetic_records",
+                  node::SHADOW_RESOURCE_MAX_SYNTHETIC_RECORDS);
+    result.pushKV("maximum_modeled_shadow_logical_bytes_per_block",
+                  node::SHADOW_RESOURCE_MAX_MODELED_SHADOW_LOGICAL_BYTES_PER_BLOCK);
+    result.pushKV("maximum_modeled_shadow_physical_bytes_per_block",
+                  node::SHADOW_RESOURCE_MAX_MODELED_SHADOW_PHYSICAL_BYTES_PER_BLOCK);
+    result.pushKV("maximum_modeled_shadow_records_per_block",
+                  node::SHADOW_RESOURCE_MAX_MODELED_SHADOW_RECORDS_PER_BLOCK);
+    result.pushKV("modeled_legacy_shadow_records_per_block",
+                  node::SHADOW_RESOURCE_MODELED_LEGACY_SHADOW_RECORDS_PER_BLOCK);
+    result.pushKV("modeled_legacy_shadow_logical_bytes_per_block",
+                  node::SHADOW_RESOURCE_MODELED_LEGACY_SHADOW_LOGICAL_BYTES_PER_BLOCK);
+    result.pushKV("remaining_gold_rush_blocks", status.remaining_gold_rush_blocks);
+    result.pushKV("projected_remaining_shadow_physical_bytes",
+                  status.projected_remaining_shadow_physical_bytes);
+    result.pushKV("projected_background_growth_bytes",
+                  status.projected_background_growth_bytes);
+    result.pushKV("minimum_free_bytes", status.minimum_free_bytes);
+    result.pushKV("required_free_bytes", status.required_free_bytes);
+    result.pushKV("warning_free_bytes", status.warning_free_bytes);
+    result.pushKV("immediate_scan_free_bytes", status.immediate_scan_free_bytes);
+    result.pushKV("critical_free_bytes", status.critical_free_bytes);
+    result.pushKV("maximum_estimated_chainstate_bytes",
+                  status.maximum_estimated_chainstate_bytes);
+    result.pushKV("maximum_records_per_cursor",
+                  status.maximum_records_per_cursor);
+    result.pushKV("maximum_sequential_visits",
+                  status.maximum_sequential_visits);
+    result.pushKV("maximum_point_seeks", status.maximum_point_seeks);
+    result.pushKV("absolute_records_per_cursor",
+                  status.absolute_records_per_cursor);
+    result.pushKV("absolute_point_seeks", status.absolute_point_seeks);
+    result.pushKV("support_through_height", status.support_through_height);
+    result.pushKV("within_supported_height", status.within_supported_height);
+    result.pushKV("within_chainstate_size", status.within_chainstate_size);
+    result.pushKV("within_immediate_scan_free_space",
+                  status.within_immediate_scan_free_space);
+    result.pushKV("within_projected_free_space",
+                  status.within_projected_free_space);
+    result.pushKV("critical_free_space_satisfied",
+                  status.critical_free_space_satisfied);
+    result.pushKV("operational_envelope_satisfied",
+                  status.operational_envelope_satisfied);
+    result.pushKV("diagnostic_scan_default_authorized",
+                  status.diagnostic_scan_default_authorized);
+    result.pushKV("consensus_behavior_changed", false);
+    result.pushKV("automatic_shutdown", false);
+    result.pushKV("automatic_network_disable", false);
+    result.pushKV("warning", status.warning);
+    result.pushKV("operator_action", status.operator_action);
+
+    UniValue scan_json(UniValue::VOBJ);
+    scan_json.pushKV("active", scan.active);
+    scan_json.pushKV("scan_id", scan.scan_id);
+    scan_json.pushKV("height", scan.height >= 0
+        ? UniValue(scan.height) : UniValue{});
+    scan_json.pushKV("bestblock", scan.best_block.empty()
+        ? UniValue{} : UniValue(scan.best_block));
+    scan_json.pushKV("stage", scan.stage);
+    scan_json.pushKV("abort_requested", scan.abort_requested);
+    scan_json.pushKV("marker_records_scanned", scan.marker_records_scanned);
+    scan_json.pushKV("utxo_records_scanned", scan.utxo_records_scanned);
+    scan_json.pushKV("active_coin_batch_payload_bytes_scanned",
+                     scan.active_coin_batch_payload_bytes_scanned);
+    scan_json.pushKV("authenticated_shadow_records_scanned",
+                     scan.authenticated_shadow_records_scanned);
+    scan_json.pushKV("authenticated_shadow_batch_payload_bytes_scanned",
+                     scan.authenticated_shadow_batch_payload_bytes_scanned);
+    scan_json.pushKV("provenance_point_seeks", scan.provenance_point_seeks);
+    scan_json.pushKV("demurrage_point_seeks", scan.demurrage_point_seeks);
+    scan_json.pushKV("elapsed_milliseconds", scan.elapsed_milliseconds);
+    scan_json.pushKV("started_at_unix", scan.started_at_unix);
+    scan_json.pushKV("completed_at_unix", scan.completed_at_unix);
+    scan_json.pushKV("last_outcome", scan.last_outcome);
+    scan_json.pushKV("last_reason", scan.last_reason);
+    result.pushKV("supply_scan", std::move(scan_json));
+    return result;
+}
+
+static RPCHelpMan getshadowresourceinfo()
+{
+    return RPCHelpMan{"getshadowresourceinfo",
+        "\nReturns the source-bound v30.1.1 mainnet operating-envelope measurement and operator guidance.\n"
+        "The measurement covers the combined Coin chainstate, not only shadow records.\n"
+        "This is not a consensus limit. Crossing it never rejects a block, disables networking, staking or mining, or starts shutdown.\n"
+        "The same warning is exposed by blackcoind RPC/CLI and the GUI warning area.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "Operational resource status", {
+            {RPCResult::Type::STR, "schema", "Versioned resource-status schema"},
+            {RPCResult::Type::STR, "scope", "Explicitly scoped non-consensus qualification"},
+            {RPCResult::Type::STR, "model_class", "scoped_operational"},
+            {RPCResult::Type::BOOL, "universal_consensus_bound", "Always false for this operating model"},
+            {RPCResult::Type::STR, "production_evidence_authorization", "External exact-SHA verifier requirement"},
+            {RPCResult::Type::BOOL, "applicable", "Whether the mainnet envelope applies"},
+            {RPCResult::Type::BOOL, "measurements_available", "Whether both chainstate and filesystem measurements succeeded"},
+            {RPCResult::Type::STR, "status", "not_applicable, unavailable, healthy, warning, or outside_operational_envelope"},
+            {RPCResult::Type::NUM, "height", /*optional=*/true, "Measured active height"},
+            {RPCResult::Type::STR_HEX, "bestblock", /*optional=*/true, "Measured active block hash"},
+            {RPCResult::Type::NUM, "chainstate_estimated_bytes", "LevelDB estimate for current chainstate key space"},
+            {RPCResult::Type::NUM, "filesystem_available_bytes", "Bytes currently available on the chainstate filesystem"},
+            {RPCResult::Type::NUM, "modeled_shadow_logical_bytes", "Completed-epoch modeled logical shadow payload"},
+            {RPCResult::Type::NUM, "policy_disk_amplification_factor", "Reviewed physical-reserve multiplier; an operating assumption, not a consensus bound"},
+            {RPCResult::Type::NUM, "modeled_shadow_physical_reserve_bytes", "Logical shadow payload multiplied by the policy disk factor"},
+            {RPCResult::Type::NUM, "current_chainstate_estimate_allowance_bytes", "Allowance for LevelDB's approximate active Coin-key-range size; not a physical-directory measurement"},
+            {RPCResult::Type::NUM, "background_physical_reserve_bytes_per_block", "Policy reserve for non-shadow physical growth; an operating assumption, not a measured maximum"},
+            {RPCResult::Type::NUM, "background_growth_records_per_block", "Empirical background record-growth operating allowance"},
+            {RPCResult::Type::NUM, "maximum_synthetic_records", "Exact completed-epoch synthetic fixture records"},
+            {RPCResult::Type::NUM, "maximum_modeled_shadow_logical_bytes_per_block", "Exact maximum canonical fixture block logical payload"},
+            {RPCResult::Type::NUM, "maximum_modeled_shadow_physical_bytes_per_block", "Maximum canonical fixture block logical payload multiplied by the policy disk factor"},
+            {RPCResult::Type::NUM, "maximum_modeled_shadow_records_per_block", "Exact maximum canonical fixture records per block"},
+            {RPCResult::Type::NUM, "modeled_legacy_shadow_records_per_block", "Exact pre-canonical-boundary shadow-family records per fixture block"},
+            {RPCResult::Type::NUM, "modeled_legacy_shadow_logical_bytes_per_block", "Exact pre-canonical-boundary logical WriteBatch payload per fixture block"},
+            {RPCResult::Type::NUM, "remaining_gold_rush_blocks", "Unmeasured blocks remaining in the fixed operating horizon"},
+            {RPCResult::Type::NUM, "projected_remaining_shadow_physical_bytes", "Modeled physical shadow reserve for remaining heights"},
+            {RPCResult::Type::NUM, "projected_background_growth_bytes", "Empirical combined-chainstate growth reserve for remaining heights"},
+            {RPCResult::Type::NUM, "minimum_free_bytes", "Free-space reserve retained after projected growth"},
+            {RPCResult::Type::NUM, "required_free_bytes", "Conservative remaining shadow, background-growth, and reserve projection"},
+            {RPCResult::Type::NUM, "warning_free_bytes", "Advisory headroom threshold"},
+            {RPCResult::Type::NUM, "immediate_scan_free_bytes", "Default full-scan free-space requirement"},
+            {RPCResult::Type::NUM, "critical_free_bytes", "Non-overridable current integrity reserve"},
+            {RPCResult::Type::NUM, "maximum_estimated_chainstate_bytes", "Reviewed current-chainstate operating limit"},
+            {RPCResult::Type::NUM, "maximum_records_per_cursor", "Default per-cursor limit for an optional full supply scan"},
+            {RPCResult::Type::NUM, "maximum_sequential_visits", "Reviewed combined sequential-visit limit"},
+            {RPCResult::Type::NUM, "maximum_point_seeks", "Reviewed default point-seek limit for an optional full supply scan"},
+            {RPCResult::Type::NUM, "absolute_records_per_cursor", "Non-overridable per-cursor protection limit"},
+            {RPCResult::Type::NUM, "absolute_point_seeks", "Non-overridable combined point-seek protection limit"},
+            {RPCResult::Type::NUM, "support_through_height", "Last height in this fixed operating horizon"},
+            {RPCResult::Type::BOOL, "within_supported_height", "Whether the measurement is inside the fixed horizon"},
+            {RPCResult::Type::BOOL, "within_chainstate_size", "Whether current estimated chainstate is inside the operating limit"},
+            {RPCResult::Type::BOOL, "within_immediate_scan_free_space", "Whether default full-scan free space is present"},
+            {RPCResult::Type::BOOL, "within_projected_free_space", "Whether projected remaining growth plus reserve fits"},
+            {RPCResult::Type::BOOL, "critical_free_space_satisfied", "Whether the non-overridable integrity reserve is present"},
+            {RPCResult::Type::BOOL, "operational_envelope_satisfied", "Whether current size and projected free space remain inside the scoped envelope"},
+            {RPCResult::Type::BOOL, "diagnostic_scan_default_authorized", "Whether a full supply scan is inside the current reviewed size"},
+            {RPCResult::Type::BOOL, "consensus_behavior_changed", "Always false"},
+            {RPCResult::Type::BOOL, "automatic_shutdown", "Always false"},
+            {RPCResult::Type::BOOL, "automatic_network_disable", "Always false"},
+            {RPCResult::Type::STR, "warning", "Persistent operator warning, or an empty string"},
+            {RPCResult::Type::STR, "operator_action", "Explicit next action without automatic consent"},
+            {RPCResult::Type::OBJ, "supply_scan", "Single-flight scan progress and last outcome", {
+                {RPCResult::Type::BOOL, "active", "Whether a full supply scan is active"},
+                {RPCResult::Type::NUM, "scan_id", "Process-local scan identifier"},
+                {RPCResult::Type::NUM, "height", /*optional=*/true, "Immutable snapshot height"},
+                {RPCResult::Type::STR_HEX, "bestblock", /*optional=*/true, "Immutable snapshot block hash"},
+                {RPCResult::Type::STR, "stage", "preparing_snapshot, scanning_markers, scanning_utxos, or idle"},
+                {RPCResult::Type::BOOL, "abort_requested", "Whether an operator requested cooperative cancellation"},
+                {RPCResult::Type::NUM, "marker_records_scanned", "Marker cursor progress"},
+                {RPCResult::Type::NUM, "utxo_records_scanned", "Monetary cursor progress"},
+                {RPCResult::Type::NUM, "active_coin_batch_payload_bytes_scanned", "Active logical Coin WriteBatch payload visited; independent of LevelDB compaction history"},
+                {RPCResult::Type::NUM, "authenticated_shadow_records_scanned", "Active authenticated append-only shadow-model records or synthetic payouts; rolling state remains background"},
+                {RPCResult::Type::NUM, "authenticated_shadow_batch_payload_bytes_scanned", "Logical WriteBatch payload in the authenticated append-only shadow-model subset or synthetic payouts; rolling state remains background"},
+                {RPCResult::Type::NUM, "provenance_point_seeks", "Payout-provenance seek progress"},
+                {RPCResult::Type::NUM, "demurrage_point_seeks", "Demurrage-state seek progress"},
+                {RPCResult::Type::NUM, "elapsed_milliseconds", "Current or last scan duration"},
+                {RPCResult::Type::NUM_TIME, "started_at_unix", "Start time for the current or last scan, or zero before any scan"},
+                {RPCResult::Type::NUM_TIME, "completed_at_unix", "Completion time for the last scan, or zero before completion"},
+                {RPCResult::Type::STR, "last_outcome", "never_run, running, complete, or aborted"},
+                {RPCResult::Type::STR, "last_reason", "Completion or cancellation reason"},
+            }},
+        }},
+        RPCExamples{
+            HelpExampleCli("getshadowresourceinfo", "") +
+            HelpExampleRpc("getshadowresourceinfo", "")
+        },
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            return ShadowResourceStatusToJSON(
+                ::node::GetShadowResourceStatus(EnsureChainman(node)));
+        },
+    };
+}
+
+class ShadowSupplyScanGuard
+{
+public:
+    explicit ShadowSupplyScanGuard(uint64_t scan_id) : m_scan_id(scan_id) {}
+    ~ShadowSupplyScanGuard()
+    {
+        if (!m_finished) {
+            const bool cancelled =
+                node::ShadowSupplyScanAbortRequested(m_scan_id);
+            node::FinishShadowSupplyScan(
+                m_scan_id, "aborted",
+                cancelled
+                    ? "Operator cancellation completed; no partial monetary result was returned"
+                    : "RPC interrupted or failed; no partial monetary result was returned");
+        }
+    }
+    ShadowSupplyScanGuard(const ShadowSupplyScanGuard&) = delete;
+    ShadowSupplyScanGuard& operator=(const ShadowSupplyScanGuard&) = delete;
+
+    void Complete()
+    {
+        node::FinishShadowSupplyScan(
+            m_scan_id, "complete",
+            "Full immutable-snapshot scan completed");
+        m_finished = true;
+    }
+
+private:
+    const uint64_t m_scan_id;
+    bool m_finished{false};
+};
+
+static RPCHelpMan abortcirculatingsupplyscan()
+{
+    return RPCHelpMan{"abortcirculatingsupplyscan",
+        "\nRequests cooperative cancellation of the active getcirculatingsupply scan.\n"
+        "The scan checks this request between records, returns no partial monetary result, and does not stop the daemon or change validation, networking, staking, mining, wallet, or consensus behavior.\n",
+        {},
+        RPCResult{RPCResult::Type::BOOL, "cancel_requested", "True when a scan was active and received the request"},
+        RPCExamples{
+            HelpExampleCli("abortcirculatingsupplyscan", "") +
+            HelpExampleRpc("abortcirculatingsupplyscan", "")
+        },
+        [&](const RPCHelpMan&, const JSONRPCRequest&) -> UniValue {
+            return node::RequestShadowSupplyScanAbort();
+        },
+    };
+}
+
 static RPCHelpMan getcirculatingsupply()
 {
     return RPCHelpMan{"getcirculatingsupply",
         "\nScans a consistent UTXO-set snapshot and returns the demurrage-adjusted supply spendable in the next block.\n"
         "This is computed on demand and may take some time. It does not use or maintain an in-block accumulator.\n"
+        "To make the immutable snapshot complete, the call first flushes already-accepted pending chainstate data to disk. It does not create or spend coins, select a chain, or change consensus rules.\n"
+        "If that flush reports a fatal storage or database error, existing node-integrity handling may request daemon shutdown; this RPC returns no monetary result.\n"
+        "The scan streams production Coin records and is single-flight. Pass allow_unqualified_resource_scan=true only to authorize this one diagnostic call outside the reviewed soft envelope. That consent never persists, never suppresses warnings, and cannot bypass critical disk, absolute record/seek, snapshot, overflow, shutdown, or cancellation protections.\n"
         "Demurrage decay realized by a spend is permanently burned; it is not a transaction fee and is never paid to a miner, staker, treasury, shadow pool, or claim participant.\n",
-        {},
+        {
+            {"allow_unqualified_resource_scan", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicitly authorize this one snapshot scan outside the reviewed soft height or size envelope; this cannot bypass storage, integrity, or absolute work limits"},
+        },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
             {
@@ -1120,10 +1410,27 @@ static RPCHelpMan getcirculatingsupply()
                     {RPCResult::Type::STR, "payout_expiration_policy", "Issued-payout expiration policy"},
                     {RPCResult::Type::STR, "pool_expiration_policy", "Unclaimed-pool expiration policy"},
                 }},
+                {RPCResult::Type::OBJ, "operational_resource", "Source-bound scan scope and exact work performed", {
+                    {RPCResult::Type::NUM, "maximum_records_per_cursor", "Reviewed default record limit for each immutable LevelDB cursor"},
+                    {RPCResult::Type::NUM, "absolute_records_per_cursor", "Non-overridable protection limit for each immutable LevelDB cursor"},
+                    {RPCResult::Type::NUM, "maximum_point_seeks", "Reviewed default combined provenance and demurrage point-seek limit"},
+                    {RPCResult::Type::NUM, "absolute_point_seeks", "Non-overridable combined point-seek protection limit"},
+                    {RPCResult::Type::BOOL, "explicit_override", "Whether the caller explicitly authorized this one scan outside that limit"},
+                    {RPCResult::Type::NUM, "scan_id", "Process-local single-flight scan identifier"},
+                    {RPCResult::Type::NUM, "marker_records_scanned", "Records streamed by the marker/inventory cursor"},
+                    {RPCResult::Type::NUM, "utxo_records_scanned", "Records streamed by the monetary UTXO cursor"},
+                    {RPCResult::Type::NUM, "active_coin_batch_payload_bytes_scanned", "Active logical Coin WriteBatch payload visited; not a physical-byte measurement"},
+                    {RPCResult::Type::NUM, "authenticated_shadow_records_scanned", "Active authenticated append-only shadow-model records or synthetic payouts; rolling state remains background"},
+                    {RPCResult::Type::NUM, "authenticated_shadow_batch_payload_bytes_scanned", "Logical WriteBatch payload in the authenticated append-only shadow-model subset or synthetic payouts; rolling state remains background"},
+                    {RPCResult::Type::NUM, "provenance_point_seeks", "Authenticated payout-provenance seeks"},
+                    {RPCResult::Type::NUM, "demurrage_point_seeks", "Authenticated demurrage-state seeks"},
+                    {RPCResult::Type::BOOL, "consensus_behavior_changed", "Always false"},
+                }},
             }
         },
         RPCExamples{
             HelpExampleCli("getcirculatingsupply", "") +
+            HelpExampleCli("getcirculatingsupply", "true") +
             HelpExampleRpc("getcirculatingsupply", "")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
@@ -1132,6 +1439,112 @@ static RPCHelpMan getcirculatingsupply()
     ChainstateManager& chainman = EnsureChainman(node);
     Chainstate& active_chainstate = chainman.ActiveChainstate();
     const Consensus::Params& consensus = chainman.GetConsensus();
+    const bool allow_unqualified_resource_scan =
+        !request.params[0].isNull() && request.params[0].get_bool();
+    const ::node::ShadowResourceStatus resource_status =
+        ::node::GetShadowResourceStatus(chainman);
+    if (resource_status.applicable &&
+        (!resource_status.measurements_available ||
+         !resource_status.within_immediate_scan_free_space ||
+         !resource_status.critical_free_space_satisfied)) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "The current chainstate filesystem cannot be safely measured or is below the non-overridable 64 GiB pre-flush scan reserve. No scan was started. Add storage or retry after chainstate initialization; explicit consent cannot bypass this protection.");
+    }
+    if (resource_status.applicable &&
+        !resource_status.diagnostic_scan_default_authorized &&
+        !allow_unqualified_resource_scan) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "The current chainstate is outside the reviewed height, size, or immediate-storage scan envelope. "
+            "No scan was started. Inspect getshadowresourceinfo, then pass true only if you explicitly authorize this one unqualified height or size envelope.");
+    }
+
+    const std::optional<uint64_t> scan_id = ::node::TryBeginShadowSupplyScan(
+        resource_status.height, resource_status.best_block);
+    if (!scan_id) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "A full supply scan is already active. Inspect getshadowresourceinfo for its immutable snapshot and progress; concurrent scans are not permitted.");
+    }
+    ShadowSupplyScanGuard scan_guard{*scan_id};
+
+    auto count_scan_record = [&](uint64_t& count, const char* cursor_name) {
+        if (count == std::numeric_limits<uint64_t>::max()) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Supply scan record count overflow");
+        }
+        ++count;
+        if (count > ::node::SHADOW_RESOURCE_ABSOLUTE_RECORDS_PER_CURSOR) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                strprintf("The %s cursor reached the non-overridable per-call protection limit of %u records. "
+                          "The snapshot scan stopped and returned no partial monetary result.",
+                          cursor_name,
+                          ::node::SHADOW_RESOURCE_ABSOLUTE_RECORDS_PER_CURSOR));
+        }
+        if (!allow_unqualified_resource_scan &&
+            count > ::node::SHADOW_RESOURCE_MAX_RECORDS_PER_CURSOR) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                strprintf("The %s cursor exceeded the reviewed operational limit of %u records. "
+                          "The snapshot scan stopped without changing consensus rules, chain selection, or wallet state. "
+                          "Retry with true only if you explicitly authorize this one out-of-envelope scan.",
+                          cursor_name,
+                          ::node::SHADOW_RESOURCE_MAX_RECORDS_PER_CURSOR));
+        }
+    };
+
+    auto count_point_seek = [&](uint64_t& count, uint64_t other_count,
+                                const char* seek_name) {
+        if (count == std::numeric_limits<uint64_t>::max()) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Supply scan point-seek count overflow");
+        }
+        ++count;
+        if (count > std::numeric_limits<uint64_t>::max() - other_count) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Supply scan combined point-seek count overflow");
+        }
+        const uint64_t combined = count + other_count;
+        if (combined > ::node::SHADOW_RESOURCE_ABSOLUTE_POINT_SEEKS) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                strprintf("The %s lookup reached the non-overridable per-call protection limit of %u combined point seeks. "
+                          "The snapshot scan stopped and returned no partial monetary result.",
+                          seek_name,
+                          ::node::SHADOW_RESOURCE_ABSOLUTE_POINT_SEEKS));
+        }
+        if (!allow_unqualified_resource_scan &&
+            combined > ::node::SHADOW_RESOURCE_MAX_POINT_SEEKS) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                strprintf("The supply scan exceeded the reviewed operational limit of %u combined point seeks. "
+                          "Retry with true only if you explicitly authorize this one unqualified scan.",
+                          ::node::SHADOW_RESOURCE_MAX_POINT_SEEKS));
+        }
+    };
+
+    auto check_scan_integrity_reserve = [&] {
+        const ::node::ShadowResourceStatus current =
+            ::node::GetShadowResourceStatus(chainman);
+        if (current.applicable &&
+            (!current.measurements_available ||
+             !current.critical_free_space_satisfied)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "The chainstate filesystem became unmeasurable or fell below the non-overridable 50 MiB integrity reserve. The scan stopped and returned no partial monetary result.");
+        }
+    };
+
+    auto scan_interruption_point = [&] {
+        node.rpc_interruption_point();
+        if (::node::ShadowSupplyScanAbortRequested(*scan_id)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "Supply scan cancellation requested; the scan stopped and returned no partial monetary result.");
+        }
+    };
 
     const CBlockIndex* tip{nullptr};
     std::unique_ptr<CCoinsViewCursor> cursor;
@@ -1139,9 +1552,40 @@ static RPCHelpMan getcirculatingsupply()
     std::unique_ptr<CCoinsViewCursor> attestation_cursor;
     {
         LOCK(::cs_main);
-        active_chainstate.ForceFlushStateToDisk();
+        BlockValidationState flush_state;
+        if (!active_chainstate.FlushStateToDisk(
+                flush_state, FlushStateMode::ALWAYS)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                strprintf(
+                    "The immutable supply snapshot could not be flushed to disk (%s). The scan stopped and returned no partial monetary result.",
+                    flush_state.ToString()));
+        }
         CCoinsView& coins_db = active_chainstate.CoinsDB();
         tip = CHECK_NONFATAL(active_chainstate.m_blockman.LookupBlockIndex(coins_db.GetBestBlock()));
+        const ::node::ShadowResourceStatus post_flush_status =
+            ::node::GetShadowResourceStatus(chainman);
+        if (post_flush_status.applicable &&
+            (!post_flush_status.measurements_available ||
+             !post_flush_status.critical_free_space_satisfied)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "The completed chainstate flush left the filesystem unmeasurable or below the non-overridable 50 MiB integrity reserve. The scan stopped and returned no partial monetary result.");
+        }
+        if (post_flush_status.applicable &&
+            !allow_unqualified_resource_scan &&
+            (!post_flush_status.within_supported_height ||
+             !post_flush_status.within_chainstate_size)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "The completed chainstate flush moved the immutable snapshot outside the reviewed height or size envelope. No records were scanned. Inspect getshadowresourceinfo, then pass true only if you explicitly authorize this one out-of-envelope diagnostic scan.");
+        }
+        if (post_flush_status.height != tip->nHeight ||
+            post_flush_status.best_block != tip->GetBlockHash().GetHex()) {
+            throw JSONRPCError(
+                RPC_INTERNAL_ERROR,
+                "Post-flush resource measurements do not match the immutable chainstate snapshot");
+        }
         // LevelDB cursors own immutable snapshots. Create both under cs_main so
         // marker classification and monetary UTXOs come from the same tip even
         // while the lengthy scan proceeds without blocking validation.
@@ -1149,21 +1593,41 @@ static RPCHelpMan getcirculatingsupply()
         attestation_cursor = coins_db.Cursor();
         cursor = coins_db.Cursor();
     }
+    // The snapshot flush can itself consume space. Recheck the non-overridable
+    // integrity floor after that I/O and before visiting any record.
+    check_scan_integrity_reserve();
 
     if (tip->nHeight == std::numeric_limits<int>::max()) {
         throw JSONRPCError(RPC_INTERNAL_ERROR, "Active chain height cannot be evaluated safely");
     }
     const int64_t tip_mtp = tip->GetMedianTimePast();
     const int evaluation_height = tip->nHeight + 1;
+    ::node::SetShadowSupplyScanAnchor(
+        *scan_id, tip->nHeight, tip->GetBlockHash().GetHex());
 
     std::optional<GoldRushInventoryInfo> inventory;
     std::optional<ShadowGoldRushInfo> pool;
     uint64_t payout_marker_count{0};
     CAmount payout_marker_nominal{0};
+    uint64_t marker_records_scanned{0};
+    uint64_t provenance_point_seeks{0};
+    uint64_t demurrage_point_seeks{0};
     COutPoint marker_key;
     Coin marker_coin;
+    ::node::UpdateShadowSupplyScan(
+        *scan_id, "scanning_markers", 0, 0, 0, 0, 0, 0, 0);
     while (marker_cursor->Valid()) {
-        node.rpc_interruption_point();
+        scan_interruption_point();
+        count_scan_record(marker_records_scanned, "marker");
+        if ((marker_records_scanned & 4095U) == 0) {
+            ::node::UpdateShadowSupplyScan(
+                *scan_id, "scanning_markers", marker_records_scanned, 0,
+                0, 0, 0, provenance_point_seeks,
+                demurrage_point_seeks);
+        }
+        if ((marker_records_scanned & 1048575U) == 0) {
+            check_scan_integrity_reserve();
+        }
         if (!marker_cursor->GetKey(marker_key) || !marker_cursor->GetValue(marker_coin)) {
             throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read lifecycle marker snapshot");
         }
@@ -1218,21 +1682,67 @@ static RPCHelpMan getcirculatingsupply()
     CAmount legacy_scheduled_final_lockout{0};
     CAmount requires_quantum_migration{0};
     uint64_t txouts{0};
+    uint64_t utxo_records_scanned{0};
+    uint64_t active_coin_batch_payload_bytes_scanned{0};
+    uint64_t authenticated_shadow_records_scanned{0};
+    uint64_t authenticated_shadow_batch_payload_bytes_scanned{0};
     uint64_t synthetic_unspent_count{0};
     uint64_t decayed_txouts{0};
     COutPoint key;
     Coin coin;
+    ::node::UpdateShadowSupplyScan(
+        *scan_id, "scanning_utxos", marker_records_scanned, 0,
+        0, 0, 0, provenance_point_seeks, demurrage_point_seeks);
     while (cursor->Valid()) {
-        node.rpc_interruption_point();
+        scan_interruption_point();
+        count_scan_record(utxo_records_scanned, "UTXO");
+        if ((utxo_records_scanned & 1048575U) == 0) {
+            check_scan_integrity_reserve();
+        }
         if (!cursor->GetKey(key) || !cursor->GetValue(coin)) {
             throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read lifecycle UTXO snapshot");
+        }
+        const std::optional<uint64_t> record_payload_bytes =
+            ActiveCoinBatchPayloadBytes(key, coin);
+        if (!record_payload_bytes ||
+            !AddCirculatingSupplyCount(
+                active_coin_batch_payload_bytes_scanned,
+                *record_payload_bytes)) {
+            throw JSONRPCError(
+                RPC_INTERNAL_ERROR,
+                "Active Coin logical payload byte count overflow");
+        }
+        const bool authenticated_shadow_marker =
+            !coin.IsSpent() && coin.out.nValue == 0 &&
+            IsAuthenticatedShadowMarkerOutpoint(key, coin, tip);
+        const bool modeled_shadow_resource_marker =
+            authenticated_shadow_marker &&
+            IsModeledShadowResourceMarkerOutpoint(key, coin, tip);
+        if (modeled_shadow_resource_marker &&
+            (!AddCirculatingSupplyCount(
+                 authenticated_shadow_records_scanned) ||
+             !AddCirculatingSupplyCount(
+                 authenticated_shadow_batch_payload_bytes_scanned,
+                 *record_payload_bytes))) {
+            throw JSONRPCError(
+                RPC_INTERNAL_ERROR,
+                "Authenticated shadow logical payload count overflow");
+        }
+        if ((utxo_records_scanned & 4095U) == 0) {
+            ::node::UpdateShadowSupplyScan(
+                *scan_id, "scanning_utxos", marker_records_scanned,
+                utxo_records_scanned,
+                active_coin_batch_payload_bytes_scanned,
+                authenticated_shadow_records_scanned,
+                authenticated_shadow_batch_payload_bytes_scanned,
+                provenance_point_seeks, demurrage_point_seeks);
         }
         if (coin.IsSpent()) {
             cursor->Next();
             continue;
         }
         if (coin.out.nValue == 0 &&
-            (IsAuthenticatedShadowMarkerOutpoint(key, coin, tip) ||
+            (authenticated_shadow_marker ||
              Consensus::IsAuthenticatedDemurrageStateOutpoint(key, coin, tip))) {
             cursor->Next();
             continue;
@@ -1242,6 +1752,8 @@ static RPCHelpMan getcirculatingsupply()
         GoldRushPayoutMarkerLookupResult payout_lookup{
             GoldRushPayoutMarkerLookupResult::MISSING};
         if (HasGoldRushPayoutShape(coin)) {
+            count_point_seek(provenance_point_seeks,
+                             demurrage_point_seeks, "provenance");
             payout_lookup = LookupAuthenticatedGoldRushPayoutMarker(
                 *marker_cursor, key, tip, payout);
         }
@@ -1258,6 +1770,15 @@ static RPCHelpMan getcirculatingsupply()
                                "Gold Rush payout candidate lacks authenticated provenance");
         }
         if (authenticated_synthetic) {
+            if (!AddCirculatingSupplyCount(
+                    authenticated_shadow_records_scanned) ||
+                !AddCirculatingSupplyCount(
+                    authenticated_shadow_batch_payload_bytes_scanned,
+                    *record_payload_bytes)) {
+                throw JSONRPCError(
+                    RPC_INTERNAL_ERROR,
+                    "Authenticated synthetic payout payload count overflow");
+            }
             if (payout.nominal_amount != coin.out.nValue ||
                 payout.payout_script != coin.out.scriptPubKey ||
                 payout.origin_height != coin.nHeight ||
@@ -1270,6 +1791,8 @@ static RPCHelpMan getcirculatingsupply()
         std::optional<Consensus::DemurrageAttestationState> latest_attestation;
         if (const std::optional<uint256> controlling_key =
                 Consensus::DemurrageControllingKeyHashForScript(coin.out.scriptPubKey)) {
+            count_point_seek(demurrage_point_seeks,
+                             provenance_point_seeks, "demurrage");
             Consensus::DemurrageAttestationState state;
             const Consensus::DemurrageLatestStateLookupResult result =
                 Consensus::LookupAuthenticatedDemurrageLatestState(
@@ -1341,6 +1864,19 @@ static RPCHelpMan getcirculatingsupply()
             throw JSONRPCError(RPC_INTERNAL_ERROR, "Decayed UTXO count overflow");
         }
         cursor->Next();
+    }
+    scan_interruption_point();
+    if (marker_records_scanned != utxo_records_scanned) {
+        throw JSONRPCError(
+            RPC_INTERNAL_ERROR,
+            "Immutable supply-scan cursors visited different record counts");
+    }
+    if (authenticated_shadow_records_scanned > utxo_records_scanned ||
+        authenticated_shadow_batch_payload_bytes_scanned >
+            active_coin_batch_payload_bytes_scanned) {
+        throw JSONRPCError(
+            RPC_INTERNAL_ERROR,
+            "Authenticated shadow work exceeds the active Coin snapshot");
     }
 
     CAmount reconciled_value{0};
@@ -1498,6 +2034,44 @@ static RPCHelpMan getcirculatingsupply()
     shadow.pushKV("payout_expiration_policy", "issued_gold_rush_payouts_do_not_expire");
     shadow.pushKV("pool_expiration_policy", "unclaimed_pool_value_expires_after_the_reward_window");
     ret.pushKV("shadow", std::move(shadow));
+
+    UniValue operational_resource(UniValue::VOBJ);
+    operational_resource.pushKV("maximum_records_per_cursor",
+                                ::node::SHADOW_RESOURCE_MAX_RECORDS_PER_CURSOR);
+    operational_resource.pushKV("absolute_records_per_cursor",
+                                ::node::SHADOW_RESOURCE_ABSOLUTE_RECORDS_PER_CURSOR);
+    operational_resource.pushKV("maximum_point_seeks",
+                                ::node::SHADOW_RESOURCE_MAX_POINT_SEEKS);
+    operational_resource.pushKV("absolute_point_seeks",
+                                ::node::SHADOW_RESOURCE_ABSOLUTE_POINT_SEEKS);
+    operational_resource.pushKV("explicit_override",
+                                allow_unqualified_resource_scan);
+    operational_resource.pushKV("scan_id", *scan_id);
+    operational_resource.pushKV("marker_records_scanned",
+                                marker_records_scanned);
+    operational_resource.pushKV("utxo_records_scanned",
+                                utxo_records_scanned);
+    operational_resource.pushKV("active_coin_batch_payload_bytes_scanned",
+                                active_coin_batch_payload_bytes_scanned);
+    operational_resource.pushKV("authenticated_shadow_records_scanned",
+                                authenticated_shadow_records_scanned);
+    operational_resource.pushKV(
+        "authenticated_shadow_batch_payload_bytes_scanned",
+        authenticated_shadow_batch_payload_bytes_scanned);
+    operational_resource.pushKV("provenance_point_seeks",
+                                provenance_point_seeks);
+    operational_resource.pushKV("demurrage_point_seeks",
+                                demurrage_point_seeks);
+    operational_resource.pushKV("consensus_behavior_changed", false);
+    ret.pushKV("operational_resource", std::move(operational_resource));
+    ::node::UpdateShadowSupplyScan(
+        *scan_id, "complete", marker_records_scanned,
+        utxo_records_scanned, active_coin_batch_payload_bytes_scanned,
+        authenticated_shadow_records_scanned,
+        authenticated_shadow_batch_payload_bytes_scanned,
+        provenance_point_seeks,
+        demurrage_point_seeks);
+    scan_guard.Complete();
     return ret;
 },
     };
@@ -4168,6 +4742,8 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getdifficulty},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &getquantumquasarinfo},
+        {"blockchain", &getshadowresourceinfo},
+        {"blockchain", &abortcirculatingsupplyscan},
         {"blockchain", &gettxout},
         {"blockchain", &gettxoutsetinfo},
         {"blockchain", &getcirculatingsupply},

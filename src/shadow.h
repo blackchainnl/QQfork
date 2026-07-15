@@ -637,6 +637,13 @@ bool DecodeShadowClaimMarker(const CTxOut& txout, ShadowClaimMarkerInfo& info);
 bool IsShadowMarkerScript(const CScript& script);
 /** Authenticate a marker by its reserved deterministic outpoint before destructive maintenance. */
 bool IsAuthenticatedShadowMarkerOutpoint(const COutPoint& outpoint, const Coin& coin, const CBlockIndex* pindexTip);
+/** Authenticate only the retained append-only marker families covered by the
+ * exact resource fixture. Rolling pool, inventory, replay, current-active,
+ * whitelist, and post-horizon spent-state records deliberately remain in the
+ * measured background rather than consuming synthetic-model headroom. */
+bool IsModeledShadowResourceMarkerOutpoint(const COutPoint& outpoint,
+                                           const Coin& coin,
+                                           const CBlockIndex* pindexTip);
 /** Decode a payout marker using only one immutable UTXO snapshot entry and its
  * exact active-chain anchor. This deliberately does not consult live chainstate. */
 bool DecodeAuthenticatedGoldRushPayoutMarker(const COutPoint& marker_outpoint,

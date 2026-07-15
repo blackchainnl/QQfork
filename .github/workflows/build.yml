@@ -1355,6 +1355,7 @@ jobs:
             --name "$name" --dir "$evidence_dir"
           synthetic_evidence="$evidence_dir/shadow-resource-synthetic-$TARGET_SHA.json"
           live_evidence="$evidence_dir/shadow-resource-live-$TARGET_SHA.json"
+          authorization="$evidence_dir/shadow-resource-authorization-$TARGET_SHA.json"
           fixture="$evidence_dir/shadow-resource-live-fixture-$TARGET_SHA.json"
           bundled_contract="$evidence_dir/ci/release/shadow_resource_production_contract.json"
           synthetic_binary="$evidence_dir/shadow_resource_leveldb_fixture"
@@ -1362,6 +1363,7 @@ jobs:
           bundled_cli="$evidence_dir/src/blackcoin-cli"
           test -s "$synthetic_evidence"
           test -s "$live_evidence"
+          test -s "$authorization"
           test -s "$fixture"
           test -s "$bundled_contract"
           test -s "$synthetic_binary"
@@ -1370,6 +1372,7 @@ jobs:
           cmp ci/release/shadow_resource_production_contract.json "$bundled_contract"
           fixture_sha=$(sha256sum "$fixture" | awk '{print $1}')
           chmod +x "$synthetic_binary" "$bundled_blackcoind" "$bundled_cli"
+          recomputed_authorization="$RUNNER_TEMP/shadow-resource-authorization-recomputed-$TARGET_SHA.json"
           python3 ci/release/verify_shadow_resource_production_evidence.py \
             --repo-root . \
             --contract ci/release/shadow_resource_production_contract.json \
@@ -1380,11 +1383,16 @@ jobs:
             --live-manifest-sha256 "$fixture_sha" \
             --blackcoind "$bundled_blackcoind" \
             --blackcoin-cli "$bundled_cli" \
-            --target-sha "$TARGET_SHA"
+            --target-sha "$TARGET_SHA" \
+            --authorization-output "$recomputed_authorization" \
+            --require-production-authorization
+          cmp "$authorization" "$recomputed_authorization"
           jq -e \
-            '.production_release_authorization.scoped_pair_sufficient == true' \
-            ci/release/shadow_resource_production_contract.json >/dev/null || {
-            echo "::error::Scoped shadow evidence is not sufficient for final production publication; terminal production qualification remains open"
+            --arg target "$TARGET_SHA" \
+            '.authorized == true and .mode == "scoped_operational" and
+             .universal_consensus_bound == false and .target_sha == $target' \
+            "$recomputed_authorization" >/dev/null || {
+            echo "::error::Verifier-derived scoped operational authorization is absent"
             exit 1
           }
           echo "SHADOW_PRODUCTION_DIR=$evidence_dir" >> "$GITHUB_ENV"

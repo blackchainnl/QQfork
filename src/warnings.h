@@ -13,6 +13,9 @@
 struct bilingual_str;
 
 void SetMiscWarning(const bilingual_str& warning);
+/** Set an independent operational resource warning without overwriting clock,
+ * disk, or other miscellaneous warnings. Returns true when the value changed. */
+bool SetShadowResourceWarning(const bilingual_str& warning);
 void SetfLargeWorkInvalidChainFound(bool flag);
 /** Format a string that describes several potential problems detected by the core.
  * @param[in] verbose bool

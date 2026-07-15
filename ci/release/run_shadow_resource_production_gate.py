@@ -709,6 +709,86 @@ class ProductionGate:
         )
         return result
 
+    def operational_observation(self, supply: dict) -> dict:
+        """Bind one production scan and cheap resource sample to one anchor."""
+        height = supply.get("height")
+        block_hash = supply.get("bestblock")
+        operational = supply.get("operational_resource", {})
+        resource = self.cli("getshadowresourceinfo", timeout=120)
+        chain = self.cli("getblockchaininfo", timeout=120)
+        header = self.cli("getblockheader", block_hash, timeout=120)
+        if (
+            resource.get("schema")
+            != "blackcoin.shadow.resource_operational.v1"
+            or resource.get("model_class") != "scoped_operational"
+            or resource.get("universal_consensus_bound") is not False
+            or resource.get("height") != height
+            or resource.get("bestblock") != block_hash
+            or resource.get("measurements_available") is not True
+            or chain.get("blocks") != height
+            or chain.get("bestblockhash") != block_hash
+            or chain.get("initialblockdownload") is not False
+            or header.get("hash") != block_hash
+            or operational.get("scan_id")
+            != resource.get("supply_scan", {}).get("scan_id")
+            or resource.get("supply_scan", {}).get("active") is not False
+            or resource.get("supply_scan", {}).get("last_outcome")
+            != "complete"
+        ):
+            raise RuntimeError(
+                "operational observation is not bound to one completed production scan"
+            )
+        return {
+            "schema": 1,
+            "height": height,
+            "bestblock": block_hash,
+            "block_mediantime": header.get("mediantime"),
+            "txouts": supply.get("txouts"),
+            "marker_records_scanned": operational.get(
+                "marker_records_scanned"
+            ),
+            "utxo_records_scanned": operational.get("utxo_records_scanned"),
+            "active_coin_batch_payload_bytes_scanned": operational.get(
+                "active_coin_batch_payload_bytes_scanned"
+            ),
+            "authenticated_shadow_records_scanned": operational.get(
+                "authenticated_shadow_records_scanned"
+            ),
+            "authenticated_shadow_batch_payload_bytes_scanned": (
+                operational.get(
+                    "authenticated_shadow_batch_payload_bytes_scanned"
+                )
+            ),
+            "provenance_point_seeks": operational.get(
+                "provenance_point_seeks"
+            ),
+            "demurrage_point_seeks": operational.get(
+                "demurrage_point_seeks"
+            ),
+            "chainstate_estimated_bytes": resource.get(
+                "chainstate_estimated_bytes"
+            ),
+            "filesystem_available_bytes": resource.get(
+                "filesystem_available_bytes"
+            ),
+            "required_free_bytes": resource.get("required_free_bytes"),
+            "resource_status": resource.get("status"),
+            "within_supported_height": resource.get(
+                "within_supported_height"
+            ),
+            "within_chainstate_size": resource.get("within_chainstate_size"),
+            "within_immediate_scan_free_space": resource.get(
+                "within_immediate_scan_free_space"
+            ),
+            "within_projected_free_space": resource.get(
+                "within_projected_free_space"
+            ),
+            "operational_envelope_satisfied": resource.get(
+                "operational_envelope_satisfied"
+            ),
+            "rpc_responsive_after_scan": True,
+        }
+
     def discard_sampler(self, sampler: PhaseSampler) -> None:
         if sampler.thread.is_alive():
             try:
@@ -1054,7 +1134,11 @@ class ProductionGate:
         )
 
         if "live_reorg_undo" in completed:
-            undo = completed["live_reorg_undo"]
+            undo_value = completed["live_reorg_undo"]
+            if set(undo_value) != {"phase", "operational_observations"}:
+                raise RuntimeError("completed live reorg undo fields differ")
+            undo = undo_value["phase"]
+            undo_observations = undo_value["operational_observations"]
             self.remove_snapshot("live_reorg_undo")
         else:
             interrupted = self.journal["active_phase"] == "live_reorg_undo"
@@ -1073,36 +1157,76 @@ class ProductionGate:
             undo_started = time.monotonic()
             undo_sampler.start()
             try:
-                self.cli(
-                    "invalidateblock",
-                    first_hash,
-                    timeout=self.contract["budgets"][
-                        "maximum_full_undo_seconds"
-                    ],
-                )
-                self.wait_for_tip(
-                    daemon,
-                    pre_height,
-                    self.manifest["pre_gold_rush_hash"],
-                    self.contract["budgets"]["maximum_full_undo_seconds"],
-                )
-                rollback_supply = self.cli(
-                    "getcirculatingsupply",
-                    timeout=self.contract["budgets"][
-                        "maximum_live_lifecycle_scan_seconds"
-                    ],
-                )
-                rollback_shadow = rollback_supply.get("shadow", {})
-                if (
-                    rollback_supply.get("height") != pre_height
-                    or rollback_supply.get("bestblock")
-                    != self.manifest["pre_gold_rush_hash"]
-                    or rollback_shadow.get("issued_count") != 0
-                    or rollback_shadow.get("spent_count") != 0
-                    or rollback_shadow.get("unspent_count") != 0
-                ):
+                end_height = self.manifest["end_height"]
+                target_heights = {pre_height}
+                for window in self.contract["authorization_policy"][
+                    "required_growth_windows_blocks"
+                ]:
+                    target = end_height - window
+                    if target >= self.contract["synthetic_fixture"][
+                        "reward_start_height"
+                    ]:
+                        target_heights.add(target)
+                anchors = {}
+                for target in sorted(target_heights, reverse=True):
+                    anchors[target] = {
+                        "bestblock": self.cli(
+                            "getblockhash", str(target), timeout=120
+                        ),
+                        "invalidate": self.cli(
+                            "getblockhash", str(target + 1), timeout=120
+                        ),
+                    }
+                if anchors[pre_height]["bestblock"] != self.manifest[
+                    "pre_gold_rush_hash"
+                ] or anchors[pre_height]["invalidate"] != first_hash:
                     raise RuntimeError(
-                        "full-epoch undo did not restore the exact pre-Gold-Rush inventory"
+                        "operational observation anchors differ from the live manifest"
+                    )
+
+                undo_observations = []
+                for target in sorted(target_heights, reverse=True):
+                    self.cli(
+                        "invalidateblock",
+                        anchors[target]["invalidate"],
+                        timeout=self.contract["budgets"][
+                            "maximum_full_undo_seconds"
+                        ],
+                    )
+                    self.wait_for_tip(
+                        daemon,
+                        target,
+                        anchors[target]["bestblock"],
+                        self.contract["budgets"][
+                            "maximum_full_undo_seconds"
+                        ],
+                    )
+                    rollback_supply = self.cli(
+                        "getcirculatingsupply",
+                        timeout=self.contract["budgets"][
+                            "maximum_live_lifecycle_scan_seconds"
+                        ],
+                    )
+                    if (
+                        rollback_supply.get("height") != target
+                        or rollback_supply.get("bestblock")
+                        != anchors[target]["bestblock"]
+                    ):
+                        raise RuntimeError(
+                            "growth-window scan differs from its exact anchor"
+                        )
+                    if target == pre_height:
+                        rollback_shadow = rollback_supply.get("shadow", {})
+                        if (
+                            rollback_shadow.get("issued_count") != 0
+                            or rollback_shadow.get("spent_count") != 0
+                            or rollback_shadow.get("unspent_count") != 0
+                        ):
+                            raise RuntimeError(
+                                "full-epoch undo did not restore the exact pre-Gold-Rush inventory"
+                            )
+                    undo_observations.append(
+                        self.operational_observation(rollback_supply)
                     )
                 undo = self.phase(
                     daemon,
@@ -1118,11 +1242,20 @@ class ProductionGate:
             except BaseException:
                 self.discard_sampler(undo_sampler)
                 raise
-            self.save_stage("live_reorg_undo", undo)
+            self.save_stage("live_reorg_undo", {
+                "phase": undo,
+                "operational_observations": undo_observations,
+            })
             self.remove_snapshot("live_reorg_undo")
 
         if "live_reorg_reapply" in completed:
-            reapply = completed["live_reorg_reapply"]
+            reapply_value = completed["live_reorg_reapply"]
+            if set(reapply_value) != {"phase", "operational_observation"}:
+                raise RuntimeError("completed live reorg reapply fields differ")
+            reapply = reapply_value["phase"]
+            reapply_observation = reapply_value[
+                "operational_observation"
+            ]
             self.remove_snapshot("live_reorg_reapply")
         else:
             interrupted = (
@@ -1182,6 +1315,9 @@ class ProductionGate:
                     raise RuntimeError(
                         "full-epoch reapply did not restore the exact live inventory"
                     )
+                reapply_observation = self.operational_observation(
+                    reapply_supply
+                )
                 reapply = self.phase(
                     daemon,
                     reapply_started,
@@ -1196,7 +1332,10 @@ class ProductionGate:
             except BaseException:
                 self.discard_sampler(reapply_sampler)
                 raise
-            self.save_stage("live_reorg_reapply", reapply)
+            self.save_stage("live_reorg_reapply", {
+                "phase": reapply,
+                "operational_observation": reapply_observation,
+            })
             self.remove_snapshot("live_reorg_reapply")
 
         if "live_reorg_cleanup" in completed:
@@ -1245,7 +1384,11 @@ class ProductionGate:
                 "obsolete_file_bytes": obsolete,
             })
             self.remove_snapshot("live_reorg_cleanup")
-        return undo, reapply, cleanup_phase, obsolete
+        observations = sorted(
+            [*undo_observations, reapply_observation],
+            key=lambda item: item["height"],
+        )
+        return undo, reapply, cleanup_phase, obsolete, observations
 
     def run_forced_compaction(self) -> tuple[dict, dict, dict]:
         if "forced_compaction" in self.journal["completed"]:
@@ -1313,7 +1456,8 @@ class ProductionGate:
         replay = self.run_full_replay()
         lifecycle = self.run_lifecycle_scan()
         startups, startup_obsolete = self.run_clean_startups()
-        undo, reapply, reorg_cleanup, reorg_obsolete = self.run_full_reorg()
+        (undo, reapply, reorg_cleanup, reorg_obsolete,
+         operational_observations) = self.run_full_reorg()
         compact_phase, steady, compacted = self.run_forced_compaction()
 
         reclaimed = max(0, steady["total_bytes"] - compacted["total_bytes"])
@@ -1343,7 +1487,7 @@ class ProductionGate:
             "forced_compaction_reclaimed_bytes": reclaimed,
         }
         evidence = {
-            "schema": 2,
+            "schema": 3,
             "status": "complete",
             "evidence_kind": "current_live_partial_epoch",
             "completed_epoch": (
@@ -1392,6 +1536,7 @@ class ProductionGate:
             },
             "phases": phases,
             "leveldb": leveldb,
+            "operational_observations": operational_observations,
             "maximum_peak_rss_bytes": max(
                 phase["peak_rss_bytes"]
                 for phase in [replay, lifecycle, undo, reapply, reorg_cleanup,

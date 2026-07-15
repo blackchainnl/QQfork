@@ -129,6 +129,27 @@ class ShadowResourceProductionTest(unittest.TestCase):
         self.assertEqual(
             fixture["authentication_point_lookups"], 372_327_984
         )
+        envelope = self.contract["operational_envelope"]
+        self.assertEqual(
+            envelope["maximum_modeled_shadow_records_per_block"],
+            751 * 3 + 9 + 1,
+        )
+        self.assertEqual(
+            envelope["maximum_modeled_shadow_logical_bytes_per_block"],
+            751 * 509 + 48_204 + 2_150,
+        )
+        self.assertEqual(
+            envelope["maximum_modeled_shadow_physical_bytes_per_block"],
+            3 * envelope["maximum_modeled_shadow_logical_bytes_per_block"],
+        )
+        self.assertEqual(
+            envelope["modeled_legacy_shadow_records_per_block"],
+            688 * 3 + 9,
+        )
+        self.assertEqual(
+            envelope["modeled_legacy_shadow_logical_bytes_per_block"],
+            688 * 509 + 48_204,
+        )
 
     def test_logical_proof_bucket_serialization_footprint(self):
         expected = {
@@ -609,6 +630,23 @@ class ShadowResourceProductionTest(unittest.TestCase):
                     repo, {"source_files": hashes}, self.contract
                 )
 
+    def test_runtime_operational_constant_cannot_drift_from_contract(self):
+        with tempfile.TemporaryDirectory() as temporary_raw:
+            temporary = Path(temporary_raw)
+            repo, _, _, hashes = self.make_repo(temporary)
+            header = repo / "src/node/shadow_resource_monitor.h"
+            source = header.read_text(encoding="utf-8").replace(
+                "SHADOW_RESOURCE_CRITICAL_FREE_BYTES{52428800ULL}",
+                "SHADOW_RESOURCE_CRITICAL_FREE_BYTES{52428799ULL}",
+            )
+            header.write_text(source, encoding="utf-8")
+            hashes["src/node/shadow_resource_monitor.h"] = sha256(header)
+            with self.assertRaisesRegex(
+                    RuntimeError, "runtime operational constant differs"):
+                verifier.verify_sources(
+                    repo, {"source_files": hashes}, self.contract
+                )
+
     def exact_scan(self, phase_name: str) -> dict:
         fixture = self.contract["synthetic_fixture"]
         return {
@@ -707,9 +745,10 @@ class ShadowResourceProductionTest(unittest.TestCase):
 
     def make_live_evidence(self, target_sha: str, contract_path: Path,
                            hashes: dict, blackcoind: Path,
-                           blackcoin_cli: Path) -> dict:
+                           blackcoin_cli: Path,
+                           height_offset: int = 100) -> dict:
         live = self.contract["live_partial_snapshot"]
-        height = live["minimum_height"] + 100
+        height = live["minimum_height"] + height_offset
         end_hash = "a" * 64
         pre_hash = "b" * 64
         first_hash = "c" * 64
@@ -727,8 +766,107 @@ class ShadowResourceProductionTest(unittest.TestCase):
             "live_reorg_cleanup": live_phase(height, end_hash),
             "forced_compaction": live_phase(height, end_hash),
         }
+        pre_height = self.contract["synthetic_fixture"][
+            "reward_start_height"
+        ] - 1
+        observation_heights = {pre_height, height}
+        for window in self.contract["authorization_policy"][
+            "required_growth_windows_blocks"
+        ]:
+            target = height - window
+            if target >= self.contract["synthetic_fixture"][
+                "reward_start_height"
+            ]:
+                observation_heights.add(target)
+
+        def observation(anchor_height):
+            distance = max(0, anchor_height - pre_height)
+            anchor_hash = (
+                pre_hash if anchor_height == pre_height
+                else end_hash if anchor_height == height
+                else f"{anchor_height:064x}"
+            )
+            fixture = self.contract["synthetic_fixture"]
+            envelope = self.contract["operational_envelope"]
+            legacy_blocks = max(
+                0,
+                min(anchor_height, fixture["competing_claims_activation_height"] - 1)
+                - fixture["reward_start_height"] + 1,
+            )
+            canonical_blocks = max(
+                0,
+                anchor_height
+                - fixture["competing_claims_activation_height"] + 1,
+            )
+            shadow_records = (
+                legacy_blocks
+                * envelope["modeled_legacy_shadow_records_per_block"]
+                + canonical_blocks
+                * envelope["maximum_modeled_shadow_records_per_block"]
+            )
+            shadow_logical_bytes = (
+                legacy_blocks
+                * envelope[
+                    "modeled_legacy_shadow_logical_bytes_per_block"
+                ]
+                + canonical_blocks
+                * envelope[
+                    "maximum_modeled_shadow_logical_bytes_per_block"
+                ]
+            )
+            records = 1_000_000 + shadow_records + distance * 10
+            active_payload_bytes = (
+                100_000_000 + shadow_logical_bytes + distance * 1_000
+            )
+            chainstate_bytes = 3_000_000_000 + distance * 1_000
+            first_unmeasured = max(
+                anchor_height + 1,
+                self.contract["synthetic_fixture"]["reward_start_height"],
+            )
+            remaining = max(
+                0,
+                self.contract["synthetic_fixture"]["reward_end_height"]
+                - first_unmeasured + 1,
+            )
+            required_free = (
+                envelope["minimum_free_bytes"]
+                + remaining
+                * envelope[
+                    "maximum_modeled_shadow_physical_bytes_per_block"
+                ]
+                + remaining
+                * envelope[
+                    "background_physical_reserve_bytes_per_block"
+                ]
+            )
+            return {
+                "schema": 1,
+                "height": anchor_height,
+                "bestblock": anchor_hash,
+                "block_mediantime": 1_700_000_000 + distance * 64,
+                "txouts": records - 100,
+                "marker_records_scanned": records,
+                "utxo_records_scanned": records,
+                "active_coin_batch_payload_bytes_scanned":
+                    active_payload_bytes,
+                "authenticated_shadow_records_scanned": shadow_records,
+                "authenticated_shadow_batch_payload_bytes_scanned":
+                    shadow_logical_bytes,
+                "provenance_point_seeks": 100,
+                "demurrage_point_seeks": 200,
+                "chainstate_estimated_bytes": chainstate_bytes,
+                "filesystem_available_bytes": 1_000_000_000_000,
+                "required_free_bytes": required_free,
+                "resource_status": "healthy",
+                "within_supported_height": True,
+                "within_chainstate_size": True,
+                "within_immediate_scan_free_space": True,
+                "within_projected_free_space": True,
+                "operational_envelope_satisfied": True,
+                "rpc_responsive_after_scan": True,
+            }
         return {
-            "schema": 2,
+            "schema": 3,
             "status": "complete",
             "evidence_kind": "current_live_partial_epoch",
             "completed_epoch": False,
@@ -783,6 +921,10 @@ class ShadowResourceProductionTest(unittest.TestCase):
                 "observed_file_churn_bytes": 1_000_000,
                 "forced_compaction_reclaimed_bytes": 100_000_000,
             },
+            "operational_observations": [
+                observation(anchor_height)
+                for anchor_height in sorted(observation_heights)
+            ],
             "maximum_peak_rss_bytes": 2_000_000_000,
         }
 
@@ -847,6 +989,25 @@ class ShadowResourceProductionTest(unittest.TestCase):
                 blackcoind, blackcoin_cli, target_sha, manifest_sha,
             )
 
+            authorization = verifier.derive_operational_authorization(
+                live, self.contract, target_sha, sha256(contract_path),
+                synthetic["fixture_binary"],
+            )
+            self.assertFalse(authorization["authorized"])
+            self.assertTrue(authorization["provisional_authorized"])
+            self.assertFalse(authorization["universal_consensus_bound"])
+            self.assertIn(
+                "minimum_block_span_unavailable",
+                authorization["blockers"],
+            )
+            self.assertEqual(
+                authorization,
+                verifier.derive_operational_authorization(
+                    live, self.contract, target_sha, sha256(contract_path),
+                    synthetic["fixture_binary"],
+                ),
+            )
+
             scaled = copy.deepcopy(synthetic)
             scaled["authentication"]["point_lookups"] -= 1
             scaled_path = self.write_json(temporary / "scaled.json", scaled)
@@ -887,6 +1048,252 @@ class ShadowResourceProductionTest(unittest.TestCase):
                     repo, contract_path, mismatched_path, manifest_path,
                     blackcoind, blackcoin_cli, target_sha, manifest_sha,
                 )
+
+            mismatched_observation = copy.deepcopy(live)
+            mismatched_observation["operational_observations"][-1][
+                "marker_records_scanned"
+            ] += 1
+            mismatched_observation_path = self.write_json(
+                temporary / "mismatched-observation.json",
+                mismatched_observation,
+            )
+            with self.assertRaisesRegex(RuntimeError, "cursor counts differ"):
+                verifier.verify_live(
+                    repo, contract_path, mismatched_observation_path,
+                    manifest_path, blackcoind, blackcoin_cli, target_sha,
+                    manifest_sha,
+                )
+
+    def test_authorization_is_derived_only_after_full_observation_span(self):
+        with tempfile.TemporaryDirectory() as temporary_raw:
+            temporary = Path(temporary_raw)
+            repo, target_sha, contract_path, hashes = self.make_repo(temporary)
+            blackcoind = self.make_executable(temporary / "blackcoind")
+            blackcoin_cli = self.make_executable(temporary / "blackcoin-cli")
+            live = self.make_live_evidence(
+                target_sha, contract_path, hashes, blackcoind, blackcoin_cli,
+                height_offset=10_000,
+            )
+
+            verifier.verify_operational_observations(
+                live["operational_observations"], live["fixture"],
+                self.contract,
+            )
+            authorization = verifier.derive_operational_authorization(
+                live, self.contract, target_sha, sha256(contract_path),
+            )
+            self.assertTrue(authorization["authorized"])
+            self.assertTrue(authorization["provisional_authorized"])
+            self.assertEqual(authorization["blockers"], [])
+            self.assertFalse(authorization["universal_consensus_bound"])
+            self.assertGreaterEqual(
+                authorization["observation_span_mediantime_seconds"],
+                self.contract["authorization_policy"][
+                    "minimum_observation_span_seconds"
+                ],
+            )
+            self.assertEqual(
+                authorization["authorized_scope"],
+                self.contract["authorization_policy"]["authorized_scope"],
+            )
+
+            excessive_growth = copy.deepcopy(live)
+            current = excessive_growth["operational_observations"][-1]
+            current["marker_records_scanned"] += 3_000
+            current["utxo_records_scanned"] += 3_000
+            blocked = verifier.derive_operational_authorization(
+                excessive_growth, self.contract, target_sha,
+                sha256(contract_path),
+            )
+            self.assertFalse(blocked["authorized"])
+            self.assertFalse(blocked["provisional_authorized"])
+            self.assertIn(
+                "growth_window_1_records_exceed_assumption",
+                blocked["blockers"],
+            )
+
+            excessive_logical_growth = copy.deepcopy(live)
+            current = excessive_logical_growth[
+                "operational_observations"
+            ][-1]
+            current["active_coin_batch_payload_bytes_scanned"] += 22_000
+            blocked = verifier.derive_operational_authorization(
+                excessive_logical_growth, self.contract, target_sha,
+                sha256(contract_path),
+            )
+            self.assertFalse(blocked["authorized"])
+            self.assertFalse(blocked["provisional_authorized"])
+            self.assertIn(
+                "growth_window_1_logical_bytes_exceed_assumption",
+                blocked["blockers"],
+            )
+
+            # Pre-existing authenticated state is excluded from every growth
+            # delta. Add the same state at every anchor so the test proves
+            # isolation without exceeding the exact per-height shadow model.
+            shadow_only_growth = copy.deepcopy(live)
+            for observation in shadow_only_growth[
+                    "operational_observations"]:
+                observation["marker_records_scanned"] += 3_000
+                observation["utxo_records_scanned"] += 3_000
+                observation[
+                    "active_coin_batch_payload_bytes_scanned"
+                ] += 100_000
+                observation["authenticated_shadow_records_scanned"] += 3_000
+                observation[
+                    "authenticated_shadow_batch_payload_bytes_scanned"
+                ] += 100_000
+            isolated = verifier.derive_operational_authorization(
+                shadow_only_growth, self.contract, target_sha,
+                sha256(contract_path),
+            )
+            self.assertTrue(isolated["authorized"])
+            self.assertTrue(isolated["provisional_authorized"])
+            self.assertEqual(isolated["blockers"], [])
+
+            excess_shadow_records = copy.deepcopy(live)
+            excess_shadow_records["operational_observations"][-1][
+                "authenticated_shadow_records_scanned"
+            ] += 1
+            blocked = verifier.derive_operational_authorization(
+                excess_shadow_records, self.contract, target_sha,
+                sha256(contract_path),
+            )
+            self.assertIn(
+                "growth_window_1_shadow_records_exceed_model",
+                blocked["blockers"],
+            )
+            self.assertIn(
+                "cumulative_shadow_records_exceed_model",
+                blocked["blockers"],
+            )
+
+            excess_shadow_bytes = copy.deepcopy(live)
+            excess_shadow_bytes["operational_observations"][-1][
+                "authenticated_shadow_batch_payload_bytes_scanned"
+            ] += 1
+            blocked = verifier.derive_operational_authorization(
+                excess_shadow_bytes, self.contract, target_sha,
+                sha256(contract_path),
+            )
+            self.assertIn(
+                "growth_window_1_shadow_logical_bytes_exceed_model",
+                blocked["blockers"],
+            )
+            self.assertIn(
+                "cumulative_shadow_logical_bytes_exceed_model",
+                blocked["blockers"],
+            )
+
+            # An older excess outside every required rolling window must still
+            # fail the cumulative pre-Gold-Rush-to-current model check.
+            historical_excess = copy.deepcopy(live)
+            pre_height = self.contract["synthetic_fixture"][
+                "reward_start_height"
+            ] - 1
+            for observation in historical_excess[
+                    "operational_observations"]:
+                if observation["height"] > pre_height:
+                    observation[
+                        "authenticated_shadow_records_scanned"
+                    ] += 1
+            blocked = verifier.derive_operational_authorization(
+                historical_excess, self.contract, target_sha,
+                sha256(contract_path),
+            )
+            self.assertIn(
+                "cumulative_shadow_records_exceed_model",
+                blocked["blockers"],
+            )
+            self.assertNotIn(
+                "growth_window_1_shadow_records_exceed_model",
+                blocked["blockers"],
+            )
+
+            # Exercise the post-5,993,200 canonical regime as well as the
+            # legacy-to-canonical cumulative transition.
+            canonical_live = self.make_live_evidence(
+                target_sha, contract_path, hashes, blackcoind, blackcoin_cli,
+                height_offset=43_300,
+            )
+            canonical = verifier.derive_operational_authorization(
+                canonical_live, self.contract, target_sha,
+                sha256(contract_path),
+            )
+            self.assertTrue(canonical["authorized"])
+            one_block = next(
+                item for item in canonical["growth_windows"]
+                if item["window_blocks"] == 1
+            )
+            envelope = self.contract["operational_envelope"]
+            self.assertEqual(
+                one_block["modeled_shadow_record_growth_maximum"],
+                envelope["maximum_modeled_shadow_records_per_block"],
+            )
+            self.assertEqual(
+                one_block[
+                    "modeled_shadow_logical_byte_growth_maximum"
+                ],
+                envelope[
+                    "maximum_modeled_shadow_logical_bytes_per_block"
+                ],
+            )
+
+            elapsed = 43_300
+            record_limit = (
+                envelope["background_growth_records_per_block"]
+                // self.contract["authorization_policy"][
+                    "growth_safety_multiplier"
+                ]
+            )
+            old_background_records = copy.deepcopy(canonical_live)
+            for observation in old_background_records[
+                    "operational_observations"]:
+                if observation["height"] > pre_height:
+                    addition = elapsed * record_limit + 1
+                    observation["marker_records_scanned"] += addition
+                    observation["utxo_records_scanned"] += addition
+            blocked = verifier.derive_operational_authorization(
+                old_background_records, self.contract, target_sha,
+                sha256(contract_path),
+            )
+            self.assertIn(
+                "cumulative_background_records_exceed_assumption",
+                blocked["blockers"],
+            )
+            self.assertNotIn(
+                "growth_window_1_records_exceed_assumption",
+                blocked["blockers"],
+            )
+
+            logical_limit = (
+                envelope["background_physical_reserve_bytes_per_block"]
+                // (
+                    envelope["policy_disk_amplification_factor"]
+                    * self.contract["authorization_policy"][
+                        "growth_safety_multiplier"
+                    ]
+                )
+            )
+            old_background_bytes = copy.deepcopy(canonical_live)
+            for observation in old_background_bytes[
+                    "operational_observations"]:
+                if observation["height"] > pre_height:
+                    observation[
+                        "active_coin_batch_payload_bytes_scanned"
+                    ] += elapsed * logical_limit + 1
+            blocked = verifier.derive_operational_authorization(
+                old_background_bytes, self.contract, target_sha,
+                sha256(contract_path),
+            )
+            self.assertIn(
+                "cumulative_background_logical_bytes_exceed_assumption",
+                blocked["blockers"],
+            )
+            self.assertNotIn(
+                "growth_window_1_logical_bytes_exceed_assumption",
+                blocked["blockers"],
+            )
 
     def test_authentication_time_and_compaction_threshold_fail_closed(self):
         with tempfile.TemporaryDirectory() as temporary_raw:

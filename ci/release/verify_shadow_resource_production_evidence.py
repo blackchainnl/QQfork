@@ -29,6 +29,8 @@ REQUIRED_SOURCE_FILES = {
     ".github/workflows/build.yml",
     ".github/workflows/pr-gate.yml",
     ".github/workflows/shadow-resource-production.yml",
+    "doc/v30.1.1-release-gate.md",
+    "doc/v30.1.1-shadow-resource-bounds.md",
     "src/bench/quantum_crypto.cpp",
     "src/coins.cpp",
     "src/coins.h",
@@ -42,7 +44,12 @@ REQUIRED_SOURCE_FILES = {
     "src/dbwrapper.cpp",
     "src/dbwrapper.h",
     "src/kernel/chainparams.cpp",
+    "src/Makefile.am",
+    "src/Makefile.test.include",
+    "src/init.cpp",
     "src/node/caches.cpp",
+    "src/node/shadow_resource_monitor.cpp",
+    "src/node/shadow_resource_monitor.h",
     "src/script/script.h",
     "src/serialize.h",
     "src/shadow.cpp",
@@ -55,7 +62,10 @@ REQUIRED_SOURCE_FILES = {
     "src/test/coins_tests.cpp",
     "src/test/demurrage_tests.cpp",
     "src/test/quantum_pool_tests.cpp",
+    "src/test/shadow_resource_monitor_tests.cpp",
     "src/test/shadow_tests.cpp",
+    "src/warnings.cpp",
+    "src/warnings.h",
     "test/functional/feature_goldrush_coinstatsindex.py",
     "ci/release/generate_resource_benchmark_evidence.py",
     "ci/release/shadow_resource_leveldb_fixture.cpp",
@@ -329,26 +339,66 @@ PINNED_QUALIFICATION_SCOPE = {
     ),
     "live": (
         "Current captured partial-mainnet combined chainstate using production "
-        "blackcoind and getcirculatingsupply at the protected "
-        "operator-attested tip. It does not project the terminal Gold Rush "
-        "height."
+        "blackcoind, getshadowresourceinfo, and the single-flight production "
+        "getcirculatingsupply path at protected operator-attested anchors. "
+        "Multi-window slopes remain empirical operating assumptions, not "
+        "consensus limits."
     ),
     "unproved": (
-        "Terminal combined-chainstate physical amplification and "
-        "full-cardinality production getcirculatingsupply wall time remain "
-        "unproved until terminal-live evidence or a separately reviewed "
-        "conservative background model exists."
+        "Consensus permits chainstate growth far above this operating model. "
+        "Universal consensus-bounded resource safety, indefinite post-horizon "
+        "growth, and cross-platform performance equivalence remain unproved. "
+        "The verifier may authorize only the declared fixed-height RPC "
+        "operating envelope."
     ),
 }
 
-PINNED_PRODUCTION_RELEASE_AUTHORIZATION = {
-    "scoped_pair_sufficient": False,
-    "remaining_gate": (
-        "Final production publication requires terminal-live "
-        "combined-chainstate and full-cardinality production "
-        "getcirculatingsupply qualification, or a separately reviewed "
-        "conservative equivalent."
-    ),
+PINNED_AUTHORIZATION_POLICY = {
+    "result_source": "verifier_derived_not_contract_boolean",
+    "authorized_mode": "scoped_operational",
+    "authorized_scope": "optional_getcirculatingsupply_capacity_and_fail_closed_runtime_controls_on_the_recorded_linux_reference_environment_through_the_fixed_height_horizon_without_a_future_completion_latency_guarantee",
+    "provisional_mode": "provisional_scoped_operational",
+    "universal_consensus_bound": False,
+    "minimum_observation_span_blocks": 10_000,
+    "minimum_observation_span_seconds": 604_800,
+    "maximum_observation_end_age_seconds": 86_400,
+    "required_growth_windows_blocks": [1, 64, 1_024, 10_000],
+    "growth_safety_multiplier": 4,
+    "require_exact_sha_source_and_binaries": True,
+    "require_combined_production_scan": True,
+    "require_runtime_single_flight_and_progress": True,
+    "require_non_consensus_failure_isolation": True,
+    "requalify_on_height_horizon_or_source_change": True,
+}
+
+PINNED_OPERATIONAL_ENVELOPE = {
+    "model_class": "scoped_operational",
+    "universal_consensus_bound": False,
+    "support_through_height": 6_192_999,
+    "modeled_shadow_logical_bytes": 103_622_484_600,
+    "policy_disk_amplification_factor": 3,
+    "modeled_shadow_physical_reserve_bytes": 310_867_453_800,
+    "maximum_modeled_shadow_logical_bytes_per_block": 432_613,
+    "maximum_modeled_shadow_physical_bytes_per_block": 1_297_839,
+    "modeled_legacy_shadow_logical_bytes_per_block": 398_396,
+    "current_chainstate_estimate_allowance_bytes": 68_719_476_736,
+    "current_background_records": 16_777_216,
+    "background_physical_reserve_bytes_per_block": 262_144,
+    "background_growth_records_per_block": 1_024,
+    "maximum_synthetic_records": 541_701_000,
+    "maximum_modeled_shadow_records_per_block": 2_263,
+    "modeled_legacy_shadow_records_per_block": 2_073,
+    "minimum_free_bytes": 68_719_476_736,
+    "immediate_scan_free_bytes": 68_719_476_736,
+    "critical_free_bytes": 52_428_800,
+    "maximum_estimated_chainstate_bytes": 443_287_922_536,
+    "maximum_records_per_cursor": 807_310_216,
+    "maximum_sequential_visits": 1_614_620_432,
+    "maximum_point_seeks": 1_614_620_432,
+    "absolute_records_per_cursor": 1_614_620_432,
+    "absolute_point_seeks": 3_229_240_864,
+    "warning_numerator": 5,
+    "warning_denominator": 4,
 }
 
 PINNED_RETENTION = {
@@ -368,21 +418,22 @@ def verify_contract(contract: dict) -> None:
     require_keys(
         contract,
         {"schema", "contract_id", "repository", "qualification_scope",
-         "production_release_authorization",
+         "authorization_policy", "operational_envelope",
          "synthetic_fixture",
          "live_partial_snapshot", "measurement", "budgets", "retention",
          "source_files"},
         "contract",
     )
-    if contract["schema"] != 2 or contract["contract_id"] != CONTRACT_ID:
+    if contract["schema"] != 3 or contract["contract_id"] != CONTRACT_ID:
         raise RuntimeError("unsupported production resource contract")
     if contract["repository"] != "Blackcoin-Dev/Blackcoin":
         raise RuntimeError("production resource repository changed")
     if contract["qualification_scope"] != PINNED_QUALIFICATION_SCOPE:
         raise RuntimeError("production resource qualification scope changed")
-    if contract["production_release_authorization"] != (
-            PINNED_PRODUCTION_RELEASE_AUTHORIZATION):
-        raise RuntimeError("production release authorization changed")
+    if contract["authorization_policy"] != PINNED_AUTHORIZATION_POLICY:
+        raise RuntimeError("production authorization policy changed")
+    if contract["operational_envelope"] != PINNED_OPERATIONAL_ENVELOPE:
+        raise RuntimeError("operational envelope changed without schema review")
     if contract["synthetic_fixture"] != PINNED_SYNTHETIC:
         raise RuntimeError("synthetic full-epoch contract changed without schema review")
     live = contract["live_partial_snapshot"]
@@ -449,6 +500,87 @@ def verify_sources(repo: Path, evidence: dict, contract: dict) -> None:
             raise RuntimeError(f"evidence source hash differs for {relative}")
     if not set(epoch_sources).issubset(hashes):
         raise RuntimeError("epoch source contract is not fully evidence-bound")
+    verify_runtime_operational_envelope(repo, contract)
+
+
+RUNTIME_ENVELOPE_CONSTANTS = {
+    "support_through_height": "SHADOW_RESOURCE_SUPPORT_THROUGH_HEIGHT",
+    "modeled_shadow_logical_bytes": "SHADOW_RESOURCE_MODELED_SHADOW_LOGICAL_BYTES",
+    "policy_disk_amplification_factor": "SHADOW_RESOURCE_POLICY_DISK_AMPLIFICATION_FACTOR",
+    "modeled_shadow_physical_reserve_bytes": "SHADOW_RESOURCE_MODELED_SHADOW_PHYSICAL_RESERVE_BYTES",
+    "maximum_modeled_shadow_logical_bytes_per_block": "SHADOW_RESOURCE_MAX_MODELED_SHADOW_LOGICAL_BYTES_PER_BLOCK",
+    "maximum_modeled_shadow_physical_bytes_per_block": "SHADOW_RESOURCE_MAX_MODELED_SHADOW_PHYSICAL_BYTES_PER_BLOCK",
+    "modeled_legacy_shadow_logical_bytes_per_block": "SHADOW_RESOURCE_MODELED_LEGACY_SHADOW_LOGICAL_BYTES_PER_BLOCK",
+    "current_chainstate_estimate_allowance_bytes": "SHADOW_RESOURCE_CURRENT_CHAINSTATE_ESTIMATE_ALLOWANCE_BYTES",
+    "current_background_records": "SHADOW_RESOURCE_CURRENT_BACKGROUND_RECORDS",
+    "background_physical_reserve_bytes_per_block": "SHADOW_RESOURCE_BACKGROUND_PHYSICAL_RESERVE_BYTES_PER_BLOCK",
+    "background_growth_records_per_block": "SHADOW_RESOURCE_BACKGROUND_GROWTH_RECORDS_PER_BLOCK",
+    "maximum_synthetic_records": "SHADOW_RESOURCE_MAX_SYNTHETIC_RECORDS",
+    "maximum_modeled_shadow_records_per_block": "SHADOW_RESOURCE_MAX_MODELED_SHADOW_RECORDS_PER_BLOCK",
+    "modeled_legacy_shadow_records_per_block": "SHADOW_RESOURCE_MODELED_LEGACY_SHADOW_RECORDS_PER_BLOCK",
+    "minimum_free_bytes": "SHADOW_RESOURCE_MINIMUM_FREE_BYTES",
+    "immediate_scan_free_bytes": "SHADOW_RESOURCE_IMMEDIATE_SCAN_FREE_BYTES",
+    "critical_free_bytes": "SHADOW_RESOURCE_CRITICAL_FREE_BYTES",
+    "maximum_estimated_chainstate_bytes": "SHADOW_RESOURCE_MAX_ESTIMATED_CHAINSTATE_BYTES",
+    "maximum_records_per_cursor": "SHADOW_RESOURCE_MAX_RECORDS_PER_CURSOR",
+    "maximum_sequential_visits": "SHADOW_RESOURCE_MAX_SEQUENTIAL_VISITS",
+    "maximum_point_seeks": "SHADOW_RESOURCE_MAX_POINT_SEEKS",
+    "absolute_records_per_cursor": "SHADOW_RESOURCE_ABSOLUTE_RECORDS_PER_CURSOR",
+    "absolute_point_seeks": "SHADOW_RESOURCE_ABSOLUTE_POINT_SEEKS",
+    "warning_numerator": "SHADOW_RESOURCE_WARNING_NUMERATOR",
+    "warning_denominator": "SHADOW_RESOURCE_WARNING_DENOMINATOR",
+}
+
+
+def verify_runtime_operational_envelope(repo: Path, contract: dict) -> None:
+    header = (repo / "src/node/shadow_resource_monitor.h").read_text(
+        encoding="utf-8"
+    )
+    envelope = contract["operational_envelope"]
+    for field, constant in RUNTIME_ENVELOPE_CONSTANTS.items():
+        match = re.search(
+            rf"inline constexpr (?:int|uint64_t) {constant}\{{([0-9]+)(?:ULL)?\}};",
+            header,
+        )
+        if match is None:
+            raise RuntimeError(
+                f"runtime operational constant is not a literal: {constant}"
+            )
+        if int(match.group(1)) != envelope[field]:
+            raise RuntimeError(
+                f"runtime operational constant differs: {constant}"
+            )
+
+    blockchain = (repo / "src/rpc/blockchain.cpp").read_text(encoding="utf-8")
+    runtime_requirements = (
+        "allow_unqualified_resource_scan",
+        "TryBeginShadowSupplyScan",
+        "abortcirculatingsupplyscan",
+        "active_coin_batch_payload_bytes_scanned",
+        "authenticated_shadow_batch_payload_bytes_scanned",
+        "IsModeledShadowResourceMarkerOutpoint",
+        "SHADOW_RESOURCE_ABSOLUTE_RECORDS_PER_CURSOR",
+        "SHADOW_RESOURCE_ABSOLUTE_POINT_SEEKS",
+        "consensus_behavior_changed\", false",
+        "no partial monetary result was returned",
+    )
+    for requirement in runtime_requirements:
+        if requirement not in blockchain:
+            raise RuntimeError(
+                f"production resource RPC protection is missing: {requirement}"
+            )
+    monitor = (repo / "src/node/shadow_resource_monitor.cpp").read_text(
+        encoding="utf-8"
+    )
+    for requirement in (
+        "Base-chain validation, networking, staking, mining, and consensus rules remain unchanged",
+        "GetShadowSupplyScanProgress",
+        "SetShadowResourceWarning",
+    ):
+        if requirement not in monitor:
+            raise RuntimeError(
+                f"resource monitor failure isolation is missing: {requirement}"
+            )
 
 
 SNAPSHOT_KEYS = {
@@ -866,6 +998,7 @@ def verify_synthetic(repo: Path, contract_path: Path, evidence_path: Path,
         "compaction_required": required,
         "reasons": reasons,
         "measurement_environment": evidence["measurement_environment"],
+        "fixture_binary": evidence["fixture_binary"],
     }
 
 
@@ -911,6 +1044,518 @@ def verify_live_phase(value: dict, label: str, height: int, block_hash: str) -> 
         raise RuntimeError(f"{label} completed at a different live anchor")
 
 
+OPERATIONAL_OBSERVATION_KEYS = {
+    "schema", "height", "bestblock", "block_mediantime", "txouts",
+    "marker_records_scanned", "utxo_records_scanned",
+    "active_coin_batch_payload_bytes_scanned",
+    "authenticated_shadow_records_scanned",
+    "authenticated_shadow_batch_payload_bytes_scanned",
+    "provenance_point_seeks", "demurrage_point_seeks",
+    "chainstate_estimated_bytes", "filesystem_available_bytes",
+    "required_free_bytes", "resource_status", "within_supported_height",
+    "within_chainstate_size", "within_immediate_scan_free_space",
+    "within_projected_free_space", "operational_envelope_satisfied",
+    "rpc_responsive_after_scan",
+}
+
+
+def verify_operational_observations(value, fixture: dict,
+                                    contract: dict) -> list[dict]:
+    if not isinstance(value, list) or not value:
+        raise RuntimeError("live evidence lacks operational observations")
+    policy = contract["authorization_policy"]
+    synthetic = contract["synthetic_fixture"]
+    pre_height = synthetic["reward_start_height"] - 1
+    end_height = fixture["end_height"]
+    expected_heights = {pre_height, end_height}
+    for window in policy["required_growth_windows_blocks"]:
+        target = end_height - window
+        if target >= synthetic["reward_start_height"]:
+            expected_heights.add(target)
+
+    observations = []
+    for index, observation in enumerate(value):
+        label = f"operational_observations[{index}]"
+        require_keys(observation, OPERATIONAL_OBSERVATION_KEYS, label)
+        if observation["schema"] != 1:
+            raise RuntimeError(f"{label} schema differs")
+        height = integer(observation["height"], f"{label}.height")
+        block_hash = observation["bestblock"]
+        if not isinstance(block_hash, str) or not BLOCK_HASH_RE.fullmatch(block_hash):
+            raise RuntimeError(f"{label}.bestblock is invalid")
+        for key in (
+            "block_mediantime", "txouts", "marker_records_scanned",
+            "utxo_records_scanned",
+            "active_coin_batch_payload_bytes_scanned",
+            "authenticated_shadow_records_scanned",
+            "authenticated_shadow_batch_payload_bytes_scanned",
+            "provenance_point_seeks",
+            "demurrage_point_seeks", "chainstate_estimated_bytes",
+            "filesystem_available_bytes", "required_free_bytes",
+        ):
+            integer(observation[key], f"{label}.{key}")
+        if observation["resource_status"] not in {
+            "healthy", "warning", "outside_operational_envelope"
+        }:
+            raise RuntimeError(f"{label}.resource_status differs")
+        for key in (
+            "within_supported_height", "within_chainstate_size",
+            "within_immediate_scan_free_space",
+            "within_projected_free_space",
+            "operational_envelope_satisfied",
+            "rpc_responsive_after_scan",
+        ):
+            if not isinstance(observation[key], bool):
+                raise RuntimeError(f"{label}.{key} must be boolean")
+        if observation["marker_records_scanned"] != observation[
+                "utxo_records_scanned"]:
+            raise RuntimeError(f"{label} immutable cursor counts differ")
+        if observation["txouts"] > observation["utxo_records_scanned"]:
+            raise RuntimeError(f"{label} UTXO count exceeds streamed records")
+        if observation["authenticated_shadow_records_scanned"] > observation[
+                "utxo_records_scanned"]:
+            raise RuntimeError(
+                f"{label} authenticated shadow records exceed active records"
+            )
+        if observation[
+                "authenticated_shadow_batch_payload_bytes_scanned"] > observation[
+                    "active_coin_batch_payload_bytes_scanned"]:
+            raise RuntimeError(
+                f"{label} authenticated shadow payload exceeds active payload"
+            )
+        if (
+            observation["provenance_point_seeks"]
+            + observation["demurrage_point_seeks"]
+            > contract["operational_envelope"]["absolute_point_seeks"]
+        ):
+            raise RuntimeError(f"{label} exceeds the absolute seek protection")
+        if observation["marker_records_scanned"] > contract[
+                "operational_envelope"]["absolute_records_per_cursor"]:
+            raise RuntimeError(f"{label} exceeds the absolute cursor protection")
+        if observation["within_supported_height"] is not (
+            height <= contract["operational_envelope"]["support_through_height"]
+        ):
+            raise RuntimeError(f"{label} support-horizon status differs")
+        envelope = contract["operational_envelope"]
+        expected_size = (
+            observation["chainstate_estimated_bytes"]
+            <= envelope["maximum_estimated_chainstate_bytes"]
+        )
+        expected_immediate = (
+            observation["filesystem_available_bytes"]
+            >= envelope["immediate_scan_free_bytes"]
+        )
+        expected_projected = (
+            observation["filesystem_available_bytes"]
+            >= observation["required_free_bytes"]
+        )
+        first_unmeasured = max(
+            height + 1, synthetic["reward_start_height"]
+        )
+        remaining = max(
+            0, synthetic["reward_end_height"] - first_unmeasured + 1
+        )
+        expected_required = (
+            envelope["minimum_free_bytes"]
+            + remaining
+            * envelope["maximum_modeled_shadow_physical_bytes_per_block"]
+            + remaining
+            * envelope["background_physical_reserve_bytes_per_block"]
+        )
+        if observation["required_free_bytes"] != expected_required:
+            raise RuntimeError(f"{label} projected free-space formula differs")
+        if observation["within_chainstate_size"] is not expected_size:
+            raise RuntimeError(f"{label} chainstate-size status differs")
+        if observation["within_immediate_scan_free_space"] is not expected_immediate:
+            raise RuntimeError(f"{label} immediate-space status differs")
+        if observation["within_projected_free_space"] is not expected_projected:
+            raise RuntimeError(f"{label} projected-space status differs")
+        expected_envelope = (
+            observation["within_supported_height"]
+            and expected_size and expected_projected
+        )
+        if observation["operational_envelope_satisfied"] is not expected_envelope:
+            raise RuntimeError(f"{label} operating-envelope status differs")
+        if observation["rpc_responsive_after_scan"] is not True:
+            raise RuntimeError(f"{label} did not prove post-scan RPC responsiveness")
+        observations.append(observation)
+
+    heights = [item["height"] for item in observations]
+    if heights != sorted(heights) or len(heights) != len(set(heights)):
+        raise RuntimeError("operational observations must have unique sorted heights")
+    if set(heights) != expected_heights:
+        raise RuntimeError("operational observation anchors differ from policy")
+    by_height = {item["height"]: item for item in observations}
+    if by_height[pre_height]["bestblock"] != fixture["pre_gold_rush_hash"]:
+        raise RuntimeError("pre-Gold-Rush operational anchor differs")
+    if by_height[end_height]["bestblock"] != fixture["end_hash"]:
+        raise RuntimeError("current operational anchor differs")
+    return observations
+
+
+def derive_operational_authorization(live_evidence: dict, contract: dict,
+                                     target_sha: str,
+                                     contract_sha: str,
+                                     synthetic_fixture_binary=None) -> dict:
+    """Derive a deterministic result; the contract contains no approval bit."""
+    fixture = live_evidence["fixture"]
+    observations = live_evidence["operational_observations"]
+    by_height = {item["height"]: item for item in observations}
+    end_height = fixture["end_height"]
+    current = by_height[end_height]
+    pre_height = contract["synthetic_fixture"]["reward_start_height"] - 1
+    baseline = by_height[pre_height]
+    policy = contract["authorization_policy"]
+    envelope = contract["operational_envelope"]
+    blockers = []
+    observations_report = []
+
+    def modeled_shadow_growth(prior_height: int,
+                              current_height: int) -> tuple[int, int]:
+        """Return the exact regime-aware maximum active shadow growth."""
+        synthetic = contract["synthetic_fixture"]
+        reward_start = synthetic["reward_start_height"]
+        reward_end = synthetic["reward_end_height"]
+        canonical_start = synthetic["competing_claims_activation_height"]
+
+        def blocks(first: int, last: int) -> int:
+            return max(0, last - first + 1)
+
+        legacy_blocks = blocks(
+            max(prior_height + 1, reward_start),
+            min(current_height, canonical_start - 1, reward_end),
+        )
+        canonical_blocks = blocks(
+            max(prior_height + 1, canonical_start, reward_start),
+            min(current_height, reward_end),
+        )
+        maximum_records = (
+            legacy_blocks
+            * envelope["modeled_legacy_shadow_records_per_block"]
+            + canonical_blocks
+            * envelope["maximum_modeled_shadow_records_per_block"]
+        )
+        maximum_logical_bytes = (
+            legacy_blocks
+            * envelope["modeled_legacy_shadow_logical_bytes_per_block"]
+            + canonical_blocks
+            * envelope[
+                "maximum_modeled_shadow_logical_bytes_per_block"
+            ]
+        )
+        return maximum_records, maximum_logical_bytes
+
+    def block(reason: str) -> None:
+        if reason not in blockers:
+            blockers.append(reason)
+
+    if end_height > envelope["support_through_height"]:
+        block("height_horizon_exceeded")
+    if end_height - pre_height < policy["minimum_observation_span_blocks"]:
+        block("minimum_block_span_unavailable")
+    if current["block_mediantime"] - baseline["block_mediantime"] < policy[
+            "minimum_observation_span_seconds"]:
+        block("minimum_time_span_unavailable")
+    if baseline["chainstate_estimated_bytes"] > envelope[
+            "current_chainstate_estimate_allowance_bytes"]:
+        block("baseline_chainstate_exceeds_allowance")
+    baseline_background_records = (
+        baseline["marker_records_scanned"]
+        - baseline["authenticated_shadow_records_scanned"]
+    )
+    if baseline_background_records > envelope["current_background_records"]:
+        block("baseline_records_exceed_allowance")
+    if current["chainstate_estimated_bytes"] > envelope[
+            "maximum_estimated_chainstate_bytes"]:
+        block("current_chainstate_exceeds_envelope")
+    if current["marker_records_scanned"] > envelope[
+            "maximum_records_per_cursor"]:
+        block("current_cursor_records_exceed_envelope")
+    if (
+        current["provenance_point_seeks"]
+        + current["demurrage_point_seeks"]
+        > envelope["maximum_point_seeks"]
+    ):
+        block("current_point_seeks_exceed_envelope")
+    if not current["within_immediate_scan_free_space"]:
+        block("immediate_scan_free_space_below_envelope")
+    if not current["within_projected_free_space"]:
+        block("projected_free_space_below_envelope")
+    if not current["operational_envelope_satisfied"]:
+        block("runtime_operational_envelope_not_satisfied")
+
+    record_limit = (
+        envelope["background_growth_records_per_block"]
+        // policy["growth_safety_multiplier"]
+    )
+    logical_byte_limit = (
+        envelope["background_physical_reserve_bytes_per_block"]
+        // (
+            envelope["policy_disk_amplification_factor"]
+            * policy["growth_safety_multiplier"]
+        )
+    )
+
+    cumulative_shadow_record_delta = max(
+        0,
+        current["authenticated_shadow_records_scanned"]
+        - baseline["authenticated_shadow_records_scanned"],
+    )
+    cumulative_shadow_logical_byte_delta = max(
+        0,
+        current["authenticated_shadow_batch_payload_bytes_scanned"]
+        - baseline["authenticated_shadow_batch_payload_bytes_scanned"],
+    )
+    (cumulative_shadow_record_maximum,
+     cumulative_shadow_logical_byte_maximum) = modeled_shadow_growth(
+        pre_height, end_height
+    )
+    if cumulative_shadow_record_delta > cumulative_shadow_record_maximum:
+        block("cumulative_shadow_records_exceed_model")
+    if (
+        cumulative_shadow_logical_byte_delta
+        > cumulative_shadow_logical_byte_maximum
+    ):
+        block("cumulative_shadow_logical_bytes_exceed_model")
+    cumulative_background_record_delta = max(
+        0,
+        (
+            current["marker_records_scanned"]
+            - current["authenticated_shadow_records_scanned"]
+        )
+        - (
+            baseline["marker_records_scanned"]
+            - baseline["authenticated_shadow_records_scanned"]
+        ),
+    )
+    cumulative_background_logical_byte_delta = max(
+        0,
+        (
+            current["active_coin_batch_payload_bytes_scanned"]
+            - current["authenticated_shadow_batch_payload_bytes_scanned"]
+        )
+        - (
+            baseline["active_coin_batch_payload_bytes_scanned"]
+            - baseline[
+                "authenticated_shadow_batch_payload_bytes_scanned"
+            ]
+        ),
+    )
+    cumulative_blocks = max(0, end_height - pre_height)
+    cumulative_background_record_maximum = cumulative_blocks * record_limit
+    cumulative_background_logical_byte_maximum = (
+        cumulative_blocks * logical_byte_limit
+    )
+    if (
+        cumulative_background_record_delta
+        > cumulative_background_record_maximum
+    ):
+        block("cumulative_background_records_exceed_assumption")
+    if (
+        cumulative_background_logical_byte_delta
+        > cumulative_background_logical_byte_maximum
+    ):
+        block("cumulative_background_logical_bytes_exceed_assumption")
+
+    for window in policy["required_growth_windows_blocks"]:
+        prior = by_height.get(end_height - window)
+        if prior is None:
+            block(f"growth_window_{window}_unavailable")
+            continue
+        current_background_records = (
+            current["marker_records_scanned"]
+            - current["authenticated_shadow_records_scanned"]
+        )
+        prior_background_records = (
+            prior["marker_records_scanned"]
+            - prior["authenticated_shadow_records_scanned"]
+        )
+        current_background_logical_bytes = (
+            current["active_coin_batch_payload_bytes_scanned"]
+            - current["authenticated_shadow_batch_payload_bytes_scanned"]
+        )
+        prior_background_logical_bytes = (
+            prior["active_coin_batch_payload_bytes_scanned"]
+            - prior["authenticated_shadow_batch_payload_bytes_scanned"]
+        )
+        background_record_delta = max(
+            0, current_background_records - prior_background_records
+        )
+        background_logical_byte_delta = max(
+            0,
+            current_background_logical_bytes
+            - prior_background_logical_bytes,
+        )
+        record_rate = (
+            background_record_delta + window - 1
+        ) // window
+        logical_byte_rate = (
+            background_logical_byte_delta + window - 1
+        ) // window
+        authenticated_shadow_record_delta = max(
+            0,
+            current["authenticated_shadow_records_scanned"]
+            - prior["authenticated_shadow_records_scanned"],
+        )
+        authenticated_shadow_logical_byte_delta = max(
+            0,
+            current["authenticated_shadow_batch_payload_bytes_scanned"]
+            - prior[
+                "authenticated_shadow_batch_payload_bytes_scanned"
+            ],
+        )
+        (maximum_shadow_records,
+         maximum_shadow_logical_bytes) = modeled_shadow_growth(
+            prior["height"], current["height"]
+        )
+        shadow_within = (
+            authenticated_shadow_record_delta <= maximum_shadow_records
+            and authenticated_shadow_logical_byte_delta
+            <= maximum_shadow_logical_bytes
+        )
+        within = (
+            shadow_within
+            and record_rate <= record_limit
+            and logical_byte_rate <= logical_byte_limit
+        )
+        observations_report.append({
+            "window_blocks": window,
+            "active_record_delta": (
+                current["marker_records_scanned"]
+                - prior["marker_records_scanned"]
+            ),
+            "authenticated_shadow_record_delta": (
+                current["authenticated_shadow_records_scanned"]
+                - prior["authenticated_shadow_records_scanned"]
+            ),
+            "authenticated_shadow_record_growth_ceiling":
+                authenticated_shadow_record_delta,
+            "modeled_shadow_record_growth_maximum": maximum_shadow_records,
+            "background_record_growth_per_block_ceiling": record_rate,
+            "background_record_growth_per_block_limit": record_limit,
+            "active_logical_byte_delta": (
+                current["active_coin_batch_payload_bytes_scanned"]
+                - prior["active_coin_batch_payload_bytes_scanned"]
+            ),
+            "authenticated_shadow_logical_byte_delta": (
+                current[
+                    "authenticated_shadow_batch_payload_bytes_scanned"
+                ]
+                - prior[
+                    "authenticated_shadow_batch_payload_bytes_scanned"
+                ]
+            ),
+            "authenticated_shadow_logical_byte_growth_ceiling":
+                authenticated_shadow_logical_byte_delta,
+            "modeled_shadow_logical_byte_growth_maximum":
+                maximum_shadow_logical_bytes,
+            "background_logical_byte_growth_per_block_ceiling":
+                logical_byte_rate,
+            "background_logical_byte_growth_per_block_limit":
+                logical_byte_limit,
+            "within_operating_assumption": within,
+        })
+        if authenticated_shadow_record_delta > maximum_shadow_records:
+            block(f"growth_window_{window}_shadow_records_exceed_model")
+        if (
+            authenticated_shadow_logical_byte_delta
+            > maximum_shadow_logical_bytes
+        ):
+            block(
+                f"growth_window_{window}_shadow_logical_bytes_exceed_model"
+            )
+        if record_rate > record_limit:
+            block(f"growth_window_{window}_records_exceed_assumption")
+        if logical_byte_rate > logical_byte_limit:
+            block(
+                f"growth_window_{window}_logical_bytes_exceed_assumption"
+            )
+
+    provisional_blockers = {
+        reason for reason in blockers
+        if reason not in {
+            "minimum_block_span_unavailable",
+            "minimum_time_span_unavailable",
+        } and not (
+            reason.startswith("growth_window_")
+            and reason.endswith("_unavailable")
+        )
+    }
+    source_manifest_sha256 = hashlib.sha256(json.dumps(
+        live_evidence["source_files"], separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")).hexdigest()
+    return {
+        "schema": 1,
+        "target_sha": target_sha,
+        "contract_sha256": contract_sha,
+        "source_manifest_sha256": source_manifest_sha256,
+        "binaries": {
+            "blackcoind": live_evidence["binaries"]["blackcoind"],
+            "blackcoin_cli": live_evidence["binaries"]["blackcoin_cli"],
+            "synthetic_fixture": synthetic_fixture_binary,
+        },
+        "measurement_environment": live_evidence["measurement_environment"],
+        "live_fixture_binding": {
+            "fixture_manifest_sha256": fixture[
+                "fixture_manifest_sha256"
+            ],
+            "archive_sha256": fixture["archive_sha256"],
+            "archive_size_bytes": fixture["archive_size_bytes"],
+        },
+        "mode": policy["authorized_mode"],
+        "authorized_scope": policy["authorized_scope"],
+        "authorized": not blockers,
+        "provisional_mode": policy["provisional_mode"],
+        "provisional_authorized": not provisional_blockers,
+        "universal_consensus_bound": False,
+        "support_through_height": envelope["support_through_height"],
+        "evidence_end_height": end_height,
+        "evidence_end_hash": fixture["end_hash"],
+        "evidence_end_mediantime": current["block_mediantime"],
+        "observation_span_blocks": end_height - pre_height,
+        "observation_span_mediantime_seconds": (
+            current["block_mediantime"] - baseline["block_mediantime"]
+        ),
+        "evidence_captured_at_unix": fixture["captured_at_unix"],
+        "authorization_expires_at_unix": (
+            fixture["captured_at_unix"]
+            + policy["maximum_observation_end_age_seconds"]
+        ),
+        "required_growth_windows_blocks": policy[
+            "required_growth_windows_blocks"
+        ],
+        "growth_safety_multiplier": policy["growth_safety_multiplier"],
+        "policy_disk_amplification_factor": envelope[
+            "policy_disk_amplification_factor"
+        ],
+        "background_physical_reserve_bytes_per_block": envelope[
+            "background_physical_reserve_bytes_per_block"
+        ],
+        "cumulative_authenticated_shadow_growth": {
+            "record_growth_ceiling": cumulative_shadow_record_delta,
+            "modeled_record_growth_maximum":
+                cumulative_shadow_record_maximum,
+            "logical_byte_growth_ceiling":
+                cumulative_shadow_logical_byte_delta,
+            "modeled_logical_byte_growth_maximum":
+                cumulative_shadow_logical_byte_maximum,
+        },
+        "cumulative_background_growth": {
+            "record_growth_ceiling": cumulative_background_record_delta,
+            "record_growth_maximum":
+                cumulative_background_record_maximum,
+            "logical_byte_growth_ceiling":
+                cumulative_background_logical_byte_delta,
+            "logical_byte_growth_maximum":
+                cumulative_background_logical_byte_maximum,
+        },
+        "growth_windows": observations_report,
+        "blockers": blockers,
+        "scope": contract["qualification_scope"],
+    }
+
+
 def verify_live(repo: Path, contract_path: Path, evidence_path: Path,
                 manifest_path: Path, blackcoind: Path,
                 blackcoin_cli: Path, target_sha: str,
@@ -929,11 +1574,12 @@ def verify_live(repo: Path, contract_path: Path, evidence_path: Path,
          "target_sha", "tree_clean", "contract_sha256", "source_files",
          "measurement_environment", "qualification_scope",
          "binaries", "fixture", "phases", "leveldb",
+         "operational_observations",
          "maximum_peak_rss_bytes"},
         "live evidence",
     )
     if (evidence["schema"], evidence["status"], evidence["evidence_kind"]) != (
-            2, "complete", "current_live_partial_epoch"):
+            3, "complete", "current_live_partial_epoch"):
         raise RuntimeError("live evidence identity or status differs")
     if evidence["repository"] != contract["repository"] or evidence["target_sha"] != target_sha or evidence["tree_clean"] is not True:
         raise RuntimeError("live evidence is not bound to the clean target")
@@ -1032,6 +1678,9 @@ def verify_live(repo: Path, contract_path: Path, evidence_path: Path,
         raise RuntimeError("live claim inventory is inconsistent")
     if evidence["completed_epoch"] is not (height == live_contract["maximum_height"]):
         raise RuntimeError("live completed_epoch label differs from height")
+    verify_operational_observations(
+        evidence["operational_observations"], fixture, contract
+    )
 
     phases = evidence["phases"]
     require_keys(
@@ -1123,7 +1772,11 @@ def verify_live(repo: Path, contract_path: Path, evidence_path: Path,
         max(item["wal_bytes"] for item in endpoint_snapshots),
     ) > contract["budgets"]["maximum_wal_bytes"]:
         raise RuntimeError("live WAL exceeded its budget")
-    return evidence["measurement_environment"]
+    return {
+        "measurement_environment": evidence["measurement_environment"],
+        "evidence": evidence,
+        "contract_sha256": contract_sha,
+    }
 
 
 def main() -> int:
@@ -1138,6 +1791,9 @@ def main() -> int:
     parser.add_argument("--blackcoind", type=Path, required=True)
     parser.add_argument("--blackcoin-cli", type=Path, required=True)
     parser.add_argument("--target-sha", required=True)
+    parser.add_argument("--authorization-output", type=Path)
+    parser.add_argument("--require-production-authorization",
+                        action="store_true")
     args = parser.parse_args()
     try:
         repo = args.repo_root.resolve()
@@ -1146,22 +1802,49 @@ def main() -> int:
             repo, contract, args.synthetic_evidence.resolve(),
             args.synthetic_binary.resolve(), args.target_sha,
         )
-        live_environment = verify_live(
+        live_result = verify_live(
             repo, contract, args.live_evidence.resolve(),
             args.live_manifest.resolve(), args.blackcoind.resolve(),
             args.blackcoin_cli.resolve(), args.target_sha,
             args.live_manifest_sha256,
         )
-        if live_environment != decision["measurement_environment"]:
+        if live_result["measurement_environment"] != decision[
+                "measurement_environment"]:
             raise RuntimeError(
                 "paired evidence was measured on different host environments"
             )
+        contract_value = load_json(contract, "production resource contract")
+        authorization = derive_operational_authorization(
+            live_result["evidence"], contract_value, args.target_sha,
+            live_result["contract_sha256"], decision["fixture_binary"],
+        )
+        if args.authorization_output:
+            output = args.authorization_output.resolve()
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(
+                json.dumps(authorization, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        if args.require_production_authorization:
+            if not authorization["authorized"]:
+                raise RuntimeError(
+                    "scoped operational authorization blockers: "
+                    + ", ".join(authorization["blockers"])
+                )
+            if int(time.time()) > authorization[
+                    "authorization_expires_at_unix"]:
+                raise RuntimeError(
+                    "scoped operational authorization evidence is stale"
+                )
     except RuntimeError as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
     print(
         "Scoped synthetic full-epoch and current live partial-epoch resource "
-        f"evidence pass; compaction_required={decision['compaction_required']}."
+        "evidence pass; "
+        f"mode={authorization['mode']}; authorized={authorization['authorized']}; "
+        f"provisional_authorized={authorization['provisional_authorized']}; "
+        f"compaction_required={decision['compaction_required']}."
     )
     return 0
 

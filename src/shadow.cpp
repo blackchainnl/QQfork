@@ -6139,6 +6139,30 @@ bool IsAuthenticatedShadowMarkerOutpoint(const COutPoint& outpoint, const Coin& 
     return false;
 }
 
+bool IsModeledShadowResourceMarkerOutpoint(const COutPoint& outpoint,
+                                           const Coin& coin,
+                                           const CBlockIndex* pindexTip)
+{
+    if (!IsAuthenticatedShadowMarkerOutpoint(outpoint, coin, pindexTip)) {
+        return false;
+    }
+    valtype payload;
+    return ParseMarkerScript(coin.out.scriptPubKey,
+                             MARKER_DIRECT_CLAIM, &payload) ||
+        ParseMarkerScript(coin.out.scriptPubKey,
+                          MARKER_GOLD_RUSH_PAYOUT, &payload) ||
+        ParseMarkerScript(coin.out.scriptPubKey,
+                          MARKER_ACTIVE_SIGNAL_UNDO, &payload) ||
+        ParseMarkerScript(coin.out.scriptPubKey,
+                          MARKER_ACTIVE_SIGNAL_UNDO_SHARD, &payload) ||
+        ParseMarkerScript(coin.out.scriptPubKey,
+                          MARKER_POOL_UNDO, &payload) ||
+        ParseMarkerScript(coin.out.scriptPubKey,
+                          MARKER_SOLVER, &payload) ||
+        ParseMarkerScript(coin.out.scriptPubKey,
+                          MARKER_LOGICAL_PROOF_BUCKET, &payload);
+}
+
 bool DecodeAuthenticatedGoldRushPayoutMarker(const COutPoint& marker_outpoint,
                                              const Coin& marker_coin,
                                              const CBlockIndex* pindex_tip,

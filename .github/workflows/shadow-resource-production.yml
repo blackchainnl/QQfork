@@ -174,6 +174,7 @@ jobs:
           live_work="$STATE_ROOT/$TARGET_SHA/live-$FIXTURE_MANIFEST_SHA256"
           synthetic_output="$synthetic_work/shadow-resource-synthetic-$TARGET_SHA.json"
           live_output="$live_work/shadow-resource-live-$TARGET_SHA.json"
+          authorization_output="$live_work/shadow-resource-authorization-$TARGET_SHA.json"
           candidate_root="$STATE_ROOT/$TARGET_SHA"
           for path in "$candidate_root" "$synthetic_work" "$live_work"; do
             test ! -L "$path"
@@ -182,20 +183,28 @@ jobs:
           test "$(realpath "$candidate_root")" = \
             "$(realpath "$STATE_ROOT")/$TARGET_SHA"
 
-          logical=$(jq -r \
-            '.synthetic_fixture.retained_logical_batch_payload_bytes' \
-            ci/release/shadow_resource_production_contract.json)
           observed_ratio=$(jq -r \
             '.budgets.maximum_observed_physical_to_logical_ratio' \
             ci/release/shadow_resource_production_contract.json)
           test "$observed_ratio" = 3
           archive_bytes=$(stat -c %s "$FIXTURE_ARCHIVE")
           available=$(df --output=avail -B1 "$STATE_ROOT" | tail -n 1 | tr -d ' ')
-          allocated=$(du -sb "$candidate_root" | awk '{print $1}')
-          reserve=$((64 * 1024 * 1024 * 1024))
-          required=$((logical * 3 + archive_bytes * 3 + reserve))
+          modeled_chainstate=$(jq -r \
+            '.operational_envelope.maximum_estimated_chainstate_bytes' \
+            ci/release/shadow_resource_production_contract.json)
+          synthetic_physical=$(jq -r \
+            '.operational_envelope.modeled_shadow_physical_reserve_bytes' \
+            ci/release/shadow_resource_production_contract.json)
+          reserve=$(jq -r \
+            '.operational_envelope.minimum_free_bytes' \
+            ci/release/shadow_resource_production_contract.json)
+          # The exact synthetic DB and the separate live replay DB coexist
+          # until paired verification completes. Use allocated bytes (not
+          # apparent file lengths) and reserve both workloads simultaneously.
+          allocated=$(du -s -B1 "$candidate_root" | awk '{print $1}')
+          required=$((synthetic_physical + modeled_chainstate + archive_bytes * 3 + reserve))
           test $((available + allocated)) -ge "$required" || {
-            echo "::error::Insufficient protected-runner capacity for exact transient, fixture extraction, and reserve"
+            echo "::error::Insufficient protected-runner capacity for simultaneous synthetic state, live replay, fixture extraction, and reserve"
             exit 1
           }
 
@@ -229,10 +238,12 @@ jobs:
             --live-manifest-sha256 "$FIXTURE_MANIFEST_SHA256" \
             --blackcoind src/blackcoind \
             --blackcoin-cli src/blackcoin-cli \
-            --target-sha "$TARGET_SHA"
+            --target-sha "$TARGET_SHA" \
+            --authorization-output "$authorization_output"
 
           cp "$synthetic_output" "shadow-resource-synthetic-$TARGET_SHA.json"
           cp "$live_output" "shadow-resource-live-$TARGET_SHA.json"
+          cp "$authorization_output" "shadow-resource-authorization-$TARGET_SHA.json"
           cp "$FIXTURE_MANIFEST" "shadow-resource-live-fixture-$TARGET_SHA.json"
           cp "$SYNTHETIC_BINARY" shadow_resource_leveldb_fixture
 
@@ -243,6 +254,7 @@ jobs:
           path: |
             shadow-resource-synthetic-${{ env.TARGET_SHA }}.json
             shadow-resource-live-${{ env.TARGET_SHA }}.json
+            shadow-resource-authorization-${{ env.TARGET_SHA }}.json
             shadow-resource-live-fixture-${{ env.TARGET_SHA }}.json
             shadow_resource_leveldb_fixture
             ci/release/shadow_resource_production_contract.json
