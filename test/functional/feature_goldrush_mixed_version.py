@@ -846,14 +846,13 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
                              "invalid_location")
 
     def exercise_v2_clock_determinism(self, coin, change_script):
-        """Prove candidate/v30.1.0 block validity never depends on node time.
+        """Prove corrected v28/v30 block validity never depends on node time.
 
         A version-1 funding transaction preserves a nonzero serialized output
-        time. v26/v28 substitute local adjusted time for the omitted timestamp
-        of the version-2 spend, making their result depend on the verifier's
-        clock. The candidate must instead preserve the already-deployed v30.1.0
-        contract: ConnectBlock supplies the candidate block time to
-        CheckTxInputs.
+        time. v26 substitutes local adjusted time for the omitted timestamp of
+        the version-2 spend, making its result depend on the verifier's clock.
+        The corrected v28 pin, deployed v30.1.0, and candidate instead supply
+        the candidate block time to CheckTxInputs.
         """
         tip_time = self.nodes[CANDIDATE].getblockheader(
             self.nodes[CANDIDATE].getbestblockhash()
@@ -906,16 +905,16 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         self.nodes[2].setmocktime(early_time)
         self.nodes[CANDIDATE].setmocktime(late_time)
 
-        # The two historical generations expose the inherited clock seam. The
-        # already-deployed v30.1.0 and this candidate must agree despite clocks
-        # on opposite sides of the funding block time.
+        # v26 exposes the inherited clock seam. Corrected v28.4.0, the already
+        # deployed v30.1.0, and this candidate must agree despite clocks on
+        # opposite sides of the funding block time.
         assert_equal(
             self.nodes[REFERENCE].submitblock(raw_block),
             "bad-txns-time-earlier-than-input",
         )
         assert_equal(
             self.nodes[1].submitblock(raw_block),
-            "bad-txns-time-earlier-than-input",
+            None,
         )
         assert_equal(self.nodes[2].submitblock(raw_block), None)
         assert_equal(self.nodes[CANDIDATE].submitblock(raw_block), None)

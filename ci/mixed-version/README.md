@@ -17,7 +17,10 @@ whose tag object and peeled commit are both pinned. CoinBlack did not publish a
 v28.4.0 tag or GitHub release; the designated source is therefore the pinned
 28.x branch commit that declares itself v28.4.0. Any movement of that branch
 fails the provenance check until the manifest is deliberately reviewed and
-updated. A proper immutable v28.4.0 tag would remove this provenance gap.
+updated. The current pin is commit
+`c2455cdd6f43756fbca137a83d9d168dae4eb442`, the direct-child mainnet fix that
+replaces verifier-local wall time with block time for version-2 input checks.
+A proper immutable v28.4.0 tag would remove this provenance gap.
 
 The functional test starts all four real daemons, checks their RPC versions,
 relays blocks produced by every historical generation, then proves reorgs in
@@ -31,9 +34,9 @@ It complements rather than replaces the synthetic legacy-policy fixtures.
 
 The fee-ceiling fixture funds its staking inputs with serialized version-1
 transactions so every implementation records the same input timestamp. The
-known version-2 transaction clock seam is intentionally separate: the existing
-clock-regression fixture in this test covers the historical v26/v28 behavior
-and the deployed v30.1.0/candidate agreement.
+known version-2 transaction clock seam is intentionally separate: the
+clock-regression fixture now proves the historical v26 rejection and the
+corrected v28.4.0/deployed v30.1.0/candidate agreement.
 
 To build and run locally on x86-64 Linux:
 
