@@ -159,6 +159,7 @@ BASE_SCRIPTS = [
     'feature_goldrush_value_path.py',
     'feature_goldrush_pow_miner_e2e.py',
     'feature_goldrush_pow_contention.py --descriptors',
+    'feature_goldrush_qqp3_duplicate_claims.py --descriptors',
     'feature_goldrush_pow_claim_singleflight.py',
     'feature_goldrush_pos_signal.py',
     'feature_goldrush_pos_multiwallet_stress.py',
