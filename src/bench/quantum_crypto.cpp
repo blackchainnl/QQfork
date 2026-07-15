@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <memory>
 #include <set>
@@ -180,6 +181,76 @@ CTransactionRef MakeSyntheticPowClaim(const CScript& target,
     transaction.vout.emplace_back(COIN, target);
     transaction.vout.emplace_back(0, CScript{} << OP_RETURN << proof);
     return MakeTransactionRef(std::move(transaction));
+}
+
+bool SameSyntheticPowWork(const ShadowPowWork& lhs,
+                          const ShadowPowWork& rhs)
+{
+    return lhs.valid == rhs.valid && lhs.target == rhs.target &&
+           lhs.quantum_payout_script == rhs.quantum_payout_script &&
+           lhs.height == rhs.height && lhs.prev_hash == rhs.prev_hash &&
+           lhs.bits == rhs.bits && lhs.origin_bound == rhs.origin_bound &&
+           lhs.input_bound == rhs.input_bound &&
+           lhs.claim_outpoint == rhs.claim_outpoint;
+}
+
+const std::vector<std::vector<unsigned char>>& MaximumSyntheticPowProofs(
+    const ShadowPowWork& work)
+{
+    struct ProofCache {
+        ShadowPowWork work;
+        std::vector<std::vector<unsigned char>> proofs;
+    };
+
+    // The two synthetic-state benchmarks use identical deterministic work.
+    // Mine its distinct logical proofs once per benchmark process, then
+    // revalidate the cached bytes against each fixture. Reusing one proof in
+    // 64 carrier transactions would correctly collapse to one QQP3 logical
+    // proof and would no longer exercise the 64-evaluation production bound.
+    static const ProofCache cache = [&work] {
+        RequireSyntheticFixture(work.valid && work.origin_bound &&
+                                    !work.input_bound,
+                                "maximum synthetic PoW work is invalid");
+        ProofCache result{work, {}};
+        result.proofs.reserve(MAX_SHADOW_POW_EVALS_PER_BLOCK);
+        uint64_t start_nonce{0};
+        for (uint32_t ordinal = 0;
+             ordinal < MAX_SHADOW_POW_EVALS_PER_BLOCK; ++ordinal) {
+            std::vector<unsigned char> proof;
+            uint64_t tries_done{0};
+            RequireSyntheticFixture(
+                GrindShadowPowWorkDetailed(
+                    work, start_nonce, /*nonce_step=*/1,
+                    /*max_tries=*/1'000'000, proof, &tries_done) ==
+                        ShadowPowGrindResult::FOUND &&
+                    tries_done > 0 && !proof.empty(),
+                "cannot mine distinct maximum synthetic PoW proof");
+            result.proofs.push_back(std::move(proof));
+            if (ordinal + 1 < MAX_SHADOW_POW_EVALS_PER_BLOCK) {
+                RequireSyntheticFixture(
+                    std::numeric_limits<uint64_t>::max() - start_nonce >=
+                        tries_done,
+                    "maximum synthetic PoW nonce range overflowed");
+                start_nonce += tries_done;
+            }
+        }
+        const std::set<std::vector<unsigned char>> unique{
+            result.proofs.begin(), result.proofs.end()};
+        RequireSyntheticFixture(
+            unique.size() == MAX_SHADOW_POW_EVALS_PER_BLOCK,
+            "maximum synthetic PoW proofs are not byte-distinct");
+        return result;
+    }();
+
+    RequireSyntheticFixture(
+        SameSyntheticPowWork(cache.work, work) &&
+            cache.proofs.size() == MAX_SHADOW_POW_EVALS_PER_BLOCK &&
+            std::all_of(cache.proofs.begin(), cache.proofs.end(),
+                        [&work](const std::vector<unsigned char>& proof) {
+                            return ValidateShadowPowProofForWork(work, proof);
+                        }),
+        "cached maximum synthetic PoW proofs do not match current work");
+    return cache.proofs;
 }
 
 CBlockUndo MakeSyntheticUndo(const CBlock& block,
@@ -402,11 +473,9 @@ public:
         m_target = m_indexes[target_index_position].get();
 
         const CScript pow_target = CScript{} << OP_3;
-        std::vector<unsigned char> pow_proof;
-        RequireSyntheticFixture(
-            MineShadowProofData(pow_target, m_payouts.front(), m_parent,
-                                m_view, 1'000'000, pow_proof),
-            "cannot mine synthetic benchmark PoW proof");
+        const ShadowPowWork pow_work = PrepareShadowPowWork(
+            pow_target, m_payouts.front(), m_parent, m_view);
+        const auto& pow_proofs = MaximumSyntheticPowProofs(pow_work);
 
         m_block.vtx.push_back(MakeSyntheticCoinbase());
         m_block.vtx.push_back(MakeSyntheticCoinstake(m_targets.front()));
@@ -414,6 +483,7 @@ public:
         target_undo_scripts.reserve(
             1 + MAINNET_AUTHENTICATED_WHITELIST_ENTRIES +
             MAX_SHADOW_POW_EVALS_PER_BLOCK);
+        std::set<uint256> pow_logical_proof_ids;
         // Refreshing every signal in the measured block exercises the maximum
         // active-state manifest, shards, and undo shards at the same time as
         // the maximum authenticated claim family.
@@ -425,10 +495,19 @@ public:
         }
         for (uint32_t ordinal = 0;
              ordinal < MAX_SHADOW_POW_EVALS_PER_BLOCK; ++ordinal) {
-            m_block.vtx.push_back(MakeSyntheticPowClaim(
-                pow_target, pow_proof, ordinal));
+            const CTransactionRef claim = MakeSyntheticPowClaim(
+                pow_target, pow_proofs.at(ordinal), ordinal);
+            const auto logical_proof_id = GetShadowPowProofLogicalId(*claim);
+            RequireSyntheticFixture(
+                logical_proof_id &&
+                    pow_logical_proof_ids.insert(*logical_proof_id).second,
+                "maximum synthetic PoW proof identity is not distinct");
+            m_block.vtx.push_back(claim);
             target_undo_scripts.push_back(pow_target);
         }
+        RequireSyntheticFixture(
+            pow_logical_proof_ids.size() == MAX_SHADOW_POW_EVALS_PER_BLOCK,
+            "maximum synthetic PoW logical proof set is incomplete");
         m_undo = MakeSyntheticUndo(m_block, target_undo_scripts);
         m_parent_pool = GetShadowGoldRushInfo(m_view, m_parent);
         m_parent_signals = GetActiveShadowSignalPayouts(m_view, m_parent);
