@@ -42,6 +42,10 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.base_args = [
             "-allowunsafequantumkeyrpc=1",
+            # This fixture exercises PoW-claim wallet serialization. Keep
+            # background PoS from advancing the tip while a boundary claim is
+            # deliberately paused across restart.
+            "-staking=0",
             "-txindex=1",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=500",

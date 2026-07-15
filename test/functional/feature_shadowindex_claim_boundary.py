@@ -514,9 +514,12 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
         )
 
         self.log.info("Restart and full reindex reproduce QQP2 and QQP3 provenance")
+        # No further blocks are intentional. Disable the process-level staking
+        # thread for these final restarts so load-on-start wallets cannot race
+        # the exact indexed tip before their wallet RPCs are available.
         for restart_args in (
-            self.node_args,
-            self.node_args + ["-reindex"],
+            self.node_args + ["-staking=0"],
+            self.node_args + ["-staking=0", "-reindex"],
         ):
             self.restart_node(
                 0, extra_args=restart_args + [f"-mocktime={self.mock_time}"]
