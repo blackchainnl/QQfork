@@ -173,11 +173,13 @@ class ImportRescanTest(BitcoinTestFramework):
         self.add_nodes(self.num_nodes, extra_args=self.extra_args)
 
         # Import keys with pruning disabled
-        self.start_nodes(extra_args=[[]] * self.num_nodes)
+        self.start_nodes(extra_args=[["-autostartstaking=0"]] * self.num_nodes)
         self.import_deterministic_coinbase_privkeys()
         self.stop_nodes()
 
-        self.start_nodes(extra_args=[["-whitelist=noban@127.0.0.1"]] * self.num_nodes)
+        self.start_nodes(extra_args=[["-whitelist=noban@127.0.0.1", "-autostartstaking=0"]] * self.num_nodes)
+        for node in self.nodes:
+            assert_equal(node.get_wallet_rpc("").getstakinginfo()["enabled"], False)
         for i in range(1, self.num_nodes):
             self.connect_nodes(i, 0)
 
