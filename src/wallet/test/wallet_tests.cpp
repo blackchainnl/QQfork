@@ -46,7 +46,6 @@
 #include <validationinterface.h>
 #include <wallet/coincontrol.h>
 #include <wallet/context.h>
-#include <wallet/context.h>
 #include <wallet/quantum_stake_ops.h>
 #include <wallet/receive.h>
 #include <wallet/scriptpubkeyman.h>

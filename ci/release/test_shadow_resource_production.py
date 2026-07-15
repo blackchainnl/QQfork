@@ -201,7 +201,7 @@ class ShadowResourceProductionTest(unittest.TestCase):
                 def __enter__(self):
                     return iter(self.entries)
 
-                def __exit__(self, exc_type, exc_value, traceback):
+                def __exit__(self, _exc_type, _exc_value, _traceback):
                     return False
 
             with mock.patch.object(os, "scandir", RacingDirectory):

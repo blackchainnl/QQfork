@@ -363,7 +363,6 @@ class GoldRushPowClaimSingleFlightTest(BitcoinTestFramework):
         before_builtin_fault = self._quarantined_claim_txids(builtin)
         started = builtin.setpowmining(True, 1, 100, True)
         assert started["created_payout_key"]
-        builtin_payout = started["payout_address"]
         try:
             builtin_fault_txid = self._wait_for_new_quarantined_claim(builtin, before_builtin_fault)
         finally:
