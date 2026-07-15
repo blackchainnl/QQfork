@@ -3060,7 +3060,21 @@ bool BuildPosPayouts(const ShadowPoolState& credited_pool, const std::optional<C
         if (!next_total) return false;
         total_out = *next_total;
     }
-    return true;
+
+    // The PoS jackpot is one global pool. Allocation may coalesce multiple
+    // signalers that selected the same payout script, but it must never create
+    // or lose value by treating the pool as a per-signaler amount. Re-sum the
+    // materialized map independently so this also detects an overwrite or
+    // aggregation regression in payouts_out.
+    CAmount materialized_total{0};
+    for (const auto& payout : payouts_out) {
+        if (payout.second <= 0) return false;
+        const auto next = CheckedAddMoney(materialized_total, payout.second);
+        if (!next) return false;
+        materialized_total = *next;
+    }
+    return remainder == 0 && materialized_total == total_out &&
+           total_out == credited_pool.pos_amount;
 }
 
 ShadowPowClaimResult FindLegacyPowShadowClaims(const CBlock& block, const CBlockIndex* pindex,

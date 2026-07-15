@@ -1330,6 +1330,185 @@ BOOST_AUTO_TEST_CASE(pos_shadow_signal_lookback_pays_without_per_block_signal_an
     BOOST_REQUIRE(UndoShadowBlock(view, solve_block, &solve_index, &solve_undo));
 }
 
+BOOST_AUTO_TEST_CASE(pos_shadow_jackpot_is_split_once_across_active_signalers)
+{
+    CCoinsView base;
+    CCoinsViewCache view{&base, true};
+
+    const std::array<CScript, 3> targets{
+        CScript{} << OP_TRUE,
+        CScript{} << OP_2,
+        CScript{} << OP_3,
+    };
+    const std::array<CScript, 3> payouts{
+        QuantumScript(0x81),
+        QuantumScript(0x82),
+        QuantumScript(0x83),
+    };
+    for (size_t i = 0; i < targets.size(); ++i) {
+        AddCoinForScript(view,
+                         COutPoint{uint256{static_cast<uint8_t>(10 + i)}, 0},
+                         10'000 * COIN, targets[i]);
+    }
+
+    uint256 whitelist_hash;
+    CBlockIndex whitelist_index;
+    InitIndex(whitelist_index, SHADOW_WHITELIST_HEIGHT, nullptr,
+              whitelist_hash);
+    BOOST_REQUIRE(ApplyLegacyWhitelistSnapshot(view, &whitelist_index));
+    for (const CScript& target : targets) {
+        BOOST_REQUIRE(IsWhitelisted(view, target));
+    }
+
+    std::array<uint256, 3> solve_hashes;
+    std::array<CBlockIndex, 3> solve_indexes;
+    std::array<CBlock, 3> solve_blocks;
+    std::array<CBlockUndo, 3> solve_undos;
+    CBlockIndex* previous = &whitelist_index;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        InitIndex(solve_indexes[i], SHADOW_REWARD_START_HEIGHT + i,
+                  previous, solve_hashes[i]);
+        solve_blocks[i].vtx.push_back(MakeCoinbaseTx(CScript{} << OP_4));
+        solve_blocks[i].vtx.push_back(MakeCoinstakeTx(targets[i]));
+        solve_undos[i] = MakeUndoWithInputScripts(
+            solve_blocks[i], {{1, targets[i]}});
+        BOOST_REQUIRE(ApplyShadowBlock(view, solve_blocks[i],
+                                       &solve_indexes[i], &solve_undos[i]));
+        previous = &solve_indexes[i];
+    }
+
+    std::array<std::vector<unsigned char>, 3> signals;
+    for (size_t i = 0; i < targets.size(); ++i) {
+        BOOST_REQUIRE(BuildShadowSignalData(
+            targets[i], payouts[i], solve_indexes[i].nHeight,
+            solve_indexes[i].GetBlockHash(), signals[i]));
+    }
+
+    uint256 payout_hash;
+    CBlockIndex payout_index;
+    InitIndex(payout_index, SHADOW_REWARD_START_HEIGHT + targets.size(),
+              previous, payout_hash);
+    CBlock payout_block;
+    payout_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_4));
+    payout_block.vtx.push_back(MakeCoinstakeTx(targets[0]));
+    for (size_t i = 0; i < targets.size(); ++i) {
+        payout_block.vtx.push_back(MakeSignalTx(targets[i], signals[i], i));
+    }
+    CBlockUndo payout_undo = MakeUndoWithInputScripts(
+        payout_block,
+        {{1, targets[0]}, {2, targets[0]}, {3, targets[1]}, {4, targets[2]}});
+
+    // Four 290 BLK PoS credits form one 1,160 BLK jackpot. The satoshi
+    // remainder is assigned deterministically in active-target map order.
+    const CAmount jackpot = 4 * 290 * COIN;
+    const CAmount share = jackpot / targets.size();
+    const CAmount remainder = jackpot - share * targets.size();
+    BOOST_REQUIRE_EQUAL(remainder, 2);
+
+    std::map<CScript, CAmount> direct_payouts;
+    CAmount direct_total{0};
+    BOOST_REQUIRE(GetShadowPosDirectPayouts(
+        view, payout_block, &payout_index, &payout_undo,
+        direct_payouts, direct_total));
+    BOOST_REQUIRE_EQUAL(direct_payouts.size(), targets.size());
+    BOOST_CHECK_EQUAL(direct_total, jackpot);
+    BOOST_CHECK_EQUAL(direct_payouts[payouts[0]], share + 1);
+    BOOST_CHECK_EQUAL(direct_payouts[payouts[1]], share + 1);
+    BOOST_CHECK_EQUAL(direct_payouts[payouts[2]], share);
+    for (const auto& payout : direct_payouts) {
+        BOOST_CHECK_LT(payout.second, jackpot);
+    }
+
+    BOOST_REQUIRE(ApplyShadowBlock(
+        view, payout_block, &payout_index, &payout_undo));
+    const ShadowGoldRushInfo paid_info =
+        GetShadowGoldRushInfo(view, &payout_index);
+    BOOST_CHECK_EQUAL(paid_info.pos_amount, 0);
+    BOOST_CHECK_EQUAL(paid_info.claimed_amount, jackpot);
+
+    std::map<CScript, CAmount> applied_payouts;
+    CAmount applied_total{0};
+    BOOST_REQUIRE(GetAppliedShadowDirectPayouts(
+        view, &payout_index, applied_payouts, applied_total));
+    BOOST_CHECK(applied_payouts == direct_payouts);
+    BOOST_CHECK_EQUAL(applied_total, jackpot);
+
+    BOOST_REQUIRE(UndoShadowBlock(
+        view, payout_block, &payout_index, &payout_undo));
+    const ShadowGoldRushInfo rewound_info =
+        GetShadowGoldRushInfo(view, previous);
+    BOOST_CHECK_EQUAL(rewound_info.pos_amount, 3 * 290 * COIN);
+    BOOST_CHECK_EQUAL(rewound_info.claimed_amount, 0);
+    for (const CScript& payout : payouts) {
+        BOOST_CHECK_EQUAL(ScanShadowClaimMarkers(view, payout).count, 0U);
+        BOOST_CHECK_EQUAL(ScanSpendableCoins(view, payout).count, 0U);
+    }
+
+    // Two active targets may select the same quantum address. Their shares
+    // intentionally coalesce into one output, while the global jackpot is
+    // still allocated exactly once.
+    std::array<std::vector<unsigned char>, 3> shared_signals;
+    BOOST_REQUIRE(BuildShadowSignalData(
+        targets[0], payouts[0], solve_indexes[0].nHeight,
+        solve_indexes[0].GetBlockHash(), shared_signals[0]));
+    BOOST_REQUIRE(BuildShadowSignalData(
+        targets[1], payouts[0], solve_indexes[1].nHeight,
+        solve_indexes[1].GetBlockHash(), shared_signals[1]));
+    BOOST_REQUIRE(BuildShadowSignalData(
+        targets[2], payouts[2], solve_indexes[2].nHeight,
+        solve_indexes[2].GetBlockHash(), shared_signals[2]));
+
+    uint256 shared_hash;
+    CBlockIndex shared_index;
+    InitIndex(shared_index, SHADOW_REWARD_START_HEIGHT + targets.size(),
+              previous, shared_hash);
+    ++shared_index.nNonce;
+    shared_hash = shared_index.GetBlockHeader().GetHash();
+    BOOST_REQUIRE(shared_index.GetBlockHash() != payout_index.GetBlockHash());
+
+    CBlock shared_block;
+    shared_block.vtx.push_back(MakeCoinbaseTx(CScript{} << OP_4));
+    shared_block.vtx.push_back(MakeCoinstakeTx(targets[0]));
+    for (size_t i = 0; i < targets.size(); ++i) {
+        shared_block.vtx.push_back(
+            MakeSignalTx(targets[i], shared_signals[i], i));
+    }
+    CBlockUndo shared_undo = MakeUndoWithInputScripts(
+        shared_block,
+        {{1, targets[0]}, {2, targets[0]}, {3, targets[1]}, {4, targets[2]}});
+    std::map<CScript, CAmount> shared_payouts;
+    CAmount shared_total{0};
+    BOOST_REQUIRE(GetShadowPosDirectPayouts(
+        view, shared_block, &shared_index, &shared_undo,
+        shared_payouts, shared_total));
+    BOOST_REQUIRE_EQUAL(shared_payouts.size(), 2U);
+    BOOST_CHECK_EQUAL(shared_payouts[payouts[0]], 2 * share + 2);
+    BOOST_CHECK_EQUAL(shared_payouts[payouts[2]], share);
+    BOOST_CHECK_EQUAL(shared_total, jackpot);
+
+    BOOST_REQUIRE(ApplyShadowBlock(
+        view, shared_block, &shared_index, &shared_undo));
+    const ShadowGoldRushInfo shared_info =
+        GetShadowGoldRushInfo(view, &shared_index);
+    BOOST_CHECK_EQUAL(shared_info.pos_amount, 0);
+    BOOST_CHECK_EQUAL(shared_info.claimed_amount, jackpot);
+    BOOST_CHECK_EQUAL(ScanShadowClaimMarkers(view, payouts[0]).count, 1U);
+    BOOST_CHECK_EQUAL(ScanShadowClaimMarkers(view, payouts[0]).total,
+                      2 * share + 2);
+    BOOST_CHECK_EQUAL(ScanSpendableCoins(view, payouts[0]).count, 1U);
+    BOOST_CHECK_EQUAL(ScanSpendableCoins(view, payouts[0]).total,
+                      2 * share + 2);
+    BOOST_CHECK_EQUAL(ScanShadowClaimMarkers(view, payouts[2]).count, 1U);
+    BOOST_CHECK_EQUAL(ScanShadowClaimMarkers(view, payouts[2]).total, share);
+
+    BOOST_REQUIRE(UndoShadowBlock(
+        view, shared_block, &shared_index, &shared_undo));
+    BOOST_CHECK_EQUAL(ScanShadowClaimMarkers(view, payouts[0]).count, 0U);
+    BOOST_CHECK_EQUAL(ScanSpendableCoins(view, payouts[0]).count, 0U);
+    BOOST_CHECK_EQUAL(ScanShadowClaimMarkers(view, payouts[2]).count, 0U);
+    BOOST_CHECK_EQUAL(ScanSpendableCoins(view, payouts[2]).count, 0U);
+}
+
 BOOST_AUTO_TEST_CASE(active_signal_and_pool_state_are_atomic_and_fail_closed)
 {
     CCoinsView base;
