@@ -270,8 +270,13 @@ void AppendBlock(leveldb::WriteBatch& batch, uint64_t block_index, bool erase)
 
 std::string EncodeState(const State& state)
 {
+    std::array<char, 32> height_buffer{};
+    const auto [height_end, error] = std::to_chars(
+        height_buffer.data(), height_buffer.data() + height_buffer.size(),
+        state.height);
+    if (error != std::errc{}) Fail("cannot encode state height");
     return std::string{CONTRACT_ID} + ";" + state.phase + ";" +
-           std::to_string(state.height);
+           std::string{height_buffer.data(), height_end};
 }
 
 State DecodeState(const std::string& encoded)
