@@ -44,10 +44,11 @@ static constexpr uint8_t DB_CUSTOM_TIP{'T'};
 // replaces unbounded per-note/per-transaction claim data with a strict
 // top-64 detail set, fixed aggregates, and an authenticated commitment. Schema
 // 9 adds origin/inclusion provenance and late-claim classifications. Schema 10
-// adds QQP4 proof-version and exact fee-input provenance. The index is
-// auxiliary and fully reconstructible, so a
-// recognized older schema is wiped and rebuilt instead of being interpreted.
-static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{10};
+// adds QQP4 proof-version and exact fee-input provenance. Schema 11 adds
+// carrier-independent logical proof identity and duplicate/replay counters.
+// The index is auxiliary and fully reconstructible, so a recognized older
+// schema is wiped and rebuilt instead of being interpreted.
+static constexpr uint32_t SHADOW_INDEX_SCHEMA_VERSION{11};
 static constexpr size_t MAX_SCRIPT_QUERY_RESULTS{1000};
 static constexpr size_t DIRECT_QUANTUM_SCRIPT_SIZE{2 + QUANTUM_MIGRATION_PROGRAM_SIZE};
 
@@ -295,7 +296,8 @@ bool IsCreditedPowDisposition(ShadowPowClaimDisposition disposition)
 
 bool IsValidShadowPowClaimSource(const ShadowIndexPowClaimSource& source)
 {
-    if (source.txid.IsNull() || source.canonical_rank.IsNull() ||
+    if (source.txid.IsNull() || source.logical_proof_id.IsNull() ||
+        source.canonical_rank.IsNull() ||
         source.inclusion_height == 0 ||
         (source.origin_bound &&
          (source.origin_height == 0 ||
@@ -392,6 +394,7 @@ bool ShadowPowClaimSourcesEqual(const ShadowIndexPowClaimSource& lhs,
                                 const ShadowIndexPowClaimSource& rhs)
 {
     return lhs.txid == rhs.txid && lhs.vout == rhs.vout &&
+        lhs.logical_proof_id == rhs.logical_proof_id &&
         lhs.canonical_rank == rhs.canonical_rank &&
         lhs.base_fee == rhs.base_fee &&
         lhs.base_fee_known == rhs.base_fee_known &&
@@ -418,13 +421,14 @@ bool IsValidShadowPowClaimRecord(const ShadowIndexPowClaimRecord& record)
     case ShadowPowClaimDisposition::INVALID_BASE_FEE:
     case ShadowPowClaimDisposition::ORIGIN_MISMATCH:
     case ShadowPowClaimDisposition::ORIGIN_EXPIRED:
+    case ShadowPowClaimDisposition::ALREADY_ACCOUNTED:
     case ShadowPowClaimDisposition::WINNER:
     case ShadowPowClaimDisposition::REIMBURSED_LOSER:
     case ShadowPowClaimDisposition::REIMBURSED_LATE:
         break;
     default:
-        // Schema 10 represents structural and over-budget outcomes only in
-        // the fixed block aggregate; they can never have detail rows.
+        // Schema 11 represents structural, duplicate-carrier, and over-budget
+        // outcomes only in the fixed block aggregate; they cannot have rows.
         return false;
     }
     const bool credited_disposition =
@@ -472,11 +476,14 @@ bool IsValidShadowIndexBlockRecord(const ShadowIndexBlockRecord& record)
         summary.malformed_transaction_count + summary.invalid_proof_count +
         summary.wrong_mode_count + summary.unknown_mode_count +
         summary.origin_mismatch_count + summary.origin_expired_count +
+        summary.duplicate_logical_proof_count +
+        summary.already_accounted_count +
         summary.input_mismatch_count + summary.invalid_base_fee_count +
         summary.evaluation_limit_count;
     const uint64_t evaluated_breakdown =
         static_cast<uint64_t>(summary.invalid_proof_count) +
         summary.origin_mismatch_count + summary.origin_expired_count +
+        summary.already_accounted_count +
         summary.input_mismatch_count + summary.invalid_base_fee_count +
         summary.winner_count + summary.reimbursed_loser_count +
         summary.reimbursed_late_count;
@@ -1273,6 +1280,10 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
             pow_accounting_aggregate.origin_mismatch_count;
         block_record.pow_claims.origin_expired_count =
             pow_accounting_aggregate.origin_expired_count;
+        block_record.pow_claims.duplicate_logical_proof_count =
+            pow_accounting_aggregate.duplicate_logical_proof_count;
+        block_record.pow_claims.already_accounted_count =
+            pow_accounting_aggregate.already_accounted_count;
         block_record.pow_claims.evaluation_limit_count =
             pow_accounting_aggregate.evaluation_limit_count;
         block_record.pow_claims.accounting_commitment =
@@ -1311,6 +1322,7 @@ bool ShadowIndex::CustomAppend(const interfaces::BlockInfo& block)
         ShadowIndexPowClaimRecord claim_record;
         claim_record.source.txid = accounting.source_txid;
         claim_record.source.vout = accounting.source_vout;
+        claim_record.source.logical_proof_id = accounting.logical_proof_id;
         claim_record.source.canonical_rank = accounting.canonical_rank;
         claim_record.source.base_fee = accounting.base_fee;
         claim_record.source.base_fee_known = accounting.base_fee_known;

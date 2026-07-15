@@ -53,6 +53,7 @@ static const valtype MARKER_ACTIVE_SIGNAL_UNDO{'Q', 'Q', 'A', 'U', 'N', 'D'};
 static const valtype MARKER_ACTIVE_SIGNAL_UNDO_SHARD{'Q', 'Q', 'A', 'U', 'S', 'H'};
 static const valtype MARKER_REPLAY_STATE{'Q', 'Q', 'R', 'E', 'P', 'L', 'A', 'Y'};
 static const valtype MARKER_CLAIM_PAYOUT_TX{'Q', 'Q', 'C', 'P', 'A', 'Y'};
+static const valtype MARKER_LOGICAL_PROOF_BUCKET{'Q', 'Q', 'P', 'R', 'O', 'O', 'F', 'S'};
 static const valtype PROOF_MAGIC_V1{'Q', 'Q', 'P', '1'};
 static const valtype PROOF_MAGIC_V2{'Q', 'Q', 'P', '2'};
 static const valtype PROOF_MAGIC_V3{'Q', 'Q', 'P', '3'};
@@ -315,6 +316,8 @@ struct ShadowProof {
     COutPoint claim_outpoint;
 };
 
+bool DecodeProof(const valtype& proof, ShadowProof& decoded);
+
 CScript MarkerScript(const valtype& tag, const valtype& payload = {})
 {
     // This is not pruned by AddCoin() because it does not start with OP_RETURN,
@@ -399,6 +402,19 @@ COutPoint PoolUndoOutpoint(int height, const uint256& block_hash)
 COutPoint PoolUndoOutpoint(const CBlockIndex* pindex)
 {
     return PoolUndoOutpoint(pindex->nHeight, pindex->GetBlockHash());
+}
+
+COutPoint LogicalProofBucketOutpoint(int height, const uint256& block_hash)
+{
+    CHashWriter ss;
+    ss << std::string{"Quantum Quasar Logical POW Proof Bucket v1"}
+       << height << block_hash;
+    return COutPoint{ss.GetHash(), 0};
+}
+
+COutPoint LogicalProofBucketOutpoint(const CBlockIndex* pindex)
+{
+    return LogicalProofBucketOutpoint(pindex->nHeight, pindex->GetBlockHash());
 }
 
 COutPoint ReplayStateOutpoint()
@@ -617,6 +633,218 @@ valtype DataStreamBytes(const DataStream& stream)
 {
     const auto bytes = MakeUCharSpan(stream);
     return valtype(bytes.begin(), bytes.end());
+}
+
+uint256 LogicalPowProofId(const valtype& proof)
+{
+    ShadowProof decoded;
+    CHashWriter ss;
+    if (!DecodeProof(proof, decoded)) {
+        // Malformed payloads are never credited. Keep their bounded
+        // evaluation identity deterministic without allowing raw carrier
+        // serialization to affect a valid proof's logical identity.
+        ss << std::string{"Quantum Quasar Invalid POW Proof Identity v1"}
+           << proof;
+        return ss.GetHash();
+    }
+    ss << std::string{"Quantum Quasar Logical POW Proof Identity v1"}
+       << decoded.version
+       << static_cast<uint8_t>(decoded.mode)
+       << decoded.nonce
+       << decoded.target
+       << decoded.payout_script
+       << decoded.origin_bound;
+    if (decoded.origin_bound) {
+        ss << decoded.origin_height << decoded.origin_previous_block_hash;
+    }
+    ss << decoded.input_bound;
+    if (decoded.input_bound) ss << decoded.claim_outpoint;
+    return ss.GetHash();
+}
+
+struct LogicalProofBucket {
+    uint32_t height{0};
+    uint256 block_hash;
+    std::vector<uint256> proof_ids;
+};
+
+valtype EncodeLogicalProofBucket(const LogicalProofBucket& bucket)
+{
+    if (bucket.height == 0 || bucket.block_hash.IsNull() ||
+        bucket.proof_ids.size() > MAX_SHADOW_POW_EVALS_PER_BLOCK ||
+        !std::is_sorted(bucket.proof_ids.begin(), bucket.proof_ids.end()) ||
+        std::adjacent_find(bucket.proof_ids.begin(), bucket.proof_ids.end()) !=
+            bucket.proof_ids.end() ||
+        std::any_of(bucket.proof_ids.begin(), bucket.proof_ids.end(),
+                    [](const uint256& id) { return id.IsNull(); })) {
+        return {};
+    }
+    DataStream stream;
+    stream << uint8_t{1} << bucket.height << bucket.block_hash
+           << bucket.proof_ids;
+    return DataStreamBytes(stream);
+}
+
+bool DecodeLogicalProofBucket(const CScript& script, LogicalProofBucket& bucket)
+{
+    bucket = {};
+    valtype payload;
+    if (!ParseMarkerScript(script, MARKER_LOGICAL_PROOF_BUCKET, &payload) ||
+        payload.empty() || payload.size() > MAX_SCRIPT_SIZE) {
+        return false;
+    }
+    try {
+        DataStream stream{MakeUCharSpan(payload)};
+        uint8_t version{0};
+        stream >> version >> bucket.height >> bucket.block_hash >> bucket.proof_ids;
+        if (!stream.empty() || version != 1) return false;
+    } catch (const std::exception&) {
+        return false;
+    }
+    return bucket.height >= static_cast<uint32_t>(SHADOW_REWARD_START_HEIGHT) &&
+           bucket.height <= static_cast<uint32_t>(SHADOW_REWARD_END_HEIGHT) &&
+           !bucket.block_hash.IsNull() &&
+           bucket.proof_ids.size() <= MAX_SHADOW_POW_EVALS_PER_BLOCK &&
+           std::is_sorted(bucket.proof_ids.begin(), bucket.proof_ids.end()) &&
+           std::adjacent_find(bucket.proof_ids.begin(), bucket.proof_ids.end()) ==
+               bucket.proof_ids.end() &&
+           std::none_of(bucket.proof_ids.begin(), bucket.proof_ids.end(),
+                        [](const uint256& id) { return id.IsNull(); });
+}
+
+bool ReadLogicalProofBucket(const CCoinsViewCache& view,
+                            const CBlockIndex* pindex,
+                            LogicalProofBucket& bucket)
+{
+    bucket = {};
+    if (!pindex) return false;
+    Coin coin;
+    if (!view.GetCoin(LogicalProofBucketOutpoint(pindex), coin) ||
+        coin.IsSpent() || coin.out.nValue != 0 || !coin.fCoinBase ||
+        coin.fCoinStake ||
+        coin.nHeight != static_cast<uint32_t>(pindex->nHeight) ||
+        coin.nTime != static_cast<uint32_t>(pindex->GetBlockTime()) ||
+        !DecodeLogicalProofBucket(coin.out.scriptPubKey, bucket)) {
+        return false;
+    }
+    return bucket.height == static_cast<uint32_t>(pindex->nHeight) &&
+           bucket.block_hash == pindex->GetBlockHash();
+}
+
+bool WriteLogicalProofBucket(CCoinsViewCache& view,
+                             const CBlockIndex* pindex,
+                             std::vector<uint256> proof_ids)
+{
+    if (!pindex || proof_ids.size() > MAX_SHADOW_POW_EVALS_PER_BLOCK) {
+        return false;
+    }
+    std::sort(proof_ids.begin(), proof_ids.end());
+    if (std::adjacent_find(proof_ids.begin(), proof_ids.end()) !=
+        proof_ids.end()) return false;
+    LogicalProofBucket bucket{static_cast<uint32_t>(pindex->nHeight),
+                              pindex->GetBlockHash(), std::move(proof_ids)};
+    const valtype payload = EncodeLogicalProofBucket(bucket);
+    if (payload.empty()) return false;
+    const COutPoint outpoint = LogicalProofBucketOutpoint(pindex);
+    if (view.HaveCoin(outpoint)) return false;
+    Coin coin;
+    coin.out.nValue = 0;
+    coin.out.scriptPubKey = MarkerScript(MARKER_LOGICAL_PROOF_BUCKET, payload);
+    coin.fCoinBase = true;
+    coin.fCoinStake = false;
+    coin.nHeight = pindex->nHeight;
+    coin.nTime = pindex->GetBlockTime();
+    view.AddCoin(outpoint, std::move(coin), false);
+    return true;
+}
+
+bool ReadRecentLogicalProofs(const CCoinsViewCache& view,
+                             const CBlockIndex* tip,
+                             const Consensus::Params& consensus,
+                             std::set<uint256>& proof_ids)
+{
+    proof_ids.clear();
+    if (!tip) return true;
+    // Buckets exist only during the finite reward-height epoch. After Gold
+    // Rush, keep authenticating the final live window without requiring
+    // nonexistent Migration/Final buckets.
+    const int effective_tip_height = std::min(
+        tip->nHeight, SHADOW_REWARD_END_HEIGHT);
+    if (effective_tip_height <
+        consensus.nShadowCompetingClaimsActivationHeight) {
+        return true;
+    }
+    const CBlockIndex* effective_tip = SafeGetAncestor(
+        tip, effective_tip_height);
+    if (!effective_tip) return false;
+    const int first_height = std::max(
+        consensus.nShadowCompetingClaimsActivationHeight,
+        effective_tip_height -
+            static_cast<int>(SHADOW_POW_LATE_ORIGIN_WINDOW) + 1);
+    for (int height = effective_tip_height; height >= first_height; --height) {
+        const CBlockIndex* ancestor = SafeGetAncestor(effective_tip, height);
+        LogicalProofBucket bucket;
+        if (!ancestor || !ReadLogicalProofBucket(view, ancestor, bucket)) {
+            return false;
+        }
+        for (const uint256& proof_id : bucket.proof_ids) {
+            if (proof_ids.size() >=
+                static_cast<size_t>(MAX_SHADOW_POW_EVALS_PER_BLOCK) *
+                    SHADOW_POW_LATE_ORIGIN_WINDOW) {
+                return false;
+            }
+            if (!proof_ids.insert(proof_id).second) return false;
+        }
+    }
+    return true;
+}
+
+uint256 LogicalProofBucketWindowCommitment(
+    const CCoinsViewCache& view, const CBlockIndex* tip,
+    const Consensus::Params& consensus)
+{
+    CHashWriter ss;
+    ss << std::string{"Quantum Quasar Logical POW Proof Bucket Window v1"};
+    if (!tip) {
+        ss << false;
+        return ss.GetHash();
+    }
+    const int effective_tip_height = std::min(
+        tip->nHeight, SHADOW_REWARD_END_HEIGHT);
+    if (effective_tip_height <
+        consensus.nShadowCompetingClaimsActivationHeight) {
+        ss << false;
+        return ss.GetHash();
+    }
+    const CBlockIndex* effective_tip = SafeGetAncestor(
+        tip, effective_tip_height);
+    if (!effective_tip) {
+        ss << true << effective_tip_height << uint256{};
+        return ss.GetHash();
+    }
+    ss << true << consensus.nShadowCompetingClaimsActivationHeight
+       << SHADOW_REWARD_END_HEIGHT << SHADOW_POW_LATE_ORIGIN_WINDOW
+       << effective_tip_height << effective_tip->GetBlockHash();
+    const int first_height = std::max(
+        consensus.nShadowCompetingClaimsActivationHeight,
+        effective_tip_height -
+            static_cast<int>(SHADOW_POW_LATE_ORIGIN_WINDOW) + 1);
+    for (int height = first_height; height <= effective_tip_height; ++height) {
+        const CBlockIndex* ancestor = SafeGetAncestor(effective_tip, height);
+        const COutPoint outpoint = ancestor
+            ? LogicalProofBucketOutpoint(ancestor) : COutPoint{};
+        Coin coin;
+        const bool present = ancestor && view.GetCoin(outpoint, coin) &&
+                             !coin.IsSpent();
+        ss << height << (ancestor ? ancestor->GetBlockHash() : uint256{})
+           << outpoint << present;
+        if (present) {
+            ss << coin.nHeight << coin.nTime << coin.out.nValue
+               << coin.fCoinBase << coin.fCoinStake
+               << coin.out.scriptPubKey;
+        }
+    }
+    return ss.GetHash();
 }
 
 valtype EncodeGoldRushPayoutRecord(const GoldRushPayoutRecord& record)
@@ -1569,6 +1797,17 @@ valtype ReplayStateFingerprint(const Consensus::Params& consensus, const CBlockI
        << WhitelistStateCommitment(view)
        << GoldRushInventoryCoinCommitment(view)
        << Consensus::DemurrageInventoryCoinCommitment(view);
+    // The QQP3 boundary is still prospective on mainnet. Keep every
+    // pre-boundary v30.1.0 checkpoint byte-for-byte compatible, then bind the
+    // one-logical-proof rule and its authenticated bucket namespace from the
+    // already-announced competing-claim height onward. A node that ever ran a
+    // superseded prerelease past this height must rebuild its shadow state.
+    if (consensus.IsShadowCompetingClaimsActive(pindex->nHeight)) {
+        ss << std::string{"Quantum Quasar Logical POW Proof Accounting v1"}
+           << consensus.nShadowCompetingClaimsActivationHeight
+           << SHADOW_POW_LATE_ORIGIN_WINDOW
+           << LogicalProofBucketWindowCommitment(view, pindex, consensus);
+    }
     // QQP4 is disabled on mainnet in this release.  Do not alter the exact
     // deployed schema-12 checkpoint stream before a separately scheduled Q4
     // activation: doing so would strand a valid v30.1.0 chainstate behind an
@@ -2888,28 +3127,37 @@ ShadowPowClaimResult FindLegacyPowShadowClaims(const CBlock& block, const CBlock
 }
 
 struct CanonicalPowCandidate {
-    size_t tx_index{0};
-    uint32_t output_index{0};
-    uint256 txid;
+    struct Carrier {
+        size_t tx_index{0};
+        uint32_t output_index{0};
+        uint256 txid;
+        CAmount base_fee{0};
+    };
+
+    uint256 logical_proof_id;
     uint256 rank;
     valtype proof;
     ShadowProof decoded;
-    CAmount base_fee{0};
+    ShadowProof decoded_shape;
+    uint32_t observation_count{1};
+    bool proof_valid{false};
+    bool late_origin{false};
+    std::optional<Carrier> canonical_carrier;
+    std::optional<Carrier> fee_valid_carrier;
+    std::optional<Carrier> eligible_carrier;
 };
 
 uint256 CanonicalPowCandidateRankV1(int height,
                                    const uint256& previous_block_hash,
-                                   const uint256& txid,
-                                   uint32_t output_index,
-                                   const valtype& proof)
+                                   const uint256& logical_proof_id)
 {
     CHashWriter ss;
-    // This is the v30.1.1 rank scheduled for the QQP3 boundary. It must remain
-    // byte-for-byte stable for every post-boundary replay.
-    ss << std::string("Quantum Quasar Canonical POW Claim Rank v1")
+    // QQP3 has not activated on mainnet. Freeze its prospective rank to the
+    // canonical decoded proof identity, never mutable carrier bytes.
+    ss << std::string("Quantum Quasar Canonical POW Logical Proof Rank v1")
        << height
        << previous_block_hash
-       << txid << output_index << proof;
+       << logical_proof_id;
     return ss.GetHash();
 }
 
@@ -2931,9 +3179,66 @@ bool CanonicalPowCandidateLess(const CanonicalPowCandidate& lhs,
                                const CanonicalPowCandidate& rhs)
 {
     if (lhs.rank != rhs.rank) return lhs.rank < rhs.rank;
-    if (lhs.txid != rhs.txid) return lhs.txid < rhs.txid;
-    if (lhs.output_index != rhs.output_index) return lhs.output_index < rhs.output_index;
+    if (lhs.logical_proof_id != rhs.logical_proof_id) {
+        return lhs.logical_proof_id < rhs.logical_proof_id;
+    }
     return lhs.proof < rhs.proof;
+}
+
+bool CarrierLess(const CanonicalPowCandidate::Carrier& lhs,
+                 const CanonicalPowCandidate::Carrier& rhs)
+{
+    if (lhs.txid != rhs.txid) return lhs.txid < rhs.txid;
+    return lhs.output_index < rhs.output_index;
+}
+
+bool ReimbursementCarrierBetter(const CanonicalPowCandidate::Carrier& lhs,
+                                const CanonicalPowCandidate::Carrier& rhs)
+{
+    const CAmount lhs_reimbursement = std::min(lhs.base_fee, CENT);
+    const CAmount rhs_reimbursement = std::min(rhs.base_fee, CENT);
+    if (lhs_reimbursement != rhs_reimbursement) {
+        return lhs_reimbursement > rhs_reimbursement;
+    }
+    return CarrierLess(lhs, rhs);
+}
+
+void InsertLogicalPowCandidate(std::vector<CanonicalPowCandidate>& candidates,
+                               valtype proof, int height,
+                               const uint256& previous_block_hash,
+                               bool qqp4_rule_active)
+{
+    const uint256 logical_proof_id = LogicalPowProofId(proof);
+    const auto duplicate = std::find_if(
+        candidates.begin(), candidates.end(),
+        [&](const CanonicalPowCandidate& candidate) {
+            return candidate.logical_proof_id == logical_proof_id;
+        });
+    if (duplicate != candidates.end()) {
+        if (duplicate->observation_count < MAX_SHADOW_POW_NOTES_PER_BLOCK) {
+            ++duplicate->observation_count;
+        }
+        return;
+    }
+
+    CanonicalPowCandidate candidate;
+    candidate.logical_proof_id = logical_proof_id;
+    candidate.rank = qqp4_rule_active
+        ? CanonicalPowCandidateRankV2(height, previous_block_hash, proof)
+        : CanonicalPowCandidateRankV1(height, previous_block_hash,
+                                      logical_proof_id);
+    candidate.proof = std::move(proof);
+    if (candidates.size() < MAX_SHADOW_POW_EVALS_PER_BLOCK) {
+        candidates.push_back(std::move(candidate));
+        std::push_heap(candidates.begin(), candidates.end(),
+                       CanonicalPowCandidateLess);
+    } else if (CanonicalPowCandidateLess(candidate, candidates.front())) {
+        std::pop_heap(candidates.begin(), candidates.end(),
+                      CanonicalPowCandidateLess);
+        candidates.back() = std::move(candidate);
+        std::push_heap(candidates.begin(), candidates.end(),
+                       CanonicalPowCandidateLess);
+    }
 }
 
 std::vector<CanonicalPowCandidate> SelectCanonicalPowCandidates(
@@ -2963,29 +3268,9 @@ std::vector<CanonicalPowCandidate> SelectCanonicalPowCandidates(
                                          context.qqp4_rule_active) ==
                     ShadowProofPayloadMode::UNKNOWN ||
                 output_pos > std::numeric_limits<uint32_t>::max()) continue;
-            CanonicalPowCandidate candidate;
-            candidate.tx_index = tx_index;
-            candidate.output_index = static_cast<uint32_t>(output_pos);
-            candidate.txid = tx.GetHash();
-            candidate.rank = context.qqp4_rule_active
-                ? CanonicalPowCandidateRankV2(
-                      context.height, context.previous_block_hash, *extracted)
-                : CanonicalPowCandidateRankV1(
-                      context.height, context.previous_block_hash,
-                      candidate.txid, candidate.output_index, *extracted);
-            candidate.proof = *extracted;
-            if (candidates.size() < MAX_SHADOW_POW_EVALS_PER_BLOCK) {
-                candidates.push_back(std::move(candidate));
-                std::push_heap(candidates.begin(), candidates.end(),
-                               CanonicalPowCandidateLess);
-            } else if (CanonicalPowCandidateLess(candidate,
-                                                 candidates.front())) {
-                std::pop_heap(candidates.begin(), candidates.end(),
-                              CanonicalPowCandidateLess);
-                candidates.back() = std::move(candidate);
-                std::push_heap(candidates.begin(), candidates.end(),
-                               CanonicalPowCandidateLess);
-            }
+            InsertLogicalPowCandidate(candidates, *extracted, context.height,
+                                      context.previous_block_hash,
+                                      context.qqp4_rule_active);
         }
     }
     std::sort_heap(candidates.begin(), candidates.end(),
@@ -3034,6 +3319,9 @@ bool FinalizePowClaimAggregate(ShadowPowClaimResult& result,
         case ShadowPowClaimDisposition::REIMBURSED_LATE:
             counter = &result.aggregate.reimbursed_late_count;
             break;
+        case ShadowPowClaimDisposition::ALREADY_ACCOUNTED:
+            counter = &result.aggregate.already_accounted_count;
+            break;
         default:
             // Structural and over-budget dispositions are aggregate-only.
             return false;
@@ -3049,6 +3337,8 @@ bool FinalizePowClaimAggregate(ShadowPowClaimResult& result,
         result.aggregate.unknown_mode_count +
         result.aggregate.origin_mismatch_count +
         result.aggregate.origin_expired_count +
+        result.aggregate.duplicate_logical_proof_count +
+        result.aggregate.already_accounted_count +
         result.aggregate.input_mismatch_count +
         result.aggregate.invalid_base_fee_count +
         result.aggregate.evaluation_limit_count +
@@ -3058,13 +3348,12 @@ bool FinalizePowClaimAggregate(ShadowPowClaimResult& result,
     if (classified != result.aggregate.observed_count) return false;
 
     CHashWriter commitment;
-    // QQP3 accounting begins at the new v30.1.1 boundary. Preserve its exact
-    // domain and byte stream from 5,993,200 onward. QQP4 provenance gets an
-    // independent v3 commitment only after its own hard fork; appending fields
-    // to the v2 stream would silently change v30.1.1 QQP3 replay commitments.
+    // QQP3 has not yet activated on mainnet. Its prospective commitment binds
+    // carrier-independent proof identity plus duplicate/replay rejection.
+    // QQP4 keeps a separate domain for its exact-input provenance.
     commitment << std::string{context.qqp4_rule_active
-                                  ? "Quantum Quasar Bounded POW Claim Accounting v3"
-                                  : "Quantum Quasar Bounded POW Claim Accounting v2"}
+                                  ? "Quantum Quasar Bounded POW Claim Accounting v4"
+                                  : "Quantum Quasar Bounded POW Claim Accounting v3"}
                << context.height << context.previous_block_hash
                << context.credited_pow_pool << context.target_bits
                << observation_commitment
@@ -3077,6 +3366,8 @@ bool FinalizePowClaimAggregate(ShadowPowClaimResult& result,
                << result.aggregate.unknown_mode_count
                << result.aggregate.origin_mismatch_count
                << result.aggregate.origin_expired_count
+               << result.aggregate.duplicate_logical_proof_count
+               << result.aggregate.already_accounted_count
                << result.aggregate.input_mismatch_count
                << result.aggregate.invalid_base_fee_count
                << result.aggregate.evaluation_limit_count
@@ -3085,6 +3376,7 @@ bool FinalizePowClaimAggregate(ShadowPowClaimResult& result,
                << result.aggregate.reimbursed_late_count;
     for (const ShadowPowClaimAccounting& accounting : result.accounting) {
         commitment << accounting.source_txid << accounting.source_vout
+                   << accounting.logical_proof_id
                    << accounting.canonical_rank << accounting.payout_script
                    << accounting.base_fee << accounting.credited_amount
                    << accounting.base_fee_known;
@@ -3118,9 +3410,10 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
                  << context.height << context.previous_block_hash
                  << block.GetHash();
 
-    // Stream every output and retain only the lowest 64 canonical candidates.
-    // This makes both validation memory and the later index batch independent
-    // of the number of QQSPROOF-shaped outputs in a legacy-valid block.
+    // Stream every output and retain only the lowest 64 *logical proofs*.
+    // Carrier variants of the same decoded proof share one candidate and one
+    // Argon2 evaluation, so cheap transaction grinding cannot multiply rank
+    // chances or consume the bounded proof budget.
     std::vector<CanonicalPowCandidate> candidates;
     candidates.reserve(MAX_SHADOW_POW_EVALS_PER_BLOCK);
     uint32_t candidate_count{0};
@@ -3191,35 +3484,31 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
                 result.internal_error = true;
                 return result;
             }
-            CanonicalPowCandidate candidate;
-            candidate.tx_index = tx_index;
-            candidate.output_index = output_index;
-            candidate.txid = txid;
-            candidate.rank = context.qqp4_rule_active
-                ? CanonicalPowCandidateRankV2(
-                      context.height, context.previous_block_hash, proof)
-                : CanonicalPowCandidateRankV1(
-                      context.height, context.previous_block_hash, candidate.txid,
-                      output_index, proof);
-            candidate.proof = std::move(proof);
-            if (candidates.size() < MAX_SHADOW_POW_EVALS_PER_BLOCK) {
-                candidates.push_back(std::move(candidate));
-                std::push_heap(candidates.begin(), candidates.end(),
-                               CanonicalPowCandidateLess);
-            } else if (CanonicalPowCandidateLess(candidate,
-                                                 candidates.front())) {
-                std::pop_heap(candidates.begin(), candidates.end(),
-                              CanonicalPowCandidateLess);
-                candidates.back() = std::move(candidate);
-                std::push_heap(candidates.begin(), candidates.end(),
-                               CanonicalPowCandidateLess);
-            }
+            InsertLogicalPowCandidate(candidates, std::move(proof),
+                                      context.height,
+                                      context.previous_block_hash,
+                                      context.qqp4_rule_active);
         }
     }
     std::sort_heap(candidates.begin(), candidates.end(),
                    CanonicalPowCandidateLess);
-    result.aggregate.evaluation_limit_count =
-        candidate_count - static_cast<uint32_t>(candidates.size());
+    uint32_t selected_observations{0};
+    for (const CanonicalPowCandidate& candidate : candidates) {
+        if (candidate.observation_count == 0 ||
+            selected_observations > MAX_SHADOW_POW_NOTES_PER_BLOCK -
+                candidate.observation_count) {
+            result.internal_error = true;
+            return result;
+        }
+        selected_observations += candidate.observation_count;
+        result.aggregate.duplicate_logical_proof_count +=
+            candidate.observation_count - 1;
+    }
+    if (selected_observations > candidate_count) {
+        result.internal_error = true;
+        return result;
+    }
+    result.aggregate.evaluation_limit_count = candidate_count - selected_observations;
     result.proof_limit_exceeded = result.aggregate.evaluation_limit_count > 0;
     const uint256 observation_commitment = observations.GetHash();
 
@@ -3233,8 +3522,7 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
         CanonicalPowCandidate& candidate = candidates[candidate_index];
         result.accounting.emplace_back();
         ShadowPowClaimAccounting& accounting = result.accounting.back();
-        accounting.source_txid = candidate.txid;
-        accounting.source_vout = candidate.output_index;
+        accounting.logical_proof_id = candidate.logical_proof_id;
         accounting.canonical_rank = candidate.rank;
         accounting.inclusion_height = static_cast<uint32_t>(context.height);
 
@@ -3248,26 +3536,27 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
             continue;
         }
 
-        ShadowProof decoded_shape;
-        if (!DecodeProof(candidate.proof, decoded_shape)) continue;
-        accounting.payout_script = decoded_shape.payout_script;
-        accounting.proof_version = decoded_shape.version;
-        accounting.origin_bound = decoded_shape.origin_bound;
-        accounting.origin_height = decoded_shape.origin_bound
-            ? decoded_shape.origin_height
+        if (!DecodeProof(candidate.proof, candidate.decoded_shape)) continue;
+        accounting.payout_script = candidate.decoded_shape.payout_script;
+        accounting.proof_version = candidate.decoded_shape.version;
+        accounting.origin_bound = candidate.decoded_shape.origin_bound;
+        accounting.origin_height = candidate.decoded_shape.origin_bound
+            ? candidate.decoded_shape.origin_height
             : static_cast<uint32_t>(context.height);
-        accounting.origin_previous_block_hash = decoded_shape.origin_bound
-            ? decoded_shape.origin_previous_block_hash
+        accounting.origin_previous_block_hash = candidate.decoded_shape.origin_bound
+            ? candidate.decoded_shape.origin_previous_block_hash
             : context.previous_block_hash;
-        accounting.input_bound = decoded_shape.input_bound;
-        accounting.claim_outpoint = decoded_shape.claim_outpoint;
+        accounting.input_bound = candidate.decoded_shape.input_bound;
+        accounting.claim_outpoint = candidate.decoded_shape.claim_outpoint;
 
         // QQP4's exact-input rule is a separate future hard fork. Until it
         // activates, retain the scheduled v30.1.1 QQP2/QQP3 accounting,
         // including QQP3 late-origin reimbursement.
         if (context.qqp4_rule_active &&
-            (decoded_shape.version != 4 || !decoded_shape.origin_bound ||
-             !decoded_shape.input_bound || decoded_shape.claim_outpoint.IsNull())) {
+            (candidate.decoded_shape.version != 4 ||
+             !candidate.decoded_shape.origin_bound ||
+             !candidate.decoded_shape.input_bound ||
+             candidate.decoded_shape.claim_outpoint.IsNull())) {
             accounting.disposition = ShadowPowClaimDisposition::INVALID_PROOF;
             continue;
         }
@@ -3276,22 +3565,22 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
         uint256 proof_previous_block_hash = context.previous_block_hash;
         unsigned int proof_target_bits = context.target_bits;
         bool late_origin{false};
-        if (decoded_shape.origin_bound) {
-            if (decoded_shape.origin_height >
+        if (candidate.decoded_shape.origin_bound) {
+            if (candidate.decoded_shape.origin_height >
                 static_cast<uint32_t>(context.height)) {
                 accounting.disposition =
                     ShadowPowClaimDisposition::ORIGIN_MISMATCH;
                 continue;
             }
             accounting.origin_age = static_cast<uint32_t>(context.height) -
-                                    decoded_shape.origin_height;
+                                    candidate.decoded_shape.origin_height;
             if (accounting.origin_age > SHADOW_POW_LATE_ORIGIN_WINDOW) {
                 accounting.disposition =
                     ShadowPowClaimDisposition::ORIGIN_EXPIRED;
                 continue;
             }
             if (accounting.origin_age == 0) {
-                if (decoded_shape.origin_previous_block_hash !=
+                if (candidate.decoded_shape.origin_previous_block_hash !=
                     context.previous_block_hash) {
                     accounting.disposition =
                         ShadowPowClaimDisposition::ORIGIN_MISMATCH;
@@ -3301,9 +3590,9 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
                 const auto origin = std::find_if(
                     context.late_origins.begin(), context.late_origins.end(),
                     [&](const ShadowPowOriginContext& item) {
-                        return item.height == decoded_shape.origin_height &&
+                        return item.height == candidate.decoded_shape.origin_height &&
                                item.previous_block_hash ==
-                                   decoded_shape.origin_previous_block_hash;
+                                   candidate.decoded_shape.origin_previous_block_hash;
                     });
                 if (origin == context.late_origins.end()) {
                     accounting.disposition =
@@ -3315,6 +3604,14 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
                 proof_target_bits = origin->target_bits;
                 late_origin = true;
             }
+        }
+
+        candidate.late_origin = late_origin;
+        if (context.accounted_logical_proofs.count(
+                candidate.logical_proof_id) != 0) {
+            accounting.disposition =
+                ShadowPowClaimDisposition::ALREADY_ACCOUNTED;
+            continue;
         }
 
         // Validation ran before fee/input classification in the deployed
@@ -3338,35 +3635,114 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
             return result;
         }
         if (status != ShadowProofValidationResult::VALID) continue;
+        candidate.proof_valid = true;
+    }
 
-        const CTransaction& tx = *block.vtx[candidate.tx_index];
-        const ShadowBaseFeeResult fee_result = GetShadowClaimBaseFee(
-            tx, candidate.tx_index, blockundo, candidate.base_fee);
-        if (fee_result == ShadowBaseFeeResult::LOCAL_INTERNAL_ERROR) {
+    // Pick one carrier only after the logical proof has been classified. An
+    // invalid copied wrapper can therefore never suppress a valid carrier.
+    // Among eligible carriers, maximize the actual reimbursable fee (capped
+    // at CENT) and then use txid/vout as the deterministic tie-break.
+    std::map<uint256, size_t> selected;
+    for (size_t candidate_index = 0; candidate_index < candidates.size();
+         ++candidate_index) {
+        if (!selected.emplace(candidates[candidate_index].logical_proof_id,
+                              candidate_index).second) {
             result.internal_error = true;
             return result;
         }
-        if (fee_result != ShadowBaseFeeResult::VALID) {
-            accounting.disposition = ShadowPowClaimDisposition::INVALID_BASE_FEE;
+    }
+    for (size_t tx_index = 0; tx_index < block.vtx.size(); ++tx_index) {
+        const CTransaction& tx = *block.vtx[tx_index];
+        if (!proof_of_stake_block || tx.IsCoinBase() || tx.IsCoinStake()) continue;
+        uint32_t proof_count{0};
+        for (const CTxOut& output : tx.vout) {
+            if (ExtractProofPayload(output.scriptPubKey) &&
+                !IncrementPowAggregate(proof_count)) {
+                result.internal_error = true;
+                return result;
+            }
+        }
+        if (proof_count != 1) continue;
+        for (size_t output_pos = 0; output_pos < tx.vout.size(); ++output_pos) {
+            const auto proof = ExtractProofPayload(tx.vout[output_pos].scriptPubKey);
+            if (!proof || output_pos > std::numeric_limits<uint32_t>::max()) continue;
+            const auto match = selected.find(LogicalPowProofId(*proof));
+            if (match == selected.end()) continue;
+            CanonicalPowCandidate& candidate = candidates[match->second];
+            CanonicalPowCandidate::Carrier carrier{
+                tx_index, static_cast<uint32_t>(output_pos), tx.GetHash(), 0};
+            if (!candidate.canonical_carrier ||
+                CarrierLess(carrier, *candidate.canonical_carrier)) {
+                candidate.canonical_carrier = carrier;
+            }
+            if (!candidate.proof_valid) continue;
+
+            const ShadowBaseFeeResult fee_result = GetShadowClaimBaseFee(
+                tx, tx_index, blockundo, carrier.base_fee);
+            if (fee_result == ShadowBaseFeeResult::LOCAL_INTERNAL_ERROR) {
+                result.internal_error = true;
+                return result;
+            }
+            if (fee_result != ShadowBaseFeeResult::VALID) continue;
+            if (!candidate.fee_valid_carrier ||
+                ReimbursementCarrierBetter(
+                    carrier, *candidate.fee_valid_carrier)) {
+                candidate.fee_valid_carrier = carrier;
+            }
+            const bool spends_target = context.qqp4_rule_active
+                ? TxSpendsBoundOutpointFromScript(
+                      tx, tx_index, blockundo,
+                      candidate.decoded_shape.claim_outpoint,
+                      candidate.decoded_shape.target)
+                : TxSpendsFromScript(tx, tx_index, blockundo,
+                                     candidate.decoded_shape.target);
+            if (spends_target &&
+                (!candidate.eligible_carrier ||
+                 ReimbursementCarrierBetter(
+                     carrier, *candidate.eligible_carrier))) {
+                candidate.eligible_carrier = carrier;
+            }
+        }
+    }
+
+    for (size_t candidate_index = 0; candidate_index < candidates.size();
+         ++candidate_index) {
+        CanonicalPowCandidate& candidate = candidates[candidate_index];
+        ShadowPowClaimAccounting& accounting = result.accounting[candidate_index];
+        if (!candidate.canonical_carrier) {
+            result.internal_error = true;
+            return result;
+        }
+        const CanonicalPowCandidate::Carrier* source =
+            &*candidate.canonical_carrier;
+        if (candidate.proof_valid && candidate.fee_valid_carrier) {
+            source = &*candidate.fee_valid_carrier;
+            accounting.base_fee = source->base_fee;
+            accounting.base_fee_known = true;
+        }
+        if (candidate.proof_valid && candidate.eligible_carrier) {
+            source = &*candidate.eligible_carrier;
+            accounting.base_fee = source->base_fee;
+            accounting.base_fee_known = true;
+        }
+        accounting.source_txid = source->txid;
+        accounting.source_vout = source->output_index;
+
+        if (!candidate.proof_valid) continue;
+        if (!candidate.fee_valid_carrier) {
+            accounting.disposition =
+                ShadowPowClaimDisposition::INVALID_BASE_FEE;
             continue;
         }
-        accounting.base_fee = candidate.base_fee;
-        accounting.base_fee_known = true;
-        const bool spends_bound_input = context.qqp4_rule_active
-            ? TxSpendsBoundOutpointFromScript(
-                  tx, candidate.tx_index, blockundo,
-                  decoded_shape.claim_outpoint, decoded_shape.target)
-            : TxSpendsFromScript(tx, candidate.tx_index, blockundo,
-                                 decoded_shape.target);
-        if (!spends_bound_input) {
+        if (!candidate.eligible_carrier) {
             accounting.disposition = ShadowPowClaimDisposition::INPUT_MISMATCH;
             continue;
         }
-
-        accounting.disposition = late_origin
+        accounting.disposition = candidate.late_origin
             ? ShadowPowClaimDisposition::REIMBURSED_LATE
             : ShadowPowClaimDisposition::REIMBURSED_LOSER;
-        (late_origin ? late_valid : current_valid).push_back(candidate_index);
+        (candidate.late_origin ? late_valid : current_valid)
+            .push_back(candidate_index);
     }
 
     result.valid_claim_count = static_cast<uint32_t>(
@@ -3389,7 +3765,7 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
     CAmount total_reimbursements{0};
     auto add_reimbursement = [&](size_t candidate_index) {
         const CAmount reimbursement = std::min(
-            candidates[candidate_index].base_fee, CENT);
+            result.accounting[candidate_index].base_fee, CENT);
         const auto next = CheckedAddMoney(total_reimbursements, reimbursement);
         if (!next) return false;
         total_reimbursements = *next;
@@ -3419,7 +3795,7 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
     for (size_t i = 0; i < current_valid.size(); ++i) {
         const CAmount amount = i == 0
             ? context.credited_pow_pool - total_reimbursements
-            : std::min(candidates[current_valid[i]].base_fee, CENT);
+            : std::min(result.accounting[current_valid[i]].base_fee, CENT);
         ShadowPowClaimAccounting& accounting =
             result.accounting[current_valid[i]];
         accounting.disposition = i == 0
@@ -3431,7 +3807,7 @@ ShadowPowClaimResult FindCanonicalPowShadowClaimsImpl(
     result.current_winner = !current_valid.empty();
     for (const size_t candidate_index : late_valid) {
         const CAmount amount = std::min(
-            candidates[candidate_index].base_fee, CENT);
+            result.accounting[candidate_index].base_fee, CENT);
         ShadowPowClaimAccounting& accounting =
             result.accounting[candidate_index];
         accounting.disposition = ShadowPowClaimDisposition::REIMBURSED_LATE;
@@ -4674,6 +5050,11 @@ ShadowPowAccountingResult PrepareShadowPowClaimAccounting(
         consensus.nShadowCompetingClaimsActivationHeight;
     context_out.qqp4_activation_height =
         consensus.nShadowQQP4ActivationHeight;
+    if (context_out.canonical_rule_active &&
+        !ReadRecentLogicalProofs(view, pindex->pprev, consensus,
+                                 context_out.accounted_logical_proofs)) {
+        return ShadowPowAccountingResult::LOCAL_INTERNAL_ERROR;
+    }
     context_out.valid = true;
     return ShadowPowAccountingResult::OK;
 }
@@ -4910,6 +5291,7 @@ bool IsShadowMarkerScript(const CScript& script)
            ParseMarkerScript(script, MARKER_ACTIVE_SIGNAL_SHARD) ||
            ParseMarkerScript(script, MARKER_ACTIVE_SIGNAL_UNDO) ||
            ParseMarkerScript(script, MARKER_ACTIVE_SIGNAL_UNDO_SHARD) ||
+           ParseMarkerScript(script, MARKER_LOGICAL_PROOF_BUCKET) ||
            ParseMarkerScript(script, MARKER_REPLAY_STATE);
 }
 
@@ -4990,6 +5372,13 @@ bool HasCurrentShadowReplayState(const CCoinsViewCache& view, const Consensus::P
     // exhaustive auditor is reserved for explicit maintenance and migration QA.
     if (!ValidateGoldRushInventorySummary(view, pindex)) return false;
     if (!Consensus::HasCurrentDemurrageInventory(view, pindex, consensus)) return false;
+    if (consensus.IsShadowCompetingClaimsActive(pindex->nHeight)) {
+        std::set<uint256> recent_logical_proofs;
+        if (!ReadRecentLogicalProofs(view, pindex, consensus,
+                                     recent_logical_proofs)) {
+            return false;
+        }
+    }
     Coin coin;
     valtype payload;
     const CBlockIndex* marker_block{nullptr};
@@ -5465,12 +5854,58 @@ COutPoint ShadowReplayStateOutpointForTesting()
     return ReplayStateOutpoint();
 }
 
+COutPoint ShadowLogicalProofBucketOutpointForTesting(
+    const CBlockIndex* pindex)
+{
+    return pindex ? LogicalProofBucketOutpoint(pindex) : COutPoint{};
+}
+
+bool WriteShadowLogicalProofBucketForTesting(
+    CCoinsViewCache& view, const CBlockIndex* pindex, size_t proof_count)
+{
+    if (proof_count > MAX_SHADOW_POW_EVALS_PER_BLOCK) return false;
+    std::vector<uint256> proof_ids;
+    proof_ids.reserve(proof_count);
+    for (size_t index = 0; index < proof_count; ++index) {
+        uint256 proof_id;
+        proof_id.begin()[0] = static_cast<unsigned char>(index + 1);
+        proof_ids.push_back(proof_id);
+    }
+    return WriteLogicalProofBucket(view, pindex, std::move(proof_ids));
+}
+
+bool ValidateShadowLogicalProofWindowForTesting(
+    const CCoinsViewCache& view, const CBlockIndex* tip,
+    const Consensus::Params& consensus)
+{
+    std::set<uint256> proof_ids;
+    return ReadRecentLogicalProofs(view, tip, consensus, proof_ids);
+}
+
 bool TransactionHasShadowProof(const CTransaction& tx)
 {
     for (const CTxOut& out : tx.vout) {
         if (ExtractProofPayload(out.scriptPubKey)) return true;
     }
     return false;
+}
+
+std::optional<uint256> GetShadowPowProofLogicalId(const CTransaction& tx)
+{
+    std::optional<uint256> logical_proof_id;
+    for (const CTxOut& out : tx.vout) {
+        const std::optional<valtype> proof =
+            ExtractProofPayload(out.scriptPubKey);
+        if (!proof) continue;
+        if (logical_proof_id) return std::nullopt;
+        ShadowProof decoded;
+        if (!DecodeProof(*proof, decoded) ||
+            decoded.mode != ShadowProofMode::POW) {
+            return std::nullopt;
+        }
+        logical_proof_id = LogicalPowProofId(*proof);
+    }
+    return logical_proof_id;
 }
 
 std::optional<COutPoint> GetShadowPowProofBoundOutpoint(
@@ -5631,6 +6066,15 @@ bool IsAuthenticatedShadowMarkerOutpoint(const COutPoint& outpoint, const Coin& 
     }
     if (ParseMarkerScript(coin.out.scriptPubKey, MARKER_ACTIVE_SIGNAL_UNDO, &payload)) {
         return false; // the deterministic per-block outpoint was handled above
+    }
+    if (ParseMarkerScript(coin.out.scriptPubKey,
+                          MARKER_LOGICAL_PROOF_BUCKET, &payload)) {
+        LogicalProofBucket bucket;
+        return branch_metadata_valid &&
+               DecodeLogicalProofBucket(coin.out.scriptPubKey, bucket) &&
+               bucket.height == coin.nHeight &&
+               bucket.block_hash == coin_block->GetBlockHash() &&
+               outpoint == LogicalProofBucketOutpoint(coin_block);
     }
     if (ParseMarkerScript(coin.out.scriptPubKey, MARKER_SOLVER, &payload)) {
         if (!pindexTip || coin.nHeight > static_cast<uint32_t>(pindexTip->nHeight)) return false;
@@ -6418,6 +6862,20 @@ ShadowProofValidationResult CheckShadowPowClaimForMempoolDetailed(const CTransac
         return ShadowProofValidationResult::INVALID;
     }
 
+    if (consensus.IsShadowCompetingClaimsActive(height)) {
+        std::set<uint256> recent_logical_proofs;
+        if (!ReadRecentLogicalProofs(view, pindexPrev, consensus,
+                                     recent_logical_proofs)) {
+            reject_reason = "local-shadow-proof-accounting-state";
+            return ShadowProofValidationResult::LOCAL_INTERNAL_ERROR;
+        }
+        const uint256 logical_proof_id = LogicalPowProofId(proofs.front());
+        if (recent_logical_proofs.count(logical_proof_id) != 0) {
+            reject_reason = "shadow-proof-already-accounted";
+            return ShadowProofValidationResult::INVALID;
+        }
+    }
+
     return ShadowProofValidationResult::VALID;
 }
 
@@ -6980,6 +7438,24 @@ static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CB
         view, block, pindex, blockundo, credited_pool,
         Params().GetConsensus());
     if (pow_claim.internal_error) return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+    std::vector<uint256> newly_accounted_logical_proofs;
+    if (Params().GetConsensus().IsShadowCompetingClaimsActive(
+            pindex->nHeight)) {
+        for (const ShadowPowClaimAccounting& accounting : pow_claim.accounting) {
+            if (accounting.disposition != ShadowPowClaimDisposition::WINNER &&
+                accounting.disposition !=
+                    ShadowPowClaimDisposition::REIMBURSED_LOSER &&
+                accounting.disposition !=
+                    ShadowPowClaimDisposition::REIMBURSED_LATE) {
+                continue;
+            }
+            if (accounting.logical_proof_id.IsNull()) {
+                return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+            }
+            newly_accounted_logical_proofs.push_back(
+                accounting.logical_proof_id);
+        }
+    }
     if (pow_claim.competing_claims) {
         LogPrintf("Quantum Quasar: evaluated %u competing QQPROOF claims at height %d; reimbursed %u valid losers under the canonical monetary rule\n",
             pow_claim.valid_claim_count, pindex->nHeight, pow_claim.reimbursed_claim_count);
@@ -7094,6 +7570,12 @@ static ShadowApplyResult ApplyShadowBlockToCache(CCoinsViewCache& view, const CB
     for (const ShadowClaim& claim : claims_to_apply) {
         if (!AddClaimMarker(view, pindex, claim_marker_index++, claim)) return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
     }
+    if (Params().GetConsensus().IsShadowCompetingClaimsActive(
+            pindex->nHeight) &&
+        !WriteLogicalProofBucket(view, pindex,
+                                 std::move(newly_accounted_logical_proofs))) {
+        return ShadowApplyResult::LOCAL_INTERNAL_ERROR;
+    }
     WritePool(view, pindex, pool);
     // The public wrapper evaluates against a child cache. This hook proves
     // that an allocation failure after a concrete staged mutation cannot
@@ -7156,6 +7638,13 @@ bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockInd
 {
     if (!gold_rush_active) return true;
     if (!pindex || pindex->nHeight < SHADOW_REWARD_START_HEIGHT || pindex->nHeight > SHADOW_REWARD_END_HEIGHT) return true;
+    const bool logical_proof_bucket_active =
+        Params().GetConsensus().IsShadowCompetingClaimsActive(pindex->nHeight);
+    LogicalProofBucket logical_proof_bucket;
+    if (logical_proof_bucket_active &&
+        !ReadLogicalProofBucket(view, pindex, logical_proof_bucket)) {
+        return false;
+    }
     Coin current_pool_coin;
     if (!view.GetCoin(PoolOutpoint(), current_pool_coin) || current_pool_coin.IsSpent() ||
         current_pool_coin.out.nValue != 0 || !current_pool_coin.fCoinBase || current_pool_coin.fCoinStake ||
@@ -7279,6 +7768,10 @@ bool UndoShadowBlock(CCoinsViewCache& view, const CBlock& block, const CBlockInd
     }
     if (!UndoActiveSignalMarkers(view, pindex, pool_undo.previous_present)) {
         LogPrintf("ERROR: Quantum Quasar active-signal undo authentication failed at height %d\n", pindex->nHeight);
+        return false;
+    }
+    if (logical_proof_bucket_active &&
+        !view.SpendCoin(LogicalProofBucketOutpoint(pindex))) {
         return false;
     }
     view.SpendCoin(PoolOutpoint());

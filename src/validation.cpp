@@ -1091,6 +1091,8 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 ? MAX_SHADOW_POW_EVALS_PER_BLOCK
                 : 1;
         size_t shadow_proof_count{0};
+        std::set<uint256> logical_proof_ids;
+        bool duplicate_logical_proof{false};
         for (const CTxMemPoolEntryRef& entry : m_pool.entryAll()) {
             const CTransactionRef pool_tx = entry.get().GetSharedTx();
             if (pool_tx->GetHash() == tx.GetHash() ||
@@ -1098,6 +1100,22 @@ bool MemPoolAccept::PreChecks(ATMPArgs& args, Workspace& ws)
                 continue;
             }
             ++shadow_proof_count;
+            if (consensus.IsShadowCompetingClaimsActive(next_height)) {
+                const auto logical_proof_id =
+                    GetShadowPowProofLogicalId(*pool_tx);
+                if (logical_proof_id) {
+                    logical_proof_ids.insert(*logical_proof_id);
+                }
+            }
+        }
+        if (consensus.IsShadowCompetingClaimsActive(next_height)) {
+            const auto logical_proof_id = GetShadowPowProofLogicalId(tx);
+            duplicate_logical_proof = logical_proof_id &&
+                logical_proof_ids.count(*logical_proof_id) != 0;
+        }
+        if (duplicate_logical_proof) {
+            return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
+                                 "shadow-proof-mempool-duplicate");
         }
         if (shadow_proof_count >= shadow_proof_limit) {
             return state.Invalid(TxValidationResult::TX_MEMPOOL_POLICY,
@@ -1691,6 +1709,7 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
                 ? MAX_SHADOW_POW_EVALS_PER_BLOCK : 1;
         size_t existing_shadow_proofs{0};
         std::set<COutPoint> bound_claim_outpoints;
+        std::set<uint256> logical_proof_ids;
         for (const CTxMemPoolEntryRef& entry : m_pool.entryAll()) {
             const CTransactionRef pool_tx = entry.get().GetSharedTx();
             if (!TransactionHasShadowProof(*pool_tx)) continue;
@@ -1698,6 +1717,12 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
             if (const auto outpoint =
                     GetShadowPowProofBoundOutpoint(*pool_tx)) {
                 bound_claim_outpoints.insert(*outpoint);
+            }
+            if (consensus.IsShadowCompetingClaimsActive(next_height)) {
+                if (const auto logical_proof_id =
+                        GetShadowPowProofLogicalId(*pool_tx)) {
+                    logical_proof_ids.insert(*logical_proof_id);
+                }
             }
         }
         size_t package_shadow_proofs{0};
@@ -1709,6 +1734,14 @@ PackageMempoolAcceptResult MemPoolAccept::AcceptMultipleTransactions(const std::
                     GetShadowPowProofBoundOutpoint(*ws.m_ptx)) {
                 duplicate = !bound_claim_outpoints.insert(*outpoint).second ||
                             duplicate;
+            }
+            if (consensus.IsShadowCompetingClaimsActive(next_height)) {
+                if (const auto logical_proof_id =
+                        GetShadowPowProofLogicalId(*ws.m_ptx)) {
+                    duplicate =
+                        !logical_proof_ids.insert(*logical_proof_id).second ||
+                        duplicate;
+                }
             }
             if (duplicate ||
                 existing_shadow_proofs + package_shadow_proofs >

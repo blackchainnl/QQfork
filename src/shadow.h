@@ -189,11 +189,21 @@ enum class ShadowPowClaimDisposition : uint8_t {
     ORIGIN_MISMATCH = 10,
     ORIGIN_EXPIRED = 11,
     REIMBURSED_LATE = 12,
+    /** Another carrier in this block contained the same logical proof. The
+     *  carrier is aggregate-only; exactly one eligible representative can be
+     *  evaluated or credited. */
+    DUPLICATE_LOGICAL_PROOF = 13,
+    /** This logical proof was already accounted on the active branch during
+     *  its bounded late-inclusion window. */
+    ALREADY_ACCOUNTED = 14,
 };
 
 struct ShadowPowClaimAccounting {
     uint256 source_txid;
     uint32_t source_vout{0};
+    /** Carrier-independent identity of the canonically decoded QQSPROOF
+     * tuple. Non-minimal outer pushes therefore cannot create a new proof. */
+    uint256 logical_proof_id;
     uint256 canonical_rank;
     CScript payout_script;
     CAmount base_fee{0};
@@ -213,7 +223,8 @@ struct ShadowPowClaimAccounting {
 /**
  * Fixed-size block aggregate for post-boundary QQSPROOF accounting.
  *
- * Only Argon2-evaluated candidates have detailed rows. All other notes are
+ * Only the bounded canonical candidate set has detailed rows. Argon2 work is
+ * performed at most once per selected logical proof. All other notes are
  * represented by these counters and by accounting_commitment, which commits
  * to every exact note plus the complete deterministic classification.
  */
@@ -227,6 +238,8 @@ struct ShadowPowClaimAggregate {
     uint32_t unknown_mode_count{0};
     uint32_t origin_mismatch_count{0};
     uint32_t origin_expired_count{0};
+    uint32_t duplicate_logical_proof_count{0};
+    uint32_t already_accounted_count{0};
     uint32_t input_mismatch_count{0};
     uint32_t invalid_base_fee_count{0};
     uint32_t evaluation_limit_count{0};
@@ -265,6 +278,9 @@ struct ShadowPowAccountingContext {
     /** True only after the separately scheduled QQP4 hard fork. The
      * canonical_rule_active field follows the new v30.1.1 QQP3 boundary. */
     bool qqp4_rule_active{false};
+    /** Logical proof IDs authenticated by the prior 64 active-branch
+     *  accounting buckets. This set is bounded by 64 * 64 entries. */
+    std::set<uint256> accounted_logical_proofs;
     bool valid{false};
 };
 
@@ -507,6 +523,9 @@ bool ValidateShadowPowProofForWork(const ShadowPowWork& work, const std::vector<
 bool GetShadowPowProofBoundOutpoint(const std::vector<unsigned char>& prefixed_proof,
                                     COutPoint& outpoint_out);
 std::optional<COutPoint> GetShadowPowProofBoundOutpoint(const CTransaction& tx);
+/** Return the carrier-independent identity of the transaction's one exact
+ * QQSPROOF payload. Structural multi-proof transactions return null. */
+std::optional<uint256> GetShadowPowProofLogicalId(const CTransaction& tx);
 
 /** Test-only, process-local fault injection for one or more Argon2id calls.
  *  No configuration, RPC, or network path can arm this hook. */
@@ -525,6 +544,14 @@ enum class ShadowAllocationFailurePoint : uint8_t {
 void SetShadowAllocationFailureForTesting(ShadowAllocationFailurePoint point);
 void ClearShadowAllocationFailureForTesting();
 COutPoint ShadowReplayStateOutpointForTesting();
+/** Test-only authenticated logical-proof window probes. */
+COutPoint ShadowLogicalProofBucketOutpointForTesting(
+    const CBlockIndex* pindex);
+bool WriteShadowLogicalProofBucketForTesting(
+    CCoinsViewCache& view, const CBlockIndex* pindex, size_t proof_count);
+bool ValidateShadowLogicalProofWindowForTesting(
+    const CCoinsViewCache& view, const CBlockIndex* tip,
+    const Consensus::Params& consensus);
 /** Test-only oracle for the authenticated pool/active-signal pair invariant. */
 bool ShadowActiveSignalPoolPairValidForTesting(const Consensus::Params& consensus,
                                                const CBlockIndex* pindex,

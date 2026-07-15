@@ -78,6 +78,8 @@ const char* ShadowPowDispositionName(ShadowPowClaimDisposition disposition)
     case static_cast<uint8_t>(ShadowPowClaimDisposition::ORIGIN_MISMATCH): return "origin_mismatch";
     case static_cast<uint8_t>(ShadowPowClaimDisposition::ORIGIN_EXPIRED): return "origin_expired";
     case static_cast<uint8_t>(ShadowPowClaimDisposition::REIMBURSED_LATE): return "reimbursed_late";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::DUPLICATE_LOGICAL_PROOF): return "duplicate_logical_proof";
+    case static_cast<uint8_t>(ShadowPowClaimDisposition::ALREADY_ACCOUNTED): return "already_accounted";
     }
     return "unknown";
 }
@@ -118,6 +120,7 @@ UniValue ShadowCreditJSON(const ShadowIndexRecord& record)
         source.setObject();
         source.pushKV("txid", record.pow_claim_source.txid.GetHex());
         source.pushKV("vout", record.pow_claim_source.vout);
+        source.pushKV("logical_proof_id", record.pow_claim_source.logical_proof_id.GetHex());
         source.pushKV("canonical_rank", record.pow_claim_source.canonical_rank.GetHex());
         source.pushKV("disposition", ShadowPowDispositionName(record.pow_claim_source.disposition));
         source.pushKV("base_fee_known", record.pow_claim_source.base_fee_known);

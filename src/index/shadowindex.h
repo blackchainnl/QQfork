@@ -31,6 +31,7 @@ static constexpr size_t MAX_SHADOW_EVENT_JSON_BYTES{16 * 1024 * 1024};
 struct ShadowIndexPowClaimSource {
     uint256 txid;
     uint32_t vout{0};
+    uint256 logical_proof_id;
     uint256 canonical_rank;
     CAmount base_fee{0};
     bool base_fee_known{false};
@@ -47,14 +48,15 @@ struct ShadowIndexPowClaimSource {
     SERIALIZE_METHODS(ShadowIndexPowClaimSource, obj)
     {
         uint8_t disposition{static_cast<uint8_t>(obj.disposition)};
-        READWRITE(obj.txid, obj.vout, obj.canonical_rank, obj.base_fee,
+        READWRITE(obj.txid, obj.vout, obj.logical_proof_id,
+                  obj.canonical_rank, obj.base_fee,
                   obj.base_fee_known, disposition, obj.proof_version,
                   obj.origin_bound,
                   obj.origin_height, obj.origin_previous_block_hash,
                   obj.inclusion_height, obj.origin_age, obj.input_bound,
                   obj.claim_outpoint);
         SER_READ(obj, {
-            if (disposition > static_cast<uint8_t>(ShadowPowClaimDisposition::REIMBURSED_LATE)) {
+            if (disposition > static_cast<uint8_t>(ShadowPowClaimDisposition::ALREADY_ACCOUNTED)) {
                 throw std::ios_base::failure("Invalid shadow POW claim disposition");
             }
             obj.disposition = static_cast<ShadowPowClaimDisposition>(disposition);
@@ -97,6 +99,8 @@ struct ShadowIndexPowClaimSummary {
     uint32_t invalid_base_fee_count{0};
     uint32_t origin_mismatch_count{0};
     uint32_t origin_expired_count{0};
+    uint32_t duplicate_logical_proof_count{0};
+    uint32_t already_accounted_count{0};
     uint32_t evaluation_limit_count{0};
     uint256 accounting_commitment;
     CAmount credited_total{0};
@@ -114,7 +118,10 @@ struct ShadowIndexPowClaimSummary {
                   obj.invalid_proof_count, obj.wrong_mode_count,
                   obj.unknown_mode_count, obj.input_mismatch_count,
                   obj.invalid_base_fee_count, obj.origin_mismatch_count,
-                  obj.origin_expired_count, obj.evaluation_limit_count,
+                  obj.origin_expired_count,
+                  obj.duplicate_logical_proof_count,
+                  obj.already_accounted_count,
+                  obj.evaluation_limit_count,
                   obj.accounting_commitment,
                   obj.credited_total, obj.winner_credited_total,
                   obj.reimbursed_credited_total);

@@ -329,6 +329,8 @@ std::string PowClaimDispositionName(ShadowPowClaimDisposition disposition)
     case ShadowPowClaimDisposition::ORIGIN_MISMATCH: return "origin_mismatch";
     case ShadowPowClaimDisposition::ORIGIN_EXPIRED: return "origin_expired";
     case ShadowPowClaimDisposition::REIMBURSED_LATE: return "reimbursed_late";
+    case ShadowPowClaimDisposition::DUPLICATE_LOGICAL_PROOF: return "duplicate_logical_proof";
+    case ShadowPowClaimDisposition::ALREADY_ACCOUNTED: return "already_accounted";
     }
     throw JSONRPCError(RPC_INTERNAL_ERROR, "Unknown indexed POW claim disposition");
 }
@@ -338,6 +340,7 @@ UniValue PowClaimSourceToJSON(const ShadowIndexPowClaimSource& source)
     UniValue result(UniValue::VOBJ);
     result.pushKV("txid", source.txid.GetHex());
     result.pushKV("vout", source.vout);
+    result.pushKV("logical_proof_id", source.logical_proof_id.GetHex());
     result.pushKV("canonical_rank", source.canonical_rank.GetHex());
     result.pushKV("disposition", PowClaimDispositionName(source.disposition));
     result.pushKV("base_fee_known", source.base_fee_known);
@@ -686,6 +689,8 @@ RPCHelpMan getshadowblock()
             claim_summary.pushKV("invalid_base_fee_count", indexed.pow_claims.invalid_base_fee_count);
             claim_summary.pushKV("origin_mismatch_count", indexed.pow_claims.origin_mismatch_count);
             claim_summary.pushKV("origin_expired_count", indexed.pow_claims.origin_expired_count);
+            claim_summary.pushKV("duplicate_logical_proof_count", indexed.pow_claims.duplicate_logical_proof_count);
+            claim_summary.pushKV("already_accounted_count", indexed.pow_claims.already_accounted_count);
             claim_summary.pushKV("evaluation_limit_count", indexed.pow_claims.evaluation_limit_count);
             claim_summary.pushKV("accounting_commitment", indexed.pow_claims.active
                 ? UniValue(indexed.pow_claims.accounting_commitment.GetHex())
