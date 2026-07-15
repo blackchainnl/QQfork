@@ -12,9 +12,12 @@
 - Verify that out-of-order blocks are correctly processed, see LoadExternalBlockFile()
 """
 
+import socket
+import time
+
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.p2p import MAGIC_BYTES
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, p2p_port, rpc_port
 
 
 class ReindexTest(BitcoinTestFramework):
@@ -39,6 +42,76 @@ class ReindexTest(BitcoinTestFramework):
             self.start_nodes([["-reindex"]])
             assert_equal(self.nodes[0].getblockcount(), blockcount)  # start_node is blocking on reindex
         self.log.info("Success")
+
+    @staticmethod
+    def _port_is_open(port):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.1)
+            return sock.connect_ex(("127.0.0.1", port)) == 0
+
+    def _assert_services_quiesced(self, node):
+        for service, port in (("RPC/HTTP", rpc_port(node.index)),
+                              ("P2P", p2p_port(node.index))):
+            assert not self._port_is_open(port), \
+                f"{service} listener was active during protected chainstate rebuild"
+
+    def _wait_for_rebuild_exit_with_services_quiesced(self, node):
+        deadline = time.monotonic() + 60 * self.options.timeout_factor
+        saw_running = False
+        while node.process.poll() is None:
+            saw_running = True
+            self._assert_services_quiesced(node)
+            if time.monotonic() > deadline:
+                raise AssertionError("protected chainstate rebuild did not exit")
+            time.sleep(0.01)
+        self._assert_services_quiesced(node)
+        assert saw_running, "protected chainstate rebuild exited before service state could be checked"
+        node.wait_until_stopped()
+
+    def _wait_for_verification_marker_with_services_quiesced(self, node, offset):
+        marker = "Verified the rebuilt chainstate after restart and retired preserved databases"
+        deadline = time.monotonic() + 60 * self.options.timeout_factor
+        while node.process.poll() is None:
+            with node.debug_log_path.open("rb") as debug_log:
+                debug_log.seek(offset)
+                verification_log = debug_log.read().decode("utf8", errors="replace")
+                marker_offset = verification_log.find(marker)
+                if marker_offset >= 0:
+                    # Normal RPC startup is allowed only after the replacement
+                    # has been verified and its preserved source retired. Check
+                    # ordering as well as live ports so a fast transition cannot
+                    # hide an endpoint that bound during verification.
+                    for rpc_marker in ("Binding RPC on address", "Starting HTTP RPC server"):
+                        rpc_offset = verification_log.find(rpc_marker)
+                        assert rpc_offset < 0 or rpc_offset > marker_offset, \
+                            f"{rpc_marker} occurred before protected verification completed"
+                    return
+            self._assert_services_quiesced(node)
+            if time.monotonic() > deadline:
+                raise AssertionError("protected chainstate verification did not complete")
+            time.sleep(0.01)
+        raise AssertionError("protected chainstate verification exited before completion")
+
+    def protected_rebuild_services(self):
+        """The two protected passes must not bind RPC/HTTP or P2P listeners."""
+        node = self.nodes[0]
+        self.log.info("Check that a protected chainstate rebuild defers services")
+        self.generatetoaddress(node, 100, node.get_deterministic_priv_key().address)
+        blockcount = node.getblockcount()
+        self.stop_node(0)
+
+        node.start(["-reindex-chainstate"])
+        self._wait_for_rebuild_exit_with_services_quiesced(node)
+
+        journal = node.chain_path / "chainstate-rebuild.journal"
+        assert journal.exists()
+        assert "phase=commit-ready\n" in journal.read_text(encoding="utf8")
+
+        log_offset = node.debug_log_size(mode="rb")
+        node.start([])
+        self._wait_for_verification_marker_with_services_quiesced(node, log_offset)
+        node.wait_for_rpc_connection()
+        assert_equal(node.getblockcount(), blockcount)
 
     # Check that blocks can be processed out of order
     def out_of_order(self):
@@ -91,6 +164,7 @@ class ReindexTest(BitcoinTestFramework):
         self.reindex(True)
 
         self.out_of_order()
+        self.protected_rebuild_services()
 
 
 if __name__ == '__main__':
