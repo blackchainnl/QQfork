@@ -171,7 +171,17 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
     return nSigOps;
 }
 
-bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, int64_t nSpendTime, int64_t nDemurrageTime, CAmount& txfee)
+namespace {
+
+enum class V2InputTimePolicy {
+    ENFORCE,
+    DEFER,
+};
+
+bool CheckTxInputsImpl(const CTransaction& tx, TxValidationState& state,
+                       const CCoinsViewCache& inputs, int nSpendHeight,
+                       int64_t nSpendTime, int64_t nDemurrageTime,
+                       CAmount& txfee, V2InputTimePolicy v2_time_policy)
 {
     // are the actual inputs available?
     if (!inputs.HaveInputs(tx)) {
@@ -194,14 +204,15 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
 
         // If prev is coinbase or coinstake, check that it's matured
         if ((coin.IsCoinBase() || coin.IsCoinStake()) &&
-            nSpendHeight - coin.nHeight < (::Params().GetConsensus().IsProtocolV3_1(nTimeTx) ? ::Params().GetConsensus().nCoinbaseMaturity : Params().nCoinbaseMaturity)) {
+            nSpendHeight - coin.nHeight < ::Params().GetConsensus().nCoinbaseMaturity) {
             return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase",
                 strprintf("tried to spend coinbase at depth %d", nSpendHeight - coin.nHeight));
         }
 
         // Check transaction timestamp. This inherited legacy consensus rule
         // applies to every spending transaction version.
-        if (coin.nTime > nTimeTx)
+        if (coin.nTime > nTimeTx &&
+            (tx.nVersion < 2 || v2_time_policy == V2InputTimePolicy::ENFORCE))
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-time-earlier-than-input");
 
         // Check for negative or overflow input values. demurrage realizes
@@ -247,6 +258,28 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
     }
 
     return true;
+}
+
+} // namespace
+
+bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state,
+                              const CCoinsViewCache& inputs, int nSpendHeight,
+                              int64_t nSpendTime, int64_t nDemurrageTime,
+                              CAmount& txfee)
+{
+    return CheckTxInputsImpl(tx, state, inputs, nSpendHeight, nSpendTime,
+                             nDemurrageTime, txfee,
+                             V2InputTimePolicy::ENFORCE);
+}
+
+bool Consensus::CheckTxInputsForMempoolReorg(
+    const CTransaction& tx, TxValidationState& state,
+    const CCoinsViewCache& inputs, int nSpendHeight,
+    int64_t nEarliestSpendTime, int64_t nDemurrageTime, CAmount& txfee)
+{
+    return CheckTxInputsImpl(tx, state, inputs, nSpendHeight,
+                             nEarliestSpendTime, nDemurrageTime, txfee,
+                             V2InputTimePolicy::DEFER);
 }
 
 // Blackcoin: GetMinFee

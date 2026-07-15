@@ -166,19 +166,30 @@ static std::optional<int64_t> GetMaxNextBlockHeaderTime(Chainstate& active_chain
     return max_header_time;
 }
 
+static std::optional<int64_t> GetMinimumNextBlockHeaderTime(
+    const CBlockIndex* pindex_prev)
+{
+    constexpr int64_t MAX_HEADER_TIME{std::numeric_limits<uint32_t>::max()};
+    if (!pindex_prev) return int64_t{0};
+    const int64_t previous_mtp{pindex_prev->GetMedianTimePast()};
+    if (previous_mtp < 0 || previous_mtp >= MAX_HEADER_TIME) {
+        return std::nullopt;
+    }
+    return previous_mtp + 1;
+}
+
 std::optional<int64_t> GetNextBlockHeaderTime(Chainstate& active_chainstate,
                                               const CBlockIndex* pindex_prev,
                                               int64_t adjusted_time)
 {
     const std::optional<int64_t> max_header_time =
         GetMaxNextBlockHeaderTime(active_chainstate, adjusted_time);
-    if (!max_header_time ||
-        (pindex_prev && pindex_prev->GetMedianTimePast() == std::numeric_limits<int64_t>::max())) {
+    const std::optional<int64_t> minimum_chain_time =
+        GetMinimumNextBlockHeaderTime(pindex_prev);
+    if (!max_header_time || !minimum_chain_time) {
         return std::nullopt;
     }
-    const int64_t minimum_time = pindex_prev
-        ? std::max<int64_t>(adjusted_time, pindex_prev->GetMedianTimePast() + 1)
-        : adjusted_time;
+    const int64_t minimum_time = std::max(adjusted_time, *minimum_chain_time);
     if (minimum_time > *max_header_time) return std::nullopt;
     return minimum_time;
 }
@@ -430,6 +441,8 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     const int64_t adjusted_time = GetAdjustedTimeSeconds();
     const std::optional<int64_t> next_block_header_time = GetNextBlockHeaderTime(
         *this, next_block_tip, adjusted_time);
+    const std::optional<int64_t> minimum_next_block_header_time =
+        GetMinimumNextBlockHeaderTime(next_block_tip);
     const int64_t next_block_spend_time = next_block_header_time.value_or(adjusted_time);
     const unsigned int next_block_script_flags = GetNextBlockScriptFlags(next_block_tip, m_chainman);
 
@@ -499,7 +512,8 @@ void Chainstate::MaybeUpdateMempoolForReorg(
     // If true, the tx would be invalid in the next block; remove this entry and all of its descendants.
     const auto filter_final_and_mature = [this, &invalid_lifecycle_transactions,
                                           next_block_height, next_block_mtp,
-                                          next_block_header_time, next_block_spend_time,
+                                          next_block_header_time, minimum_next_block_header_time,
+                                          next_block_spend_time,
                                           next_block_script_flags](CTxMemPool::txiter it)
         EXCLUSIVE_LOCKS_REQUIRED(m_mempool->cs, ::cs_main) {
         AssertLockHeld(m_mempool->cs);
@@ -507,18 +521,6 @@ void Chainstate::MaybeUpdateMempoolForReorg(
         const CTransaction& tx = it->GetTx();
 
         if (invalid_lifecycle_transactions.count(tx.GetHash())) return true;
-        // Version-2 transactions have no serialized nTime. If a local clock
-        // anomaly leaves no representable next-block header inside the
-        // future-drift window, using adjusted time here would falsely evict
-        // an otherwise valid v2 relay transaction. The maximum representable
-        // timestamp is only a reorg-check sentinel: it is never used for a
-        // candidate header, whose time remains governed by
-        // GetNextBlockHeaderTime during template assembly.
-        const int64_t reorg_input_check_time =
-            !next_block_header_time && tx.nVersion >= 2
-                ? std::numeric_limits<uint32_t>::max()
-                : next_block_spend_time;
-
         // The transaction must be final.
         if (!CheckFinalTxAtTip(*Assert(m_chain.Tip()), tx)) return true;
 
@@ -559,9 +561,25 @@ void Chainstate::MaybeUpdateMempoolForReorg(
         CCoinsViewCache next_block_view{&view_mempool};
         TxValidationState tx_state;
         CAmount next_block_fee{0};
-        if (!Consensus::CheckTxInputs(tx, tx_state, next_block_view,
-                                      next_block_height, reorg_input_check_time,
-                                      next_block_mtp, next_block_fee)) {
+        bool inputs_valid{false};
+        if (!next_block_header_time && tx.nVersion >= 2) {
+            // A v2 transaction has no serialized nTime. When only the local
+            // future-drift window prevents a header, recheck all independent
+            // input rules at the earliest representable next-header time and
+            // defer only input timestamp ordering until a real header exists.
+            // A tip with no representable successor is not a clock anomaly
+            // and cannot justify retaining an unevaluable transaction.
+            inputs_valid = minimum_next_block_header_time &&
+                Consensus::CheckTxInputsForMempoolReorg(
+                    tx, tx_state, next_block_view, next_block_height,
+                    *minimum_next_block_header_time, next_block_mtp,
+                    next_block_fee);
+        } else {
+            inputs_valid = Consensus::CheckTxInputs(
+                tx, tx_state, next_block_view, next_block_height,
+                next_block_spend_time, next_block_mtp, next_block_fee);
+        }
+        if (!inputs_valid) {
             return true;
         }
         std::string lifecycle_reject_reason;

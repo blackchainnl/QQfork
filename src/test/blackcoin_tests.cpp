@@ -259,6 +259,141 @@ BOOST_AUTO_TEST_CASE(mainnet_gold_rush_v2_missing_time_is_deterministic)
     SetMockTime(0);
 }
 
+BOOST_AUTO_TEST_CASE(mempool_reorg_deferred_v2_time_preserves_independent_checks)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int spend_height = MAINNET_SHADOW_REWARD_START_HEIGHT + 3;
+    const uint32_t earliest_spend_time =
+        static_cast<uint32_t>(consensus.nProtocolV4Time + 600);
+    const uint32_t future_input_time = earliest_spend_time + 1;
+    constexpr CAmount INPUT_VALUE{2 * COIN};
+    constexpr CAmount SUFFICIENT_FEE{COIN};
+
+    struct InputCheckResult {
+        bool accepted;
+        std::string reject_reason;
+        CAmount fee;
+    };
+    const auto check = [&](bool deferred_time, bool add_input,
+                           bool coinbase, int coin_height,
+                           CAmount output_value) {
+        CCoinsView base;
+        CCoinsViewCache view{&base};
+        const COutPoint outpoint{uint256::ONE, 0};
+        if (add_input) {
+            view.AddCoin(outpoint,
+                         Coin{CTxOut{INPUT_VALUE, CScript() << OP_TRUE},
+                              coin_height, coinbase, false,
+                              future_input_time},
+                         false);
+        }
+
+        CMutableTransaction spend;
+        spend.nVersion = 2;
+        spend.nTime = 0;
+        spend.vin.emplace_back(outpoint);
+        spend.vout.emplace_back(output_value, CScript() << OP_TRUE);
+
+        TxValidationState state;
+        CAmount fee{-1};
+        const CTransaction tx{spend};
+        const bool accepted = deferred_time
+            ? Consensus::CheckTxInputsForMempoolReorg(
+                  tx, state, view, spend_height, earliest_spend_time,
+                  earliest_spend_time, fee)
+            : Consensus::CheckTxInputs(
+                  tx, state, view, spend_height, earliest_spend_time,
+                  earliest_spend_time, fee);
+        return InputCheckResult{accepted, state.GetRejectReason(), fee};
+    };
+
+    const int mature_height = spend_height - consensus.nCoinbaseMaturity;
+    const auto exact_time_check = check(
+        false, true, false, mature_height, INPUT_VALUE - SUFFICIENT_FEE);
+    BOOST_CHECK(!exact_time_check.accepted);
+    BOOST_CHECK_EQUAL(exact_time_check.reject_reason,
+                      "bad-txns-time-earlier-than-input");
+
+    // Deferring the unrepresentable v2 spend time retains an otherwise valid
+    // transaction, while every check independent of that unknown timestamp
+    // remains active.
+    const auto valid = check(
+        true, true, false, mature_height, INPUT_VALUE - SUFFICIENT_FEE);
+    BOOST_CHECK(valid.accepted);
+    BOOST_CHECK(valid.reject_reason.empty());
+    BOOST_CHECK_EQUAL(valid.fee, SUFFICIENT_FEE);
+
+    const auto missing = check(
+        true, false, false, mature_height, INPUT_VALUE - SUFFICIENT_FEE);
+    BOOST_CHECK(!missing.accepted);
+    BOOST_CHECK_EQUAL(missing.reject_reason,
+                      "bad-txns-inputs-missingorspent");
+
+    const auto immature = check(
+        true, true, true, mature_height + 1,
+        INPUT_VALUE - SUFFICIENT_FEE);
+    BOOST_CHECK(!immature.accepted);
+    BOOST_CHECK_EQUAL(immature.reject_reason,
+                      "bad-txns-premature-spend-of-coinbase");
+
+    const auto overclaim = check(
+        true, true, false, mature_height, INPUT_VALUE + 1);
+    BOOST_CHECK(!overclaim.accepted);
+    BOOST_CHECK_EQUAL(overclaim.reject_reason, "bad-txns-in-belowout");
+
+    const auto insufficient_fee = check(
+        true, true, false, mature_height, INPUT_VALUE);
+    BOOST_CHECK(!insufficient_fee.accepted);
+    BOOST_CHECK_EQUAL(insufficient_fee.reject_reason,
+                      "bad-txns-fee-not-enough");
+}
+
+BOOST_AUTO_TEST_CASE(chain_consensus_coinbase_maturity_spans_v3_1_boundary)
+{
+    const Consensus::Params& consensus = Params().GetConsensus();
+    const int spend_height = consensus.nCoinbaseMaturity + 100;
+
+    const auto check_depth = [&](int depth, int64_t spend_time) {
+        CCoinsView base;
+        CCoinsViewCache view{&base};
+        const COutPoint outpoint{uint256::ONE, 0};
+        view.AddCoin(outpoint,
+                     Coin{CTxOut{2 * COIN, CScript() << OP_TRUE},
+                          spend_height - depth, true, false,
+                          static_cast<uint32_t>(spend_time - 1)},
+                     false);
+
+        CMutableTransaction spend;
+        spend.nVersion = 2;
+        spend.nTime = 0;
+        spend.vin.emplace_back(outpoint);
+        spend.vout.emplace_back(COIN, CScript() << OP_TRUE);
+
+        TxValidationState state;
+        CAmount fee{-1};
+        const bool accepted = Consensus::CheckTxInputs(
+            CTransaction{spend}, state, view, spend_height, spend_time,
+            spend_time, fee);
+        return std::pair{accepted, state.GetRejectReason()};
+    };
+
+    for (const int64_t spend_time : {
+             consensus.nProtocolV3_1Time - 1,
+             consensus.nProtocolV3_1Time + 1,
+         }) {
+        const auto immature = check_depth(
+            consensus.nCoinbaseMaturity - 1, spend_time);
+        BOOST_CHECK(!immature.first);
+        BOOST_CHECK_EQUAL(immature.second,
+                          "bad-txns-premature-spend-of-coinbase");
+
+        const auto mature = check_depth(
+            consensus.nCoinbaseMaturity, spend_time);
+        BOOST_CHECK(mature.first);
+        BOOST_CHECK(mature.second.empty());
+    }
+}
+
 BOOST_AUTO_TEST_CASE(phase_schedule_height_overrides)
 {
     Consensus::Params consensus;
