@@ -717,7 +717,7 @@ jobs:
       - name: Run critical protocol and wallet gates
         run: |
           python3 test/functional/test_runner.py \
-            --ci --jobs=2 --failfast --combinedlogslen=999999 \
+            --ci --jobs=2 --failfast --combinedlogslen=2000 \
             feature_quantum_activation_boundary.py \
             feature_blackcoin_phase.py \
             feature_goldrush_migration_rpc.py \
@@ -807,7 +807,7 @@ jobs:
           PREVIOUS_RELEASES_DIR: ${{ github.workspace }}/.ci/previous-releases
         run: |
           python3 test/functional/test_runner.py \
-            --ci --jobs=1 --failfast --combinedlogslen=999999 \
+            --ci --jobs=1 --failfast --combinedlogslen=2000 \
             feature_goldrush_mixed_version.py --previous-releases --legacy-wallet
 
       - name: Upload historical binary provenance
@@ -843,7 +843,7 @@ jobs:
       - name: Run all default and extended functional tests
         run: |
           python3 test/functional/test_runner.py \
-            --ci --extended --jobs=4 --combinedlogslen=999999 \
+            --ci --extended --jobs=4 --combinedlogslen=2000 \
             --exclude=feature_goldrush_mixed_version.py
 
   sanitizer-gates:
