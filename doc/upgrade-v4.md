@@ -436,11 +436,13 @@ repeat once more with `-reindex-chainstate` at the same pinned tip and compare
 again before enabling networking, staking, or mining.
 
 Optional indexes have independent replay state. v30.1.1 automatically wipes
-and rebuilds prerelease shadowindex schemas 4 and 5 as schema 6 and prerelease
-coinstatsindex schema 2 as schema 3. The automatic index-only rebuild is enough
-when complete active-chain block files are present; `-reindex-chainstate` does
-not itself wipe either index. If required block files were pruned, disable the
-affected index or restore full history with `prune=0` and `-reindex`.
+and rebuilds populated unversioned or recognized older shadowindex databases
+as schema 11, and prerelease coinstatsindex schema 2 as schema 3. It refuses to
+open a newer index schema instead of deleting data it does not understand. The
+automatic index-only rebuild is enough when complete active-chain block files
+are present; `-reindex-chainstate` does not itself wipe either index. If
+required block files were pruned, disable the affected index or restore full
+history with `prune=0` and `-reindex`.
 
 This automatic repair does not extend to a wallet database created by a
 prerelease source build that used the superseded height-5,950,000 canonical
