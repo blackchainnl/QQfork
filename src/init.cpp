@@ -2190,15 +2190,16 @@ static bool AppInitMainImpl(NodeContext& node,
         }
     }
 
+    const bool listen_onion = args.GetBoolArg("-listenonion", DEFAULT_LISTEN_ONION);
     CService onion_service_target;
     if (!connOptions.onion_binds.empty()) {
         onion_service_target = connOptions.onion_binds.front();
-    } else {
+    } else if (listen_onion) {
         onion_service_target = DefaultOnionServiceTarget();
         connOptions.onion_binds.push_back(onion_service_target);
     }
 
-    if (args.GetBoolArg("-listenonion", DEFAULT_LISTEN_ONION)) {
+    if (listen_onion) {
         if (connOptions.onion_binds.size() > 1) {
             InitWarning(strprintf(_("More than one onion bind address is provided. Using %s "
                                     "for the automatically created Tor onion service."),

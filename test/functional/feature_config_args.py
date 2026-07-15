@@ -221,6 +221,25 @@ class ConfArgsTest(BitcoinTestFramework):
         with self.nodes[0].assert_debug_log(expected_msgs=['SetNetworkActive: false\n']):
             self.start_node(0, extra_args=['-nonetworkactive=1'])
 
+    def test_listenonion_bind(self):
+        self.log.info('Test -listenonion=0 does not create the default onion bind')
+        self.stop_node(0)
+        with self.nodes[0].assert_debug_log(
+                expected_msgs=['opencon thread start'],
+                unexpected_msgs=['Bound to 127.0.0.1:35717']):
+            self.start_node(0, extra_args=['-listenonion=0'])
+        self.stop_node(0)
+
+        self.log.info('Test an explicit onion bind remains active with -listenonion=0')
+        explicit_onion_port = util.p2p_port(1)
+        with self.nodes[0].assert_debug_log(
+                expected_msgs=[f'Bound to 127.0.0.1:{explicit_onion_port}']):
+            self.start_node(0, extra_args=[
+                '-listenonion=0',
+                f'-bind=127.0.0.1:{explicit_onion_port}=onion',
+            ])
+        self.stop_node(0)
+
     def test_seed_peers(self):
         self.log.info('Test seed peers')
         default_data_dir = self.nodes[0].datadir_path
@@ -1012,6 +1031,7 @@ class ConfArgsTest(BitcoinTestFramework):
         self.test_args_log()
         self.test_seed_peers()
         self.test_networkactive()
+        self.test_listenonion_bind()
         self.test_connect_with_seednode()
 
         self.test_config_file_parser()
