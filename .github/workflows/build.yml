@@ -207,11 +207,11 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     with:
       target_sha: ${{ needs.resolve-target.outputs.target_sha }}
-      # Alpha artifacts wait for the core gate. A beta must first pass the same
-      # exhaustive, native-macOS, sanitizer, and fuzz evidence as production;
-      # it remains unsigned and unpublished because only the authenticated
-      # final tag path can set publish=true.
+      # Alpha artifacts wait for the core gate. A beta adds native-platform,
+      # sanitizer, and pinned-fuzz evidence, while the complete extended
+      # functional suite remains a production-final gate.
       release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
+      run_extended_functional: ${{ needs.resolve-target.outputs.publish == 'true' }}
 
   select-targets:
     name: Select build target

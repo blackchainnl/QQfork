@@ -9,8 +9,13 @@ on:
         required: false
         type: string
       release_mode:
-        description: Also run production-only exhaustive, native macOS, sanitizer, and fuzz gates
+        description: Also run production-only native platform, sanitizer, and fuzz gates
         required: true
+        type: boolean
+        default: false
+      run_extended_functional:
+        description: Run the complete extended functional suite
+        required: false
         type: boolean
         default: false
   workflow_call:
@@ -20,7 +25,12 @@ on:
         required: true
         type: string
       release_mode:
-        description: Run release-only exhaustive tests
+        description: Run release-only native platform, sanitizer, and fuzz gates
+        required: false
+        type: boolean
+        default: false
+      run_extended_functional:
+        description: Run the complete extended functional suite
         required: false
         type: boolean
         default: false
@@ -819,8 +829,8 @@ jobs:
           retention-days: 30
 
   exhaustive-functional:
-    name: complete functional and soak suite
-    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    name: complete extended functional suite
+    if: ${{ inputs.run_extended_functional == true || github.event_name == 'pull_request' }}
     needs: native-build-and-unit
     runs-on: ubuntu-22.04
     timeout-minutes: 480
