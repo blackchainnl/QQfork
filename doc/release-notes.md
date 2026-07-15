@@ -179,9 +179,11 @@ sanitizer or changing CRC32C results.
   quantum addresses while preserving legacy-compatible base block rewards during
   the bridge period.
 - Already-mined Gold Rush blocks retain v30.1.0 PoW-claim allocation exactly.
-  From the first scheduled halving at height 5,993,200, the new v30.1.1 QQP3
-  canonical rule ranks competing valid PoW claims independently of transaction
-  order. QQP3 binds the origin height and parent hash and remains eligible for
+  Starting with the first scheduled halving at height 5,993,200, v30.1.1
+  introduces the prospective QQP3 canonical rule, which ranks competing valid
+  PoW claims independently of transaction order. v30.1.0 does not implement
+  QQP3 or its origin-bound accounting. QQP3 binds the origin height and parent
+  hash and remains eligible for
   the bounded late-inclusion path. Current-origin losers and eligible late
   claims recover their actual base fee up to 0.01 BLK from the fixed pool. Only
   a current-origin claim can
@@ -234,13 +236,48 @@ sanitizer or changing CRC32C results.
 
 ### Wallet and RPC
 
-- Optional local wallet automation is fail-closed in v30.1.1. Automatic staking
-  restart, PoW restart, fee-paying QQSIGNAL submission, fee-paying demurrage
-  attestations, cold-stake redelegation, and background non-HD quantum-key
-  creation are off until the operator enables each behavior explicitly. The
-  GUI exposes separate persistent controls and consequence-specific
+- Optional local wallet automation is fail-closed in v30.1.1 when no prior
+  explicit setting exists. Automatic staking restart, PoW restart, fee-paying
+  QQSIGNAL submission, fee-paying demurrage attestations, cold-stake
+  redelegation, and background non-HD quantum-key creation require explicit
+  operator consent. The
+  persistent switches are process-wide and apply to every eligible loaded
+  wallet. The GUI exposes separate controls and consequence-specific
   confirmations; `getstakinginfo` and `getpowmininginfo` report effective
   automation state for CLI and daemon operators.
+- New installs do not autostart staking without consent. To avoid silently
+  changing an existing operator policy, an explicitly configured legacy
+  `staking=1` remains autostart consent unless `autostartstaking` is set
+  separately; an implicit default is never treated as consent. The staking RPC
+  reports the effective value and its source.
+- The live Gold Rush dashboard and `getpowmininginfo` expose the evaluated chain
+  height, next shadow-reward height, exact reward window, runtime state, and
+  persistent PoS/PoW/QQSIGNAL consent state.
+- Commands whose primary purpose is not key creation no longer silently create
+  a non-HD ML-DSA change, withdrawal, migration, sweep, or redelegation key.
+  They accept an existing wallet-owned destination where applicable or require
+  an explicit default-false `allow_new_quantum_key=true` authorization before
+  any key, transaction, or wallet metadata is created. Dry-run, raw-funding,
+  and PSBT-only flows never create wallet metadata. RPC failures state the
+  exact retry option and successful key-creating calls return a backup warning.
+  If an authorized non-HD key is durably written but later transaction
+  construction or broadcast fails, the GUI/RPC error identifies the retained
+  address and requires an immediate backup; failure is never reported as if no
+  key were created.
+- The ordinary Qt Send flow now refuses foreign/watch-only quantum change and
+  asks a default-No question before authorizing at most one wallet-owned non-HD
+  change key. Creation is deferred until coin selection proves positive change
+  is required, so an exact no-change transaction creates no key. The dialog
+  identifies any created address and explains that the key remains in the
+  wallet even if preparation, later confirmation, or broadcast fails.
+- Persistent staking and PoW autostart changes apply on the next wallet load or
+  process restart and do not change the current runtime workers. Scheduler
+  policy for QQSIGNAL, optional attestations, redelegation, and background key
+  creation takes effect immediately for eligible loaded wallets; the GUI
+  states that timing before consent and in its status summary.
+- The GUI runtime staking switch now starts a missing PoS worker just like
+  `staking true`. Disabling is non-blocking and idles the worker; re-enabling
+  resumes it without creating duplicate threads.
 - Mandatory consensus demurrage and permanent burn still begin automatically
   at Final height 6,922,000. The optional wallet attestation switch neither
   activates nor disables that consensus rule.
