@@ -337,3 +337,22 @@ sanitizer or changing CRC32C results.
 - Release SBOMs consume the fail-closed dependency security manifest, including
   resolved native/target aliases and every Qt source archive, so reviewed
   dependency sources are emitted with HTTPS provenance and SHA-256 values.
+- Production publication also requires a successful exact-SHA paired
+  shadow-resource artifact. A deterministic full-epoch incremental
+  shadow-family workload measures all 179,771,400 fixture claims plus two
+  complete 541,701,000-record scans, 199,800 maximum-size QQPROOFS buckets,
+  and 372,327,984 point lookups; a separately labeled
+  current-live mainnet fixture measures production replay and lifecycle
+  behavior at its captured combined-chainstate tip. The synthetic half is not a
+  terminal combined-chainstate or full production-RPC bound. The protected
+  restart-safe gate measures physical amplification, RSS, clean opens,
+  undo/reapply, and forced compaction. Interrupted phases restore byte-exact
+  closed-database predecessors, while wall-time results remain scoped to the
+  recorded host and OS-managed page cache. The current-live half requires a
+  fresh protected-operator tip
+  attestation and internally consistent capture RPC transcript; the offline
+  gate does not claim to discover the global tip independently. The gate
+  rejects scaled, stale, scope-mismatched, or manifest-mismatched evidence and
+  fails if measurements require an authenticated compaction protocol that is
+  not implemented. Terminal combined-chainstate and full-cardinality
+  production-RPC qualification remain open under roadmap issue #13.
