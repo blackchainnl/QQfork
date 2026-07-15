@@ -1220,12 +1220,25 @@ BOOST_FIXTURE_TEST_CASE(bounded_claim_accounting_accepts_max_weight_malformed_bl
     size_t estimated_weight = GetBlockWeight(many.block);
     size_t one_tx_weight{0};
     while (true) {
+        // Exercise the evaluation ceiling with distinct malformed logical
+        // proofs. Reusing malformed_output here would intentionally collapse
+        // every carrier into one logical proof under QQP3 deduplication and
+        // would no longer test the 64-evaluation resource bound.
+        valtype unique_malformed_payload{
+            'Q', 'Q', 'S', 'P', 'R', 'O', 'O', 'F'};
+        const uint64_t malformed_ordinal = many.block.vtx.size() - 2;
+        for (size_t byte = 0; byte < sizeof(malformed_ordinal); ++byte) {
+            unique_malformed_payload.push_back(static_cast<unsigned char>(
+                malformed_ordinal >> (byte * 8)));
+        }
+        const CTxOut unique_malformed_output{
+            0, CScript{} << OP_RETURN << unique_malformed_payload};
         CMutableTransaction tx;
         tx.nVersion = 1;
         tx.nTime = many.block.nTime;
         tx.vin.emplace_back(previous);
         tx.vout.emplace_back(many.claim_amount, many.legacy_script);
-        tx.vout.push_back(malformed_output);
+        tx.vout.push_back(unique_malformed_output);
         CTransactionRef tx_ref = MakeTransactionRef(std::move(tx));
         const size_t tx_weight = GetTransactionWeight(*tx_ref);
         if (one_tx_weight == 0) one_tx_weight = tx_weight;
