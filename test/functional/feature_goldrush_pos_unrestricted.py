@@ -113,8 +113,10 @@ class GoldRushPosUnrestrictedTest(BitcoinTestFramework):
         self.log.info("Funding a second address after the snapshot so it is not whitelisted")
         non_whitelist_address = wallet.getnewaddress("non-whitelisted", "legacy")
         non_whitelist_script = wallet.getaddressinfo(non_whitelist_address)["scriptPubKey"]
-        funding_txid = default_wallet.sendtoaddress(non_whitelist_address, Decimal("5000"))
-        pure_funding_txid = default_wallet.sendtoaddress(pure_address, Decimal("10000"))
+        # Give the deliberately selected non-whitelisted kernels enough stake
+        # weight that the bounded timestamp search is reliable in parallel CI.
+        funding_txid = default_wallet.sendtoaddress(non_whitelist_address, Decimal("40000"))
+        pure_funding_txid = default_wallet.sendtoaddress(pure_address, Decimal("20000"))
         funding_block = self.generatetoaddress(node, 1, funding_address, sync_fun=self.no_op)[0]
         assert funding_txid in node.getblock(funding_block)["tx"]
         assert pure_funding_txid in node.getblock(funding_block)["tx"]
