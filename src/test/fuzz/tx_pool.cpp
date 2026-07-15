@@ -148,9 +148,6 @@ FUZZ_TARGET(tx_pool_standard, .init = initialize_tx_pool)
     }
     outpoints_rbf = outpoints_supply;
 
-    // The sum of the values of all spendable outpoints
-    const CAmount SUPPLY_TOTAL{Params().GetConsensus().nCoinbaseMaturity * 50 * COIN};
-
     SetMempoolConstraints(*node.args, fuzzed_data_provider);
     CTxMemPool tx_pool_{MakeMempool(fuzzed_data_provider, node)};
     MockedTxPool& tx_pool = *static_cast<MockedTxPool*>(&tx_pool_);
@@ -164,6 +161,16 @@ FUZZ_TARGET(tx_pool_standard, .init = initialize_tx_pool)
         Assert(amount_view.GetCoin(outpoint, c));
         return c.out.nValue;
     };
+    // Derive the invariant from the chain fixture. Blackcoin regtest uses a
+    // different proof-of-work subsidy than the Bitcoin fixture this target
+    // was inherited from.
+    const CAmount SUPPLY_TOTAL{[&] {
+        CAmount total{0};
+        for (const auto& outpoint : g_outpoints_coinbase_init_mature) {
+            total += GetAmount(outpoint);
+        }
+        return total;
+    }()};
 
     LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 300)
     {

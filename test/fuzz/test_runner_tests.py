@@ -43,6 +43,12 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
         self.assertEqual(regression['name'], 'contextual-minimum-fee')
         self.assertEqual(data, bytes.fromhex('02f7'))
 
+    def test_pow_retarget_regression_is_exact(self):
+        regression = PINNED_REGRESSION_INPUTS['pow'][0]
+        data = decode_pinned_regression(regression)
+        self.assertEqual(regression['name'], 'legacy-retarget-multiplier-modulo')
+        self.assertEqual(len(data), 101)
+
     def test_corrupt_regression_fails_closed(self):
         with self.assertRaisesRegex(ValueError, 'hash mismatch'):
             decode_pinned_regression({
@@ -60,12 +66,12 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
             })
 
     def test_required_regressions_cannot_be_omitted(self):
-        required = ['block', 'mini_miner_selection']
+        required = ['block', 'mini_miner_selection', 'pow']
         self.assertEqual(missing_pinned_regression_targets([]), required)
         self.assertEqual(missing_pinned_regression_targets(['transaction']), required)
         self.assertEqual(
             missing_pinned_regression_targets(['block']),
-            ['mini_miner_selection'],
+            ['mini_miner_selection', 'pow'],
         )
         self.assertEqual(missing_pinned_regression_targets(required), [])
 
@@ -93,7 +99,7 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
             with self.subTest(name=name):
                 with mock.patch.object(sys, 'argv', argv), \
                         mock.patch('builtins.open', mock.mock_open(read_data=FAKE_CONFIG)), \
-                        mock.patch.object(test_runner, 'parse_test_list', return_value=['block', 'mini_miner_selection', 'transaction']), \
+                        mock.patch.object(test_runner, 'parse_test_list', return_value=['block', 'mini_miner_selection', 'pow', 'transaction']), \
                         mock.patch.object(test_runner.subprocess, 'run') as subprocess_run, \
                         mock.patch.object(test_runner, 'run_pinned_regressions') as pinned, \
                         self.assertLogs(level='ERROR'):
@@ -132,15 +138,15 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
             Path(corpus_dir).mkdir()
             Path(merge_dir).mkdir()
             cases = (
-                ('generate', ['test_runner.py', '--require-pinned-regressions', '--generate', corpus_dir, 'block', 'mini_miner_selection'], 'generate_corpus'),
-                ('merge', ['test_runner.py', '--require-pinned-regressions', '--m_dir', merge_dir, corpus_dir, 'block', 'mini_miner_selection'], 'merge_inputs'),
+                ('generate', ['test_runner.py', '--require-pinned-regressions', '--generate', corpus_dir, 'block', 'mini_miner_selection', 'pow'], 'generate_corpus'),
+                ('merge', ['test_runner.py', '--require-pinned-regressions', '--m_dir', merge_dir, corpus_dir, 'block', 'mini_miner_selection', 'pow'], 'merge_inputs'),
             )
             for name, argv, mode_function in cases:
                 with self.subTest(name=name):
                     calls = []
 
                     def record_pinned(**kwargs):
-                        self.assertEqual(kwargs['targets'], ['block', 'mini_miner_selection'])
+                        self.assertEqual(kwargs['targets'], ['block', 'mini_miner_selection', 'pow'])
                         self.assertTrue(kwargs['using_libfuzzer'])
                         calls.append('pinned')
 
@@ -149,7 +155,7 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
 
                     with mock.patch.object(sys, 'argv', argv), \
                             mock.patch('builtins.open', mock.mock_open(read_data=FAKE_CONFIG)), \
-                            mock.patch.object(test_runner, 'parse_test_list', return_value=['block', 'mini_miner_selection']), \
+                            mock.patch.object(test_runner, 'parse_test_list', return_value=['block', 'mini_miner_selection', 'pow']), \
                             mock.patch.object(test_runner.subprocess, 'run', return_value=help_result), \
                             mock.patch.object(test_runner, 'run_pinned_regressions', side_effect=record_pinned), \
                             mock.patch.object(test_runner, mode_function, side_effect=record_mode), \

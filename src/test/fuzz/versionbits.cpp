@@ -108,6 +108,7 @@ std::unique_ptr<const CChainParams> g_params;
 void initialize()
 {
     // this is actually comparatively slow, so only do it once
+    SelectParams(ChainType::MAIN);
     g_params = CreateChainParams(ArgsManager{}, ChainType::MAIN);
     assert(g_params != nullptr);
 }

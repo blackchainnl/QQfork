@@ -84,7 +84,9 @@ FUZZ_TARGET(script, .init = initialize_script)
     if (which_type == TxoutType::NONSTANDARD ||
         which_type == TxoutType::NULL_DATA ||
         which_type == TxoutType::MULTISIG) {
-        assert(!extract_destination_ret);
+        // Blackcoin intentionally represents an empty script as
+        // CNoDestination even though Solver classifies it NONSTANDARD.
+        assert(!extract_destination_ret || script.empty());
     }
 
     const FlatSigningProvider signing_provider;

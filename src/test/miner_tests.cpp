@@ -872,6 +872,71 @@ BOOST_AUTO_TEST_CASE(mempool_check_handles_v2_parent_legacy_child_timestamp_conf
                                        max_header_time + 1, max_header_time + 1));
 }
 
+BOOST_AUTO_TEST_CASE(mempool_check_handles_v2_fee_schedule_transition)
+{
+    LOCK(cs_main);
+
+    Chainstate& chainstate{m_node.chainman->ActiveChainstate()};
+    CBlockIndex* const tip{Assert(chainstate.m_chain.Tip())};
+    const int64_t activation_time{Params().GetConsensus().nProtocolV3_1Time};
+    BOOST_REQUIRE_GT(activation_time, 0);
+    BOOST_REQUIRE_LT(activation_time, std::numeric_limits<uint32_t>::max());
+    const int64_t entry_time{activation_time - 1};
+    const int64_t candidate_time{activation_time + 1};
+
+    CTxMemPool::Options options{MemPoolOptionsForTest(m_node)};
+    options.check_ratio = 1;
+    CTxMemPool mempool{options};
+
+    constexpr CAmount input_value{10 * COIN};
+    const COutPoint source{InsecureRand256(), 0};
+    chainstate.CoinsTip().AddCoin(
+        source,
+        Coin{CTxOut{input_value, CScript() << OP_TRUE}, tip->nHeight,
+             /*coinbase=*/false, /*coinstake=*/false,
+             static_cast<uint32_t>(entry_time)},
+        /*possible_overwrite=*/false);
+
+    CMutableTransaction tx;
+    tx.nVersion = 2;
+    tx.nTime = 0;
+    tx.vin.emplace_back(source);
+    tx.vout.emplace_back(input_value, CScript() << OP_TRUE);
+    constexpr CAmount entry_fee{0};
+    const CTransactionRef tx_ref{MakeTransactionRef(tx)};
+    BOOST_REQUIRE_LT(entry_fee, GetMinFee(*tx_ref, static_cast<uint32_t>(candidate_time)));
+
+    TestMemPoolEntryHelper entry;
+    {
+        LOCK(mempool.cs);
+        mempool.addUnchecked(
+            entry.Fee(entry_fee)
+                .Time(NodeSeconds{std::chrono::seconds{entry_time}})
+                .FromTx(tx_ref));
+    }
+
+    TxValidationState entry_state;
+    CAmount admitted_fee{-1};
+    BOOST_CHECK(Consensus::CheckTxInputs(
+        *tx_ref, entry_state, chainstate.CoinsTip(), tip->nHeight + 1,
+        entry_time, entry_time, admitted_fee));
+    BOOST_CHECK_EQUAL(admitted_fee, entry_fee);
+
+    TxValidationState state;
+    CAmount replay_fee{0};
+    BOOST_CHECK(!Consensus::CheckTxInputs(
+        *tx_ref, state, chainstate.CoinsTip(), tip->nHeight + 1,
+        candidate_time, candidate_time, replay_fee));
+    BOOST_CHECK_EQUAL(state.GetRejectReason(), "bad-txns-fee-not-enough");
+
+    // A valid cached transaction may become unmineable solely because the
+    // historical minimum-fee schedule changed after admission. The mempool
+    // diagnostic must retain its structural checks without aborting.
+    BOOST_CHECK_NO_THROW(mempool.check(
+        chainstate.CoinsTip(), tip->nHeight + 1,
+        candidate_time, candidate_time));
+}
+
 BOOST_AUTO_TEST_CASE(next_header_time_refuses_mtp_beyond_future_drift)
 {
     LOCK(cs_main);

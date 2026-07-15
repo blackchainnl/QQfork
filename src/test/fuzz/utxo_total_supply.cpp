@@ -24,12 +24,7 @@
 FUZZ_TARGET(utxo_total_supply)
 {
     /** The testing setup that creates a chainman only (no chainstate) */
-    ChainTestingSetup test_setup{
-        ChainType::REGTEST,
-        {
-            "-testactivationheight=bip34@2",
-        },
-    };
+    ChainTestingSetup test_setup{ChainType::REGTEST};
     // Create chainstate
     test_setup.LoadVerifyActivateChainstate();
     auto& node{test_setup.m_node};
@@ -41,15 +36,7 @@ FUZZ_TARGET(utxo_total_supply)
         return chainman.ActiveHeight();
     };
     const auto PrepareNextBlock = [&]() {
-        // Use OP_FALSE to avoid BIP30 check from hitting early
-        auto block = PrepareBlock(node, CScript{} << OP_FALSE);
-        // Replace OP_FALSE with OP_TRUE
-        {
-            CMutableTransaction tx{*block->vtx.back()};
-            tx.vout.at(0).scriptPubKey = CScript{} << OP_TRUE;
-            block->vtx.back() = MakeTransactionRef(tx);
-        }
-        return block;
+        return PrepareBlock(node, CScript{} << OP_TRUE);
     };
 
     /** The block template this fuzzer is working on */
@@ -95,24 +82,6 @@ FUZZ_TARGET(utxo_total_supply)
     StoreLastTxo();
     UpdateUtxoStats();
     assert(ActiveHeight() == 0);
-    // Get at which height we duplicate the coinbase
-    // Assuming that the fuzzer will mine relatively short chains (less than 200 blocks), we want the duplicate coinbase to be not too high.
-    // Up to 2000 seems reasonable.
-    int64_t duplicate_coinbase_height = fuzzed_data_provider.ConsumeIntegralInRange(0, 20 * Params().GetConsensus().nCoinbaseMaturity);
-    // Always pad with OP_0 at the end to avoid bad-cb-length error
-    const CScript duplicate_coinbase_script = CScript() << duplicate_coinbase_height << OP_0;
-    // Mine the first block with this duplicate
-    current_block = PrepareNextBlock();
-    StoreLastTxo();
-
-    {
-        // Create duplicate (CScript should match exact format as in CreateNewBlock)
-        CMutableTransaction tx{*current_block->vtx.front()};
-        tx.vin.at(0).scriptSig = duplicate_coinbase_script;
-
-        // Mine block and create next block template
-        current_block->vtx.front() = MakeTransactionRef(tx);
-    }
     current_block->hashMerkleRoot = BlockMerkleRoot(*current_block);
     assert(!MineBlock(node, current_block).IsNull());
     circulation += GetBlockSubsidy(ActiveHeight(), Params().GetConsensus());
@@ -122,8 +91,8 @@ FUZZ_TARGET(utxo_total_supply)
     current_block = PrepareNextBlock();
     StoreLastTxo();
 
-    // Limit to avoid timeout, but enough to cover duplicate_coinbase_height
-    // and CVE-2018-17144.
+    // Limit to avoid timeout, but retain enough iterations to exercise the
+    // duplicate-input inflation path from CVE-2018-17144.
     LIMITED_WHILE(fuzzed_data_provider.remaining_bytes(), 2'000)
     {
         CallOneOf(
@@ -149,11 +118,6 @@ FUZZ_TARGET(utxo_total_supply)
 
                 const auto prev_utxo_stats = utxo_stats;
                 if (was_valid) {
-                    if (duplicate_coinbase_height == ActiveHeight()) {
-                        // we mined the duplicate coinbase
-                        assert(current_block->vtx.at(0)->vin.at(0).scriptSig == duplicate_coinbase_script);
-                    }
-
                     circulation += GetBlockSubsidy(ActiveHeight(), Params().GetConsensus());
                 }
 

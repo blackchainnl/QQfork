@@ -34,6 +34,15 @@ PINNED_REGRESSION_INPUTS = {
         'base64': 'Avc=',
         'sha256': '1284a5ab316ad2ff5bf5d6a93ae46ead8605ca02c1270309f088b3bf80187b9e',
     },),
+    'pow': ({
+        'name': 'legacy-retarget-multiplier-modulo',
+        'base64': (
+            'fwAAYDAAEHoXAP////////+533L/ciq7AHocAABhoLIBAwP//////7nfcv9yKrsA'
+            'ehwAAGGgsgEDA/////////////+YACmysrIFsrLwAztcaV0AAP////9/A///+v//'
+            'AwP//wM='
+        ),
+        'sha256': 'c4789a0633f7e7744228a1f30984848c84e83ef44c44715e329ddf8fa9f122f7',
+    },),
 }
 
 

@@ -8,6 +8,7 @@
 #include <txmempool.h>
 
 #include <chain.h>
+#include <chainparams.h>
 #include <coins.h>
 #include <common/system.h>
 #include <consensus/consensus.h>
@@ -742,12 +743,12 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
                  check_spend_time);
     }
     std::set<COutPoint> structural_mempool_outputs;
-    // A v2 parent receives its timestamp only when a concrete block header is
-    // chosen. A legacy child can therefore be valid when admitted (the
-    // parent is represented by the mempool view) yet be too old for this
-    // particular candidate header. Track that expected, time-local state so
-    // the diagnostic replay never turns it into a process-aborting invariant.
-    std::set<uint256> timestamp_unmineable_transactions;
+    // A transaction can be valid at admission yet unmineable for a later
+    // candidate because a v2 parent receives its concrete timestamp only in
+    // a block or because a historical fee schedule became active. Track
+    // those narrowly proven context changes so the diagnostic replay never
+    // turns them into a process-aborting invariant.
+    std::set<uint256> context_unmineable_transactions;
 
     for (const auto& it : GetSortedDepthAndScore()) {
         checkTotal += it->GetTxSize();
@@ -756,7 +757,7 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
         const CTransaction& tx = it->GetTx();
         innerUsage += memusage::DynamicUsage(it->GetMemPoolParentsConst()) + memusage::DynamicUsage(it->GetMemPoolChildrenConst());
         CTxMemPoolEntry::Parents setParentCheck;
-        bool has_timestamp_unmineable_parent{false};
+        bool has_context_unmineable_parent{false};
         for (const CTxIn &txin : tx.vin) {
             // Check that every mempool transaction's inputs refer to available coins, or other mempool tx's.
             indexed_transaction_set::const_iterator it2 = mapTx.find(txin.prevout.hash);
@@ -766,8 +767,8 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
                        !tx2.vout[txin.prevout.n].IsNull() &&
                        !tx2.vout[txin.prevout.n].scriptPubKey.IsUnspendable());
                 setParentCheck.insert(*it2);
-                has_timestamp_unmineable_parent |=
-                    timestamp_unmineable_transactions.count(txin.prevout.hash) != 0;
+                has_context_unmineable_parent |=
+                    context_unmineable_transactions.count(txin.prevout.hash) != 0;
             }
             // We are iterating through the mempool entries sorted in order by ancestor count.
             // All parents must have been checked before their children and their coins added to
@@ -842,8 +843,43 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
                 check_spend_time, check_demurrage_time, txfee);
             const bool direct_timestamp_conflict =
                 !inputs_valid && dummy_state.GetRejectReason() == "bad-txns-time-earlier-than-input";
-            const bool timestamp_unmineable = has_timestamp_unmineable_parent ||
-                                               direct_timestamp_conflict;
+            const int64_t entry_time{it->GetTime().count()};
+            const bool entry_time_representable{
+                entry_time >= 0 &&
+                entry_time <= std::numeric_limits<uint32_t>::max()};
+            const Consensus::Params& consensus_params{Params().GetConsensus()};
+            const bool entry_fee_schedule_active{
+                entry_time_representable &&
+                consensus_params.IsProtocolV3_1(entry_time)};
+            const bool candidate_fee_schedule_active{
+                consensus_params.IsProtocolV3_1(check_spend_time)};
+            const CAmount cached_entry_fee{it->GetFee()};
+            const CAmount entry_minimum_fee{
+                entry_fee_schedule_active
+                    ? GetMinFee(tx, static_cast<uint32_t>(entry_time))
+                    : 0};
+            const CAmount candidate_minimum_fee{
+                GetMinFee(tx, static_cast<uint32_t>(check_spend_time))};
+            // A version-2 transaction can be admitted before a historical
+            // fee-schedule boundary and become unmineable after the local
+            // clock crosses it. Recognize only the provable transition: the
+            // cached admission fee must satisfy the entry-time minimum and
+            // fall below the candidate-time minimum. This must not mask a
+            // transaction that was already underfunded when admitted.
+            const bool direct_fee_schedule_conflict =
+                !inputs_valid &&
+                dummy_state.GetRejectReason() == "bad-txns-fee-not-enough" &&
+                tx.nVersion >= 2 &&
+                entry_time_representable &&
+                entry_time < check_spend_time &&
+                !entry_fee_schedule_active &&
+                candidate_fee_schedule_active &&
+                cached_entry_fee >= entry_minimum_fee &&
+                cached_entry_fee < candidate_minimum_fee;
+            const bool direct_context_conflict =
+                direct_timestamp_conflict || direct_fee_schedule_conflict;
+            const bool context_unmineable = has_context_unmineable_parent ||
+                                            direct_context_conflict;
 
             // The replay evaluates one hypothetical header time, rather than
             // the context-free mempool view used at admission. A v2 output is
@@ -851,18 +887,19 @@ void CTxMemPool::check(const CCoinsViewCache& active_coins_tip, int64_t spendhei
             // temporarily unmineable solely because its serialized nTime is
             // older. Preserve the normal assertion for every other standalone
             // failure, but retain the graph and model its outputs for a known
-            // timestamp-local dependency so its descendants are also checked
+            // context-local dependency so its descendants are also checked
             // structurally rather than crashing a node. A descendant's own
-            // non-timestamp input failure remains an invariant violation even
-            // if an ancestor is temporarily unmineable at this header time.
-            assert(inputs_valid || direct_timestamp_conflict);
-            if (timestamp_unmineable) {
-                timestamp_unmineable_transactions.insert(tx.GetHash());
+            // unrelated input failure remains an invariant violation even if
+            // an ancestor is unmineable at this header time.
+            assert(inputs_valid || direct_context_conflict);
+            if (context_unmineable) {
+                context_unmineable_transactions.insert(tx.GetHash());
                 LogPrint(BCLog::MEMPOOL,
-                         "Mempool transaction %s is structurally valid but unmineable at candidate time %d%s%s\n",
+                         "Mempool transaction %s is structurally valid but unmineable at candidate time %d%s%s%s\n",
                          tx.GetHash().ToString(), check_spend_time,
                          direct_timestamp_conflict ? ": bad-txns-time-earlier-than-input" : "",
-                         has_timestamp_unmineable_parent ? ": depends on timestamp-unmineable parent" : "");
+                         direct_fee_schedule_conflict ? ": fee-schedule-transition" : "",
+                         has_context_unmineable_parent ? ": depends on context-unmineable parent" : "");
             }
             for (const auto& input: tx.vin) mempoolDuplicate.SpendCoin(input.prevout);
             AddCoins(mempoolDuplicate, tx, std::numeric_limits<int>::max(),
