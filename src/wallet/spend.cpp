@@ -26,6 +26,7 @@
 #include <tinyformat.h>
 #include <util/check.h>
 #include <util/moneystr.h>
+#include <util/strencodings.h>
 #include <util/trace.h>
 #include <wallet/coincontrol.h>
 #include <wallet/fees.h>
@@ -1513,7 +1514,10 @@ static util::Result<CreatedTransactionResult> CreateTransactionInternal(
 
     FastRandomContext rng_fast;
     CMutableTransaction txNew; // The resulting transaction that we make
-    txNew.nVersion = std::stoi(gArgs.GetArg("-txversion", strprintf("%d", int{CTransaction::CURRENT_VERSION})));
+    const std::string tx_version_arg = gArgs.GetArg("-txversion", strprintf("%d", int{CTransaction::CURRENT_VERSION}));
+    if (!ParseInt32(tx_version_arg, &txNew.nVersion)) {
+        return util::Error{Untranslated(strprintf("Invalid -txversion value: %s", tx_version_arg))};
+    }
 
     CoinSelectionParams coin_selection_params{rng_fast}; // Parameters for coin selection, init with dummy
     coin_selection_params.m_avoid_partial_spends = coin_control.m_avoid_partial_spends;

@@ -50,10 +50,6 @@ KNOWN_VIOLATIONS = [
     "src/test/util_tests.cpp:.*strtoll",
     "src/wallet/bdb.cpp:.*DbEnv::strerror",  # False positive
     "src/util/syserror.cpp:.*strerror",      # Outside this function use `SysErrorString`
-    # Preserve the legacy -txversion parser for alpha.1. Replacing its permissive
-    # std::stoi behavior is tracked as production hardening in issue #22.
-    r'src/rpc/rawtransaction_util\.cpp:.*std::stoi\(gArgs\.GetArg\("-txversion"',
-    r'src/wallet/spend\.cpp:.*std::stoi\(gArgs\.GetArg\("-txversion"',
 ]
 
 REGEXP_EXTERNAL_DEPENDENCIES_EXCLUSIONS = [

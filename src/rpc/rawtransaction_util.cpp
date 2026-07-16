@@ -177,7 +177,10 @@ CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniVal
 CMutableTransaction ConstructTransaction(const UniValue& inputs_in, const UniValue& outputs_in, const UniValue& locktime, const UniValue& rbf)
 {
     CMutableTransaction rawTx;
-    rawTx.nVersion = std::stoi(gArgs.GetArg("-txversion", strprintf("%d", int{CTransaction::CURRENT_VERSION})));
+    const std::string tx_version_arg = gArgs.GetArg("-txversion", strprintf("%d", int{CTransaction::CURRENT_VERSION}));
+    if (!ParseInt32(tx_version_arg, &rawTx.nVersion)) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Invalid -txversion value: %s", tx_version_arg));
+    }
 
     std::optional<bool> replaceable;
     if (!rbf.isNull()) {
