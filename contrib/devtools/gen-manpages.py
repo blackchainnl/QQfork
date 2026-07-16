@@ -47,9 +47,18 @@ for relpath in BINARIES:
     # last word of line is the actual version e.g. v22.99.0-5c6b3d5b3508
     verstr = verstr.split()[-1]
     assert verstr.startswith('v')
-    # remaining lines are copyright
-    copyright = r.stdout.split('\n')[1:]
-    assert copyright[0].startswith('Copyright (C)')
+    # The version output may include provenance metadata (for example the
+    # exact source commit) before the copyright block. Locate the block
+    # explicitly instead of assuming it starts on the second line.
+    output_lines = r.stdout.splitlines()
+    copyright_start = next(
+        (index for index, line in enumerate(output_lines[1:], start=1)
+         if line.startswith('Copyright (C)')),
+        None,
+    )
+    if copyright_start is None:
+        raise RuntimeError(f'{abspath} --version did not contain a copyright block')
+    copyright = output_lines[copyright_start:]
 
     versions.append((abspath, verstr, copyright))
 
@@ -71,3 +80,13 @@ with tempfile.NamedTemporaryFile('w', suffix='.h2m') as footer:
         outname = os.path.join(mandir, os.path.basename(abspath) + '.1')
         print(f'Generating {outname}…')
         subprocess.run([help2man, '-N', '--version-string=' + verstr, '--include=' + footer.name, '-o', outname, abspath], check=True)
+        # Do not embed an exact Git commit in a tracked generated file: adding
+        # that file to the commit would immediately make the embedded identity
+        # stale. The installed binary remains the authoritative source for the
+        # exact provenance reported by --version.
+        with open(outname, encoding='utf-8') as generated:
+            manpage = generated.readlines()
+        with open(outname, 'w', encoding='utf-8') as generated:
+            generated.writelines(
+                line for line in manpage if not line.startswith('Source commit: ')
+            )

@@ -10,6 +10,11 @@
   5,993,200. Earlier Gold Rush blocks retain the v30.1.0 first-valid-claim
   allocation; upgraded shadow-ledger consumers intentionally derive the new
   canonical allocation only at and after that boundary.
+- Gold Rush PoS allocation is enforced as one global accumulated pool split
+  once across eligible active targets. Materialized payouts must sum exactly
+  to the pool, including when multiple targets select the same payout script;
+  dedicated apply-and-undo coverage prevents per-signaler multiplication or
+  value loss.
 - Demurrage activates automatically with the first Final block. Any
   nominal-minus-effective principal realized by a valid spend is permanently
   burned; it is not paid to a miner, staker, treasury, shadow pool, or claim

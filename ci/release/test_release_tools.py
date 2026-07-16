@@ -51,6 +51,63 @@ def load_path(name, path):
 
 
 class ReleaseToolTests(unittest.TestCase):
+    def test_manpage_generator_accepts_source_commit_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in (
+                "src/blackcoind",
+                "src/blackcoin-cli",
+                "src/blackcoin-tx",
+                "src/blackcoin-wallet",
+                "src/blackcoin-util",
+                "src/qt/blackcoin-qt",
+            ):
+                binary = root / relative
+                binary.parent.mkdir(parents=True, exist_ok=True)
+                binary.write_text(
+                    "#!/bin/sh\n"
+                    "printf '%s\\n' 'Blackcoin version v30.1.1' "
+                    "'Source commit: 0123456789abcdef0123456789abcdef01234567' "
+                    "'Copyright (C) 2026 Blackcoin Developers'\n",
+                    encoding="utf-8",
+                )
+                binary.chmod(0o755)
+
+            help2man = root / "help2man"
+            help2man.write_text(
+                "#!/usr/bin/env python3\n"
+                "from pathlib import Path\n"
+                "import sys\n"
+                "output = Path(sys.argv[sys.argv.index('-o') + 1])\n"
+                "output.write_text('.TH BLACKCOIN 1\\nSource commit: "
+                "0123456789abcdef0123456789abcdef01234567\\n', "
+                "encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+            help2man.chmod(0o755)
+            mandir = root / "man"
+            mandir.mkdir()
+            environment = os.environ.copy()
+            environment.update({
+                "TOPDIR": str(root),
+                "BUILDDIR": str(root),
+                "MANDIR": str(mandir),
+                "HELP2MAN": str(help2man),
+            })
+            script = TOOLS.parent.parent / "contrib/devtools/gen-manpages.py"
+            subprocess.run(
+                [sys.executable, str(script)],
+                check=True,
+                env=environment,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            generated = sorted(mandir.glob("*.1"))
+            self.assertEqual(len(generated), 6)
+            for manpage in generated:
+                self.assertNotIn("Source commit:", manpage.read_text(encoding="utf-8"))
+
     def write_native_binary(self, path, platform, architecture):
         if platform == "linux":
             machine = {"x86_64": 62, "arm64": 183}[architecture]

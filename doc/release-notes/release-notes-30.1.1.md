@@ -70,6 +70,11 @@ readiness or version bit can activate it. Witness v15 remains frozen: v30.1.1
 provides no funding or spending workflow, and consensus rejects v15 outputs
 and spends from Migration onward.
 
+Gold Rush PoS allocation is one global accumulated pool split once across all
+eligible active targets. Materialized payouts must sum exactly to that pool,
+including when multiple targets select the same payout script; dedicated
+apply-and-undo coverage prevents per-signaler multiplication or value loss.
+
 ## Gold Rush claim safety
 
 The wallet permits one unresolved wallet-authored fee-paying `QQSPROOF` at a
