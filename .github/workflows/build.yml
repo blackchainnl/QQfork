@@ -63,7 +63,7 @@ jobs:
         if: ${{ github.event_name == 'push' }}
         shell: bash
         env:
-          RELEASE_GPG_PUBLIC_KEY_B64: ${{ secrets.RELEASE_GPG_PUBLIC_KEY_B64 }}
+          RELEASE_GPG_PUBLIC_KEY_B64: ${{ vars.RELEASE_GPG_PUBLIC_KEY_B64 }}
           RELEASE_GPG_FINGERPRINT: ${{ vars.RELEASE_GPG_FINGERPRINT }}
         run: |
           set -euo pipefail

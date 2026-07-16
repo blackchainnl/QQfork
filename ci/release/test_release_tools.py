@@ -108,6 +108,23 @@ class ReleaseToolTests(unittest.TestCase):
             for manpage in generated:
                 self.assertNotIn("Source commit:", manpage.read_text(encoding="utf-8"))
 
+    def test_tag_resolution_uses_non_secret_public_verification_material(self):
+        workflow = (
+            TOOLS.parent.parent / ".github/workflows/build.yml"
+        ).read_text(encoding="utf-8")
+        self.assertIn(
+            "RELEASE_GPG_PUBLIC_KEY_B64: ${{ vars.RELEASE_GPG_PUBLIC_KEY_B64 }}",
+            workflow,
+        )
+        self.assertNotIn(
+            "RELEASE_GPG_PUBLIC_KEY_B64: ${{ secrets.RELEASE_GPG_PUBLIC_KEY_B64 }}",
+            workflow,
+        )
+        self.assertIn(
+            "RELEASE_GPG_PRIVATE_KEY_B64: ${{ secrets.RELEASE_GPG_PRIVATE_KEY_B64 }}",
+            workflow,
+        )
+
     def write_native_binary(self, path, platform, architecture):
         if platform == "linux":
             machine = {"x86_64": 62, "arm64": 183}[architecture]

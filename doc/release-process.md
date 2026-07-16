@@ -114,9 +114,13 @@ before the production tag is pushed:
 4. Restrict the `production-release` environment to `v30.1.1`, require an
    independent human reviewer, prevent self-review, and prevent administrator
    bypass.
-5. Store signing and notarization material only as protected environment
-   secrets or variables. Do not put credentials in source, logs, artifacts,
-   repository-level variables visible to pull requests, or workflow inputs.
+5. Store private signing and notarization material only as protected
+   environment secrets or variables. Configure the non-secret armored OpenPGP
+   public key and independently published fingerprint as repository variables
+   `RELEASE_GPG_PUBLIC_KEY_B64` and `RELEASE_GPG_FINGERPRINT`; the resolver
+   needs them before protected signing jobs begin. Do not put private
+   credentials in source, logs, artifacts, repository-level variables visible
+   to pull requests, or workflow inputs.
    Configure the separate `production-resource-evidence` environment and its
    protected self-hosted runner paths before final qualification. It supplies
    the immutable connected-tip manifest/archive/state-root paths used by both
@@ -137,8 +141,9 @@ evidence with the release record.
 The production workflow fails closed unless the protected environment supplies
 the complete list in `doc/v30.1.1-release-gate.md`. Those values include:
 
-- the Blackcoin-Dev OpenPGP public and private key material and exact
-  fingerprint;
+- the Blackcoin-Dev OpenPGP private key in the protected environment, plus the
+  matching public key and exact fingerprint in the documented non-secret
+  repository variables;
 - the Windows Authenticode certificate, password, certificate SHA-256, and
   RFC 3161 timestamp service;
 - the macOS Developer ID certificate, password, certificate SHA-256, and
