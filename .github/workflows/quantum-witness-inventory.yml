@@ -1,0 +1,182 @@
+name: v30.1.1 exact mainnet quantum witness inventory
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Full 40-character final candidate commit SHA
+        required: true
+        type: string
+      fixture_manifest_sha256:
+        description: Immutable SHA256 of the fresh protected connected-tip manifest
+        required: true
+        type: string
+      dispositions_sha256:
+        description: Immutable SHA256 of the exact per-outpoint dispositions file, or empty for a zero review set
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v30.1.1-quantum-witness-inventory-${{ inputs.target_sha }}
+  cancel-in-progress: false
+
+jobs:
+  exact-mainnet-witness-inventory:
+    name: exact-source connected-tip witness inventory
+    runs-on: [self-hosted, linux, x64, blackcoin-shadow-resource]
+    environment: production-resource-evidence
+    timeout-minutes: 1440
+    env:
+      HOST: x86_64-pc-linux-gnu
+      MAKEJOBS: 2
+      TARGET_SHA: ${{ inputs.target_sha }}
+      FIXTURE_MANIFEST_SHA256: ${{ inputs.fixture_manifest_sha256 }}
+      DISPOSITIONS_SHA256: ${{ inputs.dispositions_sha256 }}
+      FIXTURE_MANIFEST: ${{ vars.SHADOW_RESOURCE_FIXTURE_MANIFEST }}
+      FIXTURE_ARCHIVE: ${{ vars.SHADOW_RESOURCE_FIXTURE_ARCHIVE }}
+      STATE_ROOT: ${{ vars.SHADOW_RESOURCE_STATE_ROOT }}
+      WITNESS_DISPOSITIONS: ${{ vars.QUANTUM_WITNESS_DISPOSITIONS }}
+      LC_ALL: C
+      TZ: UTC
+    steps:
+      - name: Checkout immutable final candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ inputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Verify protected runner and immutable evidence inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$FIXTURE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$GITHUB_WORKFLOW_SHA" = "$TARGET_SHA" || {
+            echo "::error::Run this workflow from the exact candidate ref"
+            exit 1
+          }
+          test "$(uname -s)" = Linux
+          test "$(uname -m)" = x86_64
+          [[ "$FIXTURE_MANIFEST" = /* ]]
+          [[ "$FIXTURE_ARCHIVE" = /* ]]
+          [[ "$STATE_ROOT" = /* ]]
+          test -f "$FIXTURE_MANIFEST"
+          test -f "$FIXTURE_ARCHIVE"
+          test -d "$STATE_ROOT"
+          test ! -L "$FIXTURE_MANIFEST"
+          test ! -L "$FIXTURE_ARCHIVE"
+          test ! -L "$STATE_ROOT"
+          test "$(sha256sum "$FIXTURE_MANIFEST" | awk '{print $1}')" = \
+            "$FIXTURE_MANIFEST_SHA256"
+          if [[ -n "$WITNESS_DISPOSITIONS" ]]; then
+            [[ "$WITNESS_DISPOSITIONS" = /* ]]
+            [[ "$DISPOSITIONS_SHA256" =~ ^[0-9a-f]{64}$ ]]
+            test -f "$WITNESS_DISPOSITIONS"
+            test ! -L "$WITNESS_DISPOSITIONS"
+            test "$(sha256sum "$WITNESS_DISPOSITIONS" | awk '{print $1}')" = \
+              "$DISPOSITIONS_SHA256"
+          else
+            test -z "$DISPOSITIONS_SHA256" || {
+              echo "::error::A dispositions digest requires a protected dispositions path"
+              exit 1
+            }
+          fi
+          test -z "$(git status --porcelain)"
+          for tool in autoconf automake bison cmake g++ git jq make pkg-config python3; do
+            command -v "$tool" >/dev/null
+          done
+
+      - name: Build exact walletless node and CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          make -j "$MAKEJOBS" -C depends \
+            HOST="$HOST" NO_QT=1 NO_UPNP=1 NO_NATPMP=1 NO_BDB=1 NO_SQLITE=1
+          ./autogen.sh
+          ./configure \
+            --prefix="$PWD/depends/$HOST" \
+            --with-gui=no \
+            --disable-wallet \
+            --disable-tests \
+            --disable-bench \
+            --disable-zmq
+          make -j "$MAKEJOBS" src/blackcoind src/blackcoin-cli
+          test -x src/blackcoind
+          test -x src/blackcoin-cli
+          grep -Fx "Source commit: $TARGET_SHA" < <(src/blackcoind -version)
+          grep -Fx "Source commit: $TARGET_SHA" < <(src/blackcoin-cli -version)
+          test -z "$(git status --porcelain)"
+
+      - name: Generate and independently verify exact-tip witness evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          work="$STATE_ROOT/$TARGET_SHA/witness-$FIXTURE_MANIFEST_SHA256"
+          evidence="$work/quantum-witness-inventory-$TARGET_SHA.json"
+          authorization="$work/quantum-witness-authorization-$TARGET_SHA.json"
+          args=(
+            --repo-root "$GITHUB_WORKSPACE"
+            --target-sha "$TARGET_SHA"
+            --contract ci/release/shadow_resource_production_contract.json
+            --fixture-manifest "$FIXTURE_MANIFEST"
+            --fixture-manifest-sha256 "$FIXTURE_MANIFEST_SHA256"
+            --fixture-archive "$FIXTURE_ARCHIVE"
+            --work-dir "$work"
+            --blackcoind src/blackcoind
+            --blackcoin-cli src/blackcoin-cli
+            --evidence-output "$evidence"
+            --authorization-output "$authorization"
+          )
+          if [[ -n "$WITNESS_DISPOSITIONS" ]]; then
+            args+=(
+              --dispositions "$WITNESS_DISPOSITIONS"
+              --dispositions-sha256 "$DISPOSITIONS_SHA256"
+            )
+          fi
+          python3 ci/release/run_quantum_witness_inventory_gate.py "${args[@]}"
+
+          bundle="$RUNNER_TEMP/quantum-witness-inventory-$TARGET_SHA"
+          rm -rf "$bundle"
+          mkdir -m 700 "$bundle"
+          cp "$evidence" "$bundle/quantum-witness-inventory-$TARGET_SHA.json"
+          cp "$authorization" "$bundle/quantum-witness-authorization-$TARGET_SHA.json"
+          cp "$FIXTURE_MANIFEST" "$bundle/quantum-witness-capture-$TARGET_SHA.json"
+          cp ci/release/shadow_resource_production_contract.json "$bundle/"
+          cp src/blackcoind src/blackcoin-cli "$bundle/"
+          if [[ -n "$WITNESS_DISPOSITIONS" ]]; then
+            cp "$WITNESS_DISPOSITIONS" \
+              "$bundle/quantum-witness-dispositions-$TARGET_SHA.json"
+          fi
+
+          recomputed="$RUNNER_TEMP/quantum-witness-authorization-recomputed-$TARGET_SHA.json"
+          python3 ci/release/verify_quantum_witness_inventory_evidence.py \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --target-sha "$TARGET_SHA" \
+            --evidence "$bundle/quantum-witness-inventory-$TARGET_SHA.json" \
+            --capture-manifest "$bundle/quantum-witness-capture-$TARGET_SHA.json" \
+            --capture-manifest-sha256 "$FIXTURE_MANIFEST_SHA256" \
+            --contract "$bundle/shadow_resource_production_contract.json" \
+            --blackcoind "$bundle/blackcoind" \
+            --blackcoin-cli "$bundle/blackcoin-cli" \
+            --authorization-output "$recomputed"
+          cmp "$authorization" "$recomputed"
+          jq -e --arg target "$TARGET_SHA" \
+            '.authorized == true and
+             .mode == "exact_final_mainnet_witness_inventory" and
+             .network == "main" and .target_sha == $target' \
+            "$recomputed" >/dev/null
+          echo "EVIDENCE_BUNDLE=$bundle" >> "$GITHUB_ENV"
+
+      - name: Upload exact-SHA mainnet witness inventory
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: quantum-witness-mainnet-inventory-${{ env.TARGET_SHA }}
+          path: ${{ env.EVIDENCE_BUNDLE }}/*
+          if-no-files-found: error
+          retention-days: 90

@@ -117,6 +117,11 @@ before the production tag is pushed:
 5. Store signing and notarization material only as protected environment
    secrets or variables. Do not put credentials in source, logs, artifacts,
    repository-level variables visible to pull requests, or workflow inputs.
+   Configure the separate `production-resource-evidence` environment and its
+   protected self-hosted runner paths before final qualification. It supplies
+   the immutable connected-tip manifest/archive/state-root paths used by both
+   the shadow-resource and quantum-witness gates, plus an exact per-outpoint
+   disposition path only when the witness review set is nonzero.
 6. Record the release OpenPGP fingerprint on the protected default branch and
    publish the same fingerprint through an independently controlled Blackcoin
    communication channel. The fingerprint must match
@@ -203,10 +208,14 @@ independently documents the real keys and certificates.
 3. Download the `unsigned-canary-*` bundle only after both isolated builders
    reproduce every selected artifact byte for byte. Verify the unsigned
    checksum manifest and its `prerelease_channel=beta` binding.
-4. Install one isolated canary with verified wallet and datadir backups. Run
+4. Run the protected exact-final-SHA shadow-resource and mainnet quantum-witness
+   workflows. Preserve their unexpired artifacts. The witness capture must be
+   no more than 24 hours old at publication and must have either a zero review
+   set or an approved exact-snapshot disposition for every review outpoint.
+5. Install one isolated canary with verified wallet and datadir backups. Run
    the two-start upgrade, replay/reindex, restart, staking, wallet, GUI, and
    rollback checks required by the beta plan before any broader testing.
-5. If public beta testing is authorized, create the immutable
+6. If public beta testing is authorized, create the immutable
    `v30.1.1-betaN` prerelease at that exact SHA, upload only the unchanged
    verified bundle, keep `latest=false`, then redownload and compare every
    public byte. Corrections require a new release-candidate number and tag.

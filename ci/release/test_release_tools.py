@@ -4,6 +4,7 @@
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
 """Regression tests for fail-closed release metadata and identity tooling."""
 
+import copy
 import hashlib
 import importlib.util
 import json
@@ -1127,6 +1128,52 @@ class ReleaseToolTests(unittest.TestCase):
                 with self.subTest(workflow=workflow.name, line=line_number):
                     self.assertRegex(match.group(1), immutable)
 
+    def test_final_release_requires_exact_mainnet_witness_artifact(self):
+        root = TOOLS.parent.parent
+        witness = (
+            root / ".github" / "workflows" / "quantum-witness-inventory.yml"
+        ).read_text(encoding="utf-8")
+        release = (
+            root / ".github" / "workflows" / "build.yml"
+        ).read_text(encoding="utf-8")
+
+        # A dispatch from another ref cannot attest the requested candidate.
+        self.assertIn("ref: ${{ inputs.target_sha }}", witness)
+        self.assertIn('test "$(git rev-parse HEAD)" = "$TARGET_SHA"', witness)
+        self.assertIn('test "$GITHUB_WORKFLOW_SHA" = "$TARGET_SHA"', witness)
+        self.assertIn("environment: production-resource-evidence", witness)
+        self.assertIn(
+            "runs-on: [self-hosted, linux, x64, blackcoin-shadow-resource]",
+            witness,
+        )
+
+        artifact_name = "quantum-witness-mainnet-inventory-$TARGET_SHA"
+        self.assertIn(artifact_name, release)
+        self.assertIn(
+            "sort -t $'\\t' -k2,2nr -k1,1nr",
+            release,
+        )
+        self.assertIn('test -n "$artifact" || {', release)
+        self.assertIn(
+            'test "$run_path" = '
+            '".github/workflows/quantum-witness-inventory.yml"',
+            release,
+        )
+        self.assertIn('test "$run_result" = success', release)
+        self.assertIn('test "$run_sha" = "$TARGET_SHA"', release)
+        self.assertIn('test "$run_event" = workflow_dispatch', release)
+        self.assertIn('test "$run_actor" = Blackcoin-Dev', release)
+        self.assertIn('test "$triggering_actor" = Blackcoin-Dev', release)
+        self.assertIn("--maximum-age-seconds 86400", release)
+        self.assertIn("verify_quantum_witness_inventory_evidence.py", release)
+        self.assertIn("--blackcoind \"$bundled_blackcoind\"", release)
+        self.assertIn("--blackcoin-cli \"$bundled_cli\"", release)
+        self.assertIn('cmp "$authorization" "$recomputed"', release)
+        self.assertIn(
+            "Blackcoin-$VERSION-quantum-witness-authorization.json",
+            release,
+        )
+
     def test_mixed_version_command_runner_executes_all_commands(self):
         builder = load_mixed_version_module("build_previous_releases")
         with tempfile.TemporaryDirectory() as temporary:
@@ -1934,6 +1981,13 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
             TOOLS.parents[1] / "contrib" / "devtools" /
             "quantum_witness_inventory_audit.py",
         )
+        self.verifier = load_module("verify_quantum_witness_inventory_evidence")
+        self.runner = load_module("run_quantum_witness_inventory_gate")
+        self.contract_path = TOOLS / "shadow_resource_production_contract.json"
+        self.contract = json.loads(self.contract_path.read_text(encoding="utf-8"))
+        self.contract_sha = hashlib.sha256(
+            self.contract_path.read_bytes()
+        ).hexdigest()
         self.bestblock = "a" * 64
         self.muhash = "b" * 64
 
@@ -1959,6 +2013,126 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
             "coinbase": False,
             "coinstake": False,
         }
+
+    def binary_identities(self):
+        version = (
+            "Blackcoin Core version v30.1.1rc1-test\n"
+            f"Source commit: {SOURCE_SHA}"
+        )
+        return {
+            "blackcoind": {
+                "sha256": "1" * 64,
+                "version": version,
+                "source_commit": SOURCE_SHA,
+                "source_dirty": False,
+            },
+            "blackcoin_cli": {
+                "sha256": "2" * 64,
+                "version": version,
+                "source_commit": SOURCE_SHA,
+                "source_dirty": False,
+            },
+        }
+
+    def server_identity(self):
+        return {
+            "launched_by_acceptance_verifier": True,
+            "non_daemonized_process": True,
+            "pid": 123,
+            "executable": "/candidate/blackcoind",
+            "executable_sha256": "1" * 64,
+            "process_image_binding": {
+                "mechanism": "linux_proc_pid_exe",
+                "observed_path": "/candidate/blackcoind",
+                "sha256": "1" * 64,
+            },
+            "rpc_endpoint": "127.0.0.1:12345",
+            "rpc_authentication": {
+                "mechanism": "verifier_owned_cookie",
+                "private_directory_mode": "0700",
+                "cookie_path": "/private/rpc-auth.cookie",
+                "secret_recorded": False,
+            },
+            "rpc_reported_build": "v30.1.1rc1-test",
+            "rpc_reported_source_commit": SOURCE_SHA,
+            "rpc_reported_source_dirty": False,
+            "wallet_disabled": True,
+            "staking_disabled": True,
+            "pow_mining_disabled": True,
+            "network_frozen_during_snapshot": True,
+        }
+
+    def capture_manifest(self, *, captured_at=2_000_000_000):
+        return {
+            "schema": 2,
+            "evidence_kind": "current_live_partial_epoch",
+            "contract_sha256": self.contract_sha,
+            "target_sha": SOURCE_SHA,
+            "network": "main",
+            "archive_sha256": "d" * 64,
+            "archive_size_bytes": 1,
+            "archive_root": "mainnet",
+            "captured_at_unix": captured_at,
+            "capture_attestation": (
+                "protected_operator_confirmed_connected_mainnet_tip"
+            ),
+            "capture_rpc": {
+                "chain": "main",
+                "blocks": 5_953_262,
+                "headers": 5_953_262,
+                "bestblockhash": self.bestblock,
+                "initialblockdownload": False,
+                "connections": 1,
+            },
+            "end_height": 5_953_262,
+            "end_hash": self.bestblock,
+            "pre_gold_rush_hash": "c" * 64,
+            "first_gold_rush_hash": "d" * 64,
+            "issued_claims": 3,
+            "spent_claims": 0,
+            "unspent_claims": 3,
+        }
+
+    def generate_evidence(self, records, *, dispositions=None,
+                          dispositions_sha256=None):
+        return self.audit.generate_evidence(
+            self.rpc(records),
+            source={
+                "repository": "https://github.com/Blackcoin-Dev/Blackcoin.git",
+                "commit": SOURCE_SHA,
+                "clean": True,
+            },
+            binaries=self.binary_identities(),
+            source_sha=SOURCE_SHA,
+            server=self.server_identity(),
+            dispositions=dispositions,
+            dispositions_sha256=dispositions_sha256,
+            page_size=1,
+        )
+
+    def verify_evidence(self, evidence, manifest, *, now=2_000_000_100,
+                        actual_binaries=None):
+        manifest_sha = hashlib.sha256(
+            json.dumps(manifest, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        if actual_binaries is None:
+            actual_binaries = evidence["binaries"]
+        return self.verifier.verify_evidence_document(
+            evidence,
+            manifest,
+            self.contract,
+            target_sha=SOURCE_SHA,
+            manifest_sha256=manifest_sha,
+            contract_sha256=self.contract_sha,
+            actual_binaries=actual_binaries,
+            now=now,
+        )
+
+    def rehash_evidence(self, evidence):
+        evidence.pop("evidence_payload_sha256", None)
+        evidence["evidence_payload_sha256"] = hashlib.sha256(
+            self.audit.canonical_bytes(evidence)
+        ).hexdigest()
 
     def rpc(self, records, *, moving_page=False, truncate=False):
         def bucket(selected):
@@ -2174,6 +2348,146 @@ class WitnessInventoryAcceptanceTests(unittest.TestCase):
             evidence["live_shadow_reconciliation"]["unspent_count"], 3
         )
         self.assertRegex(evidence["evidence_payload_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_offline_production_verifier_authorizes_zero_review_capture(self):
+        evidence = self.generate_evidence([])
+        authorization = self.verify_evidence(evidence, self.capture_manifest())
+        self.assertTrue(authorization["authorized"])
+        self.assertEqual(
+            authorization["mode"],
+            "exact_final_mainnet_witness_inventory",
+        )
+        self.assertEqual(authorization["target_sha"], SOURCE_SHA)
+        self.assertEqual(
+            authorization["bridge_review"],
+            {
+                "result": "zero_relevant_outpoints",
+                "count": 0,
+                "dispositions_file_sha256": None,
+            },
+        )
+
+    def test_offline_production_verifier_rejects_stale_or_tampered_capture(self):
+        evidence = self.generate_evidence([])
+        manifest = self.capture_manifest()
+        with self.assertRaisesRegex(
+            self.verifier.VerificationError, "capture is stale"
+        ):
+            self.verify_evidence(
+                evidence,
+                manifest,
+                now=manifest["captured_at_unix"] + 86_401,
+            )
+
+        tampered_evidence = copy.deepcopy(evidence)
+        tampered_evidence["snapshot"]["height"] += 1
+        with self.assertRaisesRegex(
+            self.verifier.VerificationError, "payload SHA256 does not match"
+        ):
+            self.verify_evidence(tampered_evidence, manifest)
+
+        self.rehash_evidence(tampered_evidence)
+        with self.assertRaisesRegex(
+            self.verifier.VerificationError, "snapshot differs"
+        ):
+            self.verify_evidence(tampered_evidence, manifest)
+
+        tampered_manifest = copy.deepcopy(manifest)
+        tampered_manifest["capture_rpc"]["connections"] = 0
+        with self.assertRaisesRegex(
+            self.verifier.VerificationError, "connected synchronized exact tip"
+        ):
+            self.verify_evidence(evidence, tampered_manifest)
+
+    def test_offline_production_verifier_binds_downloaded_binary_identity(self):
+        evidence = self.generate_evidence([])
+        manifest = self.capture_manifest()
+        substituted = copy.deepcopy(evidence["binaries"])
+        substituted["blackcoin_cli"]["sha256"] = "f" * 64
+        with self.assertRaisesRegex(
+            self.verifier.VerificationError, "bundled witness binaries differ"
+        ):
+            self.verify_evidence(
+                evidence, manifest, actual_binaries=substituted,
+            )
+
+        wrong_source = copy.deepcopy(evidence)
+        wrong_source["binaries"]["blackcoind"]["version"] = (
+            "Blackcoin Core version v30.1.1rc1-test\n"
+            f"Source commit: {'0' * 40}"
+        )
+        self.rehash_evidence(wrong_source)
+        with self.assertRaisesRegex(
+            self.verifier.VerificationError, "blackcoind is not bound"
+        ):
+            self.verify_evidence(wrong_source, manifest)
+
+    def test_offline_production_verifier_enforces_disposition_paths(self):
+        manifest = self.capture_manifest()
+        zero_review = self.generate_evidence([])
+        zero_review["acceptance"]["dispositions_file_sha256"] = "4" * 64
+        self.rehash_evidence(zero_review)
+        with self.assertRaisesRegex(
+            self.verifier.VerificationError, "disposition-free"
+        ):
+            self.verify_evidence(zero_review, manifest)
+
+        record = self.record(1, 16, "recognized_direct_quantum")
+        disposition = {
+            "schema": self.audit.DISPOSITIONS_SCHEMA,
+            "source_commit": SOURCE_SHA,
+            "network": "main",
+            "snapshot": {
+                "height": 5_953_262,
+                "bestblock": self.bestblock,
+                "utxo_muhash": self.muhash,
+            },
+            "outpoints": {
+                f"{record['txid']}:{record['vout']}": {
+                    "action": "preserve_locked_pending_protocol_review",
+                    "rationale": "Exact-snapshot production review fixture.",
+                    "approval_ref": "release-review-1",
+                },
+            },
+        }
+        disposition_sha = hashlib.sha256(
+            json.dumps(disposition, sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        nonzero_review = self.generate_evidence(
+            [record], dispositions=disposition,
+            dispositions_sha256=disposition_sha,
+        )
+        authorization = self.verify_evidence(nonzero_review, manifest)
+        self.assertEqual(authorization["bridge_review"]["count"], 1)
+        self.assertEqual(
+            authorization["bridge_review"]["dispositions_file_sha256"],
+            disposition_sha,
+        )
+
+        incomplete = copy.deepcopy(nonzero_review)
+        incomplete["acceptance"]["dispositions_file_sha256"] = None
+        self.rehash_evidence(incomplete)
+        with self.assertRaisesRegex(
+            self.verifier.VerificationError, "dispositions are incomplete"
+        ):
+            self.verify_evidence(incomplete, manifest)
+
+    def test_protected_runner_binds_optional_dispositions(self):
+        self.runner.verify_dispositions_input(None, "")
+        with self.assertRaisesRegex(
+            RuntimeError, "digest was supplied without"
+        ):
+            self.runner.verify_dispositions_input(None, "1" * 64)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "dispositions.json"
+            path.write_text('{"schema": 1}\n', encoding="utf-8")
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            self.runner.verify_dispositions_input(path, digest)
+            with self.assertRaisesRegex(RuntimeError, "lowercase hexadecimal"):
+                self.runner.verify_dispositions_input(path, "")
+            with self.assertRaisesRegex(RuntimeError, "immutable requested digest"):
+                self.runner.verify_dispositions_input(path, "0" * 64)
 
     def test_every_relevant_outpoint_requires_snapshot_bound_disposition(self):
         records = [
