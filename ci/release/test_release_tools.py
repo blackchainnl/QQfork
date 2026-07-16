@@ -1594,6 +1594,96 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertTrue(manifest["release"]["macos_adhoc_signed"])
             self.assertFalse(manifest["release"]["published"])
 
+    def test_unsigned_beta2_manifest_is_bound_to_rc2_and_exact_source(self):
+        generator = load_module("generate_canary_manifest")
+        package_label = "30.1.1-beta2"
+        prefix = f"Blackcoin-{package_label}-{SOURCE_SHA}-"
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            (artifacts / f"{prefix}Linux-x86_64.tar.gz").write_bytes(b"beta2")
+            (artifacts / f"{prefix}linux-64-bit-SOURCE_COMMIT.txt").write_text(
+                SOURCE_SHA + "\n", encoding="utf-8"
+            )
+            (artifacts / f"{prefix}REPRODUCIBILITY.txt").write_text(
+                f"package_label={package_label}\n"
+                "prerelease_channel=beta\n"
+                "configured_version=30.1.1rc2\n"
+                f"source_commit={SOURCE_SHA}\n",
+                encoding="utf-8",
+            )
+            (artifacts / f"{prefix}UNSIGNED-CANARY.txt").write_text(
+                "UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE\n"
+                f"package_label={package_label}\n"
+                "prerelease_channel=beta\n"
+                "configured_version=30.1.1rc2\n"
+                f"source_commit={SOURCE_SHA}\n"
+                "workflow_run_id=12345\n"
+                "signed=false\n"
+                "developer_id_signed=false\n"
+                "macos_adhoc_signed=true\n"
+                "notarized=false\npublished=false\n",
+                encoding="utf-8",
+            )
+            output = artifacts / f"{prefix}MANIFEST-UNSIGNED.json"
+
+            manifest = generator.generate_manifest(
+                artifacts=artifacts,
+                package_label=package_label,
+                source_version="30.1.1",
+                configured_version="30.1.1rc2",
+                source_sha=SOURCE_SHA,
+                release_candidate="2",
+                workflow_run_id="12345",
+                output=output,
+                macos_adhoc_signed=True,
+            )
+
+            self.assertEqual(manifest["package_label"], package_label)
+            self.assertEqual(manifest["configured_version"], "30.1.1rc2")
+            self.assertEqual(manifest["release_candidate"], 2)
+            self.assertEqual(manifest["prerelease_channel"], "beta")
+            self.assertEqual(manifest["source"]["commit"], SOURCE_SHA)
+
+    def test_documentation_lint_preserves_final_and_beta2_identity_modes(self):
+        lint = load_path(
+            "lint_quantum_doc_invariants",
+            TOOLS.parent.parent / "test" / "lint" / "lint-quantum-doc-invariants.py",
+        )
+        final_configure = (
+            "define(_CLIENT_VERSION_RC, 0)\n"
+            "define(_CLIENT_VERSION_IS_RELEASE, true)\n"
+        )
+        beta2_configure = (
+            "define(_CLIENT_VERSION_RC, 2)\n"
+            "define(_CLIENT_VERSION_IS_RELEASE, false)\n"
+        )
+        self.assertEqual(lint.configured_release_identity(final_configure), (0, True))
+        self.assertEqual(lint.configured_release_identity(beta2_configure), (2, False))
+
+        for configure, expected in ((final_configure, "final"), (beta2_configure, "beta2")):
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "configure.ac").write_text(configure, encoding="utf-8")
+                failures = []
+                with mock.patch.object(lint, "check_final_release_identity") as final_check, \
+                     mock.patch.object(lint, "check_beta2_release_identity") as beta2_check:
+                    lint.check_release_identity(root, failures)
+                self.assertEqual(failures, [])
+                self.assertEqual(final_check.call_count, expected == "final")
+                self.assertEqual(beta2_check.call_count, expected == "beta2")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "configure.ac").write_text(
+                "define(_CLIENT_VERSION_RC, 0)\n"
+                "define(_CLIENT_VERSION_IS_RELEASE, false)\n",
+                encoding="utf-8",
+            )
+            failures = []
+            lint.check_release_identity(root, failures)
+            self.assertEqual(len(failures), 1)
+            self.assertIn("final RC0/true or replacement Beta 2 RC2/false", failures[0])
+
     def test_unsigned_final_metadata_is_explicit_and_source_bound(self):
         generator = load_module("generate_unsigned_release_metadata")
         version = "30.1.1"

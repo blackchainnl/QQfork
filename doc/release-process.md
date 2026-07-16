@@ -76,6 +76,22 @@ prerelease control above, remain `prerelease=true` and `latest=false`, and
 state that its full P0/P1 and operator validation is still in progress. A beta
 tag or asset is never moved, replaced, or reused for the final release.
 
+#### Withdrawn Beta 1 and replacement Beta 2
+
+`v30.1.1-beta1`, source commit
+`b328d2263038cdddef46b9f427827aac9e83b513`, is withdrawn. Two independent
+authenticated schema-12 rebuilds rejected accepted historical mainnet block
+4,272,172 because Beta 1 applied the later 500-block maturity rule to a
+pre-Protocol-V3.1 coinstake output spent at depth 182. Do not install, deploy,
+or reuse Beta 1. Preserve its immutable tag, original assets, checksums, and
+workflow record only as provenance; never relabel or replace them.
+
+The replacement uses release-candidate 2, `CLIENT_VERSION_IS_RELEASE=false`,
+a new exact source commit, new full-SHA filenames, and the immutable
+`v30.1.1-beta2` prerelease tag. Source-tracked notes must not guess the future
+Beta 2 source SHA or artifact hashes. The frozen workflow outputs and public
+prerelease record must supply those values.
+
 ### Production v30.1.1
 
 The only production publication event is a push of the annotated unsigned
@@ -231,6 +247,15 @@ signature.
    `v30.1.1-betaN` prerelease at that exact SHA, upload only the unchanged
    verified bundle, keep `latest=false`, then redownload and compare every
    public byte. Corrections require a new release-candidate number and tag.
+
+For Beta 2, step 5 includes two independent offline historical-mainnet
+schema-11-to-schema-12 rebuilds from preserved copies. Both must exit zero,
+durably commit the replacement, and agree on height, best block, UTXO MuHash,
+Gold Rush totals, replay-state commitment, and index state. A separate normal
+restart without a reindex flag must report schema 12 with replay state
+`present`, `marker_valid`, and `valid_for_tip` all true. The rebuilt results
+must match the preserved reference at the same tip. A focused unit fixture or
+a replay that stops before height 4,272,172 cannot satisfy this requirement.
 
 ## Production publication procedure
 

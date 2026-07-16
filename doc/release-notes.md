@@ -42,15 +42,25 @@ not notarized. The published text and JSON `UNSIGNED-PRODUCTION` notices state
 these facts. Source configured as final, a locally compiled binary, or a
 successful subset of jobs is not the reviewed published release.
 
-Beta 1 history
-==============
+Beta 1 history and withdrawal
+=============================
 
 The published v30.1.1 Beta 1 packages are historical publisher-unsigned,
 unnotarized canary artifacts built from exact source commit
-`b328d2263038cdddef46b9f427827aac9e83b513`. They are not the signed v30.1.1
-production release. Their source remained configured as `30.1.1rc1` with
-`CLIENT_VERSION_IS_RELEASE=false`, and their unchanged bytes were attached to
-the immutable `v30.1.1-beta1` GitHub prerelease for testing.
+`b328d2263038cdddef46b9f427827aac9e83b513`. **Beta 1 is withdrawn. Do not
+install, deploy, or reuse it.** Two independent authenticated schema-12
+rebuilds rejected accepted historical mainnet block 4,272,172,
+`41c4dbbe2a1238a4d1d901ec451b99dcbdd018746f6229b533a4f102b5840968`.
+The rejected transaction spent a historical coinstake output at depth 182,
+but Beta 1 incorrectly applied the later 500-block maturity rule and returned
+`bad-txns-premature-spend-of-coinbase`.
+
+The regression came from applying the configured current maturity to all
+historical coinbase and coinstake spends instead of preserving the accepted
+pre-Protocol-V3.1 rule. The affected Linux asset SHA-256 is
+`ae35e8bd3c7c549bfcc41e1dbd8a45733af80cf5ee8517e9db64c30ab6b59189`.
+No live Beta 1 cutover occurred in the reported canary. Its source remained
+configured as `30.1.1rc1` with `CLIENT_VERSION_IS_RELEASE=false`.
 
 Every downloadable canary archive name includes both
 `Blackcoin-30.1.1-beta1` and the full 40-character source commit. The combined
@@ -59,12 +69,31 @@ Actions artifact is named
 `UNSIGNED-CANARY` marker, an unsigned JSON manifest, unsigned SHA256 sums, exact
 source-commit markers, and the two-builder byte-for-byte reproducibility report.
 
-Confirm that the commit in every filename, source marker, manifest, and
-reproducibility report is identical before testing. Then verify the included
-`SHA256SUMS-UNSIGNED.txt` file. These checks detect corruption and identity
-mismatches; they are not a signature and do not authenticate a production
-release. Do not redistribute a beta archive without its marker, manifest,
-checksums, and full source commit.
+The immutable `v30.1.1-beta1` tag and original assets are retained only as
+provenance for the withdrawn release. They must not be relabeled, replaced,
+or used as the input to another deployment. Their checksums detect corruption
+and identity mismatches; they are not a signature and do not make the affected
+bytes safe to run.
+
+Beta 2 replacement candidate
+============================
+
+The replacement beta source is configured as `30.1.1rc2` with
+`CLIENT_VERSION_IS_RELEASE=false`. It must use a new exact source commit, a new
+immutable `v30.1.1-beta2` tag, and new full-SHA asset names. No Beta 2 source
+commit or artifact hash is asserted in these source-tracked notes; those
+values are recorded only after the candidate is frozen and the exact-source
+workflow emits them.
+
+Beta 2 is not eligible for public testing merely because it compiles or fixes
+the deterministic unit fixture. Its exact binary must complete two independent
+offline historical-mainnet schema-11-to-schema-12 rebuilds, make a durable
+authenticated commit, pass a normal restart without a reindex flag, and match
+height, best block, UTXO MuHash, Gold Rush totals, replay-state commitment, and
+index state between both rebuilds. The exact-source unit, functional,
+mixed-version, sanitizer, fuzz, native-platform, and extended functional/soak
+jobs must also pass. Until that evidence exists, these notes make no claim
+that the replacement replay gate has passed.
 
 Unsafe raw quantum-key RPC disclosure
 =====================================
@@ -78,16 +107,15 @@ normally unlocked wallet and rejects staking-only unlock. The flag does not
 disable networking, restrict RPC access, or make the process an offline key
 environment. Online operators should leave it disabled.
 
-Beta 1 limitations and final disposition
-========================================
+Withdrawn Beta 1 limitations and final disposition
+==================================================
 
-Beta 1 is a test-only prerelease, not a production recommendation. It included
-the consent-based first-launch rebuild assistant tracked in issue #30. Back up
-every wallet and preserve a cold datadir copy before any v30.1.1 upgrade.
-Operators who do not want the GUI to start the protected rebuild can choose
-the default manual/exit path and follow the explicit command-line procedure
-below. Production authorization still requires the exact final artifacts to
-complete the documented upgrade and rollback evidence on each platform.
+Beta 1 is withdrawn for the historical replay regression described above. The
+remaining paragraphs record other behavior of those historical bytes; they do
+not authorize Beta 1 testing. Beta 1 included the consent-based first-launch
+rebuild assistant tracked in issue #30. Any later candidate still requires a
+wallet backup and cold datadir copy before upgrade, plus the documented
+upgrade and rollback evidence on each platform.
 
 A fee-paying Gold Rush PoW claim that leaves the local mempool remains
 quarantined because a peer can retain and later confirm the base-valid

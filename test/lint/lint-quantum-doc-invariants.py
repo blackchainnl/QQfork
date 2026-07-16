@@ -52,6 +52,8 @@ CURRENT_FINAL_OPERATOR_DOCUMENTS = (
     "doc/whitepaper-quantum-quasar.md",
 )
 
+BETA2_RELEASE_CANDIDATE = 2
+
 
 def read_text(root, relative):
     return (root / relative).read_text(encoding="utf-8")
@@ -61,6 +63,22 @@ def normalized(text):
     text = re.sub(r"<[^>]+>", " ", text)
     text = re.sub(r"[`*_]", "", text)
     return re.sub(r"\s+", " ", text).lower()
+
+
+def configured_release_identity(configure):
+    rc_match = re.search(
+        r"^define\(_CLIENT_VERSION_RC, ([0-9]+)\)$",
+        configure,
+        re.MULTILINE,
+    )
+    release_match = re.search(
+        r"^define\(_CLIENT_VERSION_IS_RELEASE, (true|false)\)$",
+        configure,
+        re.MULTILINE,
+    )
+    if rc_match is None or release_match is None:
+        raise ValueError("configure.ac has malformed v30.1.1 release identity")
+    return int(rc_match.group(1)), release_match.group(1) == "true"
 
 
 def formatted_height(value):
@@ -662,10 +680,14 @@ def check_final_release_identity(root, failures):
         "Production release identity",
         "Only the annotated unsigned `v30.1.1` tag enters the production path.",
         "I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES",
-        "Beta 1 history",
+        "Beta 1 history and withdrawal",
         "The published v30.1.1 Beta 1 packages are historical publisher-unsigned,",
         "`b328d2263038cdddef46b9f427827aac9e83b513`",
-        "immutable `v30.1.1-beta1` GitHub prerelease for testing.",
+        "**Beta 1 is withdrawn. Do not",
+        "`bad-txns-premature-spend-of-coinbase`",
+        "Beta 2 replacement candidate",
+        "The replacement beta source is configured as `30.1.1rc2` with",
+        "No Beta 2 source\ncommit or artifact hash is asserted",
         "`Blackcoin-30.1.1-beta1`",
         "`unsigned-canary-30.1.1-beta1-<FULL_SOURCE_COMMIT>`",
         "v30.1.1 does not claim sudden-power-loss durability",
@@ -705,6 +727,107 @@ def check_final_release_identity(root, failures):
         )
     if "RELEASE_NOTES_NOT_FINAL" in final_notes:
         failures.append(f"{final_notes_relative}: final release marker remains")
+
+    beta2_notes_relative = "doc/release-notes/release-notes-30.1.1-beta2.md"
+    beta2_notes = read_text(root, beta2_notes_relative)
+    for fragment in (
+        "# Blackcoin Core 30.1.1 Beta 2 replacement candidate",
+        "Do not install, deploy, or reuse v30.1.1 Beta 1.",
+        "`b328d2263038cdddef46b9f427827aac9e83b513`",
+        "No Beta 2 source commit or artifact hash is asserted",
+    ):
+        require_fragment(
+            failures,
+            beta2_notes_relative,
+            beta2_notes,
+            fragment,
+            "withdrawn Beta 1 and replacement Beta 2 record",
+        )
+
+
+def check_beta2_release_identity(root, failures):
+    configure = read_text(root, "configure.ac")
+    for fragment in (
+        f"define(_CLIENT_VERSION_RC, {BETA2_RELEASE_CANDIDATE})",
+        "define(_CLIENT_VERSION_IS_RELEASE, false)",
+    ):
+        require_fragment(
+            failures,
+            "configure.ac",
+            configure,
+            fragment,
+            "Beta 2 source metadata",
+        )
+
+    release_notes = read_text(root, "doc/release-notes.md")
+    for fragment in (
+        "Beta 1 history and withdrawal",
+        "**Beta 1 is withdrawn. Do not",
+        "`b328d2263038cdddef46b9f427827aac9e83b513`",
+        "`bad-txns-premature-spend-of-coinbase`",
+        "Beta 2 replacement candidate",
+        "The replacement beta source is configured as `30.1.1rc2` with",
+        "`CLIENT_VERSION_IS_RELEASE=false`",
+        "No Beta 2 source\ncommit or artifact hash is asserted",
+    ):
+        require_fragment(
+            failures,
+            "doc/release-notes.md",
+            release_notes,
+            fragment,
+            "Beta 2 replacement identity",
+        )
+
+    beta2_notes_relative = "doc/release-notes/release-notes-30.1.1-beta2.md"
+    beta2_notes = read_text(root, beta2_notes_relative)
+    for fragment in (
+        "# Blackcoin Core 30.1.1 Beta 2 replacement candidate",
+        "It is an unsigned, unnotarized test candidate, not a production",
+        "as `30.1.1rc2` with `CLIENT_VERSION_IS_RELEASE=false`.",
+        "Do not install, deploy, or reuse v30.1.1 Beta 1.",
+        "`b328d2263038cdddef46b9f427827aac9e83b513`",
+        "No Beta 2 source commit or artifact hash is asserted",
+        "two independent offline rebuilds",
+        "`present`, `marker_valid`, and `valid_for_tip` all true",
+    ):
+        require_fragment(
+            failures,
+            beta2_notes_relative,
+            beta2_notes,
+            fragment,
+            "Beta 2 release note",
+        )
+
+    release_identity_notes = source_region(
+        release_notes,
+        "Beta 1 history and withdrawal",
+        "Unsafe raw quantum-key RPC disclosure",
+        "doc/release-notes.md",
+    )
+    replacement_commits = set(
+        re.findall(r"\b[0-9a-f]{40}\b", release_identity_notes + "\n" + beta2_notes)
+    )
+    expected_historical = {"b328d2263038cdddef46b9f427827aac9e83b513"}
+    if replacement_commits != expected_historical:
+        failures.append(
+            "Beta 2 source notes must identify only the affected Beta 1 commit "
+            "until the replacement candidate is frozen"
+        )
+
+
+def check_release_identity(root, failures):
+    identity = configured_release_identity(read_text(root, "configure.ac"))
+    if identity == (0, True):
+        check_final_release_identity(root, failures)
+    elif identity == (BETA2_RELEASE_CANDIDATE, False):
+        check_beta2_release_identity(root, failures)
+    else:
+        rc, is_release = identity
+        failures.append(
+            "configure.ac release identity must be final RC0/true or replacement "
+            f"Beta 2 RC{BETA2_RELEASE_CANDIDATE}/false; found "
+            f"RC{rc}/{'true' if is_release else 'false'}"
+        )
 
 
 def check_pdf_provenance(root, failures):
@@ -755,7 +878,7 @@ def verify(root):
         check_documentation_surfaces(root, failures, heights)
         check_pow_claim_documentation(root, failures, heights)
         check_release_status(root, failures)
-        check_final_release_identity(root, failures)
+        check_release_identity(root, failures)
         check_pdf_provenance(root, failures)
     except (OSError, ValueError) as error:
         failures.append(str(error))
