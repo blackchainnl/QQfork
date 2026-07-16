@@ -3,7 +3,7 @@
 
 Blackcoin version 30.1.1 is the Quantum Quasar safety and deterministic-state
 upgrade release.
-Reviewed production release binaries are made available from:
+Qualified production release binaries are made available from:
 
   <https://github.com/Blackcoin-Dev/Blackcoin/releases>
 
@@ -27,10 +27,11 @@ Only the annotated unsigned `v30.1.1` tag enters the production path. The exact
 tagged commit must be configured with release-candidate zero and
 `CLIENT_VERSION_IS_RELEASE=true`, pass the complete exact-SHA matrix, and carry
 the fresh protected resource and mainnet witness-inventory authorizations.
-Production publication also requires an independently reviewed protected
-environment, the exact unsigned-final acknowledgement, two-builder
-reproducibility, unsigned checksums and manifest, an SPDX SBOM, in-toto
-provenance, and GitHub OIDC attestations.
+Production publication also requires the protected `production-release`
+environment, recorded release-control verification, the exact unsigned-final
+acknowledgement, two-builder reproducibility, unsigned checksums and manifest,
+an SPDX SBOM, in-toto provenance, and GitHub OIDC attestations. Third-party
+human release approval is not required.
 The protected acknowledgement value is
 `I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES`.
 
@@ -40,7 +41,7 @@ Blackcoin-Dev OpenPGP signature. Windows packages are not Authenticode-signed.
 macOS applications carry only identity-free ad-hoc launch signatures and are
 not notarized. The published text and JSON `UNSIGNED-PRODUCTION` notices state
 these facts. Source configured as final, a locally compiled binary, or a
-successful subset of jobs is not the reviewed published release.
+successful subset of jobs is not the qualified published release.
 
 Beta 1 history and withdrawal
 =============================

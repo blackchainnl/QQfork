@@ -49,7 +49,7 @@ The public alpha release must satisfy all of these controls:
 
 - the tag points to the exact source SHA recorded in every asset filename and
   canary manifest;
-- immediately before promotion, the reviewer retains the response from
+- immediately before promotion, the operator retains the response from
   `GET /repos/Blackcoin-Dev/Blackcoin/immutable-releases` and requires
   `enabled=true`. The repository returned `enabled=true` and
   `enforced_by_owner=false` on 2026-07-13; that observation does not replace the
@@ -110,20 +110,18 @@ machine-readable manifest record those facts in the published bundle.
 The macOS production assets are architecture-specific Qt application ZIP and
 tar archives. This policy does not publish a DMG or universal app bundle.
 
-## Roles and separation
+## Release authorization
 
-At least two people participate in a production release:
+The authenticated Blackcoin-Dev release operator may authorize and publish a
+production release without a third-party reviewer. External review and an
+external clean-room rebuild are encouraged, but neither is a publication
+prerequisite.
 
-- the release operator prepares the unsigned source commit and annotated tag;
-- an independent reviewer approves the protected `production-release`
-  environment after checking the gate, source identity, and explicit unsigned
-  policy; and
-- an independent rebuilder verifies the published source and artifacts. The
-  rebuilder must not reuse a primary builder workspace or dependency cache.
-
-The repository administrator configures branch, tag, ruleset, and environment
-protections. The release operator must not be able to bypass the independent
-environment review.
+This single-operator policy does not relax the technical release gates. The
+operator must preserve the exact source SHA, protected branch and tag rules,
+publisher-unsigned acknowledgement, protected resource evidence, two isolated
+byte-for-byte builds, attestations, and immutable release controls. A skipped,
+stale, canceled, neutral, or failed mandatory gate still blocks publication.
 
 ## One-time repository controls
 
@@ -131,16 +129,18 @@ Repository administrators must configure and record all of these controls
 before the production tag is pushed:
 
 1. Protect the default branch. Require pull requests, the complete
-   `.github/workflows/pr-gate.yml` result, resolved review conversations, and
-   an independent approving review. Disable force pushes and deletion.
+   `.github/workflows/pr-gate.yml` result, and resolved review conversations.
+   An approving third-party review is not required. Disable force pushes and
+   deletion.
 2. Protect `refs/tags/v30.1.1` against creation, update, and deletion except by
    the designated release role. Disable ruleset bypass, including
    administrator bypass.
 3. Enable immutable GitHub releases. A published asset must never be replaced
    under the same tag or filename.
-4. Restrict the `production-release` environment to `v30.1.1`, require an
-   independent human reviewer, prevent self-review, and prevent administrator
-   bypass.
+4. Restrict the `production-release` environment to `v30.1.1`. The environment
+   protects release-scoped variables but does not require a third-party or
+   independent-human approval. Restrict deployment and administration to the
+   designated Blackcoin-Dev release role.
 5. Configure the protected environment variable `UNSIGNED_FINAL_ACK` to the
    exact value
    `I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES`.
@@ -151,21 +151,21 @@ before the production tag is pushed:
    the immutable connected-tip manifest/archive/state-root paths used by both
    the shadow-resource and quantum-witness gates, plus an exact per-outpoint
    disposition path only when the witness review set is nonzero.
-6. Publish the same publisher-unsigned warning through an independently
-   controlled Blackcoin communication channel. Do not advertise an OpenPGP,
+6. Publish the same publisher-unsigned warning through a project-controlled
+   Blackcoin communication channel. Do not advertise an OpenPGP,
    Authenticode, Developer ID, or notarization identity that does not exist.
 
 GitHub repository rules and environment settings are external state. Source
-code cannot prove that they are enabled. The independent reviewer must inspect
-them immediately before approving production publication and retain that
-evidence with the release record.
+code cannot prove that they are enabled. The release operator must inspect
+them immediately before production publication and retain that evidence with
+the release record.
 
 ## Publisher-unsigned authorization
 
-The protected `production-release` environment must require an independent
-human reviewer and provide the exact `UNSIGNED_FINAL_ACK` value above. The
-acknowledgement is not a signature and does not authenticate artifacts. It is
-a fail-closed policy control that prevents the production workflow from
+The protected `production-release` environment does not require independent
+human review, but it must provide the exact `UNSIGNED_FINAL_ACK` value above.
+The acknowledgement is not a signature and does not authenticate artifacts.
+It is a fail-closed policy control that prevents the production workflow from
 silently presenting unsigned packages as signed.
 
 The workflow must reject any detached `.asc` or release-key asset, verify that
@@ -198,9 +198,8 @@ signature.
    tests, full functional and soak coverage, mixed-version acceptance, native
    cryptographic vectors, sanitizer jobs, fuzz smoke, dependency provenance,
    resource benchmarks, wallet migration/recovery, replay, and reorg coverage.
-7. Have the independent reviewer compare the result to
-   `doc/v30.1.1-release-gate.md` and the open roadmap. A skipped, neutral,
-   canceled, stale, or failed required job is not a pass.
+7. Compare the result to `doc/v30.1.1-release-gate.md` and the open roadmap.
+   A skipped, neutral, canceled, stale, or failed required job is not a pass.
 
 ## Alpha artifact procedure
 
@@ -266,12 +265,13 @@ a replay that stops before height 4,272,172 cannot satisfy this requirement.
    commit SHA.
 2. Recheck branch/tag rules, immutable releases, and the protected environment.
    Confirm the designated release SHA does not already have a GitHub release.
-   Confirm `UNSIGNED_FINAL_ACK` has the exact reviewed value and that a person
-   other than the release operator must approve the environment.
+   Confirm `UNSIGNED_FINAL_ACK` has the exact configured value. The
+   authenticated Blackcoin-Dev tag push is the publication authorization; a
+   second person is not required.
 3. Push only the annotated tag. Do not manually upload release artifacts. The tag
    workflow reruns the complete production gate with `release_mode=true`.
-4. The protected environment reviewer verifies the exact SHA, every mandatory
-   job, publisher-unsigned warning, and roadmap disposition before approval.
+4. The workflow and release operator verify the exact SHA, every mandatory
+   job, publisher-unsigned warning, and roadmap disposition before publication.
 5. The workflow performs two isolated pinned-dependency builds for every
    target and compares each artifact byte for byte. It verifies that Windows
    packages have no Authenticode certificate and retains native evidence that
@@ -283,10 +283,12 @@ a replay that stops before height 4,272,172 cannot satisfy this requirement.
    bundle once, and publishes only after all assembly and verification steps
    pass. It refuses to overwrite an existing release.
 
-## Independent verification
+## Optional independent verification
 
 Verification must begin from a clean machine. There is no Blackcoin-Dev release
-key or platform-signing identity for v30.1.1.
+key or platform-signing identity for v30.1.1. This post-build verification is
+recommended and may be performed by any operator, but an external verifier is
+not required to publish the release.
 
 1. Fetch `v30.1.1`, verify that it is an annotated tag, confirm that the tag
    and peeled commit contain no embedded signature, and record the commit SHA.
@@ -310,9 +312,8 @@ key or platform-signing identity for v30.1.1.
    hashes in an independent rebuild report.
 
 The two workflow build jobs are clean isolated rebuilds and detect
-nondeterminism. The independent reviewer/rebuilder requirement adds a separate
-trust domain; it cannot be satisfied merely by renaming two jobs in one
-workflow.
+nondeterminism. An optional external rebuild adds a separate trust domain, but
+its absence does not block publication under this release policy.
 
 ## Release rollback and revocation
 
@@ -337,11 +338,12 @@ When a release defect is suspected:
    or bytes. Preserve the original unsigned manifest, checksums, attestations,
    and workflow record as evidence.
 5. Publish a revocation notice through the protected security advisory flow and
-   an independent Blackcoin communication channel. State that the notice is
-   publisher-unsigned. A later release must include the notice and affected
-   hashes in its bundle.
+   a second project-controlled Blackcoin communication channel. State that the
+   notice is publisher-unsigned. A later release must include the notice and
+   affected hashes in its bundle.
 6. If downgrade is proven safe, direct operators only to an older release whose
-   tag, source commit, checksums, and packages have been independently verified.
+   tag, source commit, checksums, and packages passed the verification procedure
+   above.
    If downgrade is not proven safe, direct operators to stop the affected
    process, preserve data and backups, and wait for the superseding build.
 7. Prepare a new version from a new commit and new annotated tag. Rerun the
@@ -365,13 +367,14 @@ The release record must contain:
 - mixed-version binary provenance and hashes;
 - upstream cryptographic-source provenance and vector results;
 - benchmark results for every supported release architecture;
-- primary, isolated verifier, and external rebuilder attestations;
+- primary and isolated verifier attestations, plus any optional external
+  rebuilder attestation that is later obtained;
 - unsigned checksum manifest and `UNSIGNED-PRODUCTION` metadata, SBOM, in-toto
   provenance, Windows no-Authenticode verification, macOS ad-hoc signature
   verification, and GitHub OIDC attestation output;
-- repository rules and protected-environment review evidence; and
+- repository rules and protected-environment configuration evidence; and
 - the rollback rehearsal record and designated incident contacts.
 
-Production v30.1.1 remains blocked if any item is absent, if the exact protected
-unsigned-final acknowledgement is absent, or if the independent reviewer has
-not approved the publisher-unsigned release policy.
+Production v30.1.1 remains blocked if any required item is absent or if the
+exact protected unsigned-final acknowledgement is absent. Third-party review
+is not a required completion item.

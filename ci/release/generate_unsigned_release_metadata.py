@@ -182,7 +182,8 @@ def generate_metadata(
             "mechanism": "protected-environment-exact-value-acknowledgement",
             "acknowledged": True,
             "acknowledgement_sha256": acknowledgement_sha256,
-            "independent_environment_review_required": True,
+            "protected_environment_gate_required": True,
+            "independent_environment_review_required": False,
         },
         "release": {
             "version": version,

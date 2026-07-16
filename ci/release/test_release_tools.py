@@ -1263,7 +1263,8 @@ class ReleaseToolTests(unittest.TestCase):
             "never be marked latest",
             "annotated unsigned `v30.1.1` tag",
             "production-release",
-            "independent rebuilder",
+            "third-party review",
+            "not a required completion item",
             "unsigned `sha256sums.txt`",
             "spdx sbom",
             "in-toto provenance",
@@ -1276,6 +1277,8 @@ class ReleaseToolTests(unittest.TestCase):
         for release_control in required:
             with self.subTest(release_control=release_control):
                 self.assertIn(release_control, lowered)
+        self.assertNotIn("require an independent human reviewer", lowered)
+        self.assertNotIn("independent reviewer has not approved", lowered)
         self.assertNotIn("an alpha is an unpublished", lowered)
         self.assertNotIn("do not upload an alpha to a production release page", lowered)
 
@@ -1977,6 +1980,9 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertEqual(document["source"]["commit"], SOURCE_SHA)
             self.assertTrue(document["authorization"]["acknowledged"])
             self.assertTrue(
+                document["authorization"]["protected_environment_gate_required"]
+            )
+            self.assertFalse(
                 document["authorization"]["independent_environment_review_required"]
             )
             for field in (
