@@ -279,6 +279,7 @@ jobs:
       PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
       CONFIGURED_VERSION: ${{ needs.resolve-target.outputs.configured_version }}
       ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
+      PUBLISH: ${{ needs.resolve-target.outputs.publish }}
     strategy:
       fail-fast: false
       matrix:
@@ -356,6 +357,17 @@ jobs:
             printf '%s\n' "$source_status"
             exit 1
           fi
+          case "${{ matrix.name }}" in
+            macos-*)
+              mkdir -p src/obj
+              unset BITCOIN_GENBUILD_FROZEN_SOURCE_COMMIT
+              ./share/genbuild.sh "$PWD/src/obj/build.h" "$PWD"
+              grep -Fx '#define BUILD_SOURCE_COMMIT "'"$TARGET_SHA"'"' src/obj/build.h
+              grep -Fx '#define BUILD_SOURCE_DIRTY 0' src/obj/build.h
+              export BITCOIN_GENBUILD_FROZEN_SOURCE_COMMIT="$TARGET_SHA"
+              ./share/genbuild.sh "$PWD/src/obj/build.h" "$PWD"
+              ;;
+          esac
           make_args=()
           if [[ "${{ matrix.name }}" == "windows-64-bit" ]]; then
             make_args+=("BITCOIN_WIN_INSTALLER=$PWD/blackcoin-$CONFIGURED_VERSION-win64-setup.exe")
@@ -370,7 +382,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          test "$(git rev-parse --verify HEAD)" = "$TARGET_SHA"
           test -s src/obj/build.h
+          case "${{ matrix.name }}" in
+            macos-*)
+              BITCOIN_GENBUILD_FROZEN_SOURCE_COMMIT="$TARGET_SHA" \
+                ./share/genbuild.sh "$PWD/src/obj/build.h" "$PWD"
+              ;;
+          esac
           grep -Fx '#define BUILD_SOURCE_COMMIT "'"$TARGET_SHA"'"' src/obj/build.h
           grep -Fx '#define BUILD_SOURCE_DIRTY 0' src/obj/build.h
           if grep -q '^#define BUILD_GIT_COMMIT ' src/obj/build.h; then
@@ -378,7 +397,14 @@ jobs:
           else
             grep -Fx '#define BUILD_GIT_TAG "v'"$VERSION"'"' src/obj/build.h
           fi
-          test -z "$(git status --short)"
+          git diff --quiet --exit-code --
+          git diff --cached --quiet --exit-code --
+          source_status=$(git status --porcelain=v1 --untracked-files=all)
+          if [[ -n "$source_status" ]]; then
+            echo "::error::Release source checkout contains untracked output after compilation"
+            printf '%s\n' "$source_status"
+            exit 1
+          fi
 
       - name: Build and execute target crypto vectors
         if: ${{ !startsWith(matrix.name, 'macos-') }}
@@ -427,7 +453,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected_line="Blackcoin version v$CONFIGURED_VERSION-${TARGET_SHA:0:12}"
+          if [[ "$PUBLISH" == true ]]; then
+            expected_line="Blackcoin version v$VERSION"
+          else
+            expected_line="Blackcoin version v$CONFIGURED_VERSION-${TARGET_SHA:0:12}"
+          fi
           binary="depends/${{ matrix.host }}/bin/blackcoind"
           version_home="$RUNNER_TEMP/blackcoin-version-home-${{ matrix.name }}-${{ matrix.builder }}"
           mkdir -p "$version_home"
@@ -561,9 +591,11 @@ jobs:
     env:
       SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
       TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
+      VERSION: ${{ needs.resolve-target.outputs.version }}
       PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
       CONFIGURED_VERSION: ${{ needs.resolve-target.outputs.configured_version }}
       ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
+      PUBLISH: ${{ needs.resolve-target.outputs.publish }}
     strategy:
       fail-fast: false
       matrix:
@@ -728,10 +760,16 @@ jobs:
             exit 1
           fi
 
-          expected_line="Blackcoin version v$CONFIGURED_VERSION-${TARGET_SHA:0:12}"
+          if [[ "$PUBLISH" == true ]]; then
+            expected_line="Blackcoin version v$VERSION"
+          else
+            expected_line="Blackcoin version v$CONFIGURED_VERSION-${TARGET_SHA:0:12}"
+          fi
+          expected_source_line="Source commit: $TARGET_SHA"
           mkdir -p "$RUNNER_TEMP/blackcoin-version-home"
           version_output=$(HOME="$RUNNER_TEMP/blackcoin-version-home" "$binary" -version 2>&1)
           test "$(printf '%s\n' "$version_output" | sed -n '1p')" = "$expected_line"
+          test "$(printf '%s\n' "$version_output" | sed -n '2p')" = "$expected_source_line"
           printf '%s\n' "$version_output"
 
           signed_tar="release-assets/$ASSET_PREFIX-macOS-$PLATFORM_LABEL-Qt-app.tar.gz"
@@ -816,6 +854,7 @@ jobs:
             codesign --verify --strict --verbose=4 "$verified_binary"
             verified_output=$(HOME="$RUNNER_TEMP/blackcoin-version-home" "$verified_binary" -version 2>&1)
             test "$(printf '%s\n' "$verified_output" | sed -n '1p')" = "$expected_line"
+            test "$(printf '%s\n' "$verified_output" | sed -n '2p')" = "$expected_source_line"
           done
           printf '%s\n' "$TARGET_SHA" > "release-assets/$ASSET_PREFIX-$TARGET_NAME-SOURCE_COMMIT.txt"
 

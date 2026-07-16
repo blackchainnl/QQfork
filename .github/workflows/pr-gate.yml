@@ -124,6 +124,7 @@ jobs:
       - name: Test fail-closed release tooling
         run: |
           python3 ci/release/test_release_tools.py
+          python3 ci/release/test_genbuild_frozen.py
           python3 ci/release/test_shadow_resource_production.py
 
       - name: Test script corpus precondition tooling
