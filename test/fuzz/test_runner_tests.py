@@ -171,13 +171,53 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
                     self.assertEqual(calls, ['pinned', name])
                     run_once.assert_not_called()
 
+    def test_pinned_only_run_skips_external_corpus_replay(self):
+        help_result = subprocess.CompletedProcess([], 0, stderr='libFuzzer')
+        targets = ['block', 'mini_miner_selection', 'pow', 'script']
+        with tempfile.TemporaryDirectory() as corpus_dir:
+            with mock.patch.object(
+                    sys,
+                    'argv',
+                    [
+                        'test_runner.py',
+                        '--require-pinned-regressions',
+                        '--pinned-regressions-only',
+                        corpus_dir,
+                    ],
+                ), mock.patch(
+                    'builtins.open',
+                    mock.mock_open(read_data=FAKE_CONFIG),
+                ), mock.patch.object(
+                    test_runner,
+                    'parse_test_list',
+                    return_value=targets,
+                ), mock.patch.object(
+                    test_runner.subprocess,
+                    'run',
+                    return_value=help_result,
+                ), mock.patch.object(
+                    test_runner,
+                    'run_pinned_regressions',
+                ) as pinned, mock.patch.object(
+                    test_runner,
+                    'run_once',
+                ) as run_once:
+                test_runner.main()
+
+        pinned.assert_called_once()
+        self.assertEqual(pinned.call_args.kwargs['targets'], targets)
+        run_once.assert_not_called()
+
     def test_release_fuzz_environment_retains_required_flag(self):
         repository = Path(__file__).resolve().parents[2]
         fuzz_environment = (repository / 'ci/test/00_setup_env_native_fuzz.sh').read_text(encoding='utf-8')
         fuzz_driver = (repository / 'ci/test/06_script_b.sh').read_text(encoding='utf-8')
         workflow = (repository / '.github/workflows/pr-gate.yml').read_text(encoding='utf-8')
 
-        self.assertIn('export FUZZ_TESTS_CONFIG="--require-pinned-regressions"', fuzz_environment)
+        self.assertIn(
+            'export FUZZ_TESTS_CONFIG="--require-pinned-regressions --pinned-regressions-only"',
+            fuzz_environment,
+        )
         self.assertIn('test/fuzz/test_runner.py ${FUZZ_TESTS_CONFIG}', fuzz_driver)
         self.assertIn('FILE_ENV: ci/test/00_setup_env_native_fuzz.sh', workflow)
 

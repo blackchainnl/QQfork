@@ -17,7 +17,7 @@ export DEP_OPTS="NO_QT=1 NO_UPNP=1 NO_NATPMP=1 CC=clang-17 CXX=clang++-17"
 export RUN_UNIT_TESTS=false
 export RUN_FUNCTIONAL_TESTS=false
 export RUN_FUZZ_TESTS=true
-export FUZZ_TESTS_CONFIG="--require-pinned-regressions"
+export FUZZ_TESTS_CONFIG="--require-pinned-regressions --pinned-regressions-only"
 export GOAL="install"
 export CI_CONTAINER_CAP="--cap-add SYS_PTRACE"  # If run with (ASan + LSan), the container needs access to ptrace (https://github.com/google/sanitizers/issues/764)
 export BITCOIN_CONFIG="--enable-fuzz --with-sanitizers=fuzzer,address,undefined,float-divide-by-zero,integer \

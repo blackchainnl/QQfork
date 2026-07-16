@@ -147,6 +147,11 @@ def main():
         help='Fail unless every source-pinned regression target is selected and executed',
     )
     parser.add_argument(
+        '--pinned-regressions-only',
+        action='store_true',
+        help='Run the exact source-pinned regression inputs and skip the external corpus replay',
+    )
+    parser.add_argument(
         "--empty_min_time",
         type=int,
         help="If set, run at least this long, if the existing fuzz inputs directory is empty.",
@@ -282,6 +287,9 @@ def main():
         using_libfuzzer=using_libfuzzer,
         use_valgrind=args.valgrind,
     )
+
+    if args.pinned_regressions_only:
+        return
 
     with ThreadPoolExecutor(max_workers=args.par) as fuzz_pool:
         if args.generate:
