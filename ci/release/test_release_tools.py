@@ -1647,6 +1647,27 @@ class ReleaseToolTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 identity.verify_openpgp_signature("HEAD", "commit", FINGERPRINT)
 
+    def test_source_identity_legacy_email_exception_is_sha_pinned(self):
+        identity = load_module("verify_source_identity")
+        legacy_sha = "4f87d05a741013d1e55fd9caa1c2a1cc4a6e570d"
+        legacy_metadata = (
+            "Blackcoin-Dev\0Blackcoin-Dev@users.noreply.github.com\0"
+            "Blackcoin-Dev\0Blackcoin-Dev@users.noreply.github.com\0"
+            "Add project website link"
+        )
+        with mock.patch.object(identity, "git", return_value=legacy_metadata):
+            identity.verify_commit(legacy_sha)
+            with self.assertRaisesRegex(RuntimeError, "expected the release team identity"):
+                identity.verify_commit("0" * 40)
+
+        mismatched = legacy_metadata.replace(
+            "Blackcoin-Dev@users.noreply.github.com\0Add",
+            "attacker@example.invalid\0Add",
+        )
+        with mock.patch.object(identity, "git", return_value=mismatched):
+            with self.assertRaisesRegex(RuntimeError, "committer is"):
+                identity.verify_commit(legacy_sha)
+
     def test_windows_payload_inventory_is_exact_and_excludes_test_binary(self):
         verifier = load_module("verify_windows_payload")
         self.assertIn("blackcoin-util.exe", verifier.EXPECTED_EXECUTABLES)

@@ -15,6 +15,15 @@ EXPECTED_ACTOR = "Blackcoin-Dev"
 EXPECTED_NAME = "Blackcoin-Dev"
 EXPECTED_EMAIL = "298119138+Blackcoin-Dev@users.noreply.github.com"
 TRUSTED_V30_1_0 = "f647dc75c9479c03e81414f145a8d233b60959c7"
+PINNED_IDENTITY_EXCEPTIONS = {
+    # Historical main-branch commit made by the same GitHub team account before
+    # its numeric noreply address was configured. Keep this exception scoped to
+    # the immutable commit; do not accept the legacy address generally.
+    "4f87d05a741013d1e55fd9caa1c2a1cc4a6e570d": (
+        "Blackcoin-Dev",
+        "Blackcoin-Dev@users.noreply.github.com",
+    ),
+}
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT_RE = re.compile(r"^(?:[0-9A-F]{40}|[0-9A-F]{64})$")
 ATTRIBUTION_TRAILER_RE = re.compile(r"^(?:co-authored-by|co-developed-by):", re.IGNORECASE)
@@ -42,13 +51,20 @@ def verify_commit(commit):
         raise RuntimeError(f"cannot parse identity metadata for {commit}")
     author_name, author_email, committer_name, committer_email, message = fields
     expected = (EXPECTED_NAME, EXPECTED_EMAIL)
-    if (author_name, author_email) != expected:
+    pinned_expected = PINNED_IDENTITY_EXCEPTIONS.get(commit)
+    author = (author_name, author_email)
+    committer = (committer_name, committer_email)
+    if author != expected and author != pinned_expected:
         raise RuntimeError(
             f"{commit} author is {author_name} <{author_email}>; expected the release team identity"
         )
-    if (committer_name, committer_email) != expected:
+    if committer != expected and committer != pinned_expected:
         raise RuntimeError(
             f"{commit} committer is {committer_name} <{committer_email}>; expected the release team identity"
+        )
+    if pinned_expected is not None and author != committer:
+        raise RuntimeError(
+            f"{commit} must use the same pinned release team identity for author and committer"
         )
     for line in message.splitlines():
         if ATTRIBUTION_TRAILER_RE.match(line.strip()):
