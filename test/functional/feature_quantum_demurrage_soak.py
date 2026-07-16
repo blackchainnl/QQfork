@@ -136,7 +136,7 @@ class QuantumDemurrageSoakTest(BitcoinTestFramework):
             wallet.staking(False)
 
         funder_address = funder.getnewaddress("", "legacy")
-        mining_address = node.createquantumkey()["address"]
+        mining_address = funder.getnewquantumaddress()["address"]
         self._set_mocktime(GOLD_RUSH_END_TIME + 16)
         self._generate(COINBASE_MATURITY + 2, funder_address)
 

@@ -303,14 +303,14 @@ up the wallet after creating every quantum migration, staking, operator, or
 cold-stake address. A backup made before a quantum key was created cannot
 recover that key.
 
-`-allowunsafequantumkeyrpc` is a process-wide expert opt-in. It enables
-`createquantumkey`, which is not wallet-scoped and returns an unstored ML-DSA
-private key, and `dumpquantumkey`, which exports a key from the selected normally
-unlocked wallet; staking-only unlock is rejected. The option does not make the
-node offline, store or back up `createquantumkey` output, or verify recovery.
-Online operators must leave it disabled and use `getnewquantumaddress`,
-`getquantumkeyinventory`, and `backupwallet`. A deliberate raw-key workflow must
-run in an independently isolated offline process with RPC access restricted.
+The global v30.1.0 `createquantumkey` RPC returned an unstored raw private key.
+v30.1.1 retains the method name only as a fail-closed deprecated stub and never
+generates key material through it. Use wallet-scoped `getnewquantumaddress`,
+verify `getquantumkeyinventory`, and complete `backupwallet` before using the
+address. `-allowunsafequantumkeyrpc` now enables only `dumpquantumkey`, which
+exports an already-stored key from the selected normally unlocked wallet and
+rejects staking-only unlock. The option does not make the node offline or
+restrict RPC access; use it only in an independently isolated offline process.
 
 The primary wallet flow is:
 

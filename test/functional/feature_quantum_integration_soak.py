@@ -368,7 +368,7 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
             w.staking(False)
 
         funder_address = funder.getnewaddress("", "legacy")
-        mining_address = node.createquantumkey()["address"]
+        mining_address = funder.getnewquantumaddress()["address"]
         kernel_stake_address = kernel_staker.getnewquantumstakeaddress("kernel", VAULT_7D_BLOCKS)["address"]
         kernel_fee_address = kernel_staker.getnewquantumaddress()["address"]
 

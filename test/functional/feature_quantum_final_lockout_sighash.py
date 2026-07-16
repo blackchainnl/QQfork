@@ -23,7 +23,6 @@ class QuantumFinalLockoutSighashTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.extra_args = [[
-            "-allowunsafequantumkeyrpc=1",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=14",
             f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
@@ -75,7 +74,7 @@ class QuantumFinalLockoutSighashTest(BitcoinTestFramework):
         }
 
         self.log.info("Cross the migration deadline into final lockout")
-        quantum_address = node.createquantumkey()["address"]
+        quantum_address = node.createquantummigrationaddress("11" * 32)["address"]
         # Future-witness coinbase outputs are intentionally unavailable during
         # Gold Rush. Mine the transition blocks to the existing legacy payout
         # address, then exercise the quantum destination after final lockout.

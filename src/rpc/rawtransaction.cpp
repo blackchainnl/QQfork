@@ -1429,7 +1429,7 @@ static RPCHelpMan signrawtransactionwithquantumkey()
 {
     return RPCHelpMan{"signrawtransactionwithquantumkey",
                 "\nSign Blackcoin ML-DSA witness inputs for a raw transaction.\n"
-                "Keys are raw hex values returned by createquantumkey and are not loaded from or stored in the wallet.\n"
+                "Keys are caller-supplied raw hex from an existing external or explicitly exported key; this RPC does not load or store them.\n"
                 "For Quantum Cold-Stake inputs, prefill the witness with [empty signature, empty pubkey,\n"
                 "other_pubkey_hash, branch_selector] so the RPC can identify the owner or staker branch.\n"
                 "The transaction can only be accepted by consensus once the scheduled quantum migration spend rules are active.\n",
@@ -1439,8 +1439,8 @@ static RPCHelpMan signrawtransactionwithquantumkey()
                         {
                             {"", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "",
                                 {
-                                    {"public_key", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The ML-DSA-44 public key hex from createquantumkey"},
-                                    {"private_key", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The ML-DSA-44 private key hex from createquantumkey"},
+                                    {"public_key", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The existing ML-DSA-44 public key hex"},
+                                    {"private_key", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "The matching existing ML-DSA-44 private key hex"},
                                 }},
                         }},
                     {"prevtxs", RPCArg::Type::ARR, RPCArg::Optional::OMITTED, "The previous transaction outputs this transaction depends on",

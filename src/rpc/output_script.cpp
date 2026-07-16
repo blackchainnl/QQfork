@@ -9,10 +9,8 @@
 #include <addresstype.h>
 #include <chain.h>
 #include <chainparams.h>
-#include <common/args.h>
 #include <common/system.h>
 #include <crypto/mldsa.h>
-#include <crypto/sha256.h>
 #include <kernel/cs_main.h>
 #include <outputtype.h>
 #include <pubkey.h>
@@ -180,54 +178,20 @@ static RPCHelpMan createquantumkey()
 {
     return RPCHelpMan{
         "createquantumkey",
-        "\nGenerates an ML-DSA-44 keypair and its Blackcoin witness-v16 migration address.\n"
-        "This process-wide utility is not wallet-scoped. The returned private key is raw hex and is not stored in any wallet or backup.\n"
-        "Disabled by default; use wallet-scoped getnewquantumaddress for normal operation.\n"
-        "-allowunsafequantumkeyrpc does not disable networking or restrict RPC access. Use this command only in an independently isolated offline process.\n",
+        "\nDeprecated fail-closed compatibility stub.\n"
+        "v30.1.1 no longer generates unstored raw ML-DSA private keys. Use wallet-scoped getnewquantumaddress,\n"
+        "then verify getquantumkeyinventory and complete backupwallet before using the address.\n",
         {},
-        RPCResult{
-            RPCResult::Type::OBJ, "", "", {
-                {RPCResult::Type::STR, "address", "The Blackcoin migration address"},
-                {RPCResult::Type::STR_HEX, "public_key", "The ML-DSA-44 public key"},
-                {RPCResult::Type::STR_HEX, "private_key", "The ML-DSA-44 private key. Back it up immediately."},
-                {RPCResult::Type::NUM, "witness_version", "The witness version used for quantum migration"},
-                {RPCResult::Type::STR_HEX, "witness_program", "SHA256(public_key)"},
-                {RPCResult::Type::BOOL, "stored_in_wallet", "Whether this key was inserted into the wallet database"},
-                {RPCResult::Type::STR, "warning", "Key storage warning"},
-            }},
+        RPCResult{RPCResult::Type::NONE, "", "No result; raw unstored key generation was removed in v30.1.1"},
         RPCExamples{
             HelpExampleCli("createquantumkey", "")
             + HelpExampleRpc("createquantumkey", "")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    if (!gArgs.GetBoolArg("-allowunsafequantumkeyrpc", false)) {
-        throw JSONRPCError(RPC_FORBIDDEN_BY_SAFE_MODE,
-            "createquantumkey is disabled by default because it returns unstored private material. "
-            "Use wallet-scoped getnewquantumaddress. For a deliberately isolated offline export process only, "
-            "restart with -allowunsafequantumkeyrpc; this flag does not itself disable networking or restrict RPC access.");
-    }
-    std::vector<uint8_t> pubkey;
-    std::vector<uint8_t> privkey;
-    if (!ML_DSA::KeyGen(pubkey, privkey)) {
-        throw JSONRPCError(RPC_MISC_ERROR, "ML-DSA key generation failed");
-    }
-
-    std::vector<unsigned char> program(QUANTUM_MIGRATION_PROGRAM_SIZE);
-    CSHA256().Write(pubkey.data(), pubkey.size()).Finalize(program.data());
-    const CTxDestination dest = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, program};
-
-    UniValue ret(UniValue::VOBJ);
-    ret.pushKV("address", EncodeDestination(dest));
-    ret.pushKV("public_key", HexStr(pubkey));
-    ret.pushKV("private_key", HexStr(privkey));
-    ret.pushKV("witness_version", QUANTUM_MIGRATION_WITNESS_VERSION);
-    ret.pushKV("witness_program", HexStr(program));
-    ret.pushKV("stored_in_wallet", false);
-    ret.pushKV("warning", "UNSAFE UNSTORED PRIVATE KEY: this process did not write the key to any wallet or backup. Copying terminal or RPC output is not verified recovery. Import it into a wallet and complete backupwallet before using the address.");
-    // Wipe the raw ML-DSA secret from the heap before the buffer is freed.
-    memory_cleanse(privkey.data(), privkey.size());
-    return ret;
+    throw JSONRPCError(RPC_METHOD_DEPRECATED,
+        "createquantumkey was removed in v30.1.1 because it returned an unstored private key. "
+        "Use wallet-scoped getnewquantumaddress, verify getquantumkeyinventory, and complete backupwallet before using the address.");
 },
     };
 }

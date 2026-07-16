@@ -356,7 +356,7 @@ class QuantumDemurrageTest(BitcoinTestFramework):
         auto_fee_source_address = wallet.getnewquantumaddress()["address"]
         auto_address = auto_wallet.getnewquantumaddress()["address"]
         unsafe_fee_address = unsafe_wallet.getnewquantumaddress()["address"]
-        mining_quantum_address = node.createquantumkey()["address"]
+        mining_quantum_address = wallet.getnewquantumaddress()["address"]
 
         self._set_mocktime(GOLD_RUSH_END_TIME + 16)
         self._generate(COINBASE_MATURITY + 2, funder_address)

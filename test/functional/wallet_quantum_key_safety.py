@@ -47,16 +47,16 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         legacy_address = wallet.getnewaddress("legacy-before-quantum-backup", "legacy")
         legacy_message = "Blackcoin v30.1.1 recovery proof"
 
-        self.log.info("Raw private-key RPCs are disabled by default")
+        self.log.info("Raw unstored key generation is removed and wallet export is disabled by default")
         first = wallet.getnewquantumaddress("first")
         self.assert_no_private_fields(first)
         assert first["stored_in_wallet"]
         assert not first["backup_verified"]
-        assert_raises_rpc_error(-2, "disabled by default", node.createquantumkey)
+        assert_raises_rpc_error(-32, "removed in v30.1.1", node.createquantumkey)
         assert_raises_rpc_error(-2, "disabled by default", wallet.dumpquantumkey, first["address"])
         create_help = node.help("createquantumkey")
-        assert "not wallet-scoped" in create_help
-        assert "does not disable networking or restrict RPC access" in create_help
+        assert "Deprecated fail-closed compatibility stub" in create_help
+        assert "no longer generates unstored raw ML-DSA private keys" in create_help
         dump_help = wallet.help("dumpquantumkey")
         assert "selected wallet" in dump_help
         assert "staking-only unlock is rejected" in dump_help
@@ -174,16 +174,17 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert_raises_rpc_error(-4, "requires an unlocked wallet", wallet.setpowmining, True, 1, 1)
         assert_equal(wallet.getquantumkeyinventory()["total"], locked_key_count)
 
-        self.log.info("The global raw generator is unstored; wallet export still requires normal unlock")
+        self.log.info("The deprecated raw generator remains fail-closed; wallet export requires normal unlock")
         self.restart_node(0, ["-allowunsafequantumkeyrpc=1", "-debug=rpc"])
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(wallet_name)
+        pow_wallet = node.get_wallet_rpc(pow_wallet_name)
         private_material = []
-        raw = node.createquantumkey()
-        assert not raw["stored_in_wallet"]
-        assert raw["private_key"]
-        assert "UNSAFE UNSTORED PRIVATE KEY" in raw["warning"]
-        private_material.append(raw["private_key"])
+        wallet_key_count = wallet.getquantumkeyinventory()["total"]
+        pow_key_count = pow_wallet.getquantumkeyinventory()["total"]
+        assert_raises_rpc_error(-32, "removed in v30.1.1", node.createquantumkey)
+        assert_equal(wallet.getquantumkeyinventory()["total"], wallet_key_count)
+        assert_equal(pow_wallet.getquantumkeyinventory()["total"], pow_key_count)
 
         wallet.walletpassphrase(passphrase, 100, True)
         assert_raises_rpc_error(-13, "staking only", wallet.dumpquantumkey, first["address"])
@@ -200,6 +201,12 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert_equal(dumped["address"], first["address"])
         assert dumped["private_key"]
         private_material.append(dumped["private_key"])
+
+        # Existing v30.1.0 raw key material remains importable. Use a key
+        # exported from a different wallet to exercise the same public/private
+        # import contract without reintroducing unstored key generation.
+        raw = pow_wallet.dumpquantumkey(pow_payout)
+        private_material.append(raw["private_key"])
 
         imported = wallet.importquantumkey(
             raw["public_key"],
