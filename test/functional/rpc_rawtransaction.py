@@ -101,6 +101,29 @@ class RawTransactionsTest(BitcoinTestFramework):
             self.import_deterministic_coinbase_privkeys()
             self.raw_multisig_transaction_legacy_tests()
         self.getrawtransaction_verbosity_tests()
+        self.invalid_txversion_tests()
+
+    def invalid_txversion_tests(self):
+        self.log.info("Malformed -txversion fails RPC and wallet construction without terminating the node")
+        self.restart_node(0, self.extra_args[0] + ["-txversion=not-a-number"])
+        assert_raises_rpc_error(
+            -8,
+            "Invalid -txversion value: not-a-number",
+            self.nodes[0].createrawtransaction,
+            [],
+            {},
+        )
+        assert_equal(self.nodes[0].getblockchaininfo()["chain"], "regtest")
+
+        if self.is_specified_wallet_compiled() and not self.options.descriptors:
+            address = self.nodes[0].getnewaddress()
+            assert_raises_rpc_error(
+                -6,
+                "Invalid -txversion value: not-a-number",
+                self.nodes[0].sendtoaddress,
+                address,
+                1,
+            )
 
 
     def getrawtransaction_tests(self):
