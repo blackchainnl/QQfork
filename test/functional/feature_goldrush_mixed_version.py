@@ -74,6 +74,8 @@ GOLD_RUSH_ARGS = [
 FEE = COIN // 100
 POS_SUBSIDY = 3 * COIN // 2
 QQSPROOF = b"QQSPROOF"
+QQP3_ACTIVATION_HEIGHT = 60
+QQP3_CLAIMANT_WALLET = "qqp3_mixed_claimant"
 
 
 class GoldRushMixedVersionTest(BitcoinTestFramework):
@@ -95,7 +97,11 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
             base_args + ["-rpcdoccheck=0"],
             list(base_args),
             base_args + GOLD_RUSH_ARGS,
-            base_args + GOLD_RUSH_ARGS,
+            base_args + GOLD_RUSH_ARGS + [
+                f"-shadowcompetingclaimsheight={QQP3_ACTIVATION_HEIGHT}",
+                "-shadowindex=1",
+                "-txindex=1",
+            ],
         ]
 
     def skip_test_if_missing_module(self):
@@ -131,6 +137,23 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
                 False,
             )
             wallet.staking(False)
+
+        # Keep the QQP3 fee source out of the fixed-key staking wallet. The
+        # later two-round PoS fee-boundary fixture must continue selecting only
+        # the inputs whose signing key it controls explicitly.
+        candidate = self.nodes[CANDIDATE]
+        candidate.createwallet(
+            wallet_name=QQP3_CLAIMANT_WALLET,
+            descriptors=False,
+            load_on_startup=True,
+        )
+        claimant = candidate.get_wallet_rpc(QQP3_CLAIMANT_WALLET)
+        claimant.importprivkey(
+            candidate.get_deterministic_priv_key().key,
+            "qqp3-mixed-version-target",
+            False,
+        )
+        claimant.staking(False)
 
     def setup_network(self):
         self.setup_nodes()
@@ -205,6 +228,46 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         assert_equal(len(set(heights)), 1)
         raw_blocks = [node.getblock(block_hash, 0) for node in self.v30_bridge_nodes]
         assert_equal(len(set(raw_blocks)), 1)
+
+    def wait_candidate_shadowindex(self):
+        candidate = self.nodes[CANDIDATE]
+
+        def synced():
+            status = candidate.getindexinfo().get("shadowindex", {})
+            return (
+                status.get("synced", False)
+                and status.get("best_block_height", candidate.getblockcount())
+                == candidate.getblockcount()
+            )
+
+        self.wait_until(synced, timeout=60)
+
+    def send_pos_block_via_p2p(self, node_index, full_raw, block_hash):
+        """Make one isolated daemon validate the exact PoS block bytes."""
+        node = self.nodes[node_index]
+        block = from_hex(CBlock(), full_raw)
+        block.nFlags = 1
+        block.rehash()
+        assert_equal(block.hash, block_hash)
+        peer = node.add_p2p_connection(
+            P2PDataStore(),
+            # Pinned binaries can run behind the provenance-preserving
+            # container wrapper, whose peer address differs from the host.
+            wait_for_verack=False,
+            services=P2P_SERVICES | NODE_WITNESS,
+        )
+        try:
+            peer.wait_for_verack()
+            peer.sync_with_ping()
+            peer.send_blocks_and_test(
+                [block],
+                node,
+                success=True,
+                force_send=True,
+                timeout=120,
+            )
+        finally:
+            node.disconnect_p2ps()
 
     def mine_and_sync(self, miner, blocks=1, nodes=None):
         sync_nodes = nodes or self.normative_nodes
@@ -985,6 +1048,187 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
         self.sync_blocks(self.normative_nodes, timeout=120)
         self.assert_normative_tip()
 
+    def exercise_v30_1_0_qqp3_shadow_divergence(self):
+        """Accept one base block while deriving the scheduled QQP3 divergence."""
+        deployed = self.nodes[V30_1_0]
+        candidate = self.nodes[CANDIDATE]
+        claimant = candidate.get_wallet_rpc(QQP3_CLAIMANT_WALLET)
+        staker = candidate.get_wallet_rpc(self.default_wallet_name)
+
+        # Keep the scoped pair off the v26/v28 relay path while it crosses the
+        # candidate-only regtest boundary. The deployed daemon must never see
+        # the QQP3 transaction through its pre-v30.1.1 mempool policy.
+        self.disconnect_nodes(CANDIDATE, REFERENCE)
+        assert_equal(deployed.getbestblockhash(), candidate.getbestblockhash())
+        blocks_to_parent = QQP3_ACTIVATION_HEIGHT - 1 - candidate.getblockcount()
+        assert blocks_to_parent > 0
+        self.generatetoaddress(
+            deployed,
+            blocks_to_parent,
+            candidate.get_deterministic_priv_key().address,
+            sync_fun=self.no_op,
+        )
+        self.sync_blocks(self.v30_bridge_nodes, timeout=120)
+        assert_equal(candidate.getblockcount(), QQP3_ACTIVATION_HEIGHT - 1)
+        parent_hash = candidate.getbestblockhash()
+        self.assert_v30_bridge_block(parent_hash)
+        self.wait_candidate_shadowindex()
+
+        candidate_before = candidate.getgoldrushstate()
+        deployed_before = deployed.getgoldrushstate()
+        assert_equal(candidate_before["competing_claim_rule_active_next_block"], True)
+        assert_equal(candidate_before["qqp4_active_next_block"], False)
+        for field in (
+            "pow_amount",
+            "pos_amount",
+            "claimed_amount",
+            "pow_count",
+            "pos_count",
+            "last_pow_height",
+            "last_pos_height",
+            "recent_count",
+            "pow_target_bits",
+        ):
+            assert_equal(candidate_before[field], deployed_before[field])
+
+        # v30.1.0 recognizes only QQP1/QQP2. Build QQP3 exclusively through the
+        # candidate wallet, then make each disconnected daemon validate the
+        # byte-identical PoS block independently.
+        self.disconnect_nodes(CANDIDATE, V30_1_0)
+        payout_address = claimant.getnewquantumaddress(
+            "mixed-version-qqp3-payout"
+        )["address"]
+        claim = claimant.sendshadowpowclaim(
+            candidate.get_deterministic_priv_key().address,
+            payout_address,
+            500_000,
+        )
+        proof = bytes.fromhex(claim["proof"])
+        assert proof.startswith(QQSPROOF + b"QQP3")
+        assert claim["txid"] in candidate.getrawmempool()
+
+        start_height = candidate.getblockcount()
+        kernel_time = self.find_fee_boundary_kernel_time(staker)
+        self.set_normative_mocktime(kernel_time - 16)
+        staker.staking(True)
+        try:
+            self.set_normative_mocktime(kernel_time)
+            self.wait_until(
+                lambda: candidate.getblockcount() > start_height,
+                timeout=30,
+            )
+        finally:
+            staker.staking(False)
+
+        block_hash = candidate.getbestblockhash()
+        block_json = candidate.getblock(block_hash, 2)
+        assert_equal(candidate.getblockcount(), QQP3_ACTIVATION_HEIGHT)
+        assert_equal(block_json["previousblockhash"], parent_hash)
+        assert "proof-of-stake" in block_json["flags"]
+        assert claim["txid"] in [tx["txid"] for tx in block_json["tx"][2:]]
+        stripped_raw = candidate.getblock(block_hash, 0)
+        witness_nonce = self.coinbase_witness_nonce(block_json)
+        full_block = self.restore_coinbase_witness(stripped_raw, witness_nonce)
+        full_block.rehash()
+        full_raw = full_block.serialize().hex()
+        assert_equal(full_block.hash, block_hash)
+
+        deployed.setmocktime(block_json["time"])
+        self.send_pos_block_via_p2p(V30_1_0, full_raw, block_hash)
+        self.assert_v30_bridge_block(block_hash)
+        for node in self.v30_bridge_nodes:
+            accepted = node.getblock(block_hash, 2)
+            restored = self.restore_coinbase_witness(
+                node.getblock(block_hash, 0),
+                self.coinbase_witness_nonce(accepted),
+            )
+            assert_equal(restored.serialize().hex(), full_raw)
+
+        # The shared base chain is identical. Its auxiliary state intentionally
+        # differs: v30.1.0 treats QQP3 as an unknown, non-crediting note, while
+        # the candidate writes one schema-11 winner and materializes its payout.
+        self.wait_candidate_shadowindex()
+        candidate_after = candidate.getgoldrushstate()
+        deployed_after = deployed.getgoldrushstate()
+        assert_equal(
+            candidate_after["pow_count"], candidate_before["pow_count"] + 1
+        )
+        assert_equal(candidate_after["last_pow_height"], QQP3_ACTIVATION_HEIGHT)
+        assert_equal(candidate_after["pow_amount"], 0)
+        assert candidate_after["claimed_amount"] > candidate_before["claimed_amount"]
+        assert_equal(deployed_after["pow_count"], deployed_before["pow_count"])
+        assert_equal(
+            deployed_after["claimed_amount"], deployed_before["claimed_amount"]
+        )
+        assert deployed_after["pow_amount"] > deployed_before["pow_amount"]
+
+        page = candidate.getshadowblock(block_hash, 0, 10, 0, 10)
+        accounting = page["pow_claim_accounting"]
+        assert_equal(page["total_payouts"], 1)
+        assert_equal(page["observed_pow_claim_txids"], [claim["txid"]])
+        assert_equal(accounting["active"], True)
+        assert_equal(accounting["total_records"], 1)
+        assert_equal(accounting["observed_count"], 1)
+        assert_equal(accounting["evaluated_count"], 1)
+        assert_equal(accounting["winner_count"], 1)
+        assert_equal(accounting["reimbursed_loser_count"], 0)
+        assert_equal(accounting["rejected_count"], 0)
+        assert len(accounting["accounting_commitment"]) == 64
+        record = accounting["records"][0]
+        assert_equal(record["txid"], claim["txid"])
+        assert_equal(record["disposition"], "winner")
+        assert_equal(record["proof_version"], 3)
+        assert_equal(record["origin_bound"], True)
+        assert_equal(record["input_bound"], False)
+        assert_equal(record["origin_height"], QQP3_ACTIVATION_HEIGHT)
+        assert_equal(record["origin_previous_block_hash"], parent_hash)
+        assert_equal(record["inclusion_height"], QQP3_ACTIVATION_HEIGHT)
+        assert_equal(record["origin_age"], 0)
+        assert_equal(record["payout_address"], payout_address)
+        assert len(record["logical_proof_id"]) == 64
+        assert record["synthetic_txid"] is not None
+        payout = candidate.getshadowtransaction(record["synthetic_txid"])
+        assert_equal(payout["pow_claim_source"]["txid"], claim["txid"])
+        assert_equal(payout["pow_claim_source"]["disposition"], "winner")
+        assert_equal(payout["pow_claim_source"]["proof_version"], 3)
+
+        # Each implementation must reload its own interpretation from the
+        # byte-identical base tip. This rules out a transient in-memory result
+        # while preserving the intentional auxiliary-state divergence.
+        for index in (V30_1_0, CANDIDATE):
+            self.restart_node(index)
+            assert_equal(self.nodes[index].getbestblockhash(), block_hash)
+            assert_equal(self.nodes[index].getblock(block_hash, 0), stripped_raw)
+        self.wait_candidate_shadowindex()
+        candidate_reloaded = candidate.getgoldrushstate()
+        deployed_reloaded = deployed.getgoldrushstate()
+        for field in (
+            "pow_amount",
+            "claimed_amount",
+            "pow_count",
+            "last_pow_height",
+        ):
+            assert_equal(candidate_reloaded[field], candidate_after[field])
+            assert_equal(deployed_reloaded[field], deployed_after[field])
+
+        self.connect_nodes(CANDIDATE, V30_1_0)
+        self.connect_nodes(CANDIDATE, REFERENCE)
+        active_nodes = [
+            self.nodes[REFERENCE],
+            self.nodes[V30_1_0],
+            self.nodes[CANDIDATE],
+        ]
+        self.sync_blocks(active_nodes, timeout=180)
+        assert_equal(
+            [node.getbestblockhash() for node in active_nodes],
+            [block_hash, block_hash, block_hash],
+        )
+        assert_equal(
+            [node.getblock(block_hash, 0) for node in active_nodes],
+            [stripped_raw, stripped_raw, stripped_raw],
+        )
+        candidate.unloadwallet(QQP3_CLAIMANT_WALLET, False)
+
     def run_test(self):
         self.log.info("Verifying every daemon is the pinned historical/candidate build")
         for node, expected in zip(self.nodes, EXPECTED_RPC_VERSIONS):
@@ -1024,6 +1268,9 @@ class GoldRushMixedVersionTest(BitcoinTestFramework):
 
         self.log.info("Bridging byte-identical Gold Rush base blocks with pinned v30.1.0 both ways")
         self.exercise_v30_1_0_gold_rush_bridge()
+
+        self.log.info("Crossing QQP3 with identical base bytes and intentional v30.1.0 shadow divergence")
+        self.exercise_v30_1_0_qqp3_shadow_divergence()
 
         self.log.info("Stopping diagnostic builds before known split-path fixtures")
         self.stop_node(1)
