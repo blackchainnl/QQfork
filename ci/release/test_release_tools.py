@@ -108,22 +108,31 @@ class ReleaseToolTests(unittest.TestCase):
             for manpage in generated:
                 self.assertNotIn("Source commit:", manpage.read_text(encoding="utf-8"))
 
-    def test_tag_resolution_uses_non_secret_public_verification_material(self):
+    def test_final_release_requires_explicit_unsigned_acknowledgement(self):
         workflow = (
             TOOLS.parent.parent / ".github/workflows/build.yml"
         ).read_text(encoding="utf-8")
         self.assertIn(
-            "RELEASE_GPG_PUBLIC_KEY_B64: ${{ vars.RELEASE_GPG_PUBLIC_KEY_B64 }}",
-            workflow,
-        )
-        self.assertNotIn(
-            "RELEASE_GPG_PUBLIC_KEY_B64: ${{ secrets.RELEASE_GPG_PUBLIC_KEY_B64 }}",
+            "UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}",
             workflow,
         )
         self.assertIn(
-            "RELEASE_GPG_PRIVATE_KEY_B64: ${{ secrets.RELEASE_GPG_PRIVATE_KEY_B64 }}",
+            "I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES",
             workflow,
         )
+        self.assertIn(
+            'gh api "repos/$GITHUB_REPOSITORY/immutable-releases"',
+            workflow,
+        )
+        for unavailable_credential in (
+            "RELEASE_GPG_PRIVATE_KEY_B64",
+            "RELEASE_GPG_PUBLIC_KEY_B64",
+            "WINDOWS_CERTIFICATE_PFX_B64",
+            "MACOS_CERTIFICATE_P12_B64",
+            "APPLE_NOTARY_PRIVATE_KEY_B64",
+        ):
+            with self.subTest(unavailable_credential=unavailable_credential):
+                self.assertNotIn(unavailable_credential, workflow)
 
     def write_native_binary(self, path, platform, architecture):
         if platform == "linux":
@@ -1170,16 +1179,16 @@ class ReleaseToolTests(unittest.TestCase):
             "github `prerelease` is true and `latest` remains false",
             "`signed=false`, `notarized=false`",
             "never be marked latest",
-            "signed annotated `v30.1.1` tag",
+            "annotated unsigned `v30.1.1` tag",
             "production-release",
             "independent rebuilder",
-            "signed `sha256sums.txt`",
+            "unsigned `sha256sums.txt`",
             "spdx sbom",
             "in-toto provenance",
             "release rollback and revocation",
             "never delete,",
             "or recreate the `v30.1.1` tag",
-            "human-held production credentials",
+            "publisher-unsigned authorization",
         )
         lowered = runbook.lower()
         for release_control in required:
@@ -1583,7 +1592,125 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertTrue(manifest["release"]["macos_adhoc_signed"])
             self.assertFalse(manifest["release"]["published"])
 
-    def test_prerelease_workflow_keeps_the_signed_production_gate_separate(self):
+    def test_unsigned_final_metadata_is_explicit_and_source_bound(self):
+        generator = load_module("generate_unsigned_release_metadata")
+        version = "30.1.1"
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            required = (
+                f"Blackcoin-{version}-Linux-x86_64.tar.gz",
+                f"Blackcoin-{version}-Linux-ARM64.tar.gz",
+                f"Blackcoin-{version}-Windows-x86_64-Portable.zip",
+                f"Blackcoin-{version}-Windows-x86_64-Installer.exe",
+                f"Blackcoin-{version}-macOS-Intel-x86_64-Qt-app.tar.gz",
+                f"Blackcoin-{version}-macOS-Intel-x86_64-Qt-app.zip",
+                f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz",
+                f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.zip",
+                f"Blackcoin-{version}-SBOM.spdx.json",
+                f"Blackcoin-{version}-provenance.intoto.json",
+            )
+            for name in required:
+                (artifacts / name).write_bytes(name.encode("ascii"))
+            (artifacts / "SOURCE_COMMIT.txt").write_text(
+                SOURCE_SHA + "\n", encoding="utf-8"
+            )
+            (artifacts / f"Blackcoin-{version}-REPRODUCIBILITY.txt").write_text(
+                f"package_label={version}\n"
+                "prerelease_channel=production\n"
+                f"source_commit={SOURCE_SHA}\n",
+                encoding="utf-8",
+            )
+            notice = artifacts / f"Blackcoin-{version}-UNSIGNED-PRODUCTION.txt"
+            manifest = artifacts / f"Blackcoin-{version}-UNSIGNED-PRODUCTION.json"
+            document = generator.generate_metadata(
+                artifacts=artifacts,
+                version=version,
+                source_sha=SOURCE_SHA,
+                tag=f"v{version}",
+                workflow_run_id="12345",
+                acknowledgement=generator.EXPECTED_ACKNOWLEDGEMENT,
+                notice=notice,
+                manifest=manifest,
+                macos_adhoc_signed=True,
+            )
+
+            self.assertEqual(
+                document["classification"],
+                "PUBLISHER_UNSIGNED_PRODUCTION_RELEASE",
+            )
+            self.assertEqual(document["source"]["commit"], SOURCE_SHA)
+            self.assertTrue(document["authorization"]["acknowledged"])
+            self.assertTrue(
+                document["authorization"]["independent_environment_review_required"]
+            )
+            for field in (
+                "publisher_signed",
+                "source_commit_openpgp_signed",
+                "tag_openpgp_signed",
+                "checksums_openpgp_signed",
+                "provenance_openpgp_signed",
+                "authenticode_signed",
+                "developer_id_signed",
+                "notarized",
+            ):
+                with self.subTest(field=field):
+                    self.assertFalse(document["release"][field])
+            self.assertTrue(document["release"]["macos_adhoc_signed"])
+            self.assertTrue(document["integrity"]["github_build_provenance_attestation"])
+            self.assertTrue(document["integrity"]["github_sbom_attestation"])
+            self.assertIn("PUBLISHER-UNSIGNED", notice.read_text(encoding="utf-8"))
+            self.assertTrue(manifest.is_file())
+
+    def test_unsigned_final_metadata_rejects_missing_ack_or_signature_asset(self):
+        generator = load_module("generate_unsigned_release_metadata")
+        version = "30.1.1"
+        with tempfile.TemporaryDirectory() as temporary:
+            artifacts = Path(temporary)
+            for name in (
+                f"Blackcoin-{version}-Linux-x86_64.tar.gz",
+                f"Blackcoin-{version}-Linux-ARM64.tar.gz",
+                f"Blackcoin-{version}-Windows-x86_64-Portable.zip",
+                f"Blackcoin-{version}-Windows-x86_64-Installer.exe",
+                f"Blackcoin-{version}-macOS-Intel-x86_64-Qt-app.tar.gz",
+                f"Blackcoin-{version}-macOS-Intel-x86_64-Qt-app.zip",
+                f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz",
+                f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.zip",
+                f"Blackcoin-{version}-SBOM.spdx.json",
+                f"Blackcoin-{version}-provenance.intoto.json",
+            ):
+                (artifacts / name).write_bytes(b"artifact")
+            (artifacts / "SOURCE_COMMIT.txt").write_text(
+                SOURCE_SHA + "\n", encoding="utf-8"
+            )
+            (artifacts / f"Blackcoin-{version}-REPRODUCIBILITY.txt").write_text(
+                f"package_label={version}\n"
+                "prerelease_channel=production\n"
+                f"source_commit={SOURCE_SHA}\n",
+                encoding="utf-8",
+            )
+            notice = artifacts / f"Blackcoin-{version}-UNSIGNED-PRODUCTION.txt"
+            manifest = artifacts / f"Blackcoin-{version}-UNSIGNED-PRODUCTION.json"
+            arguments = dict(
+                artifacts=artifacts,
+                version=version,
+                source_sha=SOURCE_SHA,
+                tag=f"v{version}",
+                workflow_run_id="12345",
+                notice=notice,
+                manifest=manifest,
+                macos_adhoc_signed=True,
+            )
+            with self.assertRaisesRegex(RuntimeError, "acknowledgement does not match"):
+                generator.generate_metadata(acknowledgement="yes", **arguments)
+
+            (artifacts / "SHA256SUMS.txt.asc").write_bytes(b"misleading")
+            with self.assertRaisesRegex(RuntimeError, "detached signature is forbidden"):
+                generator.generate_metadata(
+                    acknowledgement=generator.EXPECTED_ACKNOWLEDGEMENT,
+                    **arguments,
+                )
+
+    def test_prerelease_workflow_keeps_the_unsigned_production_gate_separate(self):
         workflow = (TOOLS.parent.parent / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
@@ -1610,7 +1737,11 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("macos_adhoc_signed=$MACOS_SELECTED", workflow)
         self.assertIn('metadata["LSArchitecturePriority"] = [os.environ["EXPECTED_ARCH"]]', workflow)
         self.assertIn('verify_plist_architecture "$verified_plist"', workflow)
-        self.assertIn("Developer-ID sign and notarize macOS artifacts", workflow)
+        self.assertIn("Require explicit publisher-unsigned final acknowledgement", workflow)
+        self.assertIn("--require-unsigned-objects", workflow)
+        self.assertIn("generate_unsigned_release_metadata.py", workflow)
+        self.assertNotIn("Developer-ID sign and notarize macOS artifacts", workflow)
+        self.assertNotIn("Authenticode-sign Windows artifacts", workflow)
 
     def test_reproducibility_requires_identical_bytes(self):
         verifier = load_module("verify_reproducible")
@@ -1646,6 +1777,33 @@ class ReleaseToolTests(unittest.TestCase):
         with mock.patch.object(identity.subprocess, "run", return_value=bad):
             with self.assertRaises(RuntimeError):
                 identity.verify_openpgp_signature("HEAD", "commit", FINGERPRINT)
+
+    def test_unsigned_identity_policy_rejects_embedded_signatures(self):
+        identity = load_module("verify_source_identity")
+        unsigned_commit = "tree 0123456789abcdef\nauthor Blackcoin-Dev\n\nmessage"
+        unsigned_tag = (
+            "object 0123456789abcdef\ntype commit\ntag v30.1.1\n"
+            "tagger Blackcoin-Dev\n\nrelease"
+        )
+        with mock.patch.object(identity, "git", return_value=unsigned_commit):
+            identity.verify_unsigned_object("HEAD", "commit")
+        with mock.patch.object(identity, "git", return_value=unsigned_tag):
+            identity.verify_unsigned_object("refs/tags/v30.1.1", "tag")
+
+        signed_commit = (
+            "tree 0123456789abcdef\n"
+            "gpgsig -----BEGIN PGP SIGNATURE-----\n continuation\n\nmessage"
+        )
+        with mock.patch.object(identity, "git", return_value=signed_commit):
+            with self.assertRaisesRegex(RuntimeError, "embedded commit signature"):
+                identity.verify_unsigned_object("HEAD", "commit")
+        with mock.patch.object(
+            identity,
+            "git",
+            return_value=unsigned_tag + "\n-----BEGIN PGP SIGNATURE-----\n",
+        ):
+            with self.assertRaisesRegex(RuntimeError, "embedded tag signature"):
+                identity.verify_unsigned_object("refs/tags/v30.1.1", "tag")
 
     def test_source_identity_legacy_email_exception_is_sha_pinned(self):
         identity = load_module("verify_source_identity")
@@ -1702,7 +1860,46 @@ class ReleaseToolTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unexpected entries"):
                 verifier.verify_directory(payload)
 
-    def test_windows_installer_must_embed_the_signed_portable_bytes(self):
+    def test_windows_unsigned_release_verifier_rejects_authenticode(self):
+        verifier = load_module("verify_windows_payload")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            payload = root / "payload"
+            payload.mkdir()
+            for name in verifier.EXPECTED_EXECUTABLES:
+                self.write_windows_test_pe(payload / name)
+            archive = root / "portable.zip"
+            with zipfile.ZipFile(archive, "w") as zipped:
+                for name in verifier.EXPECTED_EXECUTABLES:
+                    zipped.write(payload / name, name)
+
+            self.assertEqual(
+                verifier.verify_unsigned_archive(archive),
+                verifier.EXPECTED_EXECUTABLES,
+            )
+            installer = root / "installer.exe"
+            self.write_windows_test_pe(installer)
+            self.assertEqual(verifier.verify_unsigned_file(installer), installer.resolve())
+
+            signed = bytearray((payload / "blackcoin-qt.exe").read_bytes())
+            optional_offset = 0x80 + 24
+            struct.pack_into(
+                "<II", signed, optional_offset + 112 + 4 * 8,
+                0x700, 0x80,
+            )
+            (payload / "blackcoin-qt.exe").write_bytes(signed)
+            signed_archive = root / "signed-portable.zip"
+            with zipfile.ZipFile(signed_archive, "w") as zipped:
+                for name in verifier.EXPECTED_EXECUTABLES:
+                    zipped.write(payload / name, name)
+            with self.assertRaisesRegex(RuntimeError, "Authenticode certificate table"):
+                verifier.verify_unsigned_archive(signed_archive)
+
+            installer.write_bytes(signed)
+            with self.assertRaisesRegex(RuntimeError, "Authenticode certificate table"):
+                verifier.verify_unsigned_file(installer)
+
+    def test_windows_installer_must_embed_the_portable_bytes(self):
         verifier = load_module("verify_windows_payload")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1721,7 +1918,7 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertEqual(tuple(path.name for path in embedded), verifier.EXPECTED_EXECUTABLES)
 
             (extracted / "daemon" / "blackcoin-util.exe").write_bytes(b"unsigned-or-different")
-            with self.assertRaisesRegex(RuntimeError, "differs from signed portable"):
+            with self.assertRaisesRegex(RuntimeError, "differs from portable"):
                 verifier.verify_installer_extraction(extracted, payload)
 
             (extracted / "daemon" / "blackcoin-util.exe").write_bytes(b"signed:blackcoin-util.exe")

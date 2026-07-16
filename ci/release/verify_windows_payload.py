@@ -8,6 +8,7 @@ import argparse
 import hashlib
 from pathlib import Path, PurePosixPath
 import stat
+import struct
 import sys
 import zipfile
 
@@ -21,6 +22,9 @@ EXPECTED_EXECUTABLES = (
     "blackcoind.exe",
 )
 FORBIDDEN_EXECUTABLES = frozenset({"test_blackcoin.exe"})
+PE32_MAGIC = 0x010B
+PE32_PLUS_MAGIC = 0x020B
+CERTIFICATE_DIRECTORY_INDEX = 4
 
 
 def _require_exact_names(names, context):
@@ -69,6 +73,58 @@ def verify_archive(archive):
     return tuple(EXPECTED_EXECUTABLES)
 
 
+def verify_no_authenticode_bytes(data, context):
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        raise RuntimeError(f"{context}: invalid DOS header")
+    pe_offset, = struct.unpack_from("<I", data, 0x3C)
+    if pe_offset > len(data) - 24 or data[pe_offset:pe_offset + 4] != b"PE\0\0":
+        raise RuntimeError(f"{context}: invalid PE header")
+
+    coff = pe_offset + 4
+    optional_size, = struct.unpack_from("<H", data, coff + 16)
+    optional = coff + 20
+    optional_end = optional + optional_size
+    if optional_end > len(data) or optional_size < 2:
+        raise RuntimeError(f"{context}: truncated PE optional header")
+    magic, = struct.unpack_from("<H", data, optional)
+    if magic == PE32_PLUS_MAGIC:
+        directory_count_offset = 108
+        directories_offset = 112
+    elif magic == PE32_MAGIC:
+        directory_count_offset = 92
+        directories_offset = 96
+    else:
+        raise RuntimeError(f"{context}: unsupported PE optional-header magic {magic:#x}")
+    if optional_size < directory_count_offset + 4:
+        raise RuntimeError(f"{context}: PE data-directory count is missing")
+    directory_count, = struct.unpack_from("<I", data, optional + directory_count_offset)
+    if directory_count <= CERTIFICATE_DIRECTORY_INDEX:
+        return
+    certificate_entry = optional + directories_offset + CERTIFICATE_DIRECTORY_INDEX * 8
+    if certificate_entry > optional_end - 8:
+        raise RuntimeError(f"{context}: PE certificate directory is truncated")
+    certificate_offset, certificate_size = struct.unpack_from("<II", data, certificate_entry)
+    if certificate_offset != 0 or certificate_size != 0:
+        raise RuntimeError(f"{context}: Authenticode certificate table is present")
+
+
+def verify_unsigned_archive(archive):
+    archive = Path(archive).resolve(strict=True)
+    verify_archive(archive)
+    with zipfile.ZipFile(archive) as zipped:
+        for name in EXPECTED_EXECUTABLES:
+            verify_no_authenticode_bytes(zipped.read(name), f"{archive.name}:{name}")
+    return tuple(EXPECTED_EXECUTABLES)
+
+
+def verify_unsigned_file(path):
+    path = Path(path).resolve(strict=True)
+    if path.is_symlink() or not path.is_file():
+        raise RuntimeError(f"Windows artifact must be a regular file: {path}")
+    verify_no_authenticode_bytes(path.read_bytes(), path.name)
+    return path
+
+
 def _sha256(path):
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -106,7 +162,7 @@ def verify_installer_extraction(extracted_root, portable_root):
         portable = portable_paths[name]
         installed = found[name]
         if portable.stat().st_size != installed.stat().st_size or _sha256(portable) != _sha256(installed):
-            raise RuntimeError(f"installer payload differs from signed portable executable: {name}")
+            raise RuntimeError(f"installer payload differs from portable executable: {name}")
     return tuple(found[name] for name in EXPECTED_EXECUTABLES)
 
 
@@ -118,6 +174,14 @@ def main():
     directory.add_argument("path", type=Path)
     archive = subparsers.add_parser("archive", help="verify a portable zip inventory")
     archive.add_argument("path", type=Path)
+    unsigned_archive = subparsers.add_parser(
+        "unsigned-archive", help="verify a portable zip has no Authenticode certificates"
+    )
+    unsigned_archive.add_argument("path", type=Path)
+    unsigned_file = subparsers.add_parser(
+        "unsigned-file", help="verify a PE artifact has no Authenticode certificate"
+    )
+    unsigned_file.add_argument("path", type=Path)
     installer = subparsers.add_parser("installer", help="verify extracted installer payload bytes")
     installer.add_argument("path", type=Path)
     installer.add_argument("--portable-dir", required=True, type=Path)
@@ -131,6 +195,12 @@ def main():
     elif args.command == "archive":
         verify_archive(args.path)
         print(f"Verified {len(EXPECTED_EXECUTABLES)} portable archive member(s)")
+    elif args.command == "unsigned-archive":
+        verify_unsigned_archive(args.path)
+        print(f"Verified {len(EXPECTED_EXECUTABLES)} publisher-unsigned executable(s)")
+    elif args.command == "unsigned-file":
+        verified = verify_unsigned_file(args.path)
+        print(f"Verified publisher-unsigned PE artifact: {verified.name}")
     else:
         print("\n".join(str(path) for path in verify_installer_extraction(args.path, args.portable_dir)))
     return 0

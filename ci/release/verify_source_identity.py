@@ -27,6 +27,11 @@ PINNED_IDENTITY_EXCEPTIONS = {
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 FINGERPRINT_RE = re.compile(r"^(?:[0-9A-F]{40}|[0-9A-F]{64})$")
 ATTRIBUTION_TRAILER_RE = re.compile(r"^(?:co-authored-by|co-developed-by):", re.IGNORECASE)
+TAG_SIGNATURE_MARKERS = (
+    "-----BEGIN PGP SIGNATURE-----",
+    "-----BEGIN SSH SIGNATURE-----",
+    "-----BEGIN SIGNED MESSAGE-----",
+)
 
 
 def git(*args):
@@ -103,6 +108,19 @@ def verify_openpgp_signature(object_name, object_kind, expected_fingerprint):
         )
 
 
+def verify_unsigned_object(object_name, object_kind):
+    content = git("cat-file", "-p", object_name)
+    if object_kind == "commit":
+        headers = content.split("\n\n", 1)[0]
+        if re.search(r"^gpgsig(?:-sha256)? ", headers, re.MULTILINE):
+            raise RuntimeError(f"{object_name} has an embedded commit signature")
+        return
+    if object_kind != "tag":
+        raise RuntimeError(f"unsupported object kind: {object_kind}")
+    if any(marker in content for marker in TAG_SIGNATURE_MARKERS):
+        raise RuntimeError(f"{object_name} has an embedded tag signature")
+
+
 def verify_tag(tag, head, signing_fingerprint=None):
     ref = f"refs/tags/{tag}"
     if git("cat-file", "-t", ref) != "tag":
@@ -129,6 +147,7 @@ def main():
     parser.add_argument("--require-actor", action="store_true")
     parser.add_argument("--tag")
     parser.add_argument("--require-signatures", action="store_true")
+    parser.add_argument("--require-unsigned-objects", action="store_true")
     parser.add_argument("--signing-fingerprint")
     args = parser.parse_args()
 
@@ -138,6 +157,8 @@ def main():
         raise RuntimeError("release workflow must be initiated by the release team account")
 
     signing_fingerprint = (args.signing_fingerprint or "").replace(" ", "").upper()
+    if args.require_signatures and args.require_unsigned_objects:
+        raise RuntimeError("signed and explicitly unsigned release policies are mutually exclusive")
     if args.require_signatures and not FINGERPRINT_RE.fullmatch(signing_fingerprint):
         raise RuntimeError("a full OpenPGP release-signing fingerprint is required")
 
@@ -151,8 +172,12 @@ def main():
         verify_commit(commit)
     if args.require_signatures:
         verify_openpgp_signature(head, "commit", signing_fingerprint)
+    if args.require_unsigned_objects:
+        verify_unsigned_object(head, "commit")
     if args.tag:
         verify_tag(args.tag, head, signing_fingerprint if args.require_signatures else None)
+        if args.require_unsigned_objects:
+            verify_unsigned_object(f"refs/tags/{args.tag}", "tag")
 
     print(f"Verified {len(commits)} release commit(s) through {head}")
     return 0
