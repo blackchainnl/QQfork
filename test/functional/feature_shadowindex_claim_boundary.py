@@ -7,8 +7,8 @@
 Mainnet paid the v30.1.0 first-valid QQSPROOF rule before height 5,993,200.
 The canonical QQP3 boundary intentionally still accepts valid QQP2 carriers,
 and adds bounded late QQP3 reimbursement. QQP4 is a separate future fork. This
-test pins QQP2 plus QQP3 source records, reorg behavior, and full reindex while
-the chain remains strictly before the QQP4 activation height.
+test pins QQP2, QQP3, and exact-input-bound QQP4 source records across reorg,
+restart, and full reindex.
 """
 
 from decimal import Decimal
@@ -205,6 +205,13 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
         assert_equal(source["input_bound"], False)
         assert_equal(source["claim_outpoint"], None)
 
+    @staticmethod
+    def _assert_qqp4_source(source, claim_outpoint):
+        assert_equal(source["proof_version"], 4)
+        assert_equal(source["origin_bound"], True)
+        assert_equal(source["input_bound"], True)
+        assert_equal(source["claim_outpoint"], claim_outpoint)
+
     def _assert_qqp2_and_qqp3_current_payouts(
         self,
         block_hash,
@@ -330,6 +337,54 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
         return page, {
             txid: record["synthetic_txid"] for txid, record in records.items()
         }
+
+    def _assert_qqp4_payout(
+        self,
+        block_hash,
+        claim_txid,
+        payout_address,
+        claim_outpoint,
+        synthetic_txid=None,
+    ):
+        node = self.nodes[0]
+        page = node.getshadowblock(block_hash, 0, 10, 0, 10)
+        accounting = page["pow_claim_accounting"]
+        assert_equal(accounting["active"], True)
+        assert_equal(accounting["total_records"], 1)
+        assert_equal(accounting["observed_count"], 1)
+        assert_equal(accounting["evaluated_count"], 1)
+        assert_equal(accounting["winner_count"], 1)
+        assert_equal(accounting["reimbursed_loser_count"], 0)
+        assert_equal(accounting["reimbursed_late_count"], 0)
+        assert_equal(accounting["rejected_count"], 0)
+        assert len(accounting["accounting_commitment"]) == 64
+
+        assert_equal(len(accounting["records"]), 1)
+        record = accounting["records"][0]
+        assert_equal(record["txid"], claim_txid)
+        assert_equal(record["disposition"], "winner")
+        assert_equal(record["base_fee_known"], True)
+        assert_equal(record["payout_address"], payout_address)
+        self._assert_qqp4_source(record, claim_outpoint)
+        inclusion_height = node.getblockheader(block_hash)["height"]
+        assert_equal(record["origin_height"], inclusion_height)
+        assert_equal(record["inclusion_height"], inclusion_height)
+        assert_equal(record["origin_age"], 0)
+        assert record["synthetic_txid"] is not None
+        if synthetic_txid is not None:
+            assert_equal(record["synthetic_txid"], synthetic_txid)
+        assert_equal(
+            Decimal(str(accounting["credited_total"])),
+            Decimal(str(page["pow_payout_total"])),
+        )
+
+        payout = node.getshadowtransaction(record["synthetic_txid"])
+        assert_equal(payout["mode"], "pow")
+        assert_equal(payout["base_anchor"]["blockhash"], block_hash)
+        assert_equal(payout["pow_claim_source"]["txid"], claim_txid)
+        assert_equal(payout["pow_claim_source"]["disposition"], "winner")
+        self._assert_qqp4_source(payout["pow_claim_source"], claim_outpoint)
+        return page, record["synthetic_txid"]
 
     def run_test(self):
         node = self.nodes[0]
@@ -513,7 +568,67 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
             qqp3_late_synthetic,
         )
 
-        self.log.info("Restart and full reindex reproduce QQP2 and QQP3 provenance")
+        self.log.info("Crossing the separately configured QQP4 boundary")
+        assert_equal(node.getblockcount(), QQP4_ACTIVATION_HEIGHT - 1)
+        qqp4_state = node.getgoldrushstate()
+        assert_equal(qqp4_state["qqp4_active"], False)
+        assert_equal(qqp4_state["qqp4_active_next_block"], True)
+
+        qqp4_payout_address = wallet.getnewquantumaddress()["address"]
+        qqp4_claim = wallet.sendshadowpowclaim(
+            canonical_claim_address, qqp4_payout_address, 500_000
+        )
+        assert qqp4_claim["txid"] in node.getrawmempool()
+        qqp4_raw_claim = node.getrawtransaction(qqp4_claim["txid"], True)
+        assert_equal(len(qqp4_raw_claim["vin"]), 1)
+        qqp4_claim_outpoint = {
+            "txid": qqp4_raw_claim["vin"][0]["txid"],
+            "vout": qqp4_raw_claim["vin"][0]["vout"],
+        }
+        qqp4_block = self._mine_pos_block_with_claim(
+            wallet, qqp4_claim["txid"]
+        )
+        assert_equal(node.getblockcount(), QQP4_ACTIVATION_HEIGHT)
+        qqp4_state = node.getgoldrushstate()
+        assert_equal(qqp4_state["qqp4_active"], True)
+        assert_equal(qqp4_state["qqp4_active_next_block"], True)
+        self._wait_index_synced()
+        qqp4_page, qqp4_synthetic = self._assert_qqp4_payout(
+            qqp4_block,
+            qqp4_claim["txid"],
+            qqp4_payout_address,
+            qqp4_claim_outpoint,
+        )
+        qqp4_utxo = self._wait_for_quantum_utxo(
+            wallet, qqp4_payout_address
+        )
+        assert_equal(qqp4_utxo["txid"], qqp4_synthetic)
+        expected_issued_count += qqp4_page["total_payouts"]
+        assert_equal(node.getshadowsupply()["issued_count"], expected_issued_count)
+
+        self.log.info("Reorg removes and restores exact QQP4 input provenance")
+        qqp4_parent = node.getblockheader(qqp4_block)["previousblockhash"]
+        node.invalidateblock(qqp4_block)
+        node.syncwithvalidationinterfacequeue()
+        self._wait_index_synced()
+        assert_equal(node.getbestblockhash(), qqp4_parent)
+        assert_equal(node.getgoldrushstate()["qqp4_active"], False)
+        assert_raises_rpc_error(
+            -5, "not found", node.getshadowtransaction, qqp4_synthetic
+        )
+        node.reconsiderblock(qqp4_block)
+        node.syncwithvalidationinterfacequeue()
+        self._wait_index_synced()
+        assert_equal(node.getbestblockhash(), qqp4_block)
+        self._assert_qqp4_payout(
+            qqp4_block,
+            qqp4_claim["txid"],
+            qqp4_payout_address,
+            qqp4_claim_outpoint,
+            qqp4_synthetic,
+        )
+
+        self.log.info("Restart and full reindex reproduce QQP2, QQP3, and QQP4 provenance")
         # No further blocks are intentional. Disable the process-level staking
         # thread for these final restarts so load-on-start wallets cannot race
         # the exact indexed tip before their wallet RPCs are available.
@@ -547,6 +662,13 @@ class ShadowIndexClaimBoundaryTest(BitcoinTestFramework):
                     current_claim["txid"]: current_payout_address,
                 },
                 qqp3_late_synthetic,
+            )
+            self._assert_qqp4_payout(
+                qqp4_block,
+                qqp4_claim["txid"],
+                qqp4_payout_address,
+                qqp4_claim_outpoint,
+                qqp4_synthetic,
             )
             assert_equal(
                 node.getshadowsupply()["issued_count"], expected_issued_count
