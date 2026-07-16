@@ -360,6 +360,20 @@ jobs:
             fi
           done
 
+      - name: Verify generated source identity and clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s src/obj/build.h
+          grep -Fx '#define BUILD_SOURCE_COMMIT "'"$TARGET_SHA"'"' src/obj/build.h
+          grep -Fx '#define BUILD_SOURCE_DIRTY 0' src/obj/build.h
+          if grep -q '^#define BUILD_GIT_COMMIT ' src/obj/build.h; then
+            grep -Fx '#define BUILD_GIT_COMMIT "'"${TARGET_SHA:0:12}"'"' src/obj/build.h
+          else
+            grep -Fx '#define BUILD_GIT_TAG "v'"$VERSION"'"' src/obj/build.h
+          fi
+          test -z "$(git status --short)"
+
       - name: Build and execute target crypto vectors
         if: ${{ !startsWith(matrix.name, 'macos-') }}
         shell: bash
@@ -381,12 +395,54 @@ jobs:
                 "$test_binary" --run_test=crypto_hardening_tests --log_level=test_suite
               ;;
             windows-64-bit)
-              wine_runner=$(command -v wine64 || command -v wine)
+              wine_runner=$(
+                command -v wine64-stable || command -v wine64 ||
+                  command -v wine-stable || command -v wine || true
+              )
+              if [[ -z "$wine_runner" ]]; then
+                for candidate in \
+                  /opt/wine-stable/bin/wine64 \
+                  /usr/lib/wine/wine64 \
+                  /usr/lib/x86_64-linux-gnu/wine/wine64; do
+                  if [[ -x "$candidate" ]]; then
+                    wine_runner="$candidate"
+                    break
+                  fi
+                done
+              fi
               test -n "$wine_runner"
               WINEDEBUG=-all "$wine_runner" "$test_binary" \
                 --run_test=crypto_hardening_tests --log_level=test_suite
               ;;
           esac
+
+      - name: Verify non-macOS binary identity
+        if: ${{ !startsWith(matrix.name, 'macos-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_line="Blackcoin version v$CONFIGURED_VERSION-${TARGET_SHA:0:12}"
+          binary="depends/${{ matrix.host }}/bin/blackcoind"
+          version_home="$RUNNER_TEMP/blackcoin-version-home-${{ matrix.name }}-${{ matrix.builder }}"
+          mkdir -p "$version_home"
+          case "${{ matrix.name }}" in
+            linux-64-bit)
+              version_output=$(HOME="$version_home" "$binary" -version 2>&1)
+              ;;
+            linux-arm-64-bit)
+              version_output=$(HOME="$version_home" qemu-aarch64 -L /usr/aarch64-linux-gnu "$binary" -version 2>&1)
+              ;;
+            windows-64-bit)
+              pe_binary="${binary}.exe"
+              test -s "$pe_binary" && test ! -L "$pe_binary"
+              python3 ci/release/verify_windows_payload.py identity "$pe_binary" \
+                --version "$CONFIGURED_VERSION" --source-sha "$TARGET_SHA"
+              exit 0
+              ;;
+          esac
+          normalized_output=$(printf '%s\n' "$version_output" | tr -d '\r')
+          test "$(printf '%s\n' "$normalized_output" | grep -Fxc "$expected_line")" = 1
+          printf '%s\n' "$normalized_output"
 
       - name: Package release assets
         shell: bash
@@ -427,12 +483,14 @@ jobs:
                 test -f "depends/$HOST/bin/$file" && test ! -L "depends/$HOST/bin/$file"
               done
               (cd "depends/$HOST/bin" && printf '%s\n' "${files[@]}" | zip -X -9j "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip" -@)
-              python3 ci/release/verify_windows_payload.py archive \
+              python3 ci/release/verify_windows_payload.py unsigned-archive \
                 "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
               mapfile -t installers < <(find . -maxdepth 1 -type f -name "blackcoin-$CONFIGURED_VERSION-win64-setup.exe" -printf '%P\n' | sort)
               test "${#installers[@]}" -eq 1
               cp "${installers[0]}" "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
               touch -d "@$SOURCE_DATE_EPOCH" "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+              python3 ci/release/verify_windows_payload.py unsigned-file \
+                "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
               ;;
             macos-64-bit)
               normalize_tree dist/blackcoin-qt.app

@@ -207,6 +207,86 @@ class ReleaseToolTests(unittest.TestCase):
             data[name_offset:name_offset + len(encoded)] = encoded
         path.write_bytes(data)
 
+    @staticmethod
+    def make_version_block(key, value=b"", value_type=0, children=()):
+        encoded_key = key.encode("utf-16le") + b"\0\0"
+        block = bytearray(struct.pack("<HHH", 0, 0, value_type) + encoded_key)
+        block.extend(b"\0" * ((-len(block)) % 4))
+        block.extend(value)
+        block.extend(b"\0" * ((-len(block)) % 4))
+        for child in children:
+            block.extend(child)
+            block.extend(b"\0" * ((-len(block)) % 4))
+        value_length = len(value) // 2 if value_type == 1 else len(value)
+        struct.pack_into("<HH", block, 0, len(block), value_length)
+        return bytes(block)
+
+    def write_windows_identity_pe(self, path, version="30.1.1rc2",
+                                  source_sha=SOURCE_SHA, dirty="0",
+                                  machine=0x8664, optional_magic=0x020B):
+        strings = []
+        for key, value in (
+            ("FileVersion", version),
+            ("ConfiguredVersion", version),
+            ("ProductVersion", version),
+            ("SourceCommit", source_sha),
+            ("SourceDirty", dirty),
+        ):
+            encoded = (value + "\0").encode("utf-16le")
+            strings.append(self.make_version_block(key, encoded, 1))
+        string_table = self.make_version_block("040904E4", children=strings)
+        string_info = self.make_version_block("StringFileInfo", children=(string_table,))
+        fixed_info = struct.pack("<13I", 0xFEEF04BD, 0x00010000, *([0] * 11))
+        version_info = self.make_version_block(
+            "VS_VERSION_INFO", fixed_info, children=(string_info,)
+        )
+
+        data = bytearray(0x1000)
+        pe_offset = 0x80
+        optional_offset = pe_offset + 24
+        optional_size = 0xF0
+        section_table = optional_offset + optional_size
+        section_rva = 0x1000
+        section_raw = 0x200
+        blob_relative = 0x100
+        resource_size = blob_relative + len(version_info)
+        raw_size = 0x800
+
+        data[:2] = b"MZ"
+        struct.pack_into("<I", data, 0x3C, pe_offset)
+        data[pe_offset:pe_offset + 4] = b"PE\0\0"
+        struct.pack_into(
+            "<HHIIIHH", data, pe_offset + 4,
+            machine, 1, 0, 0, 0, optional_size, 0x0022,
+        )
+        struct.pack_into("<H", data, optional_offset, optional_magic)
+        struct.pack_into("<I", data, optional_offset + 60, section_raw)
+        struct.pack_into("<I", data, optional_offset + 108, 16)
+        struct.pack_into(
+            "<II", data, optional_offset + 112 + 2 * 8,
+            section_rva, resource_size,
+        )
+        data[section_table:section_table + 8] = b".rsrc\0\0\0"
+        struct.pack_into(
+            "<IIII", data, section_table + 8,
+            resource_size, section_rva, raw_size, section_raw,
+        )
+
+        # RT_VERSION -> resource id 1 -> U.S. English -> data entry.
+        struct.pack_into("<HH", data, section_raw + 12, 0, 1)
+        struct.pack_into("<II", data, section_raw + 16, 16, 0x80000020)
+        struct.pack_into("<HH", data, section_raw + 0x20 + 12, 0, 1)
+        struct.pack_into("<II", data, section_raw + 0x20 + 16, 1, 0x80000040)
+        struct.pack_into("<HH", data, section_raw + 0x40 + 12, 0, 1)
+        struct.pack_into("<II", data, section_raw + 0x40 + 16, 0x409, 0x60)
+        struct.pack_into(
+            "<IIII", data, section_raw + 0x60,
+            section_rva + blob_relative, len(version_info), 1200, 0,
+        )
+        data[section_raw + blob_relative:
+             section_raw + blob_relative + len(version_info)] = version_info
+        path.write_bytes(data)
+
     def make_resource_bundle(self, directory, source_sha, repository,
                              provenance_manifest):
         verifier = load_module("verify_resource_benchmark_bundle")
@@ -1987,6 +2067,16 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertNotIn("- 'v30.1.1-alpha", workflow)
         self.assertNotIn("- 'v30.1.1-beta", workflow)
         self.assertIn("UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE", workflow)
+        self.assertIn("Verify non-macOS binary identity", workflow)
+        self.assertIn("verify_windows_payload.py identity", workflow)
+        self.assertIn('--version "$CONFIGURED_VERSION" --source-sha "$TARGET_SHA"', workflow)
+        self.assertIn("verify_windows_payload.py unsigned-archive", workflow)
+        self.assertIn("verify_windows_payload.py unsigned-file", workflow)
+        self.assertNotIn("grep -aFq -- \"$TARGET_SHA\" \"$pe_binary\"", workflow)
+        self.assertNotIn('version_output="$expected_line"', workflow)
+        self.assertIn("Verify generated source identity and clean checkout", workflow)
+        self.assertIn("BUILD_SOURCE_DIRTY 0", workflow)
+        self.assertIn("git status --short", workflow)
         self.assertIn("raw-release-${{ needs.resolve-target.outputs.package_label }}", workflow)
         self.assertIn("macos-15-intel", workflow)
         self.assertIn("codesign --force --deep --sign - --timestamp=none", workflow)
@@ -2170,6 +2260,96 @@ class ReleaseToolTests(unittest.TestCase):
             installer.write_bytes(signed)
             with self.assertRaisesRegex(RuntimeError, "Authenticode certificate table"):
                 verifier.verify_unsigned_file(installer)
+
+    def test_windows_source_identity_is_bounded_to_clean_x86_64_version_resource(self):
+        verifier = load_module("verify_windows_payload")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            valid = root / "blackcoind.exe"
+            self.write_windows_identity_pe(valid)
+            self.assertEqual(
+                verifier.verify_source_identity(valid, "30.1.1rc2", SOURCE_SHA),
+                valid.resolve(),
+            )
+
+            wrong_commit = root / "wrong-commit.exe"
+            self.write_windows_identity_pe(wrong_commit, source_sha="0" * 40)
+            with wrong_commit.open("ab") as destination:
+                destination.write(SOURCE_SHA.encode("ascii"))
+            with self.assertRaisesRegex(RuntimeError, "SourceCommit"):
+                verifier.verify_source_identity(wrong_commit, "30.1.1rc2", SOURCE_SHA)
+
+            dirty = root / "dirty.exe"
+            self.write_windows_identity_pe(dirty, dirty="1")
+            with self.assertRaisesRegex(RuntimeError, "SourceDirty"):
+                verifier.verify_source_identity(dirty, "30.1.1rc2", SOURCE_SHA)
+
+            wrong_version = root / "wrong-version.exe"
+            self.write_windows_identity_pe(wrong_version, version="30.1.1rc1")
+            with self.assertRaisesRegex(RuntimeError, "ConfiguredVersion"):
+                verifier.verify_source_identity(wrong_version, "30.1.1rc2", SOURCE_SHA)
+
+            wrong_machine = root / "wrong-machine.exe"
+            self.write_windows_identity_pe(wrong_machine, machine=0xAA64)
+            with self.assertRaisesRegex(RuntimeError, "x86-64 PE machine"):
+                verifier.verify_source_identity(wrong_machine, "30.1.1rc2", SOURCE_SHA)
+
+            pe32 = root / "pe32.exe"
+            self.write_windows_identity_pe(pe32, optional_magic=0x010B)
+            with self.assertRaisesRegex(RuntimeError, "expected PE32\+"):
+                verifier.verify_source_identity(pe32, "30.1.1rc2", SOURCE_SHA)
+
+            out_of_bounds = bytearray(valid.read_bytes())
+            optional_offset = 0x80 + 24
+            struct.pack_into(
+                "<II", out_of_bounds, optional_offset + 112 + 2 * 8,
+                0x1000, 0x900,
+            )
+            malformed = root / "out-of-bounds.exe"
+            malformed.write_bytes(out_of_bounds)
+            with self.assertRaisesRegex(RuntimeError, "resource directory"):
+                verifier.verify_source_identity(malformed, "30.1.1rc2", SOURCE_SHA)
+
+    def test_windows_daemon_resource_embeds_generated_source_identity(self):
+        root = TOOLS.parent.parent
+        resource = (root / "src" / "bitcoind-res.rc").read_text(encoding="utf-8")
+        makefile = (root / "src" / "Makefile.am").read_text(encoding="utf-8")
+        self.assertIn('#include "obj/build.h"', resource)
+        self.assertIn('VALUE "ConfiguredVersion",  PACKAGE_VERSION', resource)
+        self.assertIn('VALUE "SourceCommit",       BUILD_SOURCE_COMMIT', resource)
+        self.assertIn('VALUE "SourceDirty",        STRINGIZE(BUILD_SOURCE_DIRTY)', resource)
+        self.assertIn("bitcoind-res.$(OBJEXT): obj/build.h", makefile)
+
+    def test_macos_app_build_output_is_ignored_with_exact_case(self):
+        root = TOOLS.parent.parent
+        makefile = (root / "Makefile.am").read_text(encoding="utf-8")
+        match = re.search(r"^OSX_APP=([^\s]+)$", makefile, re.MULTILINE)
+        self.assertIsNotNone(match)
+        app = match.group(1)
+        self.assertEqual(app, "blackcoin-qt.app")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            repository = Path(temporary)
+            subprocess.run(["git", "init", "-q", repository], check=True)
+            subprocess.run(
+                ["git", "-C", repository, "config", "core.ignoreCase", "false"],
+                check=True,
+            )
+            (repository / ".gitignore").write_text(
+                (root / ".gitignore").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            exact = f"{app}/Contents/PkgInfo"
+            wrong_case = f"{app.upper()}/Contents/PkgInfo"
+            subprocess.run(
+                ["git", "-C", repository, "check-ignore", "--no-index", "-q", exact],
+                check=True,
+            )
+            result = subprocess.run(
+                ["git", "-C", repository, "check-ignore", "--no-index", "-q", wrong_case],
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
 
     def test_windows_installer_must_embed_the_portable_bytes(self):
         verifier = load_module("verify_windows_payload")

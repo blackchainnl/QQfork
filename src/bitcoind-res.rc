@@ -1,5 +1,10 @@
 #include <windows.h>             // needed for VERSIONINFO
 #include "clientversion.h"       // holds the needed client version information
+#include "obj/build.h"           // binds the executable resource to the exact source
+
+#if !defined(BUILD_SOURCE_COMMIT) || !defined(BUILD_SOURCE_DIRTY)
+#error Exact source identity is required for the Windows daemon resource
+#endif
 
 #define VER_PRODUCTVERSION     CLIENT_VERSION_MAJOR,CLIENT_VERSION_MINOR,CLIENT_VERSION_BUILD
 #define VER_FILEVERSION        VER_PRODUCTVERSION
@@ -17,12 +22,15 @@ BEGIN
             VALUE "CompanyName",        "Blackcoin"
             VALUE "FileDescription",    "blackcoind (Blackcoin node with a JSON-RPC server)"
             VALUE "FileVersion",        PACKAGE_VERSION
+            VALUE "ConfiguredVersion",  PACKAGE_VERSION
             VALUE "InternalName",       "blackcoind"
             VALUE "LegalCopyright",     COPYRIGHT_STR
             VALUE "LegalTrademarks1",   "Distributed under the MIT software license, see the accompanying file COPYING or http://www.opensource.org/licenses/mit-license.php."
             VALUE "OriginalFilename",   "blackcoind.exe"
             VALUE "ProductName",        "blackcoind"
             VALUE "ProductVersion",     PACKAGE_VERSION
+            VALUE "SourceCommit",       BUILD_SOURCE_COMMIT
+            VALUE "SourceDirty",        STRINGIZE(BUILD_SOURCE_DIRTY)
         END
     END
 

@@ -110,6 +110,7 @@ qrc_*.cpp
 # Mac specific
 .DS_Store
 build
+/blackcoin-qt.app/
 
 # Previous releases
 releases
