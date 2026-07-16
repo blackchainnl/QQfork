@@ -236,10 +236,11 @@ signature.
 3. Download the `unsigned-canary-*` bundle only after both isolated builders
    reproduce every selected artifact byte for byte. Verify the unsigned
    checksum manifest and its `prerelease_channel=beta` binding.
-4. Run the protected exact-final-SHA shadow-resource and mainnet quantum-witness
-   workflows. Preserve their unexpired artifacts. The witness capture must be
-   no more than 24 hours old at publication and must have either a zero review
-   set or an approved exact-snapshot disposition for every review outpoint.
+4. Record that the protected exact-final-SHA shadow-resource and mainnet
+   quantum-witness workflows are production-release gates, not public-beta
+   promotion gates. A beta must not claim that either final-production gate
+   passed. If exact-SHA evidence already exists, preserve it without treating
+   it as a substitute for the beta canary and replay requirements.
 5. Install one isolated canary with verified wallet and datadir backups. Run
    the two-start upgrade, replay/reindex, restart, staking, wallet, GUI, and
    rollback checks required by the beta plan before any broader testing.

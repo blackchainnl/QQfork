@@ -28,7 +28,8 @@ through an explicit historical rule while retaining the independent v2
 mempool-time repair. A one-transaction exception is not an acceptable release
 correction.
 
-The exact Beta 2 artifact is blocked until all of these conditions are met:
+Public prerelease promotion of the exact Beta 2 artifact is blocked until all
+of these conditions are met:
 
 - deterministic coverage accepts the historical depth-182 coinstake spend and
   covers coinbase and coinstake behavior on both sides of the existing
