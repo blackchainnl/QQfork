@@ -350,6 +350,12 @@ jobs:
             echo "::error::Release build configured without SQLite wallet support"
             exit 1
           }
+          source_status=$(git status --porcelain=v1 --untracked-files=all)
+          if [[ -n "$source_status" ]]; then
+            echo "::error::Release source checkout became dirty before compilation"
+            printf '%s\n' "$source_status"
+            exit 1
+          fi
           make_args=()
           if [[ "${{ matrix.name }}" == "windows-64-bit" ]]; then
             make_args+=("BITCOIN_WIN_INSTALLER=$PWD/blackcoin-$CONFIGURED_VERSION-win64-setup.exe")
