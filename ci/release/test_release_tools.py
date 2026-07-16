@@ -2316,8 +2316,13 @@ class ReleaseToolTests(unittest.TestCase):
         makefile = (root / "src" / "Makefile.am").read_text(encoding="utf-8")
         self.assertIn('#include "obj/build.h"', resource)
         self.assertIn('VALUE "ConfiguredVersion",  PACKAGE_VERSION', resource)
-        self.assertIn('VALUE "SourceCommit",       BUILD_SOURCE_COMMIT', resource)
-        self.assertIn('VALUE "SourceDirty",        STRINGIZE(BUILD_SOURCE_DIRTY)', resource)
+        self.assertIn('#define RESOURCE_SOURCE_COMMIT BUILD_SOURCE_COMMIT', resource)
+        self.assertIn('#define RESOURCE_SOURCE_COMMIT "unavailable"', resource)
+        self.assertIn('#define RESOURCE_SOURCE_DIRTY STRINGIZE(BUILD_SOURCE_DIRTY)', resource)
+        self.assertIn('#define RESOURCE_SOURCE_DIRTY "unknown"', resource)
+        self.assertIn('VALUE "SourceCommit",       RESOURCE_SOURCE_COMMIT', resource)
+        self.assertIn('VALUE "SourceDirty",        RESOURCE_SOURCE_DIRTY', resource)
+        self.assertNotIn("#error Exact source identity", resource)
         self.assertIn("bitcoind-res.$(OBJEXT): obj/build.h", makefile)
 
     def test_macos_app_build_output_is_ignored_with_exact_case(self):
