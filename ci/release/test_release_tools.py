@@ -124,6 +124,8 @@ class ReleaseToolTests(unittest.TestCase):
             'gh api "repos/$GITHUB_REPOSITORY/immutable-releases"',
             workflow,
         )
+        self.assertIn("verify_windows_payload.py installer", workflow)
+        self.assertIn("--portable-dir work/windows-portable", workflow)
         for unavailable_credential in (
             "RELEASE_GPG_PRIVATE_KEY_B64",
             "RELEASE_GPG_PUBLIC_KEY_B64",

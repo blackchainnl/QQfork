@@ -1170,6 +1170,11 @@ jobs:
           pattern: quantum-resource-benchmarks-*-${{ needs.resolve-target.outputs.target_sha }}
           merge-multiple: true
 
+      - name: Install final release verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends p7zip-full unzip
+
       - name: Assemble exact-SHA publisher-unsigned release
         shell: bash
         run: |
@@ -1209,6 +1214,13 @@ jobs:
             "dist/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
           python3 ci/release/verify_windows_payload.py unsigned-file \
             "dist/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+          mkdir -p work/windows-portable work/windows-installer
+          unzip -q "dist/$ASSET_PREFIX-Windows-x86_64-Portable.zip" \
+            -d work/windows-portable
+          7z x -bd -y "-owork/windows-installer" \
+            "dist/$ASSET_PREFIX-Windows-x86_64-Installer.exe" >/dev/null
+          python3 ci/release/verify_windows_payload.py installer \
+            work/windows-installer --portable-dir work/windows-portable >/dev/null
           test -s gate-evidence/quantum-crypto/quantum-crypto-provenance-evidence.json
           cp gate-evidence/quantum-crypto/quantum-crypto-provenance-evidence.json \
             "dist/Blackcoin-$VERSION-quantum-crypto-provenance.json"
