@@ -189,10 +189,10 @@ jobs:
     with:
       target_sha: ${{ needs.resolve-target.outputs.target_sha }}
       # Alpha artifacts wait for the core gate. A beta adds native-platform,
-      # sanitizer, and pinned-fuzz evidence, while the complete extended
-      # functional suite remains a production-final gate.
+      # sanitizer, pinned-fuzz, and complete extended functional evidence.
+      # Production final runs the same complete gate.
       release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
-      run_extended_functional: ${{ needs.resolve-target.outputs.publish == 'true' }}
+      run_extended_functional: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
 
   select-targets:
     name: Select build target

@@ -1745,6 +1745,22 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertNotIn("Developer-ID sign and notarize macOS artifacts", workflow)
         self.assertNotIn("Authenticode-sign Windows artifacts", workflow)
 
+    def test_beta_and_production_run_the_extended_functional_gate(self):
+        workflow = (TOOLS.parent.parent / ".github" / "workflows" / "build.yml").read_text(
+            encoding="utf-8"
+        )
+        expected = (
+            "run_extended_functional: "
+            "${{ needs.resolve-target.outputs.publish == 'true' || "
+            "needs.resolve-target.outputs.prerelease_channel == 'beta' }}"
+        )
+        self.assertIn(expected, workflow)
+        self.assertNotIn(
+            "run_extended_functional: "
+            "${{ needs.resolve-target.outputs.publish == 'true' }}",
+            workflow,
+        )
+
     def test_reproducibility_requires_identical_bytes(self):
         verifier = load_module("verify_reproducible")
         with tempfile.TemporaryDirectory() as temporary:
