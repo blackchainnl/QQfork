@@ -175,33 +175,18 @@ class PinnedFuzzRegressionTests(unittest.TestCase):
         help_result = subprocess.CompletedProcess([], 0, stderr='libFuzzer')
         targets = ['block', 'mini_miner_selection', 'pow', 'script']
         with tempfile.TemporaryDirectory() as corpus_dir:
-            with mock.patch.object(
-                    sys,
-                    'argv',
-                    [
-                        'test_runner.py',
-                        '--require-pinned-regressions',
-                        '--pinned-regressions-only',
-                        corpus_dir,
-                    ],
-                ), mock.patch(
-                    'builtins.open',
-                    mock.mock_open(read_data=FAKE_CONFIG),
-                ), mock.patch.object(
-                    test_runner,
-                    'parse_test_list',
-                    return_value=targets,
-                ), mock.patch.object(
-                    test_runner.subprocess,
-                    'run',
-                    return_value=help_result,
-                ), mock.patch.object(
-                    test_runner,
-                    'run_pinned_regressions',
-                ) as pinned, mock.patch.object(
-                    test_runner,
-                    'run_once',
-                ) as run_once:
+            argv = [
+                'test_runner.py',
+                '--require-pinned-regressions',
+                '--pinned-regressions-only',
+                corpus_dir,
+            ]
+            with mock.patch.object(sys, 'argv', argv), \
+                    mock.patch('builtins.open', mock.mock_open(read_data=FAKE_CONFIG)), \
+                    mock.patch.object(test_runner, 'parse_test_list', return_value=targets), \
+                    mock.patch.object(test_runner.subprocess, 'run', return_value=help_result), \
+                    mock.patch.object(test_runner, 'run_pinned_regressions') as pinned, \
+                    mock.patch.object(test_runner, 'run_once') as run_once:
                 test_runner.main()
 
         pinned.assert_called_once()
