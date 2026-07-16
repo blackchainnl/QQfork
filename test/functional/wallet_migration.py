@@ -870,11 +870,13 @@ class WalletMigrationTest(BitcoinTestFramework):
                 break
             locktime += 1
 
-        # conflict with parent
-        conflict_unsigned = self.nodes[0].createrawtransaction(inputs=[conflict_utxo], outputs=[{wallet.getnewaddress(): 9.9999}])
+        # Conflict with parent. This fork rejects mempool replacement attempts
+        # as txn-mempool-conflict, so mine the conflict directly in a block
+        # rather than trying to submit it alongside the parent/child package.
+        conflict_unsigned = self.nodes[0].createrawtransaction(inputs=[conflict_utxo], outputs=[{wallet.getnewaddress(): 9.998}])
         conflict_signed = wallet.signrawtransactionwithwallet(conflict_unsigned)["hex"]
-        conflict_txid = self.nodes[0].sendrawtransaction(conflict_signed)
-        self.generate(self.nodes[0], 1)
+        conflict_txid = self.nodes[0].decoderawtransaction(conflict_signed)["txid"]
+        self.generateblock(self.nodes[0], output=def_wallet.getnewaddress(), transactions=[conflict_signed])
         assert_equal(wallet.gettransaction(txid=parent_txid)["confirmations"], -1)
         assert_equal(wallet.gettransaction(txid=child_txid)["confirmations"], -1)
         assert_equal(wallet.gettransaction(txid=conflict_txid)["confirmations"], 1)
