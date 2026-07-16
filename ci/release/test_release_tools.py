@@ -2420,6 +2420,54 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn('for goal in ${{ matrix.goal }}; do', workflow)
         self.assertNotIn('make -j "$MAKEJOBS" ${{ matrix.goal }}', workflow)
 
+    def test_windows_packages_share_one_stripped_payload_and_verify_it_early(self):
+        root = TOOLS.parent.parent
+        makefile = (root / "Makefile.am").read_text(encoding="utf-8")
+        workflow = (root / ".github" / "workflows" / "build.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("$(RM) -r $(top_builddir)/release", makefile)
+        self.assertIn("$(MKDIR_P) $(top_builddir)/release", makefile)
+        for binary in (
+            "BITCOIND_BIN",
+            "BITCOIN_QT_BIN",
+            "BITCOIN_CLI_BIN",
+            "BITCOIN_TX_BIN",
+            "BITCOIN_WALLET_BIN",
+            "BITCOIN_UTIL_BIN",
+        ):
+            self.assertIn(
+                f'$(INSTALL_STRIP_PROGRAM) $({binary}) $(top_builddir)/release',
+                makefile,
+            )
+
+        package_step = re.search(
+            r"      - name: Package release assets\n"
+            r"(?P<body>.*?)(?=\n      - name: Upload non-macOS release assets)",
+            workflow,
+            re.DOTALL,
+        )
+        self.assertIsNotNone(package_step)
+        windows_case = re.search(
+            r"            windows-64-bit\)\n(?P<body>.*?)\n              ;;",
+            package_step.group("body"),
+            re.DOTALL,
+        )
+        self.assertIsNotNone(windows_case)
+        windows_body = windows_case.group("body")
+        self.assertIn("windows_payload=release", windows_body)
+        self.assertIn('normalize_tree "$windows_payload"', windows_body)
+        self.assertIn(
+            'verify_windows_payload.py directory "$windows_payload"', windows_body
+        )
+        self.assertIn('"$windows_payload/blackcoind.exe"', windows_body)
+        self.assertIn('cd "$windows_payload"', windows_body)
+        self.assertNotIn("depends/$HOST/bin", windows_body)
+        self.assertIn('7z x -bd -y "-o$installer_verify_dir"', windows_body)
+        self.assertIn("verify_windows_payload.py installer", windows_body)
+        self.assertIn('--portable-dir "$portable_verify_dir"', windows_body)
+
     def test_sbom_and_provenance_are_bound_to_artifacts_and_source(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -483,12 +483,15 @@ jobs:
               deterministic_tar "depends/$HOST/bin" "$OUT/$ASSET_PREFIX-Linux-ARM64.tar.gz" "${files[@]}"
               ;;
             windows-64-bit)
-              normalize_tree "depends/$HOST/bin"
+              windows_payload=release
+              normalize_tree "$windows_payload"
+              python3 ci/release/verify_windows_payload.py directory "$windows_payload"
+              python3 ci/release/verify_windows_payload.py identity \
+                "$windows_payload/blackcoind.exe" \
+                --version "$CONFIGURED_VERSION" --source-sha "$TARGET_SHA"
               mapfile -t files < <(python3 ci/release/verify_windows_payload.py names)
-              for file in "${files[@]}"; do
-                test -f "depends/$HOST/bin/$file" && test ! -L "depends/$HOST/bin/$file"
-              done
-              (cd "depends/$HOST/bin" && printf '%s\n' "${files[@]}" | zip -X -9j "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip" -@)
+              (cd "$windows_payload" && printf '%s\n' "${files[@]}" | \
+                zip -X -9j "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip" -@)
               python3 ci/release/verify_windows_payload.py unsigned-archive \
                 "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
               mapfile -t installers < <(find . -maxdepth 1 -type f -name "blackcoin-$CONFIGURED_VERSION-win64-setup.exe" -printf '%P\n' | sort)
@@ -497,6 +500,15 @@ jobs:
               touch -d "@$SOURCE_DATE_EPOCH" "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
               python3 ci/release/verify_windows_payload.py unsigned-file \
                 "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+              portable_verify_dir="$RUNNER_TEMP/windows-portable-${{ matrix.builder }}"
+              installer_verify_dir="$RUNNER_TEMP/windows-installer-${{ matrix.builder }}"
+              mkdir "$portable_verify_dir" "$installer_verify_dir"
+              unzip -q "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip" \
+                -d "$portable_verify_dir"
+              7z x -bd -y "-o$installer_verify_dir" \
+                "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe" >/dev/null
+              python3 ci/release/verify_windows_payload.py installer \
+                "$installer_verify_dir" --portable-dir "$portable_verify_dir" >/dev/null
               ;;
             macos-64-bit)
               normalize_tree dist/blackcoin-qt.app
