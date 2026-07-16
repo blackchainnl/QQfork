@@ -347,7 +347,17 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         n0, n1 = self.nodes
         assert_equal(n0.getbestblockhash(), n1.getbestblockhash())
         assert_equal(n0.gettxoutsetinfo("muhash")["muhash"], n1.gettxoutsetinfo("muhash")["muhash"])
-        assert_equal(n0.getcirculatingsupply(), n1.getcirculatingsupply())
+        supply0 = n0.getcirculatingsupply()
+        supply1 = n1.getcirculatingsupply()
+        resource0 = supply0.pop("operational_resource")
+        resource1 = supply1.pop("operational_resource")
+        # scan_id is a node-local invocation sequence, not chainstate. Keep
+        # every measured bound in the equality check while excluding only the
+        # diagnostic identifier that can legitimately differ between nodes.
+        assert resource0.pop("scan_id") > 0
+        assert resource1.pop("scan_id") > 0
+        assert_equal(resource0, resource1)
+        assert_equal(supply0, supply1)
         assert_equal(n0.getgoldrushstate(), n1.getgoldrushstate())
 
     # --- the soak ------------------------------------------------------------
