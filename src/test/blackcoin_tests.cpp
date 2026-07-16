@@ -348,50 +348,218 @@ BOOST_AUTO_TEST_CASE(mempool_reorg_deferred_v2_time_preserves_independent_checks
                       "bad-txns-fee-not-enough");
 }
 
-BOOST_AUTO_TEST_CASE(chain_consensus_coinbase_maturity_spans_v3_1_boundary)
+BOOST_AUTO_TEST_CASE(chain_consensus_reward_maturity_preserves_v3_1_history)
 {
     const Consensus::Params& consensus = Params().GetConsensus();
-    const int spend_height = consensus.nCoinbaseMaturity + 100;
+    enum class RewardOrigin {
+        COINBASE,
+        COINSTAKE,
+    };
 
-    const auto check_depth = [&](int depth, int64_t spend_time) {
+    const auto check_depth = [&](RewardOrigin origin, int depth,
+                                 int spend_height, int64_t spend_time,
+                                 int32_t tx_version = 1,
+                                 uint32_t coin_time = 0,
+                                 int64_t candidate_spend_time = 0) {
         CCoinsView base;
         CCoinsViewCache view{&base};
         const COutPoint outpoint{uint256::ONE, 0};
+        if (coin_time == 0) {
+            coin_time = static_cast<uint32_t>(spend_time - 1);
+        }
+        if (candidate_spend_time == 0) {
+            candidate_spend_time = spend_time;
+        }
         view.AddCoin(outpoint,
                      Coin{CTxOut{2 * COIN, CScript() << OP_TRUE},
-                          spend_height - depth, true, false,
-                          static_cast<uint32_t>(spend_time - 1)},
+                          spend_height - depth,
+                          origin == RewardOrigin::COINBASE,
+                          origin == RewardOrigin::COINSTAKE,
+                          coin_time},
                      false);
 
         CMutableTransaction spend;
-        spend.nVersion = 2;
-        spend.nTime = 0;
+        spend.nVersion = tx_version;
+        spend.nTime = tx_version >= 2 ? 0 : static_cast<uint32_t>(spend_time);
         spend.vin.emplace_back(outpoint);
         spend.vout.emplace_back(COIN, CScript() << OP_TRUE);
 
         TxValidationState state;
         CAmount fee{-1};
         const bool accepted = Consensus::CheckTxInputs(
-            CTransaction{spend}, state, view, spend_height, spend_time,
-            spend_time, fee);
+            CTransaction{spend}, state, view, spend_height,
+            candidate_spend_time, candidate_spend_time, fee);
         return std::pair{accepted, state.GetRejectReason()};
     };
 
-    for (const int64_t spend_time : {
-             consensus.nProtocolV3_1Time - 1,
-             consensus.nProtocolV3_1Time + 1,
-         }) {
-        const auto immature = check_depth(
-            consensus.nCoinbaseMaturity - 1, spend_time);
-        BOOST_CHECK(!immature.first);
-        BOOST_CHECK_EQUAL(immature.second,
-                          "bad-txns-premature-spend-of-coinbase");
+    BOOST_CHECK_EQUAL(
+        consensus.CoinbaseMaturityForSpendTime(
+            consensus.nProtocolV3_1Time - 1),
+        Consensus::HISTORICAL_PRE_V3_1_COINBASE_MATURITY);
+    // IsProtocolV3_1 is strictly greater than its configured cutoff. Keeping
+    // the cutoff second historical preserves existing consensus; the exact
+    // activation boundary is therefore the following second.
+    BOOST_CHECK_EQUAL(
+        consensus.CoinbaseMaturityForSpendTime(
+            consensus.nProtocolV3_1Time),
+        Consensus::HISTORICAL_PRE_V3_1_COINBASE_MATURITY);
+    const int64_t activation_time = consensus.nProtocolV3_1Time + 1;
+    BOOST_CHECK_EQUAL(
+        consensus.CoinbaseMaturityForSpendTime(activation_time),
+        consensus.nCoinbaseMaturity);
 
-        const auto mature = check_depth(
-            consensus.nCoinbaseMaturity, spend_time);
-        BOOST_CHECK(mature.first);
-        BOOST_CHECK(mature.second.empty());
+    // Preserve the inherited all-network exception at the mainnet cutoff
+    // timestamp even when a network's configured V3.1 cutoff is earlier.
+    // Removing this exception from the maturity helper would alter accepted
+    // testnet-style history at exactly 1,713,938,400.
+    Consensus::Params earlier_cutoff{consensus};
+    earlier_cutoff.nProtocolV3_1Time = 1'667'779'200;
+    BOOST_REQUIRE(1'713'938'400 > earlier_cutoff.nProtocolV3_1Time);
+    BOOST_CHECK(!earlier_cutoff.IsProtocolV3_1(1'713'938'400));
+    BOOST_CHECK_EQUAL(
+        earlier_cutoff.CoinbaseMaturityForSpendTime(1'713'938'399),
+        earlier_cutoff.nCoinbaseMaturity);
+    BOOST_CHECK_EQUAL(
+        earlier_cutoff.CoinbaseMaturityForSpendTime(1'713'938'400),
+        Consensus::HISTORICAL_PRE_V3_1_COINBASE_MATURITY);
+    BOOST_CHECK_EQUAL(
+        earlier_cutoff.CoinbaseMaturityForSpendTime(1'713'938'401),
+        earlier_cutoff.nCoinbaseMaturity);
+
+    // Decode the real coinstake origin from the Beta 1 replay regression, then
+    // exercise its exact output in a reduced one-input spender. This proves
+    // the maturity-relevant transaction shape and UTXO metadata; it is not a
+    // substitute for replaying full block 41c4db...0968. The reported ordinary
+    // version-1 spender has 359 inputs, and vin[25] spends this output.
+    static const std::string HISTORICAL_ORIGIN_TX_HEX{
+        "0100000000989d63018f0b8106baac03063684166c8bf49f1b966c2f6db633c4"
+        "157c43611b6e5835480100000048473044022063fb1598979c8c58fbe6a55993c"
+        "45ba700002f5e6d3d128df2c5555f2780ce5002203971109a6a495bbe048f0066"
+        "f1fa4eef1bb2c0b9f7bbe6f7d68658e1af78a35801ffffffff03000000000000"
+        "0000006c277c360e000000232102a41deaaf5864fbbad4e3b62e68b929340a07"
+        "b69dac122f9e90a2566d4ab9a069ac80c3c901000000001976a914a20cf4062e"
+        "cbf7358b871e6062b550aa2fb92ec788ac00000000"};
+    static const std::string HISTORICAL_SPENDER_VIN25_SCRIPTSIG{
+        "47304402205aaa2c4a77809e24f57f2aebc18ce8b4824ac4c640e009b95072cfc"
+        "7dfcd4fe002201a9c588336da5ca0b6fab86476cbf59eb139dfed66e9e2f38aa"
+        "9adbfbcecf2bf0121023009eabae289b7d937a7e41e1edc522b308b0a7015f20c"
+        "f935081aa97004cf7d"};
+    constexpr int HISTORICAL_ORIGIN_HEIGHT{4'271'990};
+    constexpr int HISTORICAL_SPEND_HEIGHT{4'272'172};
+    constexpr uint32_t HISTORICAL_ORIGIN_TIME{1'671'272'448};
+    constexpr int64_t HISTORICAL_SPEND_TIME{1'671'283'931};
+    constexpr int64_t HISTORICAL_BLOCK_TIME{1'671'284'624};
+    BOOST_CHECK_EQUAL(HISTORICAL_SPEND_HEIGHT - HISTORICAL_ORIGIN_HEIGHT,
+                      182);
+    BOOST_CHECK(!consensus.IsProtocolV3_1(HISTORICAL_SPEND_TIME));
+
+    CMutableTransaction historical_origin_mutable;
+    BOOST_REQUIRE(DecodeHexTx(historical_origin_mutable,
+                              HISTORICAL_ORIGIN_TX_HEX,
+                              /*try_no_witness=*/true,
+                              /*try_witness=*/false));
+    const CTransaction historical_origin{historical_origin_mutable};
+    BOOST_CHECK_EQUAL(
+        historical_origin.GetHash().GetHex(),
+        "0f7b756894c9e6e92c9cb43858026ff3a414a6bcdf51738753f04c21f0c2c246");
+    BOOST_CHECK(historical_origin.IsCoinStake());
+    BOOST_CHECK_EQUAL(historical_origin.nVersion, 1);
+    BOOST_CHECK_EQUAL(historical_origin.nTime, HISTORICAL_ORIGIN_TIME);
+    BOOST_REQUIRE_EQUAL(historical_origin.vout.size(), 3U);
+    BOOST_CHECK_EQUAL(historical_origin.vout[2].nValue, 30'000'000);
+    BOOST_CHECK_EQUAL(
+        HexStr(historical_origin.vout[2].scriptPubKey),
+        "76a914a20cf4062ecbf7358b871e6062b550aa2fb92ec788ac");
+
+    const COutPoint historical_outpoint{historical_origin.GetHash(), 2};
+    CCoinsView historical_base;
+    CCoinsViewCache historical_view{&historical_base};
+    historical_view.AddCoin(
+        historical_outpoint,
+        Coin{historical_origin.vout[2], HISTORICAL_ORIGIN_HEIGHT,
+             /*coinbase=*/false, /*coinstake=*/true,
+             historical_origin.nTime},
+        /*possible_overwrite=*/false);
+
+    const std::vector<unsigned char> historical_script_sig_bytes{
+        ParseHex(HISTORICAL_SPENDER_VIN25_SCRIPTSIG)};
+    const CScript historical_script_sig{historical_script_sig_bytes.begin(),
+                                        historical_script_sig_bytes.end()};
+    CMutableTransaction historical_spend;
+    historical_spend.nVersion = 1;
+    historical_spend.nTime = HISTORICAL_SPEND_TIME;
+    historical_spend.nLockTime = 4'272'161;
+    historical_spend.vin.emplace_back(
+        historical_outpoint, historical_script_sig,
+        CTxIn::MAX_SEQUENCE_NONFINAL);
+    historical_spend.vout.emplace_back(
+        historical_origin.vout[2].nValue - 1,
+        historical_origin.vout[2].scriptPubKey);
+    BOOST_CHECK(!CTransaction{historical_spend}.IsCoinStake());
+
+    TxValidationState historical_state;
+    CAmount historical_fee{-1};
+    BOOST_CHECK(Consensus::CheckTxInputs(
+        CTransaction{historical_spend}, historical_state, historical_view,
+        HISTORICAL_SPEND_HEIGHT, HISTORICAL_BLOCK_TIME,
+        HISTORICAL_BLOCK_TIME, historical_fee));
+    BOOST_CHECK(historical_state.IsValid());
+    BOOST_CHECK_EQUAL(historical_fee, 1);
+
+    const int boundary_spend_height = consensus.nCoinbaseMaturity + 100;
+    for (const RewardOrigin origin : {
+             RewardOrigin::COINBASE,
+             RewardOrigin::COINSTAKE,
+         }) {
+        // Both reward-origin flags retain the historical zero-depth rule up
+        // to and including the configured cutoff second.
+        const auto historical = check_depth(
+            origin, /*depth=*/182, boundary_spend_height,
+            activation_time - 1);
+        BOOST_CHECK(historical.first);
+        BOOST_CHECK(historical.second.empty());
+        const auto historical_zero_depth = check_depth(
+            origin, /*depth=*/0, boundary_spend_height,
+            activation_time - 1);
+        BOOST_CHECK(historical_zero_depth.first);
+        BOOST_CHECK(historical_zero_depth.second.empty());
+
+        // At the first Protocol-V3.1-active second and afterward, the current
+        // 500-block rule rejects depth 499 and accepts depth 500.
+        for (const int64_t spend_time : {
+                 activation_time,
+                 activation_time + 1,
+             }) {
+            const auto immature = check_depth(
+                origin, consensus.nCoinbaseMaturity - 1,
+                boundary_spend_height, spend_time);
+            BOOST_CHECK(!immature.first);
+            BOOST_CHECK_EQUAL(immature.second,
+                              "bad-txns-premature-spend-of-coinbase");
+
+            const auto mature = check_depth(
+                origin, consensus.nCoinbaseMaturity,
+                boundary_spend_height, spend_time);
+            BOOST_CHECK(mature.first);
+            BOOST_CHECK(mature.second.empty());
+        }
     }
+
+    // Version 2 does not serialize nTime. Its maturity decision must use the
+    // supplied candidate block time, while the version-1 fixture above proves
+    // serialized transaction time remains authoritative for version 1 even
+    // when the supplied candidate time is already post-activation.
+    const auto v2_historical = check_depth(
+        RewardOrigin::COINSTAKE, /*depth=*/0, boundary_spend_height,
+        activation_time - 1, /*tx_version=*/2);
+    BOOST_CHECK(v2_historical.first);
+    BOOST_CHECK(v2_historical.second.empty());
+    const auto v2_immature = check_depth(
+        RewardOrigin::COINSTAKE, consensus.nCoinbaseMaturity - 1,
+        boundary_spend_height, activation_time, /*tx_version=*/2);
+    BOOST_CHECK(!v2_immature.first);
+    BOOST_CHECK_EQUAL(v2_immature.second,
+                      "bad-txns-premature-spend-of-coinbase");
 }
 
 BOOST_AUTO_TEST_CASE(phase_schedule_height_overrides)

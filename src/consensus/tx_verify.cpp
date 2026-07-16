@@ -196,6 +196,9 @@ bool CheckTxInputsImpl(const CTransaction& tx, TxValidationState& state,
     if (tx.nVersion >= 2)
         nTimeTx = nSpendTime;
 
+    const int coinbase_maturity =
+        ::Params().GetConsensus().CoinbaseMaturityForSpendTime(nTimeTx);
+
     CAmount nValueIn = 0;
     for (unsigned int i = 0; i < tx.vin.size(); ++i) {
         const COutPoint &prevout = tx.vin[i].prevout;
@@ -204,7 +207,7 @@ bool CheckTxInputsImpl(const CTransaction& tx, TxValidationState& state,
 
         // If prev is coinbase or coinstake, check that it's matured
         if ((coin.IsCoinBase() || coin.IsCoinStake()) &&
-            nSpendHeight - coin.nHeight < ::Params().GetConsensus().nCoinbaseMaturity) {
+            nSpendHeight - coin.nHeight < coinbase_maturity) {
             return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase",
                 strprintf("tried to spend coinbase at depth %d", nSpendHeight - coin.nHeight));
         }

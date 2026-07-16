@@ -54,6 +54,14 @@ static constexpr int64_t QUANTUM_QUASAR_MIGRATION_SECONDS = 540 * 24 * 60 * 60;
 static constexpr int64_t QUANTUM_QUASAR_MAINNET_V4_TIME = 1783835299; // Expected mainnet height 5,950,000 (2026-07-12 05:48:19 UTC)
 
 /**
+ * The legacy pre-Protocol-V3.1 replay branch obtained this maturity from a
+ * value-initialized Consensus::Params temporary, which evaluated to zero.
+ * Preserve that accepted-chain replay behavior explicitly rather than
+ * depending on namespace lookup and implicit value initialization.
+ */
+static constexpr int HISTORICAL_PRE_V3_1_COINBASE_MATURITY = 0;
+
+/**
  * Struct for each individual consensus rule change using BIP9.
  */
 struct BIP9Deployment {
@@ -167,6 +175,20 @@ struct Params {
     bool IsProtocolV3(int64_t nTime) const { return nTime > nProtocolV3Time && nTime != 1444028400; }
     bool IsProtocolV3_1(int64_t nTime) const { return nTime > nProtocolV3_1Time && nTime != 1713938400; }
     bool IsProtocolV4(int64_t nTime) const { return nTime > nProtocolV4Time; }
+    /**
+     * Return the coinbase/coinstake maturity enforced for a spending
+     * transaction's effective consensus time. IsProtocolV3_1 is used
+     * deliberately: its strict boundary and historical timestamp exception
+     * are part of the already-accepted chain and must not be rewritten as a
+     * greater-than-or-equal comparison during replay. The method name follows
+     * the legacy nCoinbaseMaturity parameter and reject-reason vocabulary;
+     * callers apply the returned depth to both coinbase and coinstake outputs.
+     */
+    int CoinbaseMaturityForSpendTime(int64_t nTime) const
+    {
+        return IsProtocolV3_1(nTime) ? nCoinbaseMaturity
+                                     : HISTORICAL_PRE_V3_1_COINBASE_MATURITY;
+    }
     struct QuantumLifecycleState {
         QuantumQuasarPhase phase{QuantumQuasarPhase::LEGACY};
         bool schedule_valid{true};
