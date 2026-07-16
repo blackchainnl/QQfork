@@ -393,9 +393,15 @@ BOOST_AUTO_TEST_CASE(shadow_pow_claim_quarantine_refuses_generic_abandonment)
 
     CKey wallet_key;
     wallet_key.MakeNewKey(/*fCompressed=*/true);
-    wallet.SetupLegacyScriptPubKeyMan();
-    BOOST_REQUIRE(wallet.GetOrCreateLegacyScriptPubKeyMan()->AddKeyPubKey(
-        wallet_key, wallet_key.GetPubKey()));
+    {
+        // Match the production wallet lock order: wallet state is acquired
+        // before the legacy keystore. AddKeyPubKey may clear the blank-wallet
+        // flag through CWallet while it holds cs_KeyStore.
+        LOCK(wallet.cs_wallet);
+        wallet.SetupLegacyScriptPubKeyMan();
+        BOOST_REQUIRE(wallet.GetOrCreateLegacyScriptPubKeyMan()->AddKeyPubKey(
+            wallet_key, wallet_key.GetPubKey()));
+    }
     CMutableTransaction funding;
     funding.vout.emplace_back(2 * COIN, GetScriptForRawPubKey(wallet_key.GetPubKey()));
     const CTransactionRef funding_ref = MakeTransactionRef(std::move(funding));
@@ -447,9 +453,14 @@ BOOST_AUTO_TEST_CASE(incoming_shadow_proof_cannot_quarantine_or_pause_recipient_
 
     CKey wallet_key;
     wallet_key.MakeNewKey(/*fCompressed=*/true);
-    wallet.SetupLegacyScriptPubKeyMan();
-    BOOST_REQUIRE(wallet.GetOrCreateLegacyScriptPubKeyMan()->AddKeyPubKey(
-        wallet_key, wallet_key.GetPubKey()));
+    {
+        // Keep the fixture on the same cs_wallet -> cs_KeyStore order used by
+        // key import and generation in production.
+        LOCK(wallet.cs_wallet);
+        wallet.SetupLegacyScriptPubKeyMan();
+        BOOST_REQUIRE(wallet.GetOrCreateLegacyScriptPubKeyMan()->AddKeyPubKey(
+            wallet_key, wallet_key.GetPubKey()));
+    }
 
     std::vector<unsigned char> proof = GetShadowPrefix();
     proof.insert(proof.end(), {'Q', 'Q', 'P', '2', 0, 0, 0, 0, 0, 0, 0, 0,
