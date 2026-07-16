@@ -156,7 +156,10 @@ tiered staking, stake-reward split, and permanent-burn demurrage paths are
 implemented in this branch. Demurrage starts automatically at Final height
 6,922,000; it is not activated by a vote, and burned principal is not paid to
 miners, stakers, a treasury, or a reward pool. A source checkout or locally
-compiled artifact is not an authenticated production release. Operators should
-use only published binaries whose v30.1.1 tag, checksums, platform signatures,
-notarization, and provenance verify, and should retain verified wallet backups
+compiled artifact is not the reviewed published release. Blackcoin-Dev has no
+OpenPGP, Authenticode, Apple Developer ID, or notarization credentials for
+v30.1.1. Operators should use only published binaries whose exact source
+commit, annotated tag, `UNSIGNED-PRODUCTION` notices, unsigned checksums,
+two-builder reproducibility report, SBOM, provenance, GitHub attestations, and
+protected mainnet evidence verify, and should retain verified wallet backups
 throughout the transition.

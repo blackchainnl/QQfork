@@ -660,7 +660,8 @@ def check_final_release_identity(root, failures):
     release_notes = read_text(root, "doc/release-notes.md")
     for fragment in (
         "Production release identity",
-        "Only the signed annotated `v30.1.1` tag enters the production path.",
+        "Only the annotated unsigned `v30.1.1` tag enters the production path.",
+        "I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES",
         "Beta 1 history",
         "The published v30.1.1 Beta 1 packages are historical publisher-unsigned,",
         "`b328d2263038cdddef46b9f427827aac9e83b513`",

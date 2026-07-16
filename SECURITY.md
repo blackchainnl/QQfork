@@ -3,10 +3,19 @@
 ## Supported Versions
 
 Supported Blackcoin versions are listed in the repository release notes.
-Source configured as v30.1.1 final is not an authenticated production binary:
-trust only a published release whose signed tag, checksum manifest, platform
-signatures, notarization, SBOM, and provenance verify against the independently
-published release-key fingerprint.
+Source configured as v30.1.1 final is not the reviewed published binary.
+Blackcoin-Dev has no OpenPGP, Authenticode, Apple Developer ID, or notarization
+credentials for v30.1.1. The source commit, annotated tag, checksums, and
+in-toto statement have no Blackcoin-Dev OpenPGP signature. Windows packages are
+not Authenticode-signed. macOS applications carry only identity-free ad-hoc
+launch signatures and are not notarized.
+
+Use only the immutable release after verifying its text and JSON
+`UNSIGNED-PRODUCTION` notices, exact source commit, unsigned SHA256 checksum
+manifest, two-builder reproducibility report, SPDX SBOM, in-toto provenance,
+GitHub OIDC attestations, and protected mainnet evidence. These controls detect
+substitution and improve traceability; they are not a Blackcoin-Dev package
+signature.
 
 ## Protocol Safety Boundaries
 
@@ -29,6 +38,15 @@ the [launch disclosures](doc/v4-launch-disclosures.md) and
 ML-DSA quantum keys are non-HD and are not derived from the wallet seed. Back
 up the wallet after every new quantum address or key. A backup made before a
 quantum key was created cannot recover that key.
+
+Raw unstored quantum-key generation was removed in v30.1.1. The global
+`createquantumkey` RPC is an unconditional fail-closed deprecated stub; use the
+wallet-scoped `getnewquantumaddress` RPC so the new key is stored and covered by
+the wallet's backup state. `-allowunsafequantumkeyrpc=1` is a process-wide
+expert opt-in only for wallet-scoped `dumpquantumkey`. Export uses the selected
+normally unlocked wallet and rejects staking-only unlock. The flag does not
+disable networking, restrict RPC access, or make the process an offline key
+environment. Online operators should leave it disabled.
 
 A wallet-authored Gold Rush PoW claim absent from the local mempool remains
 quarantined because a peer may still confirm it. Its input stays reserved and

@@ -9,15 +9,21 @@ boundaries.
 
 ## Verify the release before installing
 
-Use only the immutable `v30.1.1` release. Verify the signed annotated tag and
-commit against the independently published Blackcoin-Dev OpenPGP fingerprint,
-then verify `SHA256SUMS.txt.asc` and every file in `SHA256SUMS.txt`. Windows
-packages must carry the expected Authenticode signature and RFC 3161 timestamp;
-macOS packages must carry the expected Developer ID signature, notarization
-ticket, and successful Gatekeeper assessment. The signed bundle also contains
-the SPDX SBOM, in-toto provenance, exact-source resource evidence, and mainnet
-quantum-witness inventory. A locally compiled binary or unsigned Beta 1 canary
-is not the authenticated production release.
+Use only the immutable `v30.1.1` release. It is explicitly publisher-unsigned:
+Blackcoin-Dev has no OpenPGP, Authenticode, Apple Developer ID, or notarization
+credentials for this release. The source commit and annotated tag have no
+Blackcoin-Dev OpenPGP signature. Windows packages have no Authenticode
+signature. macOS applications carry only identity-free ad-hoc launch signatures
+and are not notarized, so expect an operating-system warning or block until you
+make an explicit local choice.
+
+Read `Blackcoin-30.1.1-UNSIGNED-PRODUCTION.txt` and its machine-readable JSON
+manifest. Record the exact source commit, then verify every file in the
+unsigned `SHA256SUMS.txt`. Inspect the two-builder reproducibility report, SPDX
+SBOM, in-toto provenance, GitHub OIDC build-provenance and SBOM attestations,
+exact-source resource evidence, and mainnet quantum-witness inventory. These
+controls detect substitution and improve traceability; they are not a
+Blackcoin-Dev package signature.
 
 ## Mandatory upgrade procedure
 
@@ -104,6 +110,14 @@ one-click conflict broadcast.
 - Commands that may create non-HD quantum change or payout keys fail closed or
   require an explicit default-false authorization. Back up immediately after
   any successful quantum key creation.
+- Raw unstored quantum-key generation was removed. The global
+  `createquantumkey` RPC is an unconditional fail-closed deprecated stub. Use
+  wallet-scoped `getnewquantumaddress` so the key is stored and covered by the
+  wallet's backup state. `-allowunsafequantumkeyrpc=1` is a process-wide expert
+  opt-in only for wallet-scoped `dumpquantumkey`; export uses the selected
+  normally unlocked wallet and rejects staking-only unlock. The flag does not
+  disable networking, restrict RPC access, or make the process an offline key
+  environment. Online operators should leave it disabled.
 - The Qt Staking & Mining page moves expensive detail work off the GUI thread,
   coalesces refreshes, and exposes the same staking/mining state and consequence
   warnings available through RPC.
@@ -121,8 +135,9 @@ snapshot checks, overflow protection, shutdown, or cancellation. A successful
 qualification is fixed-height and host-scoped and reports
 `universal_consensus_bound=false`.
 
-The signed release bundle must contain fresh exact-source production resource
-evidence and an exact-source connected-tip mainnet witness inventory. The
+The publisher-unsigned release bundle must contain fresh exact-source
+production resource evidence and an exact-source
+connected-tip mainnet witness inventory. The
 witness artifact binds the release daemon and CLI, UTXO MuHash, complete
 value-bearing witness-v2-through-v16 inventory, and live shadow reconciliation,
 with either no bridge-review outpoints or an approved disposition for every

@@ -78,19 +78,28 @@ tag or asset is never moved, replaced, or reused for the final release.
 
 ### Production v30.1.1
 
-The only production publication event is a push of the signed annotated tag
-`v30.1.1`. The tag must resolve to the signed Blackcoin-Dev commit that passed
-the complete exact-SHA gate. The workflow rejects a lightweight tag, an
-unsigned tag or commit, a different version, a release-candidate source
+The only production publication event is a push of the annotated unsigned
+`v30.1.1` tag. The tag must resolve to the unsigned Blackcoin-Dev commit that
+passed the complete exact-SHA gate. The workflow rejects a lightweight or
+signed tag, a signed commit, a different version, a release-candidate source
 version, a non-Blackcoin-Dev identity, and an existing GitHub release.
+
+Blackcoin-Dev has no OpenPGP, Authenticode, Apple Developer ID, or notarization
+credentials for v30.1.1. The production release is therefore explicitly
+publisher-unsigned. Windows packages carry no Authenticode signature. macOS
+applications carry only identity-free ad-hoc launch signatures and are not
+notarized. The source commit, annotated tag, checksums, and in-toto statement
+carry no Blackcoin-Dev OpenPGP signature. A conspicuous text notice and
+machine-readable manifest record those facts in the published bundle.
 
 ## Roles and separation
 
 At least two people participate in a production release:
 
-- the release operator prepares the signed source commit and annotated tag;
+- the release operator prepares the unsigned source commit and annotated tag;
 - an independent reviewer approves the protected `production-release`
-  environment after checking the gate and source identity; and
+  environment after checking the gate, source identity, and explicit unsigned
+  policy; and
 - an independent rebuilder verifies the published source and artifacts. The
   rebuilder must not reuse a primary builder workspace or dependency cache.
 
@@ -114,45 +123,41 @@ before the production tag is pushed:
 4. Restrict the `production-release` environment to `v30.1.1`, require an
    independent human reviewer, prevent self-review, and prevent administrator
    bypass.
-5. Store private signing and notarization material only as protected
-   environment secrets or variables. Configure the non-secret armored OpenPGP
-   public key and independently published fingerprint as repository variables
-   `RELEASE_GPG_PUBLIC_KEY_B64` and `RELEASE_GPG_FINGERPRINT`; the resolver
-   needs them before protected signing jobs begin. Do not put private
-   credentials in source, logs, artifacts, repository-level variables visible
-   to pull requests, or workflow inputs.
+5. Configure the protected environment variable `UNSIGNED_FINAL_ACK` to the
+   exact value
+   `I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES`.
+   Do not expose the protected environment to pull requests. The workflow
+   checks the value both before assembly and inside the publication job.
    Configure the separate `production-resource-evidence` environment and its
    protected self-hosted runner paths before final qualification. It supplies
    the immutable connected-tip manifest/archive/state-root paths used by both
    the shadow-resource and quantum-witness gates, plus an exact per-outpoint
    disposition path only when the witness review set is nonzero.
-6. Record the release OpenPGP fingerprint on the protected default branch and
-   publish the same fingerprint through an independently controlled Blackcoin
-   communication channel. The fingerprint must match
-   `RELEASE_GPG_FINGERPRINT` exactly.
+6. Publish the same publisher-unsigned warning through an independently
+   controlled Blackcoin communication channel. Do not advertise an OpenPGP,
+   Authenticode, Developer ID, or notarization identity that does not exist.
 
 GitHub repository rules and environment settings are external state. Source
 code cannot prove that they are enabled. The independent reviewer must inspect
 them immediately before approving production publication and retain that
 evidence with the release record.
 
-## Human-held production credentials
+## Publisher-unsigned authorization
 
-The production workflow fails closed unless the protected environment supplies
-the complete list in `doc/v30.1.1-release-gate.md`. Those values include:
+The protected `production-release` environment must require an independent
+human reviewer and provide the exact `UNSIGNED_FINAL_ACK` value above. The
+acknowledgement is not a signature and does not authenticate artifacts. It is
+a fail-closed policy control that prevents the production workflow from
+silently presenting unsigned packages as signed.
 
-- the Blackcoin-Dev OpenPGP private key in the protected environment, plus the
-  matching public key and exact fingerprint in the documented non-secret
-  repository variables;
-- the Windows Authenticode certificate, password, certificate SHA-256, and
-  RFC 3161 timestamp service;
-- the macOS Developer ID certificate, password, certificate SHA-256, and
-  signing identity; and
-- the Apple team and notarization API credentials.
-
-CI can verify use of these credentials but cannot create or approve them. A
-production release is blocked until the project supplies, protects, and
-independently documents the real keys and certificates.
+The workflow must reject any detached `.asc` or release-key asset, verify that
+the Windows portable executables and installer have no Authenticode certificate
+table, and retain native macOS evidence showing only identity-free ad-hoc
+signatures. It publishes unsigned `SHA256SUMS.txt`, a machine-readable
+`UNSIGNED-PRODUCTION` manifest, an SPDX SBOM, in-toto provenance, GitHub OIDC
+build-provenance and SBOM attestations, and the two-builder reproducibility
+report. None of these controls should be described as a Blackcoin-Dev package
+signature.
 
 ## Candidate preparation
 
@@ -227,54 +232,54 @@ independently documents the real keys and certificates.
 
 ## Production publication procedure
 
-1. Import the documented Blackcoin-Dev release key in an isolated signing
-   environment. Verify its full fingerprint against the protected repository
-   record and independent communication channel.
-2. Create a signed source commit with the exact Blackcoin-Dev name and email.
-   Create a signed annotated `v30.1.1` tag pointing to that commit. Verify both
-   objects locally with `git verify-commit` and `git verify-tag`.
-3. Recheck branch/tag rules, immutable releases, and the protected environment.
+1. Create an unsigned source commit with the exact Blackcoin-Dev name and
+   email. Create an annotated unsigned `v30.1.1` tag pointing to that commit.
+   Verify that both objects contain no embedded signature and record the peeled
+   commit SHA.
+2. Recheck branch/tag rules, immutable releases, and the protected environment.
    Confirm the designated release SHA does not already have a GitHub release.
-4. Push only the signed tag. Do not manually upload release artifacts. The tag
+   Confirm `UNSIGNED_FINAL_ACK` has the exact reviewed value and that a person
+   other than the release operator must approve the environment.
+3. Push only the annotated tag. Do not manually upload release artifacts. The tag
    workflow reruns the complete production gate with `release_mode=true`.
-5. The protected environment reviewer verifies the exact SHA, every mandatory
-   job, credential fingerprints, and roadmap disposition before approval.
-6. The workflow performs two isolated pinned-dependency builds for every
-   target and compares each artifact byte for byte before signing. It then
-   Authenticode-signs the Windows payload and installer, Developer-ID-signs and
-   notarizes the macOS packages, and verifies each resulting signature.
-7. The workflow emits an SPDX SBOM, in-toto provenance, source commit record,
-   reproducibility report, exported release public key, detached provenance
-   signature, and signed `SHA256SUMS.txt`.
-8. The workflow creates the GitHub release as a draft, uploads the complete
+4. The protected environment reviewer verifies the exact SHA, every mandatory
+   job, publisher-unsigned warning, and roadmap disposition before approval.
+5. The workflow performs two isolated pinned-dependency builds for every
+   target and compares each artifact byte for byte. It verifies that Windows
+   packages have no Authenticode certificate and retains native evidence that
+   macOS app bundles have only identity-free ad-hoc signatures.
+6. The workflow emits an SPDX SBOM, in-toto provenance, source commit record,
+   reproducibility report, publisher-unsigned text/JSON notices, unsigned
+   `SHA256SUMS.txt`, and GitHub OIDC build-provenance and SBOM attestations.
+7. The workflow creates the GitHub release as a draft, uploads the complete
    bundle once, and publishes only after all assembly and verification steps
    pass. It refuses to overwrite an existing release.
 
 ## Independent verification
 
-Verification must begin from a clean machine and the independently obtained
-OpenPGP fingerprint. Do not trust a public key only because it is stored next
-to the signature it verifies.
+Verification must begin from a clean machine. There is no Blackcoin-Dev release
+key or platform-signing identity for v30.1.1.
 
-1. Fetch `v30.1.1`, verify that it is an annotated tag, verify the tag and
-   commit signatures, and record the peeled commit SHA.
-2. Download every release asset. Import the release key only after its full
-   fingerprint matches the independently published fingerprint.
-3. Verify `SHA256SUMS.txt.asc`, then run `sha256sum --check --strict
+1. Fetch `v30.1.1`, verify that it is an annotated tag, confirm that the tag
+   and peeled commit contain no embedded signature, and record the commit SHA.
+2. Download every release asset. Read both `UNSIGNED-PRODUCTION` files and
+   confirm that the source commit and tag match step 1.
+3. Run `sha256sum --check --strict
    SHA256SUMS.txt` (or the platform equivalent).
-4. Verify the detached in-toto provenance signature. Confirm that its subject
-   inventory, repository, tag, and source commit match the downloaded release.
-5. Inspect the SPDX SBOM and GitHub artifact attestations. Confirm the
-   attestation subject hashes are present in the signed checksum manifest.
-6. Verify Authenticode and RFC 3161 timestamp information for every Windows
-   executable and installer. Extract the installer and confirm its embedded
-   executables match the signed portable payload.
-7. Verify Developer ID signatures, notarization tickets, and Gatekeeper
-   assessment for both macOS architectures.
-8. Run a clean pinned-dependency rebuild from the signed source. Compare the
-   unsigned packages byte for byte with the reproducibility inventory. Record
-   builder identity, operating system image, tool versions, source SHA, and
-   resulting hashes in an independently signed rebuild attestation.
+4. Inspect the in-toto statement. Confirm that its subject inventory,
+   repository, tag, and source commit match the downloaded release.
+5. Inspect the SPDX SBOM and GitHub OIDC artifact attestations. Confirm the
+   attestation subject hashes are present in the unsigned checksum manifest.
+6. Confirm every Windows executable and installer lacks an Authenticode
+   certificate table. Extract the installer and confirm its embedded
+   executables match the portable payload.
+7. Confirm both macOS app bundles have `Signature=adhoc`, no signing authority,
+   no TeamIdentifier, and no notarization ticket. Expect Gatekeeper to warn or
+   block until the operator makes an explicit local choice.
+8. Run a clean pinned-dependency rebuild from the exact source. Compare the
+   packages byte for byte with the reproducibility inventory. Record builder
+   identity, operating system image, tool versions, source SHA, and resulting
+   hashes in an independent rebuild report.
 
 The two workflow build jobs are clean isolated rebuilds and detect
 nondeterminism. The independent reviewer/rebuilder requirement adds a separate
@@ -301,41 +306,44 @@ When a release defect is suspected:
    hashes, observed risk, required operator action, and whether shutdown,
    backup, reindex, rescan, or wallet migration is required.
 4. Remove the affected release's `latest` designation without deleting its tag
-   or bytes. Preserve the original signed manifest as evidence.
-5. Sign a revocation notice with the documented release key. Publish it through
-   the security advisory and independent Blackcoin communication channel. A
-   later release must include the notice and affected hashes in its signed
-   bundle.
+   or bytes. Preserve the original unsigned manifest, checksums, attestations,
+   and workflow record as evidence.
+5. Publish a revocation notice through the protected security advisory flow and
+   an independent Blackcoin communication channel. State that the notice is
+   publisher-unsigned. A later release must include the notice and affected
+   hashes in its bundle.
 6. If downgrade is proven safe, direct operators only to an older release whose
    tag, source commit, checksums, and packages have been independently verified.
    If downgrade is not proven safe, direct operators to stop the affected
    process, preserve data and backups, and wait for the superseding build.
-7. Prepare a new version from a new signed commit and new signed tag. Rerun the
-   complete production gate. Do not reuse v30.1.1 filenames or signatures.
+7. Prepare a new version from a new commit and new annotated tag. Rerun the
+   complete production gate. Do not reuse v30.1.1 filenames.
 8. After recovery, rotate any credential whose confidentiality may have been
    affected and document the incident, decision points, operator impact, and
    permanent test or control added.
 
 Before production publication, rehearse this procedure with an unsigned alpha.
-The rehearsal must cover a failed gate before signing, a failed signing step,
-a failed notarization, a draft-release upload failure, and a post-publication
-defect. Confirm that no rehearsal can overwrite a tag or published asset.
+The rehearsal must cover a failed gate, a missing or wrong unsigned-final
+acknowledgement, a platform unsigned-status mismatch, a draft-release upload
+failure, and a post-publication defect. Confirm that no rehearsal can overwrite
+a tag or published asset.
 
 ## Production completion record
 
 The release record must contain:
 
-- exact source commit and signed annotated tag;
+- exact source commit and annotated unsigned tag;
 - required-job names and successful run identifiers;
 - mixed-version binary provenance and hashes;
 - upstream cryptographic-source provenance and vector results;
 - benchmark results for every supported release architecture;
 - primary, isolated verifier, and external rebuilder attestations;
-- signed checksum manifest, SBOM, in-toto provenance, and platform signature
-  verification output;
+- unsigned checksum manifest and `UNSIGNED-PRODUCTION` metadata, SBOM, in-toto
+  provenance, Windows no-Authenticode verification, macOS ad-hoc signature
+  verification, and GitHub OIDC attestation output;
 - repository rules and protected-environment review evidence; and
 - the rollback rehearsal record and designated incident contacts.
 
-Production v30.1.1 remains blocked if any item is absent, if the documented
-OpenPGP fingerprint is not independently available, or if a required signing
-or notarization credential is unavailable.
+Production v30.1.1 remains blocked if any item is absent, if the exact protected
+unsigned-final acknowledgement is absent, or if the independent reviewer has
+not approved the publisher-unsigned release policy.

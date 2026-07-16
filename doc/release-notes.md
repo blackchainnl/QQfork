@@ -3,7 +3,7 @@
 
 Blackcoin version 30.1.1 is the Quantum Quasar safety and deterministic-state
 upgrade release.
-Authenticated release binaries are made available from:
+Reviewed production release binaries are made available from:
 
   <https://github.com/Blackcoin-Dev/Blackcoin/releases>
 
@@ -23,15 +23,24 @@ To receive security and update notifications, please subscribe to:
 Production release identity
 ===========================
 
-Only the signed annotated `v30.1.1` tag enters the production path. The exact
+Only the annotated unsigned `v30.1.1` tag enters the production path. The exact
 tagged commit must be configured with release-candidate zero and
 `CLIENT_VERSION_IS_RELEASE=true`, pass the complete exact-SHA matrix, and carry
 the fresh protected resource and mainnet witness-inventory authorizations.
 Production publication also requires an independently reviewed protected
-environment, release-key signatures, Authenticode, Developer ID signing and
-notarization, signed checksums, an SPDX SBOM, and provenance attestations.
-Source configured as final, a locally compiled binary, or a successful subset
-of jobs is not an authenticated release.
+environment, the exact unsigned-final acknowledgement, two-builder
+reproducibility, unsigned checksums and manifest, an SPDX SBOM, in-toto
+provenance, and GitHub OIDC attestations.
+The protected acknowledgement value is
+`I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES`.
+
+Blackcoin-Dev has no OpenPGP, Authenticode, Apple Developer ID, or notarization
+credentials for v30.1.1. The source commit and annotated tag have no
+Blackcoin-Dev OpenPGP signature. Windows packages are not Authenticode-signed.
+macOS applications carry only identity-free ad-hoc launch signatures and are
+not notarized. The published text and JSON `UNSIGNED-PRODUCTION` notices state
+these facts. Source configured as final, a locally compiled binary, or a
+successful subset of jobs is not the reviewed published release.
 
 Beta 1 history
 ==============
@@ -56,6 +65,18 @@ reproducibility report is identical before testing. Then verify the included
 mismatches; they are not a signature and do not authenticate a production
 release. Do not redistribute a beta archive without its marker, manifest,
 checksums, and full source commit.
+
+Unsafe raw quantum-key RPC disclosure
+=====================================
+
+Raw unstored quantum-key generation was removed in v30.1.1. The global
+`createquantumkey` RPC is an unconditional fail-closed deprecated stub. Use the
+wallet-scoped `getnewquantumaddress` RPC so a new key is stored and covered by
+the wallet's backup state. `-allowunsafequantumkeyrpc=1` is a process-wide
+expert opt-in only for wallet-scoped `dumpquantumkey`. Export uses the selected
+normally unlocked wallet and rejects staking-only unlock. The flag does not
+disable networking, restrict RPC access, or make the process an offline key
+environment. Online operators should leave it disabled.
 
 Beta 1 limitations and final disposition
 ========================================
