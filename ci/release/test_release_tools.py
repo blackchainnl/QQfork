@@ -2296,7 +2296,7 @@ class ReleaseToolTests(unittest.TestCase):
 
             pe32 = root / "pe32.exe"
             self.write_windows_identity_pe(pe32, optional_magic=0x010B)
-            with self.assertRaisesRegex(RuntimeError, "expected PE32\+"):
+            with self.assertRaisesRegex(RuntimeError, r"expected PE32\+"):
                 verifier.verify_source_identity(pe32, "30.1.1rc2", SOURCE_SHA)
 
             out_of_bounds = bytearray(valid.read_bytes())
