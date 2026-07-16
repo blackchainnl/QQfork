@@ -525,6 +525,7 @@ class WalletMigrationTest(BitcoinTestFramework):
     def clear_default_wallet(self, backup_file):
         # Test cleanup: Clear unnamed default wallet for subsequent tests
         node = self.nodes[0]
+        assert "" not in node.listwallets()
         (node.wallets_path / "wallet.dat").unlink(missing_ok=True)
         shutil.rmtree(node.wallets_path / "default_wallet_watchonly", ignore_errors=True)
         shutil.rmtree(node.wallets_path / "default_wallet_solvables", ignore_errors=True)
@@ -612,6 +613,7 @@ class WalletMigrationTest(BitcoinTestFramework):
         self.assert_is_bdb("")
 
         # Test cleanup: clear default wallet for next test
+        wallet.unloadwallet()
         self.clear_default_wallet(backup_path)
 
     def test_direct_file(self):
