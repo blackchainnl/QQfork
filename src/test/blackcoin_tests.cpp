@@ -546,10 +546,20 @@ BOOST_AUTO_TEST_CASE(chain_consensus_reward_maturity_preserves_v3_1_history)
         }
     }
 
-    // Version 2 does not serialize nTime. Its maturity decision must use the
-    // supplied candidate block time, while the version-1 fixture above proves
-    // serialized transaction time remains authoritative for version 1 even
-    // when the supplied candidate time is already post-activation.
+    // Version 1 serializes nTime, so its own historical time remains
+    // authoritative even when the supplied candidate block time is already
+    // post-activation.
+    const auto v1_historical_despite_post_activation_candidate = check_depth(
+        RewardOrigin::COINSTAKE, /*depth=*/0, boundary_spend_height,
+        activation_time - 1, /*tx_version=*/1,
+        /*coin_time=*/activation_time - 2,
+        /*candidate_spend_time=*/activation_time);
+    BOOST_CHECK(v1_historical_despite_post_activation_candidate.first);
+    BOOST_CHECK(
+        v1_historical_despite_post_activation_candidate.second.empty());
+
+    // Version 2 does not serialize nTime. Its maturity decision instead uses
+    // the supplied candidate block time.
     const auto v2_historical = check_depth(
         RewardOrigin::COINSTAKE, /*depth=*/0, boundary_spend_height,
         activation_time - 1, /*tx_version=*/2);
