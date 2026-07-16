@@ -449,6 +449,7 @@ BOOST_AUTO_TEST_CASE(chain_consensus_reward_maturity_preserves_v3_1_history)
     constexpr uint32_t HISTORICAL_ORIGIN_TIME{1'671'272'448};
     constexpr int64_t HISTORICAL_SPEND_TIME{1'671'283'931};
     constexpr int64_t HISTORICAL_BLOCK_TIME{1'671'284'624};
+    constexpr uint32_t HISTORICAL_SPENDER_SEQUENCE{0xfffffffe};
     BOOST_CHECK_EQUAL(HISTORICAL_SPEND_HEIGHT - HISTORICAL_ORIGIN_HEIGHT,
                       182);
     BOOST_CHECK(!consensus.IsProtocolV3_1(HISTORICAL_SPEND_TIME));
@@ -491,7 +492,7 @@ BOOST_AUTO_TEST_CASE(chain_consensus_reward_maturity_preserves_v3_1_history)
     historical_spend.nLockTime = 4'272'161;
     historical_spend.vin.emplace_back(
         historical_outpoint, historical_script_sig,
-        CTxIn::MAX_SEQUENCE_NONFINAL);
+        HISTORICAL_SPENDER_SEQUENCE);
     historical_spend.vout.emplace_back(
         historical_origin.vout[2].nValue - 1,
         historical_origin.vout[2].scriptPubKey);
