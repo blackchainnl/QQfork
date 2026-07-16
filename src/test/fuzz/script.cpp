@@ -56,11 +56,23 @@ FUZZ_TARGET(script, .init = initialize_script)
     }
 
     TxoutType which_type;
-    bool is_standard_ret = IsStandard(script, std::nullopt, which_type);
+    const bool is_standard_ret = IsStandard(script, std::nullopt, which_type, /*witnessEnabled=*/true);
+    const bool is_witness_type =
+        which_type == TxoutType::WITNESS_V0_SCRIPTHASH ||
+        which_type == TxoutType::WITNESS_V0_KEYHASH ||
+        which_type == TxoutType::WITNESS_V1_TAPROOT ||
+        which_type == TxoutType::EUTXO_COMMITMENT ||
+        which_type == TxoutType::WITNESS_UNKNOWN;
+    TxoutType witness_disabled_type;
+    const bool is_standard_without_witness =
+        IsStandard(script, std::nullopt, witness_disabled_type, /*witnessEnabled=*/false);
+    assert(witness_disabled_type == which_type);
+    assert(is_standard_without_witness == (!is_witness_type && is_standard_ret));
     if (!is_standard_ret) {
         assert(which_type == TxoutType::NONSTANDARD ||
                which_type == TxoutType::NULL_DATA ||
-               which_type == TxoutType::MULTISIG);
+               which_type == TxoutType::MULTISIG ||
+               which_type == TxoutType::RGB_COMMITMENT);
     }
     if (which_type == TxoutType::NONSTANDARD) {
         assert(!is_standard_ret);
@@ -70,6 +82,7 @@ FUZZ_TARGET(script, .init = initialize_script)
     }
     if (script.IsUnspendable()) {
         assert(which_type == TxoutType::NULL_DATA ||
+               which_type == TxoutType::RGB_COMMITMENT ||
                which_type == TxoutType::NONSTANDARD);
     }
 
@@ -79,13 +92,15 @@ FUZZ_TARGET(script, .init = initialize_script)
         assert(which_type == TxoutType::PUBKEY ||
                which_type == TxoutType::NONSTANDARD ||
                which_type == TxoutType::NULL_DATA ||
-               which_type == TxoutType::MULTISIG);
+               which_type == TxoutType::MULTISIG ||
+               which_type == TxoutType::RGB_COMMITMENT);
     }
     if (which_type == TxoutType::NONSTANDARD ||
         which_type == TxoutType::NULL_DATA ||
-        which_type == TxoutType::MULTISIG) {
-        // Blackcoin intentionally represents an empty script as
-        // CNoDestination even though Solver classifies it NONSTANDARD.
+        which_type == TxoutType::MULTISIG ||
+        which_type == TxoutType::RGB_COMMITMENT) {
+        // Blackcoin intentionally returns true for an empty script while
+        // representing it as CNoDestination.
         assert(!extract_destination_ret || script.empty());
     }
 

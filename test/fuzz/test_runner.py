@@ -43,6 +43,11 @@ PINNED_REGRESSION_INPUTS = {
         ),
         'sha256': 'c4789a0633f7e7744228a1f30984848c84e83ef44c44715e329ddf8fa9f122f7',
     },),
+    'script': ({
+        'name': 'witness-disabled-standardness',
+        'base64': 'AisFUcL/',
+        'sha256': '21efba4044557d4bef40544077233f40dfbb07cfedc7d0cabce99e8ad3f640fa',
+    },),
 }
 
 
