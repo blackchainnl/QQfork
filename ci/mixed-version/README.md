@@ -18,8 +18,10 @@ v28.4.0 tag or GitHub release; the designated source is therefore the pinned
 28.x branch commit that declares itself v28.4.0. Any movement of that branch
 fails the provenance check until the manifest is deliberately reviewed and
 updated. The current pin is commit
-`c2455cdd6f43756fbca137a83d9d168dae4eb442`, the direct-child mainnet fix that
-replaces verifier-local wall time with block time for version-2 input checks.
+`36c5bba862472fed959fc8d3ba3ea00d8ba275d2`, a signed direct child of
+`c2455cdd6f43756fbca137a83d9d168dae4eb442`. The parent replaces
+verifier-local wall time with block time for version-2 input checks; the child
+adds optional-index locator recovery without changing consensus or P2P rules.
 A proper immutable v28.4.0 tag would remove this provenance gap.
 
 The functional test starts all four real daemons, checks their RPC versions,

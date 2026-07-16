@@ -28,8 +28,8 @@
       "install_dir": "v28.4",
       "repository": "https://github.com/CoinBlack/blackcoin-more.git",
       "source_ref": "refs/heads/28.x",
-      "ref_object": "c2455cdd6f43756fbca137a83d9d168dae4eb442",
-      "commit": "c2455cdd6f43756fbca137a83d9d168dae4eb442",
+      "ref_object": "36c5bba862472fed959fc8d3ba3ea00d8ba275d2",
+      "commit": "36c5bba862472fed959fc8d3ba3ea00d8ba275d2",
       "tag_kind": "untagged-release-branch",
       "source_daemon": "blackmored",
       "source_cli": "blackmore-cli"

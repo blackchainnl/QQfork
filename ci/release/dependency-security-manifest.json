@@ -5,7 +5,7 @@
     "v30_1_0": "f647dc75c9479c03e81414f145a8d233b60959c7",
     "v30_1_1_audit_base": "7fde566f5f564e43f4c2d76502bd7e43c819e35f",
     "legacy_v26_2_0": "b54edb619b0d42df4b3a73a29b02d9eb885516d5",
-    "active_legacy_v28_4_0": "c2455cdd6f43756fbca137a83d9d168dae4eb442"
+    "active_legacy_v28_4_0": "36c5bba862472fed959fc8d3ba3ea00d8ba275d2"
   },
   "package_index_recipe": {
     "path": "depends/packages/packages.mk",
@@ -421,6 +421,7 @@
     {"id": "CVE-2025-54605", "severity": "low", "disposition": "deferred", "reason": "Global log rate limiting first shipped in Bitcoin Core 29.1/30 and postdates both compared branches.", "risk": "Repeated invalid blocks can fill logs only over a long period; the broad logging subsystem port needs focused retention and invalid-block diagnostics tests.", "owner": "validation", "target": "post-beta log rate limiting", "source": "https://bitcoincore.org/en/2025/10/24/disclose-cve-2025-54605/"}
   ],
   "legacy_delta_dispositions": [
+    {"commit": "36c5bba862472fed959fc8d3ba3ea00d8ba275d2", "category": "indexing", "disposition": "deferred", "risk": "The active legacy branch now walks a stored optional-index locator to a known ancestor when its tip is absent. The candidate has an older tip fallback; changing index recovery during Beta preparation requires restart, reorg, and corrupted-locator coverage but does not alter block consensus or P2P interoperability.", "owner": "indexing", "target": "v30.1.1 final index recovery review", "evidence": ["src/index/base.cpp", "doc/v30.1.1-dependency-security-audit.md"]},
     {"commit": "c2455cdd6f43756fbca137a83d9d168dae4eb442", "category": "consensus", "disposition": "equivalent", "risk": "Block consensus is aligned on deterministic header time; v28 mempool policy still selects tip time rather than the candidate's prospective next-header time.", "evidence": ["src/consensus/tx_verify.cpp", "src/validation.cpp", "src/test/v2_block_time_tests.cpp", "test/functional/feature_goldrush_mixed_version.py"]},
     {"commit": "beaaa0601f06ee36a8dbd449f821aed9f111c788", "category": "p2p", "disposition": "equivalent", "risk": "none identified", "evidence": ["src/net_processing.cpp"]},
     {"commit": "a86700192f0525e33dc84b7b2fda51450ce4c5e6", "category": "validation", "disposition": "ported", "risk": "deterministic malformed signature only", "evidence": ["src/validation.cpp", "src/test/crypto_hardening_tests.cpp"]},

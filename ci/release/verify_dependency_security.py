@@ -21,7 +21,7 @@ EXPECTED_BASELINES = {
     "v30_1_0": "f647dc75c9479c03e81414f145a8d233b60959c7",
     "v30_1_1_audit_base": "7fde566f5f564e43f4c2d76502bd7e43c819e35f",
     "legacy_v26_2_0": "b54edb619b0d42df4b3a73a29b02d9eb885516d5",
-    "active_legacy_v28_4_0": "c2455cdd6f43756fbca137a83d9d168dae4eb442",
+    "active_legacy_v28_4_0": "36c5bba862472fed959fc8d3ba3ea00d8ba275d2",
 }
 CRC32C_ARM64_BACKPORT = "d3d60ac6e0f16780bcfcc825385e1d338801a558"
 CRC32C_ARM64_BACKPORT_FILES = {
