@@ -1711,6 +1711,243 @@ static RPCHelpMan sendshadowpowclaim()
     };
 }
 
+static RPCHelpMan createshadowpowclaimresolution()
+{
+    return RPCHelpMan{
+        "createshadowpowclaimresolution",
+        "\nPrepare, but do not broadcast, a signed on-chain conflict that can resolve one quarantined Gold Rush PoW claim.\n"
+        "A peer can retain a base-valid QQSPROOF after this node removes it from the mempool, so the wallet cannot safely abandon the claim or release its input based on elapsed time. This RPC instead spends the claim's exact input back to the same wallet script. Whichever transaction confirms first resolves the conflict on chain; the other cannot confirm on that active chain.\n"
+        "The default dry_run=true returns the exact fee and output without signing. dry_run=false requires an unlocked wallet and explicit acknowledge_fee_and_conflict_risk=true, but still does not broadcast. Review the result and use sendrawtransaction separately if you choose to publish it. If the resolution confirms, its base-chain fee is not reimbursed by the shadow ledger. Some peers retaining the original claim may reject the conflict, and confirmation is not guaranteed. After an explicit broadcast, ordinary wallet resubmission may relay the still-unconfirmed resolution again across restart until one side confirms.\n",
+        {
+            {"claim_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Quarantined wallet QQSPROOF transaction id."},
+            {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{true}, "Return a fee/output preview without signing when true."},
+            {"acknowledge_fee_and_conflict_risk", RPCArg::Type::BOOL, RPCArg::Default{false}, "Must be true when dry_run=false. A signed transaction is returned but not broadcast."},
+            {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Optional fee rate in " + CURRENCY_ATOM + "/vB."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::BOOL, "dry_run", "Whether this is an unsigned preview."},
+            {RPCResult::Type::BOOL, "broadcast", "Always false; this RPC never broadcasts."},
+            {RPCResult::Type::BOOL, "reused_legacy_resolution", "Whether an already-signed compatibility transaction was reused instead of creating a new conflict."},
+            {RPCResult::Type::STR_HEX, "claim_txid", "The quarantined QQSPROOF transaction."},
+            {RPCResult::Type::STR_HEX, "claim_input_txid", "Transaction id of the exact input shared by the claim and resolution."},
+            {RPCResult::Type::NUM, "claim_input_vout", "Output number of the exact shared input."},
+            {RPCResult::Type::STR_AMOUNT, "input_amount", "Confirmed input value."},
+            {RPCResult::Type::STR_AMOUNT, "fee", "Base-chain fee paid only if the resolution confirms."},
+            {RPCResult::Type::STR_AMOUNT, "output_amount", "Value returned to the original wallet script."},
+            {RPCResult::Type::NUM, "vsize", "Maximum signed virtual size used for fee calculation."},
+            {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "Signed raw resolution transaction; present only when dry_run=false."},
+            {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "Resolution transaction id; present only when dry_run=false."},
+            {RPCResult::Type::STR, "next_step", "Explicit action required after reviewing this result."},
+            {RPCResult::Type::STR, "warning", "Safety and fee warning."},
+        }},
+        RPCExamples{
+            HelpExampleCli("createshadowpowclaimresolution", "\"claim_txid\"") +
+            HelpExampleCli("createshadowpowclaimresolution", "\"claim_txid\" false true") +
+            HelpExampleCli("-named createshadowpowclaimresolution", "claim_txid=\"claim_txid\" dry_run=false acknowledge_fee_and_conflict_risk=true fee_rate=1")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+
+    pwallet->BlockUntilSyncedToCurrentChain();
+    if (!pwallet->chain().isReadyToBroadcast()) {
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                           "Gold Rush PoW claim resolution is unavailable while the node is reindexing, importing blocks, or in initial block download");
+    }
+
+    const uint256 claim_txid = ParseHashV(request.params[0], "claim_txid");
+    const bool dry_run = request.params[1].isNull() || request.params[1].get_bool();
+    const bool acknowledged = !request.params[2].isNull() && request.params[2].get_bool();
+    if (!dry_run && !acknowledged) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "acknowledge_fee_and_conflict_risk=true is required to sign a claim-resolution transaction; preview first with dry_run=true");
+    }
+    if (!dry_run) {
+        EnsureWalletIsUnlocked(*pwallet);
+        if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+        }
+        if (pwallet->m_wallet_unlock_staking_only) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to sign a claim-resolution transaction");
+        }
+    }
+
+    CCoinControl coin_control;
+    coin_control.m_allow_other_inputs = false;
+    coin_control.m_avoid_address_reuse = false;
+    if (!request.params[3].isNull()) {
+        coin_control.m_feerate = FeeRateFromSatVbValue(request.params[3]);
+        coin_control.fOverrideFeeRate = true;
+    }
+
+    CMutableTransaction resolution_tx;
+    COutPoint claim_input;
+    CAmount input_amount{0};
+    CAmount fee{0};
+    CAmount output_amount{0};
+    int64_t vsize{-1};
+    bool reused_legacy_resolution{false};
+    {
+        LOCK2(::cs_main, pwallet->cs_wallet);
+        const CWalletTx* claim = pwallet->GetWalletTx(claim_txid);
+        if (!claim) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Gold Rush PoW claim not found in this wallet");
+        }
+        if (!TransactionHasShadowProof(*claim->tx)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "claim_txid is not a Gold Rush PoW QQSPROOF transaction");
+        }
+        if (pwallet->GetTxDepthInMainChain(*claim) != 0 || !claim->isUnconfirmed()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim is already resolved on chain");
+        }
+        if (claim->InMempool()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim is still in the local mempool; wait for confirmation or quarantine before preparing a conflict");
+        }
+        if (!pwallet->IsQuarantinedShadowPowClaim(claim_txid)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim is absent from the mempool but has no persisted quarantine marker; restart or rescan the wallet before using the guided resolution path");
+        }
+        if (claim->tx->vin.size() != 1) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Only a single-input wallet Gold Rush PoW claim can use the guided resolution path");
+        }
+        if (pwallet->HasWalletSpend(claim->tx)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Gold Rush PoW claim has an unresolved wallet descendant; resolve or abandon the descendant before preparing a conflict that would invalidate it");
+        }
+        claim_input = claim->tx->vin.front().prevout;
+
+        for (const uint256& conflict_txid : pwallet->GetConflicts(claim_txid)) {
+            if (conflict_txid == claim_txid) continue;
+            const CWalletTx* other = pwallet->GetWalletTx(conflict_txid);
+            if (!other || other->isAbandoned() || other->isConflicted()) continue;
+            if (pwallet->GetTxDepthInMainChain(*other) > 0) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   strprintf("Gold Rush PoW claim was already resolved by confirmed conflict %s", conflict_txid.ToString()));
+            }
+            if (pwallet->IsLegacyShadowPowCleanupFor(*other, claim_txid)) {
+                if (reused_legacy_resolution) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Multiple unresolved legacy cleanup transactions spend the claim input; manual wallet review is required");
+                }
+                if (other->tx->vin.size() != 1 ||
+                    other->tx->vin.front().prevout != claim_input ||
+                    other->tx->vout.size() != 1 ||
+                    TransactionHasShadowProof(*other->tx)) {
+                    throw JSONRPCError(RPC_WALLET_ERROR,
+                                       strprintf("Legacy cleanup %s does not match the safe single-input self-spend shape", conflict_txid.ToString()));
+                }
+                resolution_tx = CMutableTransaction{*other->tx};
+                reused_legacy_resolution = true;
+                continue;
+            }
+            throw JSONRPCError(RPC_WALLET_ERROR,
+                               strprintf("An unresolved wallet conflict %s already spends the claim input; do not create another resolution", conflict_txid.ToString()));
+        }
+
+        Coin input_coin;
+        const CCoinsViewCache& coins_tip = pwallet->chain().chainman().ActiveChainstate().CoinsTip();
+        if (!coins_tip.GetCoin(claim_input, input_coin) || input_coin.IsSpent()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim input is already spent on the active chain; wait for wallet conflict reconciliation");
+        }
+        if ((pwallet->IsMine(input_coin.out) & ISMINE_SPENDABLE) == ISMINE_NO) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Wallet cannot spend the quarantined claim input");
+        }
+
+        input_amount = input_coin.out.nValue;
+        if (reused_legacy_resolution) {
+            if (coin_control.m_feerate) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "fee_rate cannot modify an already-signed legacy claim-resolution transaction");
+            }
+            if (resolution_tx.vout.front().scriptPubKey != input_coin.out.scriptPubKey) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Legacy claim-resolution transaction does not return value to the exact claim-input script");
+            }
+            output_amount = resolution_tx.vout.front().nValue;
+            fee = input_amount - output_amount;
+            vsize = GetVirtualTransactionSize(CTransaction{resolution_tx}, 0, 0);
+            if (!MoneyRange(output_amount) || output_amount <= 0 || fee <= 0 ||
+                !MoneyRange(fee) || IsDust(resolution_tx.vout.front(), pwallet->chain().relayDustFee())) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Legacy claim-resolution transaction has an invalid output or fee");
+            }
+        } else {
+            const int64_t current_time = GetAdjustedTimeSeconds();
+            const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
+            if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
+            }
+
+            resolution_tx.nVersion = CTransaction::CURRENT_VERSION;
+            resolution_tx.nTime = current_time;
+            resolution_tx.vin.emplace_back(claim_input);
+            resolution_tx.vout.emplace_back(input_coin.out.nValue, input_coin.out.scriptPubKey);
+            const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(resolution_tx), pwallet.get(), &coin_control);
+            if (tx_size.vsize <= 0) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Unable to estimate the signed claim-resolution transaction size");
+            }
+            fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
+            output_amount = input_coin.out.nValue - fee;
+            CTxOut resolution_output{output_amount, input_coin.out.scriptPubKey};
+            if (!MoneyRange(output_amount) || output_amount <= 0 || IsDust(resolution_output, pwallet->chain().relayDustFee())) {
+                throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Quarantined claim input is too small to pay the resolution fee and return a non-dust output");
+            }
+            resolution_tx.vout[0].nValue = output_amount;
+            vsize = tx_size.vsize;
+        }
+        if (fee > pwallet->m_default_max_tx_fee) {
+            throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
+        }
+
+        if (!dry_run && !reused_legacy_resolution) {
+            // The unlock mode can change after the initial RPC argument and
+            // wallet checks. Recheck it while holding cs_wallet so a
+            // concurrent staking-only unlock cannot authorize this spend.
+            if (pwallet->IsLocked()) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.");
+            }
+            if (pwallet->m_wallet_unlock_staking_only) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to sign a claim-resolution transaction");
+            }
+            std::map<int, bilingual_str> input_errors;
+            if (!pwallet->SignTransaction(resolution_tx, input_errors)) {
+                const std::string detail = input_errors.empty()
+                    ? "unknown signing failure" : input_errors.begin()->second.original;
+                throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Signing claim-resolution transaction failed: %s", detail));
+            }
+        }
+    }
+
+    if (!dry_run) {
+        const CTransactionRef signed_tx = MakeTransactionRef(resolution_tx);
+        LOCK(cs_main);
+        const MempoolAcceptResult accept = pwallet->chain().chainman().ProcessTransaction(signed_tx, /*test_accept=*/true);
+        if (accept.m_result_type != MempoolAcceptResult::ResultType::VALID) {
+            throw JSONRPCError(RPC_VERIFY_REJECTED,
+                               strprintf("Claim-resolution transaction is not currently relayable: %s", accept.m_state.ToString()));
+        }
+    }
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("dry_run", dry_run);
+    result.pushKV("broadcast", false);
+    result.pushKV("reused_legacy_resolution", reused_legacy_resolution);
+    result.pushKV("claim_txid", claim_txid.GetHex());
+    result.pushKV("claim_input_txid", claim_input.hash.GetHex());
+    result.pushKV("claim_input_vout", claim_input.n);
+    result.pushKV("input_amount", ValueFromAmount(input_amount));
+    result.pushKV("fee", ValueFromAmount(fee));
+    result.pushKV("output_amount", ValueFromAmount(output_amount));
+    result.pushKV("vsize", vsize);
+    if (!dry_run) {
+        const CTransactionRef signed_tx = MakeTransactionRef(resolution_tx);
+        result.pushKV("hex", EncodeHexTx(*signed_tx));
+        result.pushKV("txid", signed_tx->GetHash().GetHex());
+        result.pushKV("next_step", "Review the fee and warning, then call sendrawtransaction with hex only if you choose to broadcast this conflict.");
+    } else {
+        result.pushKV("next_step", "Repeat with dry_run=false and acknowledge_fee_and_conflict_risk=true to obtain a signed, non-broadcast transaction.");
+    }
+    result.pushKV("warning", "This is an explicit on-chain conflict, not abandonment. If this resolution confirms, it pays the displayed base-chain fee without a shadow reimbursement. Peers retaining the original claim may reject the conflict; confirmation is not guaranteed. The wallet keeps the input reserved until either transaction actually confirms. After you explicitly broadcast, ordinary wallet resubmission may relay the unresolved resolution again across restart.");
+    return result;
+},
+    };
+}
+
 static RPCHelpMan getgoldrushinfo()
 {
     return RPCHelpMan{"getgoldrushinfo",
@@ -2202,6 +2439,9 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::STR_AMOUNT, "next_claim_payout", "Estimated payout for a valid PoW claim in the next block."},
             {RPCResult::Type::NUM, "next_claim_amount", "Estimated payout for a valid PoW claim in the next block, in satoshis."},
             {RPCResult::Type::NUM, "claims_submitted", "Claims submitted by this miner since it started."},
+            {RPCResult::Type::NUM, "unresolved_claims", "Unconfirmed wallet QQSPROOF transactions, whether live or quarantined."},
+            {RPCResult::Type::NUM, "live_claims", "Unconfirmed wallet QQSPROOF transactions currently in the local mempool."},
+            {RPCResult::Type::NUM, "quarantined_claims", "Unconfirmed wallet QQSPROOF transactions absent from the local mempool whose inputs remain reserved."},
         }},
         RPCExamples{
             HelpExampleCli("getpowmininginfo", "")
@@ -2221,6 +2461,9 @@ static RPCHelpMan getpowmininginfo()
     obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
     obj.pushKV("hashrate", pwallet->m_pow_hashrate.load());
     obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
+    obj.pushKV("unresolved_claims", static_cast<uint64_t>(pwallet->CountUnresolvedShadowPowClaims()));
+    obj.pushKV("live_claims", static_cast<uint64_t>(pwallet->CountLiveShadowPowClaims()));
+    obj.pushKV("quarantined_claims", static_cast<uint64_t>(pwallet->CountQuarantinedShadowPowClaims()));
     {
         LOCK(pwallet->cs_wallet);
         obj.pushKV("payout_address", pwallet->m_pow_payout_quantum);
@@ -3127,6 +3370,7 @@ static const CRPCCommand commands[] =
     { "staking",            &reservebalance,                 },
     { "staking",            &sendshadowsignal,               },
     { "staking",            &sendshadowpowclaim,             },
+    { "staking",            &createshadowpowclaimresolution, },
     { "staking",            &setpowmining,                   },
     { "staking",            &getpowmininginfo,               },
     { "staking",            &getquantumstakeaddressinfo,     },

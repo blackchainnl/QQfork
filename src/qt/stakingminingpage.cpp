@@ -2910,7 +2910,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
         recommended_action = tr("Send this wallet a confirmed, spendable legacy BLK UTXO so it can authenticate and pay the fee for a Gold Rush PoW claim.");
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED) {
-        recommended_action = tr("A prior Gold Rush PoW claim is quarantined outside the local mempool. Its fee input remains reserved so the wallet does not create an unsafe competing claim. Wait for on-chain resolution before submitting another claim from this wallet.");
+        recommended_action = tr("A prior Gold Rush PoW claim is quarantined outside the local mempool. Its fee input remains reserved so the wallet does not create an unsafe competing claim. Waiting for on-chain resolution is safest. For advanced, explicit recovery, copy the claim txid from Transactions and use createshadowpowclaimresolution in the debug console; it previews first, never broadcasts, and requires separate fee-risk consent and sendrawtransaction.");
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
         recommended_action = tr("Unlock this wallet normally. Gold Rush PoW claims cannot be signed while the wallet is locked or unlocked for staking only.");
     } else if (info.state == interfaces::WalletPowMiningState::RUNTIME_ERROR) {
@@ -2947,7 +2947,7 @@ void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMining
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::EPOCH_INACTIVE) {
         m_pow_status->setText(tr("PoW mining is enabled and waiting until the Gold Rush epoch is active."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED) {
-        m_pow_status->setText(tr("PoW mining is enabled but paused because a prior claim is quarantined outside the local mempool. Its fee input remains reserved; the wallet will not create a second fee-input claim."));
+        m_pow_status->setText(tr("PoW mining is enabled but paused because a prior claim is quarantined outside the local mempool. Its fee input remains reserved; the wallet will not create a second fee-input claim. Waiting is safest. Advanced recovery is available through the preview-only createshadowpowclaimresolution debug-console RPC and a separate explicit broadcast."));
     } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_IN_FLIGHT) {
         m_pow_status->setText(tr("PoW mining is enabled and waiting for the submitted claim to confirm, conflict, or expire at the next tip."));
     } else if (info.enabled && info.epoch_active) {

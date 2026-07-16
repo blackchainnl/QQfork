@@ -1752,7 +1752,8 @@ CWalletTx* CWallet::AddToWallet(CTransactionRef tx, const TxState& state, const 
                 desc_tx->mapValue.count(SHADOW_POW_CLEANUP_FOR_KEY) != 0;
             desc_tx->m_state = TxStateInactive{
                 /*abandoned=*/!preserve_reservation};
-            if (TransactionHasShadowProof(*desc_tx->tx)) {
+            if (TransactionHasShadowProof(*desc_tx->tx) &&
+                GetDebit(*desc_tx->tx, ISMINE_SPENDABLE) > 0) {
                 desc_tx->mapValue[SHADOW_POW_QUARANTINE_KEY] = "1";
             }
             RefreshLiveUnspentStakeOutpoints(*desc_tx);
@@ -2210,7 +2211,9 @@ void CWallet::transactionRemovedFromMempool(const CTransactionRef& tx, MemPoolRe
         // wallet cannot reuse the same input while that peer copy can still
         // confirm. Claims removed because they were included in a block are
         // deliberately excluded.
-        if (reason == MemPoolRemovalReason::SHADOW_STALE && TransactionHasShadowProof(*tx)) {
+        if (reason == MemPoolRemovalReason::SHADOW_STALE &&
+            TransactionHasShadowProof(*tx) &&
+            GetDebit(*tx, ISMINE_SPENDABLE) > 0) {
             // removeRecursive() can notify a root before its wallet descendants.
             // Refresh the complete wallet package against the already-updated
             // mempool before recursive abandonment so no descendant still
@@ -2338,7 +2341,8 @@ void CWallet::blockConnected(ChainstateRole role, const interfaces::BlockInfo& b
     // remaining unconfirmed proof for the scheduler's broadcast-independent
     // validation pass after each connected block.
     for (auto& [txid, wtx] : mapWallet) {
-        if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx)) continue;
+        if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx) ||
+            GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) continue;
         if (wtx.mapValue[SHADOW_POW_QUARANTINE_KEY] == "1") continue;
         wtx.mapValue[SHADOW_POW_QUARANTINE_KEY] = "1";
         wtx.MarkDirty();
@@ -2414,7 +2418,8 @@ void CWallet::blockDisconnected(const interfaces::BlockInfo& block)
     // later callback automatically abandons it.
     WalletBatch pending_batch(GetDatabase());
     for (auto& [txid, wtx] : mapWallet) {
-        if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx)) continue;
+        if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx) ||
+            GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) continue;
         pending_shadow_repair = true;
         if (wtx.mapValue[SHADOW_POW_QUARANTINE_KEY] != "1") {
             wtx.mapValue[SHADOW_POW_QUARANTINE_KEY] = "1";
@@ -3164,7 +3169,8 @@ void CWallet::RepairStaleShadowTransactions(bool force)
         LOCK(cs_wallet);
         WalletBatch batch(GetDatabase());
         for (auto& [txid, wtx] : mapWallet) {
-            if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx)) continue;
+            if (!wtx.isUnconfirmed() || !TransactionHasShadowProof(*wtx.tx) ||
+                GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) continue;
             if (wtx.mapValue[SHADOW_POW_QUARANTINE_KEY] == "1") continue;
             wtx.mapValue[SHADOW_POW_QUARANTINE_KEY] = "1";
             wtx.MarkDirty();
@@ -3185,7 +3191,8 @@ void CWallet::RepairStaleShadowTransactions(bool force)
             chain().chainman().ActiveChainstate().CoinsTip();
         for (auto& [txid, wtx] : mapWallet) {
             if (!wtx.isAbandoned() ||
-                !TransactionHasShadowProof(*wtx.tx)) {
+                !TransactionHasShadowProof(*wtx.tx) ||
+                GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) {
                 continue;
             }
             bool conclusively_spent{false};
@@ -3238,6 +3245,7 @@ void CWallet::RepairStaleShadowTransactions(bool force)
             const auto provenance = wtx.mapValue.find(SHADOW_POW_QUARANTINE_KEY);
             const bool pending_auto_repair = provenance != wtx.mapValue.end() && provenance->second == "1";
             if (wtx.isUnconfirmed() && TransactionHasShadowProof(*wtx.tx) &&
+                GetDebit(*wtx.tx, ISMINE_SPENDABLE) > 0 &&
                 (force || pending_auto_repair)) {
                 repair_candidates.emplace_back(txid, wtx.tx);
             }
@@ -3412,7 +3420,9 @@ void CWallet::ResubmitWalletTransactions(bool relay, bool force)
 
         const bool is_shadow_proof = WITH_LOCK(cs_wallet, {
             const auto it = mapWallet.find(txid);
-            return it != mapWallet.end() && TransactionHasShadowProof(*it->second.tx);
+            return it != mapWallet.end() &&
+                   TransactionHasShadowProof(*it->second.tx) &&
+                   GetDebit(*it->second.tx, ISMINE_SPENDABLE) > 0;
         });
         if (force && is_shadow_proof && IsTerminalShadowProofReject(err_string)) {
             LOCK(cs_wallet);
@@ -8922,33 +8932,57 @@ void CWallet::MaybeDelayShadowPowClaimSubmissionForTest(const COutPoint& selecte
 size_t CWallet::CountUnresolvedShadowPowClaims() const
 {
     LOCK(cs_wallet);
-    return std::count_if(mapWallet.begin(), mapWallet.end(), [](const auto& entry) {
+    return std::count_if(mapWallet.begin(), mapWallet.end(), [this](const auto& entry) {
         const CWalletTx& wtx = entry.second;
-        return wtx.isUnconfirmed() && TransactionHasShadowProof(*wtx.tx);
+        return wtx.isUnconfirmed() && TransactionHasShadowProof(*wtx.tx) &&
+               GetDebit(*wtx.tx, ISMINE_SPENDABLE) > 0;
     });
 }
 
 size_t CWallet::CountLiveShadowPowClaims() const
 {
     LOCK(cs_wallet);
-    return std::count_if(mapWallet.begin(), mapWallet.end(), [](const auto& entry) {
+    return std::count_if(mapWallet.begin(), mapWallet.end(), [this](const auto& entry) {
         const CWalletTx& wtx = entry.second;
         return wtx.isUnconfirmed() && wtx.InMempool() &&
-               TransactionHasShadowProof(*wtx.tx);
+               TransactionHasShadowProof(*wtx.tx) &&
+               GetDebit(*wtx.tx, ISMINE_SPENDABLE) > 0;
     });
 }
 
 size_t CWallet::CountQuarantinedShadowPowClaims() const
 {
     LOCK(cs_wallet);
-    return std::count_if(mapWallet.begin(), mapWallet.end(), [](const auto& entry) {
+    return std::count_if(mapWallet.begin(), mapWallet.end(), [this](const auto& entry) {
         const CWalletTx& wtx = entry.second;
         if (!wtx.isUnconfirmed() || wtx.InMempool() ||
-            !TransactionHasShadowProof(*wtx.tx)) {
+            !TransactionHasShadowProof(*wtx.tx) ||
+            GetDebit(*wtx.tx, ISMINE_SPENDABLE) <= 0) {
             return false;
         }
         return true;
     });
+}
+
+bool CWallet::IsQuarantinedShadowPowClaim(const uint256& txid) const
+{
+    AssertLockHeld(cs_wallet);
+    const auto it = mapWallet.find(txid);
+    if (it == mapWallet.end()) return false;
+    const CWalletTx& wtx = it->second;
+    const auto marker = wtx.mapValue.find(SHADOW_POW_QUARANTINE_KEY);
+    return wtx.isUnconfirmed() && !wtx.InMempool() &&
+           TransactionHasShadowProof(*wtx.tx) &&
+           GetDebit(*wtx.tx, ISMINE_SPENDABLE) > 0 &&
+           marker != wtx.mapValue.end() && marker->second == "1";
+}
+
+bool CWallet::IsLegacyShadowPowCleanupFor(const CWalletTx& wtx, const uint256& claim_txid) const
+{
+    AssertLockHeld(cs_wallet);
+    const auto cleanup_for = wtx.mapValue.find(SHADOW_POW_CLEANUP_FOR_KEY);
+    return cleanup_for != wtx.mapValue.end() &&
+           cleanup_for->second == claim_txid.GetHex();
 }
 
 bool CWallet::QuarantineShadowPowClaim(const uint256& txid)
@@ -8956,7 +8990,8 @@ bool CWallet::QuarantineShadowPowClaim(const uint256& txid)
     LOCK(cs_wallet);
     auto it = mapWallet.find(txid);
     if (it == mapWallet.end() || !it->second.isUnconfirmed() ||
-        !TransactionHasShadowProof(*it->second.tx)) {
+        !TransactionHasShadowProof(*it->second.tx) ||
+        GetDebit(*it->second.tx, ISMINE_SPENDABLE) <= 0) {
         return false;
     }
     if (it->second.mapValue[SHADOW_POW_QUARANTINE_KEY] == "1") return true;

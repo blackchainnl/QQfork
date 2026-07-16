@@ -1595,19 +1595,28 @@ public:
         m_shadow_pow_claim_submission_inflight.store(false, std::memory_order_release);
     }
     /**
-     * Return true while one wallet-created QQSPROOF remains capable of
+     * Count wallet-authored QQSPROOF transactions that remain capable of
      * confirming. Such a transaction must keep its inputs quarantined even
-     * after local mempool eviction because a peer may still retain it.
+     * after local mempool eviction because a peer may still retain it. An
+     * incoming proof that merely pays this wallet is not wallet-authored and
+     * must not occupy its single-flight slot.
      */
     size_t CountUnresolvedShadowPowClaims() const;
     /** Count only QQSPROOF transactions currently in the local mempool, which
      * occupy relay/template capacity. Non-mempool proofs are handled by the
      * quarantine gate and never authorize a new fee-input claim. */
     size_t CountLiveShadowPowClaims() const;
-    /** Count every unconfirmed QQSPROOF absent from the local mempool. Even
-     * without a persisted marker, a peer may still confirm it, so a new
-     * fee-input claim must not be created until this count returns to zero. */
+    /** Count every wallet-authored unconfirmed QQSPROOF absent from the local
+     * mempool. Even without a persisted marker, a peer may still confirm it,
+     * so a new fee-input claim must not be created until this count is zero. */
     size_t CountQuarantinedShadowPowClaims() const;
+    /** Return true only for a persisted, locally recognized quarantine. This
+     * is intentionally narrower than CountQuarantinedShadowPowClaims(), which
+     * fail-closes for every absent unconfirmed proof. */
+    bool IsQuarantinedShadowPowClaim(const uint256& txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Identify a compatibility transaction created by an older release for
+     * one exact claim. Callers must still validate its inputs and outputs. */
+    bool IsLegacyShadowPowCleanupFor(const CWalletTx& wtx, const uint256& claim_txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Persist input quarantine after a claim was added to the wallet but
      * could not be kept in the local mempool. */
     bool QuarantineShadowPowClaim(const uint256& txid);
