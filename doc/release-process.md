@@ -91,6 +91,8 @@ applications carry only identity-free ad-hoc launch signatures and are not
 notarized. The source commit, annotated tag, checksums, and in-toto statement
 carry no Blackcoin-Dev OpenPGP signature. A conspicuous text notice and
 machine-readable manifest record those facts in the published bundle.
+The macOS production assets are architecture-specific Qt application ZIP and
+tar archives. This policy does not publish a DMG or universal app bundle.
 
 ## Roles and separation
 

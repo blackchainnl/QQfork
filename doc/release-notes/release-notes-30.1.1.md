@@ -16,6 +16,9 @@ Blackcoin-Dev OpenPGP signature. Windows packages have no Authenticode
 signature. macOS applications carry only identity-free ad-hoc launch signatures
 and are not notarized, so expect an operating-system warning or block until you
 make an explicit local choice.
+The macOS downloads are architecture-specific Qt application ZIP and tar
+archives. v30.1.1 does not publish a signed/notarized DMG or a universal app
+bundle.
 
 Read `Blackcoin-30.1.1-UNSIGNED-PRODUCTION.txt` and its machine-readable JSON
 manifest. Record the exact source commit, then verify every file in the
