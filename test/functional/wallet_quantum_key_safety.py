@@ -54,6 +54,12 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert not first["backup_verified"]
         assert_raises_rpc_error(-2, "disabled by default", node.createquantumkey)
         assert_raises_rpc_error(-2, "disabled by default", wallet.dumpquantumkey, first["address"])
+        create_help = node.help("createquantumkey")
+        assert "not wallet-scoped" in create_help
+        assert "does not disable networking or restrict RPC access" in create_help
+        dump_help = wallet.help("dumpquantumkey")
+        assert "selected wallet" in dump_help
+        assert "staking-only unlock is rejected" in dump_help
 
         inventory = wallet.getquantumkeyinventory()
         self.assert_public_inventory(inventory)
@@ -168,7 +174,7 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         assert_raises_rpc_error(-4, "requires an unlocked wallet", wallet.setpowmining, True, 1, 1)
         assert_equal(wallet.getquantumkeyinventory()["total"], locked_key_count)
 
-        self.log.info("The explicit unsafe gate still requires a normal, non-staking-only unlock")
+        self.log.info("The global raw generator is unstored; wallet export still requires normal unlock")
         self.restart_node(0, ["-allowunsafequantumkeyrpc=1", "-debug=rpc"])
         node = self.nodes[0]
         wallet = node.get_wallet_rpc(wallet_name)
@@ -176,6 +182,7 @@ class WalletQuantumKeySafetyTest(BitcoinTestFramework):
         raw = node.createquantumkey()
         assert not raw["stored_in_wallet"]
         assert raw["private_key"]
+        assert "UNSAFE UNSTORED PRIVATE KEY" in raw["warning"]
         private_material.append(raw["private_key"])
 
         wallet.walletpassphrase(passphrase, 100, True)

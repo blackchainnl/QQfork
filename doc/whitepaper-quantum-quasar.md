@@ -680,11 +680,20 @@ RPC set.
 | RPC | Purpose |
 |-----|---------|
 | `getnewquantumaddress` / `listquantumaddresses` | Create / list wallet-backed ML-DSA migration addresses |
-| `createquantumkey` / `createquantummigrationaddress` | Generate an ML-DSA keypair / encode a migration commitment |
-| `dumpquantumkey` / `importquantumkey` | Export / import an ML-DSA key for a migration address |
+| `createquantumkey` | Expert-only raw key generation; disabled unless `-allowunsafequantumkeyrpc`; not wallet-scoped, stored, or backed up |
+| `createquantummigrationaddress` | Encode a migration commitment from an existing ML-DSA public key |
+| `dumpquantumkey` | Expert-only export from the selected normally unlocked wallet; disabled unless `-allowunsafequantumkeyrpc`; staking-only unlock is rejected |
+| `importquantumkey` | Import an ML-DSA key into the selected wallet |
 | `migratetoquantum` | Sweep legacy coins into a quantum migration address |
 | `migrategoldrushrewards` | Move Gold Rush reward outputs to a fresh quantum address |
 | `getmigrationstatus` | Migration progress, eligible legacy amount, deadline countdown, advice |
+
+The unsafe-key option is an explicit exception to the normal wallet-durability
+flow. It does not make the node offline, restrict RPC access, store
+`createquantumkey` output, or verify a backup. Online operators should leave it
+disabled. Any raw-key operation should run in a separately isolated offline
+process, and the address must not be used until the key has been imported into a
+wallet and a verified post-import backup is complete.
 
 ### 9.4 Quantum staking, cold staking, operator bonds
 

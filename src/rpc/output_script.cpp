@@ -181,8 +181,9 @@ static RPCHelpMan createquantumkey()
     return RPCHelpMan{
         "createquantumkey",
         "\nGenerates an ML-DSA-44 keypair and its Blackcoin witness-v16 migration address.\n"
-        "The returned private key is raw hex and is not stored in the wallet.\n"
-        "Disabled by default; start with -allowunsafequantumkeyrpc only for an explicit offline export workflow.\n",
+        "This process-wide utility is not wallet-scoped. The returned private key is raw hex and is not stored in any wallet or backup.\n"
+        "Disabled by default; use wallet-scoped getnewquantumaddress for normal operation.\n"
+        "-allowunsafequantumkeyrpc does not disable networking or restrict RPC access. Use this command only in an independently isolated offline process.\n",
         {},
         RPCResult{
             RPCResult::Type::OBJ, "", "", {
@@ -203,7 +204,8 @@ static RPCHelpMan createquantumkey()
     if (!gArgs.GetBoolArg("-allowunsafequantumkeyrpc", false)) {
         throw JSONRPCError(RPC_FORBIDDEN_BY_SAFE_MODE,
             "createquantumkey is disabled by default because it returns unstored private material. "
-            "Use wallet-scoped getnewquantumaddress, or restart with -allowunsafequantumkeyrpc for an explicit offline workflow.");
+            "Use wallet-scoped getnewquantumaddress. For a deliberately isolated offline export process only, "
+            "restart with -allowunsafequantumkeyrpc; this flag does not itself disable networking or restrict RPC access.");
     }
     std::vector<uint8_t> pubkey;
     std::vector<uint8_t> privkey;
@@ -222,7 +224,7 @@ static RPCHelpMan createquantumkey()
     ret.pushKV("witness_version", QUANTUM_MIGRATION_WITNESS_VERSION);
     ret.pushKV("witness_program", HexStr(program));
     ret.pushKV("stored_in_wallet", false);
-    ret.pushKV("warning", "This key is not stored in the wallet database. Loss of the private_key permanently loses funds sent to this address.");
+    ret.pushKV("warning", "UNSAFE UNSTORED PRIVATE KEY: this process did not write the key to any wallet or backup. Copying terminal or RPC output is not verified recovery. Import it into a wallet and complete backupwallet before using the address.");
     // Wipe the raw ML-DSA secret from the heap before the buffer is freed.
     memory_cleanse(privkey.data(), privkey.size());
     return ret;

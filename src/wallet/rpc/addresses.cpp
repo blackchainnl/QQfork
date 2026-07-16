@@ -613,7 +613,8 @@ RPCHelpMan dumpquantumkey()
 {
     return RPCHelpMan{"dumpquantumkey",
                 "\nReveals the wallet-backed ML-DSA private key for a Blackcoin migration address.\n"
-                "Requires a normally unlocked wallet and -allowunsafequantumkeyrpc. Keep the returned private key secret.\n",
+                "Requires the selected wallet to be normally unlocked and -allowunsafequantumkeyrpc; staking-only unlock is rejected.\n"
+                "The option does not disable networking or restrict RPC access. Use this command only in an independently isolated offline process.\n",
                 {
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "The wallet-backed Blackcoin migration address"},
                 },
@@ -635,7 +636,8 @@ RPCHelpMan dumpquantumkey()
 {
     if (!gArgs.GetBoolArg("-allowunsafequantumkeyrpc", false)) {
         throw JSONRPCError(RPC_FORBIDDEN_BY_SAFE_MODE,
-            "dumpquantumkey is disabled by default. Restart with -allowunsafequantumkeyrpc only for an explicit offline export workflow.");
+            "dumpquantumkey is disabled by default. For an independently isolated offline export process only, restart with "
+            "-allowunsafequantumkeyrpc; this flag does not itself disable networking or restrict RPC access.");
     }
     std::shared_ptr<const CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
