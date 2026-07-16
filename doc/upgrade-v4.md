@@ -8,8 +8,9 @@ data directories. Witness-v15 EUTXO has no supported funding or spending
 workflow in v30.1.1, and consensus rejects v15 outputs and spends from Migration
 onward.
 
-This document describes the intended transition model for testing and operator
-review. It is not a public-network activation notice.
+This document describes the active mainnet transition and the required
+v30.1.1 operator procedure. Gold Rush is already active from height 5,950,000;
+the later Migration and Final boundaries remain height-authoritative.
 
 ## Transition Timeline
 
@@ -51,24 +52,24 @@ of Gold Rush through final lockout.
 
 ## Required two-start upgrade and rollback rehearsal
 
-Do not treat a successful in-place startup as rollback evidence. Before a beta
-artifact is used beyond an isolated canary, rehearse with a stopped v30.1.0
+Do not treat a successful in-place startup as rollback evidence. Before the
+production upgrade, rehearse with a stopped v30.1.0
 datadir and three separate copies: an immutable cold source, a disposable
 v30.1.1 upgrade copy, and a rollback copy restored again from the cold source.
 Never start v30.1.0 on the upgraded copy.
 
-1. Verify the candidate artifact checksum and record its full source SHA. Stop
+1. Verify the release artifact checksum and record its full source SHA. Stop
    v30.1.0 cleanly. Copy the complete datadir while it is stopped, then hash
    every wallet database. For every loaded wallet, record the public
    `getquantumkeyinventory` rows (address, public key, creation time, and backup
    state) and prove one existing legacy key with `signmessage`/`verifymessage`.
 2. Clone the cold source into the disposable upgrade directory. Disable all
    networking, staking, mining, automatic signalling, redelegation, and
-   automatic key creation. Start the candidate once with
+   automatic key creation. Start the v30.1.1 artifact once with
    `-reindex-chainstate`. That isolated process must reach durable
    `COMMIT_READY`, retain the source chainstate backup, open no RPC/P2P/wallet
    services, and exit successfully.
-3. Start the same candidate artifact a second time without a reindex flag. It
+3. Start the same v30.1.1 artifact a second time without a reindex flag. It
    must reopen and verify the replacement before deleting the source backup.
    Compare every wallet's quantum address/public-key inventory with step 1 and
    prove the same legacy key again. Run `backupwallet` to a new external path;
@@ -83,7 +84,7 @@ Never start v30.1.0 on the upgraded copy.
    networking disabled. Require the exact pre-upgrade quantum inventory and a
    fresh signature from the same legacy key, then stop cleanly.
 5. Preserve the artifact hashes, commands, process exit codes, journal phases,
-   pre/candidate/rollback inventories, wallet-file hashes, signature results,
+   pre-upgrade/upgraded/rollback inventories, wallet-file hashes, signature results,
    and backup paths in the release record. Any missing key, changed public key,
    unverified backup, service opened during the first start, source backup
    removed before the second start, or rollback file not sourced from the cold
@@ -126,7 +127,7 @@ over-limit claims receive nothing; the total credit never exceeds the existing
 pool.
 
 QQP4 adds an exact legacy fee-input outpoint, but it has a separate consensus
-activation and is disabled on mainnet in this alpha/beta channel. Signalling
+activation and is disabled on mainnet in v30.1.1. Signalling
 does not activate QQP4. A future QQP4 release must declare its activation
 height and prove the Q3 late-claim transition through block, mempool, reorg,
 and replay coverage before scheduling it.
@@ -143,6 +144,25 @@ QQP3 is a v30.1.1 rule, not an existing v30.1.0 deployment rule. Before the
 boundary, the prospective rule does not rewrite historical shadow allocation.
 At and after the boundary, an operator that needs authoritative QQP3 shadow
 accounting must run v30.1.1 or a later compatible release.
+
+The wallet allows only one unresolved wallet-authored `QQSPROOF` at a time. A
+claim absent from the local mempool remains quarantined with its exact fee input
+reserved because another peer may still confirm it. `getpowmininginfo` reports
+the unresolved, live, and quarantined counts, and generic
+`abandontransaction` refuses the claim.
+
+Advanced operators can preview an exact-input, same-script conflict with
+`createshadowpowclaimresolution <claim_txid>`. The default dry run does not
+sign. Signing requires a normally unlocked wallet, `dry_run=false`, and
+`acknowledge_fee_and_conflict_risk=true`; the result is still not broadcast.
+Review the fee and warning, then use `sendrawtransaction` separately only if
+you accept that peers may reject the conflict, confirmation is not guaranteed,
+and a confirmed resolution fee receives no shadow reimbursement. The shared
+input remains reserved until one side confirms. The Qt dashboard and embedded
+guide present the same warning without a one-click broadcast action.
+After the operator explicitly broadcasts and the wallet learns the resolution,
+ordinary wallet rebroadcast may continue across restart; that behavior is
+downstream of the explicit broadcast decision.
 
 The wallet exposes helper RPCs for both paths, including `getgoldrushstate`,
 `getgoldrushinfo`, `sendshadowsignal`, `getshadowpowwork`,
@@ -384,7 +404,7 @@ or available block files. Allow sufficient disk space and keep the pre-upgrade
 backup until the rebuilt node has synchronized and passed a clean-restart
 comparison.
 
-Pruning is not supported by the v30.1.1 beta. Run archival and replay nodes
+Pruning is not supported by v30.1.1. Run archival and replay nodes
 with `prune=0`. Mainnet, testnet, and signet startup reject nonzero `-prune`
 because no Blackcoin proof-of-stake retention and recovery claim has passed the
 release gate. Nonzero values remain available only on regtest for test
@@ -395,7 +415,7 @@ v30.1.1 checks the saved chainstate tip and every ancestor through genesis
 before wiping. If a known-pruned block is missing, startup stops with a full
 `-reindex` instruction and leaves the existing chainstate intact. This check
 also runs before an assumeUTXO snapshot is removed. It cannot predict a later
-disk or checksum failure, so use a copied datadir for the first alpha test and
+disk or checksum failure, so use a copied datadir for the first upgrade rehearsal and
 retain the original backup.
 
 Before it creates a rebuild journal or moves a source database, v30.1.1 also
@@ -431,8 +451,8 @@ demurrage inventory match the same tip.
 The rebuild process stops itself at `COMMIT_READY`; restart offline without
 either reindex option. Confirm that
 height, best-block hash, UTXO MuHash, Gold Rush totals, and the complete
-`replay_state` object match byte-for-byte. For release-candidate qualification,
-repeat once more with `-reindex-chainstate` at the same pinned tip and compare
+`replay_state` object match byte-for-byte. For release qualification, repeat
+once more with `-reindex-chainstate` at the same pinned tip and compare
 again before enabling networking, staking, or mining.
 
 Optional indexes have independent replay state. v30.1.1 automatically wipes

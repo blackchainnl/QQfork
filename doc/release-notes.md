@@ -3,7 +3,7 @@
 
 Blackcoin version 30.1.1 is the Quantum Quasar safety and deterministic-state
 upgrade release.
-Release binaries will be made available from:
+Authenticated release binaries are made available from:
 
   <https://github.com/Blackcoin-Dev/Blackcoin/releases>
 
@@ -20,16 +20,28 @@ To receive security and update notifications, please subscribe to:
 
   <https://github.com/Blackcoin-Dev/Blackcoin/releases>
 
-Beta 1 canary identity
-======================
+Production release identity
+===========================
 
-The v30.1.1 beta 1 packages are publisher-unsigned, unnotarized canary
-artifacts. They are not the signed v30.1.1 production release. A manual
-exact-SHA build initially creates an unpublished bundle and accepts only the
-`30.1.1-beta1` package label while the source remains configured as
-`30.1.1rc1` with `CLIENT_VERSION_IS_RELEASE=false`. After the complete beta
-gate and public-prerelease controls pass, the project may attach those
-unchanged bytes to an immutable `v30.1.1-beta1` GitHub prerelease for testing.
+Only the signed annotated `v30.1.1` tag enters the production path. The exact
+tagged commit must be configured with release-candidate zero and
+`CLIENT_VERSION_IS_RELEASE=true`, pass the complete exact-SHA matrix, and carry
+the fresh protected resource and mainnet witness-inventory authorizations.
+Production publication also requires an independently reviewed protected
+environment, release-key signatures, Authenticode, Developer ID signing and
+notarization, signed checksums, an SPDX SBOM, and provenance attestations.
+Source configured as final, a locally compiled binary, or a successful subset
+of jobs is not an authenticated release.
+
+Beta 1 history
+==============
+
+The published v30.1.1 Beta 1 packages are historical publisher-unsigned,
+unnotarized canary artifacts built from exact source commit
+`b328d2263038cdddef46b9f427827aac9e83b513`. They are not the signed v30.1.1
+production release. Their source remained configured as `30.1.1rc1` with
+`CLIENT_VERSION_IS_RELEASE=false`, and their unchanged bytes were attached to
+the immutable `v30.1.1-beta1` GitHub prerelease for testing.
 
 Every downloadable canary archive name includes both
 `Blackcoin-30.1.1-beta1` and the full 40-character source commit. The combined
@@ -45,30 +57,26 @@ mismatches; they are not a signature and do not authenticate a production
 release. Do not redistribute a beta archive without its marker, manifest,
 checksums, and full source commit.
 
-The production workflow remains separate. Only a signed `v30.1.1` tag may enter
-that path, and it requires release-candidate zero, final release metadata,
-production signing credentials, platform signatures, notarization, signed
-checksums, an SPDX SBOM, and provenance attestations.
+Beta 1 limitations and final disposition
+========================================
 
-Known Beta 1 limitations
-========================
-
-This is a test-only prerelease, not a production recommendation. Beta 1
-includes the consent-based first-launch rebuild assistant tracked in issue
-#30. Back up every wallet and preserve a cold datadir copy before using it.
+Beta 1 is a test-only prerelease, not a production recommendation. It included
+the consent-based first-launch rebuild assistant tracked in issue #30. Back up
+every wallet and preserve a cold datadir copy before any v30.1.1 upgrade.
 Operators who do not want the GUI to start the protected rebuild can choose
 the default manual/exit path and follow the explicit command-line procedure
-below. The assistant remains a beta candidate until the exact published
-artifacts complete operator upgrade and rollback testing on each platform.
+below. Production authorization still requires the exact final artifacts to
+complete the documented upgrade and rollback evidence on each platform.
 
 A fee-paying Gold Rush PoW claim that leaves the local mempool remains
 quarantined because a peer can retain and later confirm the base-valid
 transaction. Its input is intentionally not released for spending or staking,
 and the wallet's built-in PoW miner pauses while any such claim remains
 unresolved. Automatic abandonment would create an unsafe double-spend race.
-Use isolated canary wallets and expect this limitation while issues #6 and #26
-remain open. A retained pre-QQP3 claim can still confirm late and pay a base fee
-without receiving shadow credit.
+Beta 1 had no guided conflict-construction RPC. Final v30.1.1 adds the explicit
+`createshadowpowclaimresolution` path described below, but this does not make
+automatic abandonment safe or guarantee resolution. A retained pre-QQP3 claim
+can still confirm late and pay a base fee without receiving shadow credit.
 
 Height 5,993,200 is a new v30.1.1 QQP3 shadow-ledger rule, not behavior deployed
 in v30.1.0. Both versions can continue accepting the same base chain, but their
@@ -117,7 +125,7 @@ and chainstate. The client checks known block availability before staging and
 leaves the existing chainstate intact when a chainstate-only rebuild is not
 possible. Preserve wallet files and all available block files.
 
-Pruning is not supported by this beta. Run Quantum Quasar archival and replay
+Pruning is not supported by v30.1.1. Run Quantum Quasar archival and replay
 nodes with `prune=0`. Mainnet, testnet, and signet startup reject nonzero
 `-prune`; nonzero values remain regtest-only for test coverage. A datadir with
 missing historical blocks cannot use `-reindex-chainstate`; preserve every
@@ -142,8 +150,8 @@ automatic quantum-key creation are forced off in memory. Existing command-line
 and persistent values are restored only after verified cleanup and before
 normal wallet loading; the assistant never rewrites those settings.
 
-For this beta, sudden-power-loss durability of directory renames is not yet
-claimed on Windows. Keep a cold datadir copy and stable power, and do not
+v30.1.1 does not claim sudden-power-loss durability of directory renames on
+Windows. Keep a cold datadir copy and stable power, and do not
 force-stop Windows during either rebuild start. Preserve the full datadir if a
 journal or backup-topology diagnostic appears.
 
@@ -180,8 +188,9 @@ sanitizer or changing CRC32C results.
 
 ### Protocol transition
 
-- V4 activation, Gold Rush, and quantum transition logic are included in the
-  codebase so operators can review the full feature set before network activation.
+- Gold Rush is already active from height 5,950,000. v30.1.1 preserves the
+  legacy-compatible base chain while upgrading authenticated shadow state and
+  the later Migration and Final transition paths.
 - Gold Rush staking and PoW claim paths credit the upgraded shadow ledger to
   quantum addresses while preserving legacy-compatible base block rewards during
   the bridge period.
@@ -202,7 +211,7 @@ sanitizer or changing CRC32C results.
   unreimbursed pool accumulated. Authenticated shadow replay commits to this
   boundary under schema 12.
 - QQP4 exact-input binding is staged behind a separate consensus activation.
-  It is disabled on mainnet in this beta channel (`INT_MAX`), and no readiness
+  It is disabled on mainnet in v30.1.1 (`INT_MAX`), and no readiness
   or version bit can activate it. A future activation must publish its own
   height and demonstrate the Q3 late-claim transition in block, mempool, reorg,
   and replay tests.
@@ -324,11 +333,29 @@ sanitizer or changing CRC32C results.
 - PoW claim creation pauses during reindex, import, or initial sync and
   rechecks the exact tip through commit. A claim that leaves the local mempool
   remains persisted and keeps its input reserved because a peer may still
-  confirm it. In Beta 1, any unresolved quarantined claim pauses that wallet's
+  confirm it. Any unresolved quarantined claim pauses that wallet's
   built-in miner; distinct inputs do not bypass this wallet-wide safety gate.
   `abandontransaction` intentionally refuses a quarantined Gold Rush PoW claim,
   and its exact fee input remains reserved until an on-chain claim or conflict
   resolves the reservation.
+- `getpowmininginfo` exposes unresolved, live, and quarantined wallet-authored
+  claim counts. `createshadowpowclaimresolution` accepts only an exact persisted,
+  wallet-authored, single-input quarantined `QQSPROOF`. It refuses a live claim,
+  unresolved descendant or conflict, spent or foreign input, incomplete sync,
+  unsafe fee, locked or staking-only wallet, and disabled private keys. The
+  default dry run returns the exact input, amount, fee, same-script output, and
+  maximum virtual size without signing. `dry_run=false` additionally requires
+  `acknowledge_fee_and_conflict_risk=true` and returns signed hex but still sets
+  `broadcast=false`. Review it and call `sendrawtransaction` separately only if
+  you accept that a retained original may win, peers may reject the conflict,
+  confirmation is not guaranteed, and a confirmed resolution fee receives no
+  shadow reimbursement. The input stays reserved until one side confirms.
+  After the operator explicitly broadcasts and the wallet learns the
+  resolution, ordinary wallet rebroadcast may continue across restart; this is
+  downstream of the explicit broadcast decision.
+- The Qt Staking & Mining page and embedded guide show the same quarantine and
+  fee/conflict warnings and direct advanced users to the preview RPC in the
+  debug console. There is no one-click conflict broadcast.
 - Wallet backups reject destinations that resolve to the wallet root itself,
   and failed wallet-dump imports clean up incomplete databases without
   terminating the wallet tool.
@@ -363,3 +390,10 @@ sanitizer or changing CRC32C results.
   fails if measurements require an authenticated compaction protocol that is
   not implemented. Terminal combined-chainstate and full-cardinality
   production-RPC qualification remain open under roadmap issue #13.
+- Production publication independently requires the protected exact-source
+  mainnet quantum-witness inventory. Its connected-tip snapshot, UTXO MuHash,
+  complete value-bearing witness-v2-through-v16 records, and live shadow
+  reconciliation must agree. The artifact must be fresh and derived from the
+  final daemon and CLI, with either a zero bridge-review set or an approved
+  exact-snapshot disposition for every review outpoint. Missing, stale,
+  tampered, or scope-mismatched evidence fails closed.

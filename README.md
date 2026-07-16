@@ -77,11 +77,34 @@ that has processed post-boundary v30.1.1 state in v30.1.0; use the cold
 pre-upgrade copy for rollback. Base-chain compatibility does not imply
 identical shadow state.
 
-QQP4 exact-input proofs have a separate consensus activation. This mainnet
-beta leaves that activation disabled (`INT_MAX`); a readiness bit or other
+QQP4 exact-input proofs have a separate consensus activation. This release
+leaves that activation disabled on mainnet (`INT_MAX`); a readiness bit or other
 signalling state cannot enable it. A future QQP4 release must publish an
 explicit activation height and include a declared, tested Q3 late-claim
 transition and replay path before it is scheduled.
+
+### Gold Rush PoW claim safety
+
+The wallet permits only one unresolved fee-paying `QQSPROOF` claim at a time.
+If a claim leaves the local mempool, it remains quarantined and its input stays
+reserved because another peer can retain and later confirm the transaction.
+The miner pauses rather than creating an unsafe competing claim, and generic
+`abandontransaction` refuses to release that input.
+
+`getpowmininginfo` reports the unresolved, live, and quarantined wallet-authored
+claim counts. An operator who chooses to resolve a quarantined claim can first
+preview an exact-input, same-script conflict with
+`createshadowpowclaimresolution <claim_txid>`. Signing requires a normally
+unlocked wallet, `dry_run=false`, and explicit
+`acknowledge_fee_and_conflict_risk=true`; the RPC still never broadcasts.
+Review its fee and warning, then call `sendrawtransaction` separately only if
+you accept the conflict risk. The resolution fee receives no shadow
+reimbursement, peers retaining the original may reject the conflict, and
+confirmation is not guaranteed. The input remains reserved until either the
+original claim or the resolution actually confirms. After an operator
+explicitly broadcasts the signed resolution and the wallet learns it, ordinary
+wallet rebroadcast may continue across restart; that is downstream of the
+separate broadcast decision and does not add new consent.
 
 ## Required v30.1.0 chainstate rebuild
 
@@ -104,7 +127,7 @@ delete wallet files or available block files. v30.1.1 checks required block
 availability before staging and leaves the existing chainstate intact if known
 pruned history makes a chainstate-only rebuild impossible.
 
-The v30.1.1 beta supports archival `prune=0` operation only. Startup rejects a
+v30.1.1 supports archival `prune=0` operation only. Startup rejects a
 nonzero `-prune` value on mainnet, testnet, and signet because this Blackcoin
 branch does not have an audited proof-of-stake pruning and recovery path.
 Nonzero values remain available only on regtest for test coverage. Keep
@@ -122,11 +145,23 @@ the replacement before retiring the backup. Do not request a full `-reindex`
 between those two starts; v30.1.1 refuses that transition rather than risking
 the preserved recovery point.
 
-The v30.1.1 beta does not claim power-loss-atomic directory renames on Windows.
+v30.1.1 does not claim power-loss-atomic directory renames on Windows.
 Keep a cold datadir copy, use stable power, and do not force-stop or power-cycle
 Windows during the rebuild or its verification restart. If startup reports a
 chainstate-rebuild journal or backup-topology error, preserve the entire datadir
 and restore the cold copy instead of deleting recovery files individually.
+
+## Optional supply-scan resource controls
+
+The base node, P2P, staking, mining, and consensus paths do not depend on the
+optional full circulating-supply scan. Before requesting that diagnostic,
+inspect `getshadowresourceinfo`. A scan is single-flight, reports progress, and
+can be cooperatively stopped with `abortcirculatingsupplyscan`. Outside the
+reviewed operating envelope, `getcirculatingsupply` requires explicit one-call
+consent; that consent cannot bypass the absolute record/seek limits, integrity
+floor, storage reserve, snapshot, overflow, shutdown, or cancellation checks.
+Even a successful qualification is fixed-height and host-scoped, reports
+`universal_consensus_bound=false`, and is not a universal chainstate bound.
 
 After synchronization, record and compare the height, best-block hash, UTXO
 MuHash, and Gold Rush totals across a clean restart:

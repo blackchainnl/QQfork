@@ -41,7 +41,7 @@ non-whitelisted and smaller holders a direct quantum-entry path, while the PoS
 side remains snapshot-limited and equalized across active eligible targets.
 
 QQP4 exact-input binding is a separate future consensus change. It is disabled
-on mainnet in this alpha/beta channel and cannot be activated by readiness or
+on mainnet in v30.1.1 and cannot be activated by readiness or
 version-bit signalling. Before it is scheduled, its release must publish an
 explicit height and a tested transition for QQP3 claims that remain eligible
 for late inclusion.

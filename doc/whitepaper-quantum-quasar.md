@@ -2,7 +2,7 @@
 
 ## A Post-Quantum, Participation-First Evolution of Blackcoin
 
-**Version 30.1.1 Candidate, Technical White Paper**
+**Version 30.1.1, Technical White Paper**
 
 ---
 
@@ -29,7 +29,7 @@ participate**.
 This paper documents the V4 protocol in exhaustive detail: every consensus constant,
 every phase boundary, every reward formula, and the exact wallet workflows and RPC
 commands a user needs. All numbers in this document are taken directly from the
-v30.1.1 candidate source and are annotated with the file that defines them.
+v30.1.1 release source and are annotated with the file that defines them.
 
 ---
 
@@ -320,14 +320,30 @@ transactions carried in OP_RETURN outputs:
   expired, off-branch, and excess claims receive nothing.
 
   QQP4 additionally binds the exact single legacy fee-input outpoint. It has a
-  separate consensus activation and is disabled on mainnet in the v30.1.1
-  alpha/beta channel. Readiness or version-bit signalling cannot activate QQP4.
+  separate consensus activation and is disabled on mainnet in v30.1.1.
+  Readiness or version-bit signalling cannot activate QQP4.
   Any future QQP4 release must publish an explicit activation height and a tested
   transition for QQP3 claims that are still inside their late-inclusion window.
 
 The wallet can automate both when the corresponding staking/mining mode and signing
 prerequisites are satisfied. See §9 for the exact RPCs (`sendshadowsignal`,
 `sendshadowpowclaim`, `setpowmining`, `getgoldrushinfo`).
+
+A wallet-authored `QQSPROOF` that leaves the local mempool remains unresolved: another
+peer can retain and later confirm the base-valid transaction. The wallet therefore
+quarantines the claim, reserves its exact fee input, refuses generic abandonment, and
+pauses its built-in miner instead of creating a second claim. `getpowmininginfo` reports
+the live, quarantined, and total unresolved claim counts.
+
+The consent-only `createshadowpowclaimresolution` RPC can preview an exact-input,
+same-script conflict. Its default dry run does not sign. A signing request requires a
+normally unlocked wallet and explicit acknowledgement of the fee and conflict risk, but
+the RPC still never broadcasts; the operator must review the result and separately call
+`sendrawtransaction`. A confirmed resolution pays its base-chain fee without shadow
+reimbursement. Peers retaining the original may reject the conflict, confirmation is not
+guaranteed, and the input remains reserved until one transaction confirms.
+After an explicit broadcast and wallet recognition, ordinary wallet rebroadcast may
+continue across restart; this is downstream of the prior broadcast decision.
 
 ---
 
@@ -640,7 +656,9 @@ RPC set.
 | `getquantumquasarinfo` | V4 phase, activation/Gold-Rush/deadline times, next-block phase |
 | `getgoldrushstate` | Chain-level Gold Rush (Shadow Network) state |
 | `getgoldrushinfo` | Gold Rush pools (PoS/PoW amounts), solver counts, wallet qualification |
-| `getcirculatingsupply` | Demurrage-adjusted circulating supply |
+| `getcirculatingsupply` | Demurrage-adjusted circulating supply; guarded full scan with explicit one-call consent outside its reviewed envelope |
+| `getshadowresourceinfo` | Inspect optional supply-scan qualification, bounds, warnings, and progress |
+| `abortcirculatingsupplyscan` | Request cooperative cancellation of the active full-supply scan |
 | `getquantumpoolinfo` | Non-consensus quantum cold-stake pool registry |
 
 ### 9.2 Staking, Gold Rush, and mining
@@ -654,6 +672,7 @@ RPC set.
 | `sendshadowsignal` | Broadcast a QQSIGNAL for a recent PoS solve (Gold Rush PoS credit) |
 | `sendshadowpowclaim` | Grind and submit a QQSPROOF Argon2id PoW claim |
 | `setpowmining` / `getpowmininginfo` | Control / inspect the in-process Argon2id miner |
+| `createshadowpowclaimresolution` | Preview or, after explicit acknowledgement, sign but never broadcast an exact-input conflict for one quarantined wallet claim |
 | `optimizeutxoset` | Rebuild the UTXO set into equal outputs to maximize PoS yield |
 
 ### 9.3 Quantum addresses and migration
@@ -727,6 +746,12 @@ Staking Only** (mint PoS blocks, no spending or quantum actions) and **Legacy an
 Staking** (full unlock, required for any quantum, Gold Rush, migration, or cold-staking
 transaction). Automatic demurrage-attestation attempts additionally require staking to be
 enabled and a safe spendable fee input.
+
+The Staking & Mining dashboard reports a quarantined claim prominently and identifies the
+preview command available in the Qt debug console. It does not provide a one-click
+claim-resolution broadcast button. The same warning applies to CLI and headless daemon
+operators: signing the guided conflict is a separate explicit action, broadcasting it is
+another, and neither step guarantees peer acceptance or confirmation.
 
 ---
 
@@ -863,6 +888,24 @@ that help nearly effortless, and burns realized decay rather than redistributing
   phase, and consensus rejects v15 outputs and spends from Migration onward. Its decode,
   verification, and wallet-metadata surfaces are inspection-only.
 
+- **A mempool departure is not safe claim abandonment.** A peer can retain a base-valid
+  `QQSPROOF` after the local node removes it. v30.1.1 therefore reserves the exact input
+  until the original or a confirmed conflict resolves it. Guided conflict construction is
+  dry-run by default, requires explicit acknowledgement to sign, never broadcasts, and
+  does not promise a no-loss result.
+
+- **Resource diagnostics are scoped, not consensus permissions.** Optional full-supply
+  scans are single-flight, bounded, progress-reporting, and cooperatively cancellable.
+  One-call operator consent cannot bypass critical record/seek, integrity, storage,
+  snapshot, overflow, shutdown, or cancellation protections. A successful qualification
+  is fixed-height and host-scoped and reports `universal_consensus_bound=false`.
+
+- **Production witness evidence is exact-source and fail-closed.** The release gate binds
+  the final daemon and CLI to a fresh connected-tip mainnet UTXO MuHash, complete
+  value-bearing witness-v2-through-v16 inventory, and same-tip shadow reconciliation.
+  Publication requires either no bridge-review outpoints or an approved disposition for
+  every such outpoint. Missing, stale, or mismatched evidence is not authorization.
+
 - **Consensus compatibility is paramount.** Mainnet's whitelist height (5,945,000), Gold
   Rush boundaries (5,950,000 through 6,192,999), Migration boundaries (6,193,000 through
   6,921,999), and Final Lockout height (6,922,000) are consensus rules. The retained
@@ -878,7 +921,7 @@ that help nearly effortless, and burns realized decay rather than redistributing
 
 ## Appendix A: Consensus Constant Reference
 
-Values reflect the v30.1.1 candidate source. The nominal time anchors and
+Values reflect the v30.1.1 release source. The nominal time anchors and
 durations descend from v30.1.0. v30.1.1 makes the mainnet lifecycle
 height-authoritative, starts demurrage automatically at Final Lockout, and adds
 the competing-claim boundary shown below.
@@ -893,7 +936,7 @@ the competing-claim boundary shown below.
 | `SHADOW_WHITELIST_MIN_BALANCE` | 10,000 BLK | Whitelist eligibility threshold | `shadow.h` |
 | `SHADOW_REWARD_START_HEIGHT` | 5,950,000 | Gold Rush rewards begin | `shadow_schedule.cpp` |
 | `MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT` | 5,993,200 | Canonical competing-claim allocation begins | `shadow.h` |
-| `Consensus::Params::nShadowQQP4ActivationHeight` | `INT_MAX` (disabled in alpha/beta) | Separately scheduled exact-input QQP4 activation; not a readiness-bit activation | `consensus/params.h` |
+| `Consensus::Params::nShadowQQP4ActivationHeight` | `INT_MAX` (disabled in v30.1.1) | Separately scheduled exact-input QQP4 activation; not a readiness-bit activation | `consensus/params.h` |
 | `SHADOW_GOLD_RUSH_BLOCKS` | 243,000 (180 days) | Gold Rush length | `shadow_schedule.cpp` |
 | `SHADOW_REWARD_END_HEIGHT` | 6,192,999 | Gold Rush rewards end | `shadow_schedule.cpp` |
 | `MAINNET_QUANTUM_MIGRATION_END_HEIGHT` | 6,921,999 | Last height-authoritative Migration block | `shadow.h` |
@@ -960,6 +1003,6 @@ the competing-claim boundary shown below.
 
 ---
 
-*This document describes the Blackcoin Quantum Quasar (Protocol V4) v30.1.1 candidate.
-All consensus boundaries are drawn from that candidate source. Blackcoin is
+*This document describes the Blackcoin Quantum Quasar (Protocol V4) v30.1.1 release.
+All consensus boundaries are drawn from the v30.1.1 source. Blackcoin is
 free/open-source software under the MIT license.*

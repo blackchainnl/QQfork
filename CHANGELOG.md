@@ -1,6 +1,6 @@
 # Changelog
 
-## v30.1.1 candidate
+## v30.1.1
 
 - Mainnet lifecycle decisions are height-authoritative: Gold Rush is
   5,950,000-6,192,999, Migration is 6,193,000-6,921,999, and Final Lockout
@@ -28,6 +28,23 @@
   PoW, and autonomous quantum actions remain forced off until the replacement
   is reopened and verified; fresh and already-upgraded datadirs are not
   prompted.
+- A wallet-authored Gold Rush PoW claim that leaves the local mempool remains
+  quarantined with its exact input reserved. `getpowmininginfo` exposes live,
+  quarantined, and total unresolved claim counts. The new
+  `createshadowpowclaimresolution` RPC previews an exact-input, same-script
+  on-chain conflict by default and signs only after explicit fee-and-conflict
+  acknowledgement with a normally unlocked wallet. It never broadcasts,
+  cannot guarantee peer acceptance or confirmation, and does not reimburse a
+  confirmed resolution's base fee from the shadow ledger.
+- Optional full circulating-supply scans are single-flight, bounded,
+  progress-reporting, and cooperatively cancellable. The daemon, CLI RPC, and
+  Qt resource guidance expose the same scoped qualification and refusal state;
+  one-call consent cannot bypass critical integrity or storage protections.
+- Final publication is fail-closed on a protected exact-source mainnet witness
+  inventory. The artifact must bind the final binaries and connected-tip UTXO
+  MuHash to a complete value-bearing witness-v2-through-v16 inventory and live
+  shadow reconciliation, with either a zero bridge-review set or an approved
+  disposition for every review outpoint.
 
 ## v30.1.0, Quantum Quasar production release
 

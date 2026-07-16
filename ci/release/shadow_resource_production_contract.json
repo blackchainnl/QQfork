@@ -89,7 +89,7 @@
     "require_positive_issued_claim_count": true,
     "completed_epoch_equivalence_required_when_available": true,
     "maximum_capture_age_seconds": 604800,
-    "scope": "Protected-operator-attested current mainnet evidence proves real partial-epoch replay, immutable-snapshot provenance, lifecycle accounting, startup and current physical state under the v30.1.1 candidate. The offline verifier authenticates capture freshness and RPC/archive consistency but does not independently discover the global tip. The 5993200 QQP3 shadow boundary is prospective v30.1.1 behavior, not a v30.1.0 rule; base-block compatibility does not imply equal post-boundary shadow state. This evidence does not replace the exact synthetic completed-epoch maximum or claim that mainnet has reached height 6192999."
+    "scope": "Protected-operator-attested current mainnet evidence proves real partial-epoch replay, immutable-snapshot provenance, lifecycle accounting, startup and current physical state under the exact v30.1.1 release source. The offline verifier authenticates capture freshness and RPC/archive consistency but does not independently discover the global tip. The 5993200 QQP3 shadow boundary is prospective v30.1.1 behavior, not a v30.1.0 rule; base-block compatibility does not imply equal post-boundary shadow state. This evidence does not replace the exact synthetic completed-epoch maximum or claim that mainnet has reached height 6192999."
   },
   "measurement": {
     "database": "leveldb",

@@ -2,9 +2,11 @@
 
 ## Supported Versions
 
-Supported Blackcoin versions are listed in the repository release notes. The
-v30.1.1 candidate remains prerelease validation code until a signed production
-release is published.
+Supported Blackcoin versions are listed in the repository release notes.
+Source configured as v30.1.1 final is not an authenticated production binary:
+trust only a published release whose signed tag, checksum manifest, platform
+signatures, notarization, SBOM, and provenance verify against the independently
+published release-key fingerprint.
 
 ## Protocol Safety Boundaries
 
@@ -27,6 +29,24 @@ the [launch disclosures](doc/v4-launch-disclosures.md) and
 ML-DSA quantum keys are non-HD and are not derived from the wallet seed. Back
 up the wallet after every new quantum address or key. A backup made before a
 quantum key was created cannot recover that key.
+
+A wallet-authored Gold Rush PoW claim absent from the local mempool remains
+quarantined because a peer may still confirm it. Its input stays reserved and
+generic abandonment is refused. `createshadowpowclaimresolution` is an
+explicit, non-broadcast conflict-construction tool, not a no-loss guarantee:
+it previews by default, requires normal wallet unlock plus a separate fee and
+conflict acknowledgement to sign, never broadcasts, and cannot guarantee peer
+acceptance or confirmation. A confirmed resolution pays its displayed
+base-chain fee without shadow reimbursement. After explicit broadcast and
+wallet recognition, ordinary wallet rebroadcast may continue across restart.
+
+Optional circulating-supply scans do not gate validation or consensus. They
+are single-flight, bounded, cancellable diagnostics with a non-overridable
+integrity floor and storage reserve. Production publication separately
+requires a protected, fresh, exact-source mainnet witness inventory tied to a
+connected-tip UTXO MuHash and live shadow reconciliation. A missing, stale,
+tampered, scope-mismatched, or incompletely dispositioned artifact blocks
+publication.
 
 ## Reporting a Vulnerability
 

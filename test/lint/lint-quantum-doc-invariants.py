@@ -45,9 +45,11 @@ WALLET_RECOVERY_DOCUMENTS = (
     "src/wallet/rpc/backup.cpp",
 )
 
-CURRENT_BETA_OPERATOR_DOCUMENTS = (
+CURRENT_FINAL_OPERATOR_DOCUMENTS = (
     "README.md",
-    "doc/release-notes.md",
+    "SECURITY.md",
+    "TRANSITION_GUIDE.md",
+    "doc/whitepaper-quantum-quasar.md",
 )
 
 
@@ -627,30 +629,52 @@ def check_release_status(root, failures):
         )
 
 
-def check_beta_channel_identity(root, failures):
-    for relative in CURRENT_BETA_OPERATOR_DOCUMENTS:
+def check_final_release_identity(root, failures):
+    configure = read_text(root, "configure.ac")
+    for fragment in (
+        "define(_CLIENT_VERSION_RC, 0)",
+        "define(_CLIENT_VERSION_IS_RELEASE, true)",
+    ):
+        require_fragment(
+            failures,
+            "configure.ac",
+            configure,
+            fragment,
+            "final v30.1.1 source metadata",
+        )
+
+    stale_channel_patterns = (
+        r"version\s+30[.]1[.]1\s+candidate",
+        r"v30[.]1[.]1\s+(?:alpha|beta)",
+        r"v30[.]1[.]1\s+candidate\s+source",
+        r"(?:alpha|beta)\s+channel",
+    )
+    for relative in CURRENT_FINAL_OPERATOR_DOCUMENTS:
         text = normalized(read_text(root, relative))
-        if re.search(r"\balpha(?:\s*1|1)?\b", text):
-            failures.append(
-                f"{relative}: current beta operator document contains an alpha channel label"
-            )
+        for pattern in stale_channel_patterns:
+            if re.search(pattern, text):
+                failures.append(
+                    f"{relative}: final operator document retains current-product prerelease wording: {pattern}"
+                )
 
     release_notes = read_text(root, "doc/release-notes.md")
     for fragment in (
-        "Beta 1 canary identity",
-        "The v30.1.1 beta 1 packages are publisher-unsigned, unnotarized canary",
+        "Production release identity",
+        "Only the signed annotated `v30.1.1` tag enters the production path.",
+        "Beta 1 history",
+        "The published v30.1.1 Beta 1 packages are historical publisher-unsigned,",
+        "`b328d2263038cdddef46b9f427827aac9e83b513`",
         "immutable `v30.1.1-beta1` GitHub prerelease for testing.",
-        "`30.1.1-beta1`",
         "`Blackcoin-30.1.1-beta1`",
         "`unsigned-canary-30.1.1-beta1-<FULL_SOURCE_COMMIT>`",
-        "For this beta, sudden-power-loss durability",
+        "v30.1.1 does not claim sudden-power-loss durability",
     ):
         require_fragment(
             failures,
             "doc/release-notes.md",
             release_notes,
             fragment,
-            "current beta 1 canary identity",
+            "final release or historical Beta 1 identity",
         )
 
     readme = read_text(root, "README.md")
@@ -658,9 +682,28 @@ def check_beta_channel_identity(root, failures):
         failures,
         "README.md",
         readme,
-        "The v30.1.1 beta does not claim power-loss-atomic directory renames on Windows.",
-        "current beta Windows recovery warning",
+        "v30.1.1 does not claim power-loss-atomic directory renames on Windows.",
+        "final Windows recovery warning",
     )
+
+    final_notes_relative = "doc/release-notes/release-notes-30.1.1.md"
+    final_notes = read_text(root, final_notes_relative)
+    for fragment in (
+        "# Blackcoin Core 30.1.1",
+        "Gold Rush is already active from",
+        "createshadowpowclaimresolution",
+        "getshadowresourceinfo",
+        "connected-tip mainnet witness inventory",
+    ):
+        require_fragment(
+            failures,
+            final_notes_relative,
+            final_notes,
+            fragment,
+            "canonical final release notes",
+        )
+    if "RELEASE_NOTES_NOT_FINAL" in final_notes:
+        failures.append(f"{final_notes_relative}: final release marker remains")
 
 
 def check_pdf_provenance(root, failures):
@@ -711,7 +754,7 @@ def verify(root):
         check_documentation_surfaces(root, failures, heights)
         check_pow_claim_documentation(root, failures, heights)
         check_release_status(root, failures)
-        check_beta_channel_identity(root, failures)
+        check_final_release_identity(root, failures)
         check_pdf_provenance(root, failures)
     except (OSError, ValueError) as error:
         failures.append(str(error))

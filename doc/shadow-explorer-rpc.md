@@ -159,7 +159,7 @@ height or up to 64 blocks later while the origin remains on the active branch.
 Late claims receive only their capped actual fee. A late-only block therefore
 reports reimbursement payouts but no winner and does not consume the remaining
 PoW jackpot. QQP4 additionally commits the exact single legacy fee input, but
-its activation is separate and disabled on mainnet in this alpha/beta channel.
+its activation is separate and disabled on mainnet in v30.1.1.
 No readiness or version-bit state activates QQP4. A future QQP4 schedule must
 publish its height and the tested treatment of already-eligible QQP3 late
 claims; explorers must not infer that a QQP4 boundary is the 5,993,200 QQP3
