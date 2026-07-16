@@ -136,8 +136,11 @@ class GoldRushPosSignalRecoveryTest(BitcoinTestFramework):
         ):
             wallet.staking(True)
         assert_equal(self._is_abandoned(wallet, first_signal["txid"]), False)
+        # Reaching the retry ceiling makes cleanup eligible. The production
+        # path deliberately uses nonblocking wallet and mempool locks, so lock
+        # contention may safely defer the actual abandonment to a later retry.
         with node.assert_debug_log(
-            expected_msgs=["after 2 failed resubmissions and released its inputs"],
+            expected_msgs=["failed resubmissions and released its inputs"],
             timeout=10,
         ):
             self.wait_until(lambda: self._is_abandoned(wallet, first_signal["txid"]), timeout=10)
