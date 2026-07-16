@@ -160,10 +160,65 @@ def remote_objects(source):
     for line in output.splitlines():
         object_id, object_ref = line.split(maxsplit=1)
         objects[object_ref] = object_id
-    if objects.get(ref) != source["ref_object"]:
+    observed = objects.get(ref)
+    if source["tag_kind"] == "untagged-release-branch":
+        if not ref.startswith("refs/heads/"):
+            raise RuntimeError(
+                f"{source['version']} untagged release source is not a branch: {ref}"
+            )
+        if source["ref_object"] != source["commit"]:
+            raise RuntimeError(
+                f"{source['version']} untagged release branch pin must be an exact commit"
+            )
+        if observed is None:
+            raise RuntimeError(f"{source['version']} provenance changed: {ref} is missing")
+        with tempfile.TemporaryDirectory(prefix="mixed-version-ref-") as temporary:
+            repository = Path(temporary) / "repository.git"
+            run(["git", "init", "--bare", "--quiet", repository])
+            run([
+                "git", "remote", "add", "origin", source["repository"],
+            ], cwd=repository)
+            run([
+                "git", "fetch", "--quiet", "--no-tags", "--filter=blob:none",
+                "origin",
+                f"{ref}:refs/remotes/provenance/observed",
+            ], cwd=repository)
+            fetched = run(
+                ["git", "rev-parse", "refs/remotes/provenance/observed"],
+                cwd=repository,
+                capture=True,
+            ).strip()
+            if fetched != observed:
+                raise RuntimeError(
+                    f"{source['version']} {ref} moved during provenance verification: "
+                    f"observed {observed}, fetched {fetched}"
+                )
+            reachable = subprocess.run(
+                [
+                    "git", "merge-base", "--is-ancestor",
+                    source["commit"], observed,
+                ],
+                cwd=repository,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            if reachable.returncode != 0:
+                raise RuntimeError(
+                    f"{source['version']} provenance changed: pinned commit "
+                    f"{source['commit']} is not an ancestor of observed {ref} head {observed}"
+                )
+        print(
+            f"{source['version']} observed untagged release branch {ref} at {observed}; "
+            f"pinned build commit remains {source['commit']}",
+            flush=True,
+        )
+        return observed
+
+    if observed != source["ref_object"]:
         raise RuntimeError(
             f"{source['version']} provenance changed: {ref} is "
-            f"{objects.get(ref, '<missing>')}, expected {source['ref_object']}"
+            f"{observed or '<missing>'}, expected {source['ref_object']}"
         )
     peeled = objects.get(f"{ref}^{{}}", objects[ref])
     if peeled != source["commit"]:
@@ -174,6 +229,7 @@ def remote_objects(source):
         raise RuntimeError(f"{source['version']} is no longer an annotated tag")
     if source["tag_kind"] == "lightweight" and source["ref_object"] != source["commit"]:
         raise RuntimeError(f"{source['version']} lightweight tag does not point to its pinned commit")
+    return observed
 
 
 def source_version(source_dir):

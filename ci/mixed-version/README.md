@@ -15,9 +15,12 @@ installer verifies those exact members and exposes compatibility filenames to
 the functional framework without modifying their bytes. The v30.1.0 source is an annotated tag
 whose tag object and peeled commit are both pinned. CoinBlack did not publish a
 v28.4.0 tag or GitHub release; the designated source is therefore the pinned
-28.x branch commit that declares itself v28.4.0. Any movement of that branch
-fails the provenance check until the manifest is deliberately reviewed and
-updated. The current pin is commit
+28.x branch commit that declares itself v28.4.0. The gate reports the observed
+branch head and accepts later descendants only after independently fetching the
+branch and proving the pinned commit remains its ancestor. It still builds the
+exact pinned commit. A rewrite that removes the pin, an otherwise unreachable
+pin, a missing branch, or branch movement during verification fails closed. The
+current pin is commit
 `36c5bba862472fed959fc8d3ba3ea00d8ba275d2`, a signed direct child of
 `c2455cdd6f43756fbca137a83d9d168dae4eb442`. The parent replaces
 verifier-local wall time with block time for version-2 input checks; the child

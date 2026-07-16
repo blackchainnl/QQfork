@@ -1290,6 +1290,170 @@ class ReleaseToolTests(unittest.TestCase):
                     cwd=root,
                 )
 
+    def make_mixed_version_remote(self, directory):
+        working = directory / "working"
+        remote = directory / "remote.git"
+        subprocess.run(["git", "init", "-q", working], check=True)
+        subprocess.run(
+            ["git", "-C", working, "config", "user.name", "Blackcoin-Dev"],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git", "-C", working, "config", "user.email",
+                "298119138+Blackcoin-Dev@users.noreply.github.com",
+            ],
+            check=True,
+        )
+        subprocess.run(["git", "-C", working, "checkout", "-q", "-b", "28.x"], check=True)
+        tracked = working / "tracked.txt"
+        tracked.write_text("pinned\n", encoding="utf-8")
+        subprocess.run(["git", "-C", working, "add", "tracked.txt"], check=True)
+        subprocess.run(["git", "-C", working, "commit", "-q", "-m", "pinned"], check=True)
+        pinned = subprocess.check_output(
+            ["git", "-C", working, "rev-parse", "HEAD"], text=True,
+        ).strip()
+        tracked.write_text("descendant\n", encoding="utf-8")
+        subprocess.run(["git", "-C", working, "commit", "-q", "-am", "descendant"], check=True)
+        descendant = subprocess.check_output(
+            ["git", "-C", working, "rev-parse", "HEAD"], text=True,
+        ).strip()
+        subprocess.run(["git", "init", "--bare", "-q", remote], check=True)
+        subprocess.run(
+            ["git", "-C", remote, "config", "uploadpack.allowFilter", "true"],
+            check=True,
+        )
+        subprocess.run(["git", "-C", working, "remote", "add", "origin", remote], check=True)
+        subprocess.run(
+            ["git", "-C", working, "push", "-q", "origin", "28.x:refs/heads/28.x"],
+            check=True,
+        )
+        return working, remote, pinned, descendant
+
+    def test_mixed_version_untagged_branch_accepts_only_reachable_descendant_head(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _working, remote, pinned, descendant = self.make_mixed_version_remote(root)
+            source = {
+                "version": "v28.4.0",
+                "repository": str(remote),
+                "source_ref": "refs/heads/28.x",
+                "ref_object": pinned,
+                "commit": pinned,
+                "tag_kind": "untagged-release-branch",
+            }
+            with mock.patch("builtins.print") as reported:
+                self.assertEqual(builder.remote_objects(source), descendant)
+            self.assertTrue(any(
+                descendant in " ".join(str(argument) for argument in call.args)
+                for call in reported.call_args_list
+            ))
+
+    def test_mixed_version_untagged_branch_rejects_ls_remote_fetch_race(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _working, remote, pinned, _descendant = self.make_mixed_version_remote(root)
+            source = {
+                "version": "v28.4.0",
+                "repository": str(remote),
+                "source_ref": "refs/heads/28.x",
+                "ref_object": pinned,
+                "commit": pinned,
+                "tag_kind": "untagged-release-branch",
+            }
+            original_run = builder.run
+
+            def raced_run(command, **kwargs):
+                if command[:2] == ["git", "ls-remote"]:
+                    return f"{pinned}\trefs/heads/28.x\n"
+                return original_run(command, **kwargs)
+
+            with mock.patch.object(builder, "run", side_effect=raced_run):
+                with self.assertRaisesRegex(RuntimeError, "moved during provenance"):
+                    builder.remote_objects(source)
+
+    def test_mixed_version_untagged_branch_rejects_missing_ref_and_pin(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _working, remote, _pinned, _descendant = self.make_mixed_version_remote(root)
+            source = {
+                "version": "v28.4.0",
+                "repository": str(remote),
+                "source_ref": "refs/heads/missing",
+                "ref_object": "0" * 40,
+                "commit": "0" * 40,
+                "tag_kind": "untagged-release-branch",
+            }
+            with self.assertRaisesRegex(RuntimeError, "is missing"):
+                builder.remote_objects(source)
+
+            source["source_ref"] = "refs/heads/28.x"
+            with self.assertRaisesRegex(RuntimeError, "not an ancestor"):
+                builder.remote_objects(source)
+
+    def test_mixed_version_untagged_branch_rejects_rewrite_or_unreachable_pin(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            working, remote, pinned, _descendant = self.make_mixed_version_remote(root)
+            subprocess.run(
+                ["git", "-C", working, "checkout", "-q", "--orphan", "rewritten"],
+                check=True,
+            )
+            (working / "tracked.txt").write_text("rewritten\n", encoding="utf-8")
+            subprocess.run(["git", "-C", working, "add", "tracked.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", working, "commit", "-q", "-m", "rewritten"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", working, "push", "-q", "--force", "origin", "HEAD:refs/heads/28.x"],
+                check=True,
+            )
+            source = {
+                "version": "v28.4.0",
+                "repository": str(remote),
+                "source_ref": "refs/heads/28.x",
+                "ref_object": pinned,
+                "commit": pinned,
+                "tag_kind": "untagged-release-branch",
+            }
+            with self.assertRaisesRegex(RuntimeError, "not an ancestor"):
+                builder.remote_objects(source)
+
+    def test_mixed_version_tags_remain_exact_when_remote_tag_moves(self):
+        builder = load_mixed_version_module("build_previous_releases")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            working, remote, pinned, descendant = self.make_mixed_version_remote(root)
+            subprocess.run(["git", "-C", working, "tag", "v28.4.0", pinned], check=True)
+            subprocess.run(
+                ["git", "-C", working, "push", "-q", "origin", "refs/tags/v28.4.0"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", working, "tag", "-f", "v28.4.0", descendant],
+                check=True,
+                stdout=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["git", "-C", working, "push", "-q", "--force", "origin", "refs/tags/v28.4.0"],
+                check=True,
+            )
+            source = {
+                "version": "v28.4.0",
+                "repository": str(remote),
+                "source_ref": "refs/tags/v28.4.0",
+                "ref_object": pinned,
+                "commit": pinned,
+                "tag_kind": "lightweight",
+            }
+            with self.assertRaisesRegex(RuntimeError, "provenance changed"):
+                builder.remote_objects(source)
+
     def test_mixed_version_check_isolates_datadir_and_home(self):
         builder = load_mixed_version_module("build_previous_releases")
         with tempfile.TemporaryDirectory() as temporary:
