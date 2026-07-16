@@ -341,8 +341,47 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         assert "changed" in outcome[0][1]["message"].lower()
         assert "retry" in outcome[0][1]["message"].lower()
 
+    def _assert_explorer_help_schemas(self):
+        expected_fields = {
+            "getshadowblock": (
+                "schema", "pow_claim_accounting", "canonical_rank",
+                "accounting_commitment", "payouts", "lifecycle", "spend",
+            ),
+            "getshadowtransaction": (
+                "schema", "base_anchor", "pow_claim_source", "demurrage",
+                "spend", "units",
+            ),
+            "getshadowaddress": (
+                "schema", "scriptPubKey", "next_cursor", "records",
+                "base_anchor", "demurrage",
+            ),
+            "getshadowscript": (
+                "schema", "address", "next_cursor", "synthetic",
+                "records", "demurrage",
+            ),
+            "getshadowoutpoint": (
+                "schema", "lookup_index", "base_anchor", "lifecycle",
+                "spend", "units",
+            ),
+            "getquantumwitnessinventory": (
+                "schema", "utxo_snapshot", "current_utxos", "history",
+                "coverage", "bridge_handling",
+                "history_reconciles_current_utxos", "records",
+            ),
+            "getshadowsupply": (
+                "schema", "schedule", "pool", "lifecycle", "burn", "legacy",
+                "decay_paid_as_fee", "units",
+            ),
+        }
+        for command, fields in expected_fields.items():
+            command_help = self.nodes[1].help(command)
+            assert "Fields are defined by the top-level schema discriminator" not in command_help
+            for field in fields:
+                assert f'"{field}"' in command_help, (command, field)
+
     def run_test(self):
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
+        self._assert_explorer_help_schemas()
 
         self.log.info("Preparing a wallet with mature staking and QQSPROOF funding coins")
         for node in self.nodes:

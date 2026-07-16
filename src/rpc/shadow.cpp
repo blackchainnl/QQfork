@@ -519,6 +519,500 @@ UniValue ShadowRecordToJSON(const ShadowIndexRecord& record,
     return result;
 }
 
+RPCResult NullableRPCResult(RPCResult::Type type, std::string key,
+                            std::string description,
+                            std::vector<RPCResult> inner = {})
+{
+    return RPCResult{type, std::move(key), /*optional=*/false,
+                     std::move(description), std::move(inner),
+                     /*skip_type_check=*/true};
+}
+
+RPCResult AmountUnitsResult(std::string key = "units")
+{
+    return RPCResult{RPCResult::Type::OBJ, std::move(key),
+                     "Amount display and encoding contract", {
+        {RPCResult::Type::STR, "display", "Display unit"},
+        {RPCResult::Type::NUM, "atomic_decimals", "Number of atomic decimal places"},
+        {RPCResult::Type::STR, "amount_encoding", "JSON amount encoding"},
+    }};
+}
+
+std::vector<RPCResult> SpendResultFields()
+{
+    return {
+        {RPCResult::Type::NUM, "height", "Active-chain spend height"},
+        {RPCResult::Type::STR_HEX, "blockhash", "Active-chain spend block hash"},
+        {RPCResult::Type::STR_HEX, "txid", "Base-chain spending transaction id"},
+        {RPCResult::Type::NUM, "tx_index", "Spending transaction index in the block"},
+        {RPCResult::Type::NUM, "input_index", "Input index that spends the payout"},
+    };
+}
+
+std::vector<RPCResult> PowClaimSourceResultFields()
+{
+    return {
+        {RPCResult::Type::STR_HEX, "txid", "Base-chain claim transaction id"},
+        {RPCResult::Type::NUM, "vout", "Claim output index"},
+        {RPCResult::Type::STR_HEX, "logical_proof_id", "Canonical logical proof identifier"},
+        {RPCResult::Type::STR_HEX, "canonical_rank", "Deterministic claim rank"},
+        {RPCResult::Type::STR, "disposition", "Indexed claim disposition"},
+        {RPCResult::Type::BOOL, "base_fee_known", "Whether the base fee was derived exactly"},
+        NullableRPCResult(RPCResult::Type::STR_AMOUNT, "base_fee",
+                          "Base-chain fee in BLK, or null when unavailable"),
+        {RPCResult::Type::NUM, "proof_version", "Claim proof version"},
+        {RPCResult::Type::BOOL, "origin_bound", "Whether the proof binds an origin block"},
+        {RPCResult::Type::NUM, "origin_height", "Claimed origin height"},
+        NullableRPCResult(RPCResult::Type::STR_HEX, "origin_previous_block_hash",
+                          "Bound origin previous-block hash, or null"),
+        {RPCResult::Type::NUM, "inclusion_height", "Claim inclusion height"},
+        {RPCResult::Type::NUM, "origin_age", "Blocks between origin and inclusion"},
+        {RPCResult::Type::BOOL, "input_bound", "Whether the proof binds an input outpoint"},
+        NullableRPCResult(RPCResult::Type::OBJ, "claim_outpoint",
+                          "Bound input outpoint, or null", {
+            {RPCResult::Type::STR_HEX, "txid", "Bound input transaction id"},
+            {RPCResult::Type::NUM, "vout", "Bound input output index"},
+        }),
+    };
+}
+
+RPCResult PowClaimSourceResult(std::string key)
+{
+    return NullableRPCResult(RPCResult::Type::OBJ, std::move(key),
+                             "Canonical POW claim provenance, or null for a PoS payout",
+                             PowClaimSourceResultFields());
+}
+
+RPCResult PowClaimRecordResult(std::string key = "")
+{
+    std::vector<RPCResult> fields = PowClaimSourceResultFields();
+    fields.emplace_back(RPCResult::Type::NUM, "index", "Canonical accounting-record index");
+    fields.emplace_back(RPCResult::Type::STR_AMOUNT, "credited_amount", "Synthetic amount credited in BLK");
+    fields.emplace_back(RPCResult::Type::BOOL, "rejected", "Whether this record received no credit");
+    fields.push_back(NullableRPCResult(RPCResult::Type::STR_HEX, "payout_scriptPubKey",
+                                      "Credited payout script, or null"));
+    fields.push_back(NullableRPCResult(RPCResult::Type::STR, "payout_address",
+                                      "Decoded credited payout address, or null"));
+    fields.push_back(NullableRPCResult(RPCResult::Type::STR_HEX, "synthetic_txid",
+                                      "Synthetic payout transaction id, or null"));
+    fields.push_back(NullableRPCResult(RPCResult::Type::NUM, "synthetic_vout",
+                                      "Synthetic payout output index, or null"));
+    return RPCResult{RPCResult::Type::OBJ, std::move(key),
+                     "Canonical POW claim accounting record", std::move(fields)};
+}
+
+std::vector<RPCResult> ShadowRecordResultFields()
+{
+    return {
+        {RPCResult::Type::BOOL, "synthetic", "Always true for a shadow payout"},
+        {RPCResult::Type::BOOL, "merkle_included", "Always false; the synthetic payout is outside the base transaction Merkle tree"},
+        {RPCResult::Type::STR_HEX, "synthetic_txid", "Deterministic synthetic payout transaction id"},
+        {RPCResult::Type::NUM, "vout", "Synthetic payout output index"},
+        {RPCResult::Type::STR, "mode", "pow or pos"},
+        {RPCResult::Type::STR, "status", "immature, gold_rush_locked, demurrage_locked, unspent, or spent"},
+        {RPCResult::Type::STR, "lifecycle_category", "Consensus lifecycle classification"},
+        {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal payout amount in BLK"},
+        {RPCResult::Type::STR_AMOUNT, "effective_amount", "Current or recorded-at-spend effective amount in BLK"},
+        {RPCResult::Type::STR_AMOUNT, "decayed_amount", "Current or recorded-at-spend demurrage burn in BLK"},
+        {RPCResult::Type::STR, "valuation_status", "Valuation snapshot semantics"},
+        {RPCResult::Type::STR_HEX, "scriptPubKey", "Exact payout script"},
+        {RPCResult::Type::STR, "address", /*optional=*/true, "Decoded payout address when available"},
+        PowClaimSourceResult("pow_claim_source"),
+        {RPCResult::Type::OBJ, "base_anchor", "Active-chain source anchor", {
+            {RPCResult::Type::NUM, "height", "Source block height"},
+            {RPCResult::Type::STR_HEX, "blockhash", "Source block hash"},
+            {RPCResult::Type::NUM_TIME, "time", "Source block time"},
+            {RPCResult::Type::NUM, "claim_index", "Deterministic payout index within the source block"},
+        }},
+        {RPCResult::Type::OBJ, "lifecycle", "Next-block maturity and spendability state", {
+            {RPCResult::Type::NUM, "coinbase_maturity", "Generated-output maturity depth"},
+            NullableRPCResult(RPCResult::Type::NUM, "maturity_height",
+                              "Exact maturity height, or null for a spent payout"),
+            NullableRPCResult(RPCResult::Type::BOOL, "mature",
+                              "Whether mature at the next block, or null when spent"),
+            {RPCResult::Type::BOOL, "gold_rush_phase_locked", "Whether a mature payout remains locked by the Gold Rush phase"},
+            NullableRPCResult(RPCResult::Type::NUM, "earliest_spend_height",
+                              "Earliest authoritative spend height, or null"),
+            NullableRPCResult(RPCResult::Type::NUM_TIME, "earliest_spend_mtp",
+                              "Earliest spend median time, or null"),
+            {RPCResult::Type::BOOL, "earliest_spend_height_exact", "Whether earliest_spend_height is authoritative"},
+            {RPCResult::Type::BOOL, "consensus_spendable_next_block", "Whether consensus permits spending in the next block"},
+            {RPCResult::Type::BOOL, "ordinary_spendable_next_block", "Whether an ordinary wallet spend is permitted in the next block"},
+            {RPCResult::Type::BOOL, "spendable_next_block", "Compatibility alias for ordinary spendability"},
+            {RPCResult::Type::BOOL, "permanently_locked", "Whether consensus permanently locks this value"},
+        }},
+        {RPCResult::Type::OBJ, "demurrage", "Next-block or recorded-at-spend demurrage state", {
+            {RPCResult::Type::NUM, "valuation_height", "Height used for valuation"},
+            {RPCResult::Type::BOOL, "active", "Whether demurrage is active"},
+            {RPCResult::Type::BOOL, "exempt", "Whether the payout is exempt"},
+            {RPCResult::Type::BOOL, "locked", "Whether demurrage has locked the payout"},
+            {RPCResult::Type::NUM, "inactive_blocks", "Consecutive inactive blocks"},
+            {RPCResult::Type::NUM, "remaining_ppm", "Effective nominal value remaining in parts per million"},
+            {RPCResult::Type::STR, "classification", /*optional=*/true, "Demurrage exemption classification when present"},
+        }},
+        NullableRPCResult(RPCResult::Type::OBJ, "spend",
+                          "Active-chain spend details, or null while unspent",
+                          SpendResultFields()),
+    };
+}
+
+RPCResult ShadowRecordResult(std::string key = "", bool include_index = false)
+{
+    std::vector<RPCResult> fields = ShadowRecordResultFields();
+    if (include_index) {
+        fields.emplace_back(RPCResult::Type::NUM, "index", "Payout index in this page's source block");
+    }
+    return RPCResult{RPCResult::Type::OBJ, std::move(key),
+                     "Synthetic payout record", std::move(fields)};
+}
+
+RPCResult CursorResult(std::string key)
+{
+    return NullableRPCResult(RPCResult::Type::OBJ, std::move(key),
+                             "Exclusive cursor for the next page, or null", {
+        {RPCResult::Type::NUM, "height", "Cursor origin height"},
+        {RPCResult::Type::STR_HEX, "txid", "Cursor synthetic transaction id"},
+    });
+}
+
+RPCResult InventoryBucketResult(std::string key, bool optional = false)
+{
+    return RPCResult{RPCResult::Type::OBJ, std::move(key), optional,
+                     "Witness output count and amount", {
+        {RPCResult::Type::NUM, "count", "Output count"},
+        {RPCResult::Type::STR_AMOUNT, "amount", "Amount in BLK"},
+        {RPCResult::Type::STR, "amount_atomic", "Exact atomic-unit amount as a decimal string"},
+    }};
+}
+
+RPCResult InventoryMapResult(std::string key, bool optional = false)
+{
+    return RPCResult{RPCResult::Type::OBJ_DYN, std::move(key), optional,
+                     "Classification names mapped to witness inventory buckets", {
+        InventoryBucketResult("classification"),
+    }};
+}
+
+RPCResult WitnessRecordResult()
+{
+    return RPCResult{RPCResult::Type::OBJ, "", "Current UTXO or active-chain history record", {
+        {RPCResult::Type::STR_HEX, "txid", "Output transaction id"},
+        {RPCResult::Type::NUM, "vout", "Output index"},
+        {RPCResult::Type::STR_AMOUNT, "amount", "Nominal output amount in BLK"},
+        {RPCResult::Type::STR_HEX, "scriptPubKey", "Exact output script"},
+        {RPCResult::Type::NUM, "witness_version", "Native witness version"},
+        {RPCResult::Type::STR, "version_class", "v14, v15, v16, or unknown"},
+        {RPCResult::Type::STR, "bridge_handling", "Recognized protocol handling or explicit-review classification"},
+        {RPCResult::Type::NUM, "origin_height", "Active-chain creation height"},
+        {RPCResult::Type::STR_HEX, "origin_blockhash", "Active-chain creation block hash"},
+        {RPCResult::Type::NUM_TIME, "origin_block_time", "Creation block time"},
+        {RPCResult::Type::NUM_TIME, "coin_time", /*optional=*/true, "Coin timestamp in the current-UTXO view"},
+        {RPCResult::Type::STR, "origin_phase", "Lifecycle phase at creation"},
+        {RPCResult::Type::STR, "origin_group", "pre_migration_window or migration_or_later"},
+        {RPCResult::Type::BOOL, "coinbase", "Whether created by a coinbase"},
+        {RPCResult::Type::BOOL, "coinstake", "Whether created by a coinstake"},
+        {RPCResult::Type::STR, "address", /*optional=*/true, "Decoded current-UTXO address when available"},
+        {RPCResult::Type::BOOL, "spent", /*optional=*/true, "Whether the historical output is actively spent"},
+        {RPCResult::Type::OBJ, "spend", /*optional=*/true,
+         "Active-chain historical spend details, or null", SpendResultFields(),
+         /*skip_type_check=*/true},
+    }};
+}
+
+RPCResult ShadowLifecycleBucketResult(std::string key)
+{
+    return NullableRPCResult(RPCResult::Type::OBJ, std::move(key),
+                             "Lifecycle bucket, or null when classification is not exact", {
+        {RPCResult::Type::NUM, "count", "Payout count"},
+        {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal amount in BLK"},
+        {RPCResult::Type::STR_AMOUNT, "effective_amount", "Effective amount in BLK"},
+        {RPCResult::Type::STR_AMOUNT, "burned_amount", "Demurrage-burned amount in BLK"},
+    });
+}
+
+RPCResult ShadowBlockResult()
+{
+    return RPCResult{RPCResult::Type::OBJ, "",
+                     "Versioned explorer-facing shadow block record", {
+        {RPCResult::Type::STR, "schema", "blackcoin.shadow.block.v3"},
+        {RPCResult::Type::NUM, "height", "Active-chain block height"},
+        {RPCResult::Type::STR_HEX, "blockhash", "Active-chain block hash"},
+        {RPCResult::Type::NUM_TIME, "time", "Block time"},
+        {RPCResult::Type::NUM_TIME, "mediantime", "Parent median time past used for this block"},
+        {RPCResult::Type::NUM, "confirmations", "Active-chain confirmations"},
+        {RPCResult::Type::STR, "phase", "Lifecycle phase at this block"},
+        {RPCResult::Type::BOOL, "gold_rush_reward_active", "Whether the scheduled shadow reward was active"},
+        {RPCResult::Type::STR_AMOUNT, "scheduled_reward", "Scheduled reward in BLK"},
+        {RPCResult::Type::BOOL, "synthetic", "Always true for the payout view"},
+        {RPCResult::Type::BOOL, "merkle_included", "Always false for synthetic payouts"},
+        {RPCResult::Type::NUM, "total_payouts", "Total synthetic payouts anchored to this block"},
+        {RPCResult::Type::NUM, "offset", "Requested payout offset"},
+        {RPCResult::Type::NUM, "count", "Payouts returned"},
+        NullableRPCResult(RPCResult::Type::NUM, "next_offset",
+                          "Next payout offset, or null at the end"),
+        {RPCResult::Type::STR_AMOUNT, "pow_payout_total", "Nominal POW payout total in BLK"},
+        {RPCResult::Type::STR_AMOUNT, "pos_payout_total", "Nominal PoS payout total in BLK"},
+        {RPCResult::Type::OBJ, "pow_claim_accounting", "Bounded canonical POW-claim accounting", {
+            {RPCResult::Type::BOOL, "active", "Whether canonical claim accounting is active"},
+            {RPCResult::Type::NUM, "total_records", "Total accounting records"},
+            {RPCResult::Type::NUM, "observed_count", "Observed claims"},
+            {RPCResult::Type::NUM, "evaluated_count", "Claims evaluated within the bound"},
+            {RPCResult::Type::NUM, "winner_count", "Winner records"},
+            {RPCResult::Type::NUM, "reimbursed_loser_count", "Same-block reimbursed loser records"},
+            {RPCResult::Type::NUM, "reimbursed_late_count", "Late reimbursed records"},
+            {RPCResult::Type::NUM, "rejected_count", "Records receiving no credit"},
+            {RPCResult::Type::NUM, "invalid_location_count", "Claims in an invalid transaction location"},
+            {RPCResult::Type::NUM, "malformed_transaction_count", "Malformed claim transactions"},
+            {RPCResult::Type::NUM, "invalid_proof_count", "Invalid claim proofs"},
+            {RPCResult::Type::NUM, "wrong_mode_count", "PoS-mode records in the POW claim path"},
+            {RPCResult::Type::NUM, "unknown_mode_count", "Unknown claim modes"},
+            {RPCResult::Type::NUM, "input_mismatch_count", "Input-bound proof mismatches"},
+            {RPCResult::Type::NUM, "invalid_base_fee_count", "Claims with an invalid base fee"},
+            {RPCResult::Type::NUM, "origin_mismatch_count", "Origin-bound proof mismatches"},
+            {RPCResult::Type::NUM, "origin_expired_count", "Claims outside the origin-age window"},
+            {RPCResult::Type::NUM, "duplicate_logical_proof_count", "Duplicate logical proofs"},
+            {RPCResult::Type::NUM, "already_accounted_count", "Proofs accounted by an earlier block"},
+            {RPCResult::Type::NUM, "evaluation_limit_count", "Claims outside the bounded evaluation set"},
+            NullableRPCResult(RPCResult::Type::STR_HEX, "accounting_commitment",
+                              "Canonical accounting commitment, or null when inactive"),
+            {RPCResult::Type::STR_AMOUNT, "credited_total", "Total credited amount in BLK"},
+            {RPCResult::Type::STR_AMOUNT, "winner_credited_total", "Winner credits in BLK"},
+            {RPCResult::Type::STR_AMOUNT, "reimbursed_credited_total", "Reimbursement credits in BLK"},
+            {RPCResult::Type::NUM, "offset", "Requested claim-record offset"},
+            {RPCResult::Type::NUM, "count", "Claim records returned"},
+            NullableRPCResult(RPCResult::Type::NUM, "next_offset",
+                              "Next claim-record offset, or null at the end"),
+            {RPCResult::Type::ARR, "records", "Canonical claim records", {
+                PowClaimRecordResult(),
+            }},
+        }},
+        {RPCResult::Type::ARR, "observed_pow_claim_txids", "Observed base-chain POW claim transaction ids", {
+            {RPCResult::Type::STR_HEX, "", "Observed claim transaction id"},
+        }},
+        {RPCResult::Type::ARR, "observed_signal_txids", "Observed base-chain PoS signal transaction ids", {
+            {RPCResult::Type::STR_HEX, "", "Observed signal transaction id"},
+        }},
+        AmountUnitsResult(),
+        {RPCResult::Type::ARR, "payouts", "Synthetic payout page", {
+            ShadowRecordResult("", /*include_index=*/true),
+        }},
+    }};
+}
+
+RPCResult ShadowTransactionResult()
+{
+    std::vector<RPCResult> fields = ShadowRecordResultFields();
+    fields.emplace_back(RPCResult::Type::STR, "schema", "blackcoin.shadow.transaction.v1");
+    fields.emplace_back(RPCResult::Type::NUM, "confirmations", "Active-chain confirmations");
+    fields.push_back(AmountUnitsResult());
+    return RPCResult{RPCResult::Type::OBJ, "",
+                     "Versioned explorer-facing synthetic transaction record",
+                     std::move(fields)};
+}
+
+RPCResult ShadowHistoryResult(bool exact_script)
+{
+    std::vector<RPCResult> fields{
+        {RPCResult::Type::STR, "schema", exact_script
+            ? "blackcoin.shadow.script.v1" : "blackcoin.shadow.address.v1"},
+    };
+    if (!exact_script) {
+        fields.emplace_back(RPCResult::Type::STR, "address", "Normalized destination address");
+    }
+    fields.emplace_back(RPCResult::Type::STR_HEX, "scriptPubKey", "Exact destination script");
+    if (exact_script) {
+        fields.push_back(NullableRPCResult(RPCResult::Type::STR, "address",
+                                           "Decoded destination address, or null"));
+    }
+    fields.emplace_back(RPCResult::Type::NUM, "height", "Snapshot tip height");
+    fields.emplace_back(RPCResult::Type::STR_HEX, "bestblock", "Snapshot tip hash");
+    fields.emplace_back(RPCResult::Type::NUM, "count", "Records returned");
+    fields.push_back(CursorResult("next_cursor"));
+    if (exact_script) {
+        fields.emplace_back(RPCResult::Type::BOOL, "synthetic", "Always true for the history view");
+        fields.emplace_back(RPCResult::Type::BOOL, "merkle_included", "Always false for synthetic payouts");
+    }
+    fields.push_back(AmountUnitsResult());
+    fields.emplace_back(RPCResult::Type::ARR, "records", "Synthetic payout history", std::vector<RPCResult>{
+        ShadowRecordResult(),
+    });
+    return RPCResult{RPCResult::Type::OBJ, "",
+                     exact_script ? "Versioned exact-script history page"
+                                  : "Versioned address-history page",
+                     std::move(fields)};
+}
+
+RPCResult ShadowOutpointResult()
+{
+    std::vector<RPCResult> fields = ShadowRecordResultFields();
+    fields.emplace_back(RPCResult::Type::STR, "schema", "blackcoin.shadow.outpoint.v1");
+    fields.emplace_back(RPCResult::Type::STR, "lookup_index", "spent_outpoint or synthetic_transaction");
+    fields.emplace_back(RPCResult::Type::NUM, "height", "Snapshot tip height");
+    fields.emplace_back(RPCResult::Type::STR_HEX, "bestblock", "Snapshot tip hash");
+    fields.emplace_back(RPCResult::Type::NUM, "confirmations", "Active-chain confirmations");
+    fields.push_back(AmountUnitsResult());
+    return RPCResult{RPCResult::Type::OBJ, "", "Versioned synthetic outpoint record",
+                     std::move(fields)};
+}
+
+RPCResult QuantumWitnessInventoryResult()
+{
+    return RPCResult{RPCResult::Type::OBJ, "",
+                     "Versioned witness inventory, history coverage, and selected records page", {
+        {RPCResult::Type::STR, "schema", "blackcoin.quantum.witness_inventory.v1"},
+        {RPCResult::Type::NUM, "height", "Immutable UTXO snapshot height"},
+        {RPCResult::Type::STR_HEX, "bestblock", "Immutable UTXO snapshot block hash"},
+        {RPCResult::Type::STR, "view", "utxos or history"},
+        {RPCResult::Type::NUM, "offset", "Requested record offset"},
+        {RPCResult::Type::NUM, "count", "Records returned"},
+        NullableRPCResult(RPCResult::Type::NUM, "total_records",
+                          "Total records when the selected view completed, or null"),
+        NullableRPCResult(RPCResult::Type::NUM, "next_offset",
+                          "Next record offset, or null at the end"),
+        {RPCResult::Type::STR, "classification", "Inventory inclusion and classification contract"},
+        {RPCResult::Type::OBJ, "utxo_snapshot", "Independent UTXO snapshot commitment", {
+            {RPCResult::Type::STR, "algorithm", "Commitment algorithm"},
+            {RPCResult::Type::STR_HEX, "commitment", "Snapshot UTXO commitment"},
+            {RPCResult::Type::NUM, "txouts", "Committed ordinary UTXO count"},
+            {RPCResult::Type::BOOL, "excludes_authenticated_zero_value_protocol_markers", "Whether protocol markers are excluded"},
+        }},
+        {RPCResult::Type::OBJ, "current_utxos", "Exact current active-chain witness UTXO inventory", {
+            InventoryBucketResult("total"),
+            InventoryMapResult("by_version"),
+            InventoryMapResult("by_origin_group"),
+            InventoryMapResult("by_origin_phase"),
+            InventoryMapResult("by_version_and_origin"),
+            InventoryMapResult("by_bridge_handling"),
+            InventoryBucketResult("excluded_synthetic_shadow"),
+        }},
+        {RPCResult::Type::OBJ, "history", "Exact history aggregates when covered and complete", {
+            InventoryBucketResult("created", /*optional=*/true),
+            InventoryBucketResult("spent", /*optional=*/true),
+            InventoryBucketResult("unspent", /*optional=*/true),
+            InventoryMapResult("created_by_version", /*optional=*/true),
+            InventoryMapResult("spent_by_version", /*optional=*/true),
+            InventoryMapResult("created_by_origin_group", /*optional=*/true),
+            InventoryMapResult("created_by_version_and_origin", /*optional=*/true),
+        }},
+        {RPCResult::Type::OBJ, "coverage", "Snapshot and history coverage guarantees", {
+            {RPCResult::Type::BOOL, "snapshot_current_utxos_exact", "Whether the current UTXO inventory is exact"},
+            {RPCResult::Type::BOOL, "snapshot_tip_still_active", "Whether the immutable snapshot remained the active tip"},
+            {RPCResult::Type::BOOL, "snapshot_utxo_commitment_exact", "Whether the UTXO commitment is exact"},
+            {RPCResult::Type::BOOL, "snapshot_includes_mempool", "Always false"},
+            {RPCResult::Type::BOOL, "snapshot_includes_synthetic_shadow_outputs", "Always false; authenticated synthetic outputs are counted separately"},
+            {RPCResult::Type::BOOL, "history_index_enabled", "Whether shadowindex is enabled"},
+            {RPCResult::Type::BOOL, "history_index_synced_to_current_chain", "Whether shadowindex reported synchronized"},
+            NullableRPCResult(RPCResult::Type::NUM, "history_index_tip_height",
+                              "Synchronized history index tip height, or null"),
+            NullableRPCResult(RPCResult::Type::STR_HEX, "history_index_tip_hash",
+                              "Synchronized history index tip hash, or null"),
+            {RPCResult::Type::BOOL, "history_snapshot_tip_covered", "Whether history covers the immutable UTXO snapshot"},
+            NullableRPCResult(RPCResult::Type::NUM, "history_creation_start_height",
+                              "First covered creation height, or null"),
+            {RPCResult::Type::BOOL, "history_includes_spent_creations", "Whether spent creations are covered"},
+            {RPCResult::Type::BOOL, "history_scan_complete", "Whether the bounded history scan completed"},
+            {RPCResult::Type::BOOL, "history_aggregates_exact", "Whether history aggregates are exact"},
+            {RPCResult::Type::NUM, "history_database_records_scanned", "History database records visited"},
+            {RPCResult::Type::NUM, "history_stale_branch_records_ignored", "Stale-branch records ignored"},
+            NullableRPCResult(RPCResult::Type::BOOL, "history_reconciles_current_utxos",
+                              "Whether exact history reconciles to current UTXOs, or null"),
+        }},
+        AmountUnitsResult(),
+        {RPCResult::Type::ARR, "records", "Selected current-UTXO or history page", {
+            WitnessRecordResult(),
+        }},
+    }};
+}
+
+RPCResult ShadowSupplyResult()
+{
+    return RPCResult{RPCResult::Type::OBJ, "",
+                     "Versioned explorer-facing shadow supply record", {
+        {RPCResult::Type::STR, "schema", "blackcoin.shadow.supply.v1"},
+        {RPCResult::Type::STR, "lifecycle_schema", "blackcoin.shadow.supply.lifecycle.v1"},
+        {RPCResult::Type::STR, "accounting_scope", "Synthetic-only accounting scope"},
+        {RPCResult::Type::BOOL, "synthetic", "Always true for this supply scope"},
+        {RPCResult::Type::BOOL, "merkle_included", "Always false for synthetic payouts"},
+        {RPCResult::Type::NUM, "height", "Snapshot tip height"},
+        {RPCResult::Type::STR_HEX, "bestblock", "Snapshot tip hash"},
+        {RPCResult::Type::NUM, "evaluation_height", "Next-block lifecycle evaluation height"},
+        {RPCResult::Type::STR, "phase", "Lifecycle phase at the evaluation height"},
+        {RPCResult::Type::NUM, "issued_count", "Authenticated issued payout count"},
+        {RPCResult::Type::STR_AMOUNT, "issued_nominal_amount", "Authenticated issued value in BLK"},
+        {RPCResult::Type::NUM, "spent_count", "Authenticated spent payout count"},
+        {RPCResult::Type::STR_AMOUNT, "spent_nominal_amount", "Spent nominal value in BLK"},
+        {RPCResult::Type::STR_AMOUNT, "spent_effective_amount", "Effective spent value in BLK"},
+        {RPCResult::Type::STR_AMOUNT, "spent_decayed_amount", "Demurrage removed from spent value in BLK"},
+        {RPCResult::Type::STR_AMOUNT, "spent_burned_amount", "Compatibility alias for spent_decayed_amount"},
+        {RPCResult::Type::NUM, "unspent_count", "Authenticated unspent payout count"},
+        {RPCResult::Type::STR_AMOUNT, "unspent_nominal_amount", "Unspent nominal value in BLK"},
+        {RPCResult::Type::BOOL, "demurrage_active", "Whether demurrage applies at the evaluation height"},
+        {RPCResult::Type::BOOL, "effective_scan_requested", "Whether a bounded effective-value scan was authorized"},
+        {RPCResult::Type::NUM, "effective_scan_records", "Payout records visited by that scan"},
+        {RPCResult::Type::BOOL, "effective_amount_exact", "Whether effective and projected burn amounts are exact"},
+        NullableRPCResult(RPCResult::Type::STR_AMOUNT, "unspent_effective_amount",
+                          "Exact unspent effective value in BLK, or null"),
+        NullableRPCResult(RPCResult::Type::STR_AMOUNT, "unspent_decayed_amount",
+                          "Exact unspent demurrage value in BLK, or null"),
+        NullableRPCResult(RPCResult::Type::STR_AMOUNT, "unspent_projected_burn_amount",
+                          "Projected unspent consensus burn in BLK, or null"),
+        {RPCResult::Type::OBJ, "schedule", "Fixed Gold Rush reward schedule reconciliation", {
+            {RPCResult::Type::NUM, "start_height", "First reward height"},
+            {RPCResult::Type::NUM, "end_height", "Last reward height"},
+            {RPCResult::Type::STR_AMOUNT, "total_amount", "Total scheduled reward in BLK"},
+            {RPCResult::Type::STR_AMOUNT, "through_height_amount", "Scheduled amount through the snapshot height"},
+            {RPCResult::Type::STR_AMOUNT, "accrued_amount", "Issued plus pooled amount in BLK"},
+            {RPCResult::Type::STR_AMOUNT, "unaccrued_amount", "Scheduled amount not yet accrued in BLK"},
+        }},
+        {RPCResult::Type::OBJ, "pool", "Outstanding reward-pool state", {
+            {RPCResult::Type::STR_AMOUNT, "amount", "Combined pool amount in BLK"},
+            {RPCResult::Type::STR_AMOUNT, "pow_amount", "POW pool amount in BLK"},
+            {RPCResult::Type::STR_AMOUNT, "pos_amount", "PoS pool amount in BLK"},
+            {RPCResult::Type::BOOL, "claimable_next_block", "Whether the pool remains claimable in the next block"},
+            {RPCResult::Type::STR_AMOUNT, "claimable_amount", "Amount claimable in the next block"},
+            {RPCResult::Type::STR_AMOUNT, "expired_unissued_amount", "Unissued amount expired after the reward window"},
+        }},
+        {RPCResult::Type::OBJ, "lifecycle", "Mutually exclusive unspent synthetic payout buckets", {
+            {RPCResult::Type::BOOL, "classification_exact", "Whether all lifecycle buckets are exact"},
+            {RPCResult::Type::NUM, "records_scanned", "Payout records visited"},
+            NullableRPCResult(RPCResult::Type::NUM, "locked_count", "Total locked count, or null"),
+            NullableRPCResult(RPCResult::Type::STR_AMOUNT, "locked_nominal_amount", "Locked nominal amount, or null"),
+            NullableRPCResult(RPCResult::Type::STR_AMOUNT, "locked_effective_amount", "Locked effective amount, or null"),
+            NullableRPCResult(RPCResult::Type::STR_AMOUNT, "locked_burned_amount", "Locked burned amount, or null"),
+            NullableRPCResult(RPCResult::Type::NUM, "spendable_count", "Spendable count, or null"),
+            NullableRPCResult(RPCResult::Type::STR_AMOUNT, "spendable_nominal_amount", "Spendable nominal amount, or null"),
+            NullableRPCResult(RPCResult::Type::STR_AMOUNT, "spendable_effective_amount", "Spendable effective amount, or null"),
+            NullableRPCResult(RPCResult::Type::STR_AMOUNT, "spendable_burned_amount", "Spendable burned amount, or null"),
+            ShadowLifecycleBucketResult("synthetic_immature"),
+            ShadowLifecycleBucketResult("synthetic_mature_gold_rush_locked"),
+            ShadowLifecycleBucketResult("migration_spendable_direct_quantum"),
+            ShadowLifecycleBucketResult("demurrage_locked"),
+            {RPCResult::Type::NUM, "expired_payout_count", "Always zero; issued payouts do not expire"},
+            {RPCResult::Type::STR_AMOUNT, "expired_payout_nominal_amount", "Always zero in BLK"},
+            {RPCResult::Type::STR, "payout_expiration_policy", "Issued-payout expiration policy"},
+        }},
+        {RPCResult::Type::OBJ, "burn", "Realized and projected demurrage burn", {
+            {RPCResult::Type::STR_AMOUNT, "realized_amount", "Burn realized by spends in BLK"},
+            NullableRPCResult(RPCResult::Type::STR_AMOUNT, "projected_unspent_amount",
+                              "Projected unspent burn in BLK, or null"),
+            NullableRPCResult(RPCResult::Type::STR_AMOUNT, "projected_total_amount",
+                              "Realized plus projected burn in BLK, or null"),
+            {RPCResult::Type::STR, "disposition", "Consensus disposition"},
+        }},
+        {RPCResult::Type::OBJ, "legacy", "Explicit exclusion of legacy UTXOs from this scope", {
+            {RPCResult::Type::BOOL, "included", "Always false"},
+            NullableRPCResult(RPCResult::Type::STR_AMOUNT, "spendable_amount", "Always null in this scope"),
+            NullableRPCResult(RPCResult::Type::STR_AMOUNT, "locked_amount", "Always null in this scope"),
+            {RPCResult::Type::STR, "source_rpc", "RPC that reports combined legacy circulation"},
+            {RPCResult::Type::STR, "reason", "Scope exclusion explanation"},
+        }},
+        {RPCResult::Type::STR, "decay_disposition", "burned_by_consensus"},
+        {RPCResult::Type::BOOL, "decay_paid_as_fee", "Always false"},
+        {RPCResult::Type::BOOL, "decay_redistributed", "Always false"},
+        AmountUnitsResult(),
+    }};
+}
+
 RPCHelpMan getshadowblock()
 {
     return RPCHelpMan{
@@ -534,8 +1028,7 @@ RPCHelpMan getshadowblock()
             {"claim_offset", RPCArg::Type::NUM, RPCArg::Default{0}, "Zero-based canonical POW-claim accounting offset"},
             {"claim_count", RPCArg::Type::NUM, RPCArg::Default{MAX_SHADOW_CLAIM_PAGE_SIZE}, "Maximum POW-claim records to return (1-64)"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing shadow block record",
-            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
+        ShadowBlockResult(),
         RPCExamples{
             HelpExampleCli("getshadowblock", "5950003") +
             HelpExampleRpc("getshadowblock", "5950003, 0, 100")
@@ -719,8 +1212,7 @@ RPCHelpMan getshadowtransaction()
         "getshadowtransaction",
         "Returns one deterministic synthetic shadow-ledger payout and its active-chain origin/spend status.\n",
         {{"synthetic_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Synthetic payout transaction id"}},
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing synthetic transaction record",
-            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
+        ShadowTransactionResult(),
         RPCExamples{
             HelpExampleCli("getshadowtransaction", "\"txid\"") +
             HelpExampleRpc("getshadowtransaction", "\"txid\"")
@@ -762,8 +1254,7 @@ RPCHelpMan getshadowaddress()
             {"after_txid", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"null"}, "Exclusive cursor synthetic transaction id; provide with after_height"},
             {"count", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_SHADOW_PAGE_SIZE}, "Maximum records to return (1-1000)"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned address-history page",
-            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
+        ShadowHistoryResult(/*exact_script=*/false),
         RPCExamples{
             HelpExampleCli("getshadowaddress", "\"blk1...\"") +
             HelpExampleCli("getshadowaddress", "\"blk1...\" 5950003 \"txid\" 100")
@@ -856,8 +1347,7 @@ RPCHelpMan getshadowscript()
             {"after_txid", RPCArg::Type::STR_HEX, RPCArg::DefaultHint{"null"}, "Exclusive cursor synthetic transaction id; provide with after_height"},
             {"count", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_SHADOW_PAGE_SIZE}, "Maximum records to return (1-1000)"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned exact-script history page",
-            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
+        ShadowHistoryResult(/*exact_script=*/true),
         RPCExamples{
             HelpExampleCli("getshadowscript", "\"5120...\"") +
             HelpExampleCli("getshadowscript", "\"5120...\" 5950003 \"txid\" 100")
@@ -954,8 +1444,7 @@ RPCHelpMan getshadowoutpoint()
             {"txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Synthetic payout transaction id"},
             {"vout", RPCArg::Type::NUM, RPCArg::Optional::NO, "Synthetic payout output index"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned synthetic outpoint record",
-            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
+        ShadowOutpointResult(),
         RPCExamples{
             HelpExampleCli("getshadowoutpoint", "\"txid\" 0") +
             HelpExampleRpc("getshadowoutpoint", "\"txid\", 0")
@@ -1021,8 +1510,7 @@ RPCHelpMan getquantumwitnessinventory()
             {"count", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_SHADOW_PAGE_SIZE}, "Maximum records to return (1-1000)"},
             {"max_history_records", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_EFFECTIVE_SCAN_LIMIT}, "Hard cap for historical index reconciliation (1-10000000)"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned witness inventory, history coverage, and selected records page",
-            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
+        QuantumWitnessInventoryResult(),
         RPCExamples{
             HelpExampleCli("getquantumwitnessinventory", "") +
             HelpExampleCli("getquantumwitnessinventory", "\"history\" 0 100")
@@ -1455,8 +1943,7 @@ RPCHelpMan getshadowsupply()
             {"include_effective", RPCArg::Type::BOOL, RPCArg::Default{true}, "Run the bounded per-payout scan when current lifecycle or demurrage values require it"},
             {"max_records", RPCArg::Type::NUM, RPCArg::Default{DEFAULT_EFFECTIVE_SCAN_LIMIT}, "Hard cap for a lifecycle/effective-value scan (1-10000000)"},
         },
-        RPCResult{RPCResult::Type::OBJ, "", "Versioned explorer-facing shadow supply record",
-            {{RPCResult::Type::ELISION, "", "Fields are defined by the top-level schema discriminator"}}},
+        ShadowSupplyResult(),
         RPCExamples{
             HelpExampleCli("getshadowsupply", "") +
             HelpExampleRpc("getshadowsupply", "")
