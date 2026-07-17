@@ -25,13 +25,14 @@ Production release identity
 
 Only the annotated unsigned `v30.1.1` tag enters the production path. The exact
 tagged commit must be configured with release-candidate zero and
-`CLIENT_VERSION_IS_RELEASE=true`, pass the complete exact-SHA matrix, and carry
-the fresh protected resource and mainnet witness-inventory authorizations.
+`CLIENT_VERSION_IS_RELEASE=true` and pass the complete exact-SHA matrix.
 Production publication also requires the protected `production-release`
 environment, recorded release-control verification, the exact unsigned-final
 acknowledgement, two-builder reproducibility, unsigned checksums and manifest,
 an SPDX SBOM, in-toto provenance, and GitHub OIDC attestations. Third-party
-human release approval is not required.
+human release approval is not required. Live shadow-resource and mainnet
+witness-inventory evidence is optional post-release qualification and is not
+included in the production bundle unless separately published later.
 The protected acknowledgement value is
 `I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES`.
 
@@ -421,9 +422,9 @@ sanitizer or changing CRC32C results.
 - Release SBOMs consume the fail-closed dependency security manifest, including
   resolved native/target aliases and every Qt source archive, so reviewed
   dependency sources are emitted with HTTPS provenance and SHA-256 values.
-- Production publication also requires a successful exact-SHA paired
-  shadow-resource artifact. A deterministic full-epoch incremental
-  shadow-family workload measures all 179,771,400 fixture claims plus two
+- The optional exact-SHA paired shadow-resource workflow runs a deterministic
+  full-epoch incremental shadow-family workload that measures all 179,771,400
+  fixture claims plus two
   complete 541,701,000-record scans, 199,800 maximum-size QQPROOFS buckets,
   and 372,327,984 point lookups; a separately labeled
   current-live mainnet fixture measures production replay and lifecycle
@@ -439,11 +440,14 @@ sanitizer or changing CRC32C results.
   rejects scaled, stale, scope-mismatched, or manifest-mismatched evidence and
   fails if measurements require an authenticated compaction protocol that is
   not implemented. Terminal combined-chainstate and full-cardinality
-  production-RPC qualification remain open under roadmap issue #13.
-- Production publication independently requires the protected exact-source
-  mainnet quantum-witness inventory. Its connected-tip snapshot, UTXO MuHash,
-  complete value-bearing witness-v2-through-v16 records, and live shadow
-  reconciliation must agree. The artifact must be fresh and derived from the
+  production-RPC qualification remain open under roadmap issue #13. Missing
+  runner paths, capture inputs, maturity, or artifacts do not block
+  publication and leave #13's live qualification incomplete.
+- The optional exact-source mainnet quantum-witness workflow can validate that
+  a connected-tip snapshot, UTXO MuHash, complete value-bearing
+  witness-v2-through-v16 records, and live shadow reconciliation agree. The
+  artifact must be fresh and derived from the
   final daemon and CLI, with either a zero bridge-review set or an approved
-  exact-snapshot disposition for every review outpoint. Missing, stale,
-  tampered, or scope-mismatched evidence fails closed.
+  exact-snapshot disposition for every review outpoint. Missing evidence does
+  not block publication; when the optional workflow is run, stale, tampered,
+  or scope-mismatched evidence fails its qualification.

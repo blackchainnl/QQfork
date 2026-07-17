@@ -1296,8 +1296,11 @@ class ReleaseToolTests(unittest.TestCase):
                 with self.subTest(workflow=workflow.name, line=line_number):
                     self.assertRegex(match.group(1), immutable)
 
-    def test_final_release_requires_exact_mainnet_witness_artifact(self):
+    def test_live_mainnet_evidence_is_optional_and_source_bound(self):
         root = TOOLS.parent.parent
+        shadow = (
+            root / ".github" / "workflows" / "shadow-resource-production.yml"
+        ).read_text(encoding="utf-8")
         witness = (
             root / ".github" / "workflows" / "quantum-witness-inventory.yml"
         ).read_text(encoding="utf-8")
@@ -1305,42 +1308,34 @@ class ReleaseToolTests(unittest.TestCase):
             root / ".github" / "workflows" / "build.yml"
         ).read_text(encoding="utf-8")
 
-        # A dispatch from another ref cannot attest the requested candidate.
-        self.assertIn("ref: ${{ inputs.target_sha }}", witness)
-        self.assertIn('test "$(git rev-parse HEAD)" = "$TARGET_SHA"', witness)
-        self.assertIn('test "$GITHUB_WORKFLOW_SHA" = "$TARGET_SHA"', witness)
-        self.assertIn("environment: production-resource-evidence", witness)
-        self.assertIn(
-            "runs-on: [self-hosted, linux, x64, blackcoin-shadow-resource]",
-            witness,
-        )
+        # Optional live-evidence runs remain fail-closed and cannot attest a
+        # candidate other than the exact source used by their workflow code.
+        for workflow in (shadow, witness):
+            self.assertIn("ref: ${{ inputs.target_sha }}", workflow)
+            self.assertIn(
+                'test "$(git rev-parse HEAD)" = "$TARGET_SHA"', workflow
+            )
+            self.assertIn('test "$GITHUB_WORKFLOW_SHA" = "$TARGET_SHA"', workflow)
+            self.assertIn("environment: production-resource-evidence", workflow)
+            self.assertIn(
+                "runs-on: [self-hosted, linux, x64, blackcoin-shadow-resource]",
+                workflow,
+            )
 
-        artifact_name = "quantum-witness-mainnet-inventory-$TARGET_SHA"
-        self.assertIn(artifact_name, release)
-        self.assertIn(
-            "sort -t $'\\t' -k2,2nr -k1,1nr",
-            release,
-        )
-        self.assertIn('test -n "$artifact" || {', release)
-        self.assertIn(
-            'test "$run_path" = '
-            '".github/workflows/quantum-witness-inventory.yml"',
-            release,
-        )
-        self.assertIn('test "$run_result" = success', release)
-        self.assertIn('test "$run_sha" = "$TARGET_SHA"', release)
-        self.assertIn('test "$run_event" = workflow_dispatch', release)
-        self.assertIn('test "$run_actor" = Blackcoin-Dev', release)
-        self.assertIn('test "$triggering_actor" = Blackcoin-Dev', release)
-        self.assertIn("--maximum-age-seconds 86400", release)
-        self.assertIn("verify_quantum_witness_inventory_evidence.py", release)
-        self.assertIn("--blackcoind \"$bundled_blackcoind\"", release)
-        self.assertIn("--blackcoin-cli \"$bundled_cli\"", release)
-        self.assertIn('cmp "$authorization" "$recomputed"', release)
-        self.assertIn(
+        # Publication is deliberately independent of missing runners, capture
+        # paths, immature observation windows, and absent live artifacts.
+        for forbidden in (
+            "quantum-shadow-production-resources-$TARGET_SHA",
+            "quantum-witness-mainnet-inventory-$TARGET_SHA",
+            "SHADOW_PRODUCTION_DIR",
+            "WITNESS_INVENTORY_DIR",
+            "verify_shadow_resource_production_evidence.py",
+            "verify_quantum_witness_inventory_evidence.py",
+            "Blackcoin-$VERSION-shadow-resource-live.json",
             "Blackcoin-$VERSION-quantum-witness-authorization.json",
-            release,
-        )
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, release)
 
     def test_mixed_version_command_runner_executes_all_commands(self):
         builder = load_mixed_version_module("build_previous_releases")

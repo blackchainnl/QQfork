@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or https://opensource.org/license/mit/.
-"""Verify exact-source mainnet quantum-witness release evidence offline."""
+"""Verify optional exact-source mainnet quantum-witness evidence offline."""
 
 import argparse
 import copy
@@ -33,7 +33,7 @@ SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 class VerificationError(RuntimeError):
-    """The evidence does not authorize production publication."""
+    """The evidence does not satisfy optional live qualification."""
 
 
 def require(condition, message):
@@ -107,7 +107,7 @@ def verify_capture_manifest(manifest, contract, *, contract_sha256,
     require(isinstance(maximum_age_seconds, int) and maximum_age_seconds > 0,
             "maximum capture age is invalid")
     require(age <= maximum_age_seconds,
-            "mainnet witness inventory capture is stale for production publication")
+            "mainnet witness inventory capture is stale for live qualification")
 
     height = manifest["end_height"]
     require(isinstance(height, int) and not isinstance(height, bool) and

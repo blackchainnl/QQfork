@@ -13,9 +13,11 @@ launch signatures and are not notarized.
 Use only the immutable release after verifying its text and JSON
 `UNSIGNED-PRODUCTION` notices, exact source commit, unsigned SHA256 checksum
 manifest, two-builder reproducibility report, SPDX SBOM, in-toto provenance,
-GitHub OIDC attestations, and protected mainnet evidence. These controls detect
-substitution and improve traceability; they are not a Blackcoin-Dev package
-signature.
+and GitHub OIDC attestations. These controls detect substitution and improve
+traceability; they are not a Blackcoin-Dev package signature. Separately
+published exact-source live-mainnet evidence is optional post-release
+qualification and must not be treated as present unless its strict verifier
+succeeds.
 
 ## Protocol Safety Boundaries
 
@@ -60,11 +62,11 @@ wallet recognition, ordinary wallet rebroadcast may continue across restart.
 
 Optional circulating-supply scans do not gate validation or consensus. They
 are single-flight, bounded, cancellable diagnostics with a non-overridable
-integrity floor and storage reserve. Production publication separately
-requires a protected, fresh, exact-source mainnet witness inventory tied to a
-connected-tip UTXO MuHash and live shadow reconciliation. A missing, stale,
-tampered, scope-mismatched, or incompletely dispositioned artifact blocks
-publication.
+integrity floor and storage reserve. A protected, fresh, exact-source mainnet
+witness inventory tied to a connected-tip UTXO MuHash and live shadow
+reconciliation remains available as optional post-release qualification.
+Missing runners, capture paths, maturity, or artifacts do not block
+publication; they leave that live-mainnet qualification incomplete.
 
 ## Reporting a Vulnerability
 

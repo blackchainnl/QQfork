@@ -408,8 +408,9 @@ PINNED_RETENTION = {
         "maximum-observed physical amplification, obsolete-file retention, "
         "or measured forced-compaction reclaim crosses its pinned budget. "
         "Periodic sampling is not asserted as an unseen transient upper "
-        "bound. The release gate fails when compaction is required but no "
-        "separately authenticated compaction protocol is implemented."
+        "bound. Optional evidence qualification fails when compaction is "
+        "required but no separately authenticated compaction protocol is "
+        "implemented."
     ),
 }
 

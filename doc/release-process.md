@@ -119,9 +119,11 @@ prerequisite.
 
 This single-operator policy does not relax the technical release gates. The
 operator must preserve the exact source SHA, protected branch and tag rules,
-publisher-unsigned acknowledgement, protected resource evidence, two isolated
-byte-for-byte builds, attestations, and immutable release controls. A skipped,
-stale, canceled, neutral, or failed mandatory gate still blocks publication.
+publisher-unsigned acknowledgement, two isolated byte-for-byte builds,
+attestations, and immutable release controls. A skipped, stale, canceled,
+neutral, or failed mandatory build or test gate still blocks publication.
+Live shadow-resource and mainnet witness evidence is optional post-release
+qualification and is not a publication gate.
 
 ## One-time repository controls
 
@@ -146,11 +148,10 @@ before the production tag is pushed:
    `I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES`.
    Do not expose the protected environment to pull requests. The workflow
    checks the value both before assembly and inside the publication job.
-   Configure the separate `production-resource-evidence` environment and its
-   protected self-hosted runner paths before final qualification. It supplies
-   the immutable connected-tip manifest/archive/state-root paths used by both
-   the shadow-resource and quantum-witness gates, plus an exact per-outpoint
-   disposition path only when the witness review set is nonzero.
+   The separate `production-resource-evidence` environment, self-hosted runner,
+   capture paths, and witness dispositions are needed only when an operator
+   elects to run optional post-release live qualification. Their absence does
+   not block v30.1.1 publication.
 6. Publish the same publisher-unsigned warning through a project-controlled
    Blackcoin communication channel. Do not advertise an OpenPGP,
    Authenticode, Developer ID, or notarization identity that does not exist.
@@ -181,7 +182,9 @@ signature.
 
 1. Freeze release scope. Resolve or explicitly defer every roadmap item.
    Production v30.1.1 requires all P0/P1 acceptance conditions assigned to the
-   release; an alpha does not waive that production requirement.
+   release except the explicitly optional post-release live qualification for
+   issues #13 and #14; an alpha does not waive any mandatory production
+   requirement.
 2. Set `configure.ac` to version 30.1.1 with release candidate `0` and
    `_CLIENT_VERSION_IS_RELEASE` set to `true` only for the final production
    commit. Alpha and beta sources retain a nonzero release-candidate number
@@ -236,10 +239,11 @@ signature.
    reproduce every selected artifact byte for byte. Verify the unsigned
    checksum manifest and its `prerelease_channel=beta` binding.
 4. Record that the protected exact-final-SHA shadow-resource and mainnet
-   quantum-witness workflows are production-release gates, not public-beta
-   promotion gates. A beta must not claim that either final-production gate
-   passed. If exact-SHA evidence already exists, preserve it without treating
-   it as a substitute for the beta canary and replay requirements.
+   quantum-witness workflows are optional post-release qualification, not
+   public-beta or production-publication gates. A beta must not claim that
+   either live qualification passed. If exact-SHA evidence already exists,
+   preserve it without treating it as a substitute for the beta canary and
+   replay requirements.
 5. Install one isolated canary with verified wallet and datadir backups. Run
    the two-start upgrade, replay/reindex, restart, staking, wallet, GUI, and
    rollback checks required by the beta plan before any broader testing.
@@ -372,9 +376,13 @@ The release record must contain:
 - unsigned checksum manifest and `UNSIGNED-PRODUCTION` metadata, SBOM, in-toto
   provenance, Windows no-Authenticode verification, macOS ad-hoc signature
   verification, and GitHub OIDC attestation output;
-- repository rules and protected-environment configuration evidence; and
+- repository rules and `production-release` environment configuration
+  evidence; and
 - the rollback rehearsal record and designated incident contacts.
 
 Production v30.1.1 remains blocked if any required item is absent or if the
 exact protected unsigned-final acknowledgement is absent. Third-party review
-is not a required completion item.
+is not a required completion item. A registered live-evidence runner, capture
+paths, 10,000-block/seven-day maturity, and shadow/witness evidence artifacts
+are not required completion items; they remain optional post-release
+qualification.

@@ -160,6 +160,8 @@ compiled artifact is not the reviewed published release. Blackcoin-Dev has no
 OpenPGP, Authenticode, Apple Developer ID, or notarization credentials for
 v30.1.1. Operators should use only published binaries whose exact source
 commit, annotated tag, `UNSIGNED-PRODUCTION` notices, unsigned checksums,
-two-builder reproducibility report, SBOM, provenance, GitHub attestations, and
-protected mainnet evidence verify, and should retain verified wallet backups
-throughout the transition.
+two-builder reproducibility report, SBOM, provenance, and GitHub attestations
+verify, and should retain verified wallet backups throughout the transition.
+Exact-source live-mainnet shadow-resource and witness evidence may be
+published later as optional qualification; its absence does not block the
+release and must not be read as evidence that the live checks passed.

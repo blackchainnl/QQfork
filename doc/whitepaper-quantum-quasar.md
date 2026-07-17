@@ -909,11 +909,12 @@ that help nearly effortless, and burns realized decay rather than redistributing
   snapshot, overflow, shutdown, or cancellation protections. A successful qualification
   is fixed-height and host-scoped and reports `universal_consensus_bound=false`.
 
-- **Production witness evidence is exact-source and fail-closed.** The release gate binds
-  the final daemon and CLI to a fresh connected-tip mainnet UTXO MuHash, complete
-  value-bearing witness-v2-through-v16 inventory, and same-tip shadow reconciliation.
-  Publication requires either no bridge-review outpoints or an approved disposition for
-  every such outpoint. Missing, stale, or mismatched evidence is not authorization.
+- **Live witness evidence is optional post-release qualification.** When run, the
+  exact-source gate binds the final daemon and CLI to a fresh connected-tip mainnet UTXO
+  MuHash, complete value-bearing witness-v2-through-v16 inventory, and same-tip shadow
+  reconciliation. It requires either no bridge-review outpoints or an approved disposition
+  for every such outpoint. Missing runners, capture paths, maturity, or evidence do not
+  block publication and must not be represented as a successful live qualification.
 
 - **Consensus compatibility is paramount.** Mainnet's whitelist height (5,945,000), Gold
   Rush boundaries (5,950,000 through 6,192,999), Migration boundaries (6,193,000 through

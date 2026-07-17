@@ -45,11 +45,12 @@
   progress-reporting, and cooperatively cancellable. The daemon, CLI RPC, and
   Qt resource guidance expose the same scoped qualification and refusal state;
   one-call consent cannot bypass critical integrity or storage protections.
-- Final publication is fail-closed on a protected exact-source mainnet witness
-  inventory. The artifact must bind the final binaries and connected-tip UTXO
-  MuHash to a complete value-bearing witness-v2-through-v16 inventory and live
-  shadow reconciliation, with either a zero bridge-review set or an approved
-  disposition for every review outpoint.
+- Optional post-release qualification can bind the exact final binaries and a
+  connected-tip UTXO MuHash to a complete value-bearing
+  witness-v2-through-v16 inventory and live shadow reconciliation. Its strict
+  verifier requires either a zero bridge-review set or an approved disposition
+  for every review outpoint. Missing live evidence does not block publication
+  and must not be represented as a successful qualification.
 
 ## v30.1.0, Quantum Quasar production release
 

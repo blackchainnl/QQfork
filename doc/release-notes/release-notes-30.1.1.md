@@ -24,9 +24,11 @@ Read `Blackcoin-30.1.1-UNSIGNED-PRODUCTION.txt` and its machine-readable JSON
 manifest. Record the exact source commit, then verify every file in the
 unsigned `SHA256SUMS.txt`. Inspect the two-builder reproducibility report, SPDX
 SBOM, in-toto provenance, GitHub OIDC build-provenance and SBOM attestations,
-exact-source resource evidence, and mainnet quantum-witness inventory. These
-controls detect substitution and improve traceability; they are not a
-Blackcoin-Dev package signature.
+and the packaged resource benchmarks. These controls detect substitution and
+improve traceability; they are not a Blackcoin-Dev package signature. Inspect
+exact-source live shadow-resource evidence and the
+connected-tip mainnet witness inventory only if they are separately published
+as optional post-release qualification.
 
 ## Mandatory upgrade procedure
 
@@ -127,7 +129,7 @@ one-click conflict broadcast.
 - Theme, palette, contrast, and runtime theme-transition fixes make light and
   dark modes readable across the primary wallet surfaces.
 
-## Resource and publication gates
+## Resource diagnostics and optional live validation
 
 Optional full circulating-supply scans are single-flight, bounded,
 progress-reporting, and cooperatively cancellable. Inspect
@@ -138,14 +140,15 @@ snapshot checks, overflow protection, shutdown, or cancellation. A successful
 qualification is fixed-height and host-scoped and reports
 `universal_consensus_bound=false`.
 
-The publisher-unsigned release bundle must contain fresh exact-source
-production resource evidence and an exact-source
-connected-tip mainnet witness inventory. The
-witness artifact binds the release daemon and CLI, UTXO MuHash, complete
-value-bearing witness-v2-through-v16 inventory, and live shadow reconciliation,
-with either no bridge-review outpoints or an approved disposition for every
-outpoint. Missing, stale, tampered, scope-mismatched, or incomplete evidence is
-not release authorization.
+The separate live-evidence workflows can bind the exact release daemon and CLI
+to current-mainnet physical resource observations, a connected-tip UTXO
+MuHash, the complete value-bearing witness-v2-through-v16 inventory, and live
+shadow reconciliation. Their strict verifiers require fresh, scope-matched
+evidence and either no bridge-review outpoints or an approved disposition for
+every outpoint. These workflows are optional post-release qualification.
+Missing runners, capture paths, 10,000-block/seven-day maturity, or artifacts
+do not block publication and leave the corresponding live qualification
+incomplete.
 
 See [TRANSITION_GUIDE.md](../../TRANSITION_GUIDE.md), the
 [detailed release notes](../release-notes.md), and the

@@ -717,6 +717,7 @@ def check_final_release_identity(root, failures):
         "createshadowpowclaimresolution",
         "getshadowresourceinfo",
         "connected-tip mainnet witness inventory",
+        "optional post-release qualification",
     ):
         require_fragment(
             failures,
