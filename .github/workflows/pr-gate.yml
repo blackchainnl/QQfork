@@ -19,7 +19,7 @@ on:
         type: boolean
         default: false
       corrective_fast_path:
-        description: Reuse the recorded v30.1.1 core gate for a release-tool-only corrective source
+        description: Reuse reviewed historical core evidence for a metadata/signature-only correction
         required: false
         type: boolean
         default: false
@@ -40,7 +40,7 @@ on:
         type: boolean
         default: false
       corrective_fast_path:
-        description: Reuse the recorded v30.1.1 core gate for a release-tool-only corrective source
+        description: Reuse reviewed historical core evidence for a metadata/signature-only correction
         required: false
         type: boolean
         default: false
@@ -153,6 +153,7 @@ jobs:
 
   crypto-source-provenance:
     name: pinned independent quantum crypto provenance
+    if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 20
     steps:
@@ -184,6 +185,7 @@ jobs:
 
   native-build-and-unit:
     name: pinned native build and unit tests
+    if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 120
     steps:
@@ -250,6 +252,7 @@ jobs:
 
   resource-benchmarks-linux:
     name: measured worst-case quantum crypto resources (Linux x86_64)
+    if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
     needs: native-build-and-unit
     runs-on: ubuntu-22.04
     timeout-minutes: 30
@@ -310,7 +313,7 @@ jobs:
 
   native-linux-arm64-crypto:
     name: Linux ARM64 native cryptographic vectors and resources
-    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
     env:
@@ -475,7 +478,7 @@ jobs:
 
   windows-crypto-cross-build:
     name: Build pinned Windows x86_64 vector binaries
-    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     runs-on: ubuntu-22.04
     timeout-minutes: 300
     env:
@@ -543,7 +546,7 @@ jobs:
 
   native-windows-crypto:
     name: Windows x86_64 native cryptographic vectors and resources
-    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     needs: windows-crypto-cross-build
     runs-on: windows-2025
     timeout-minutes: 180
@@ -623,7 +626,7 @@ jobs:
 
   native-macos-crypto:
     name: ${{ matrix.name }} native cryptographic vectors
-    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 240
     strategy:

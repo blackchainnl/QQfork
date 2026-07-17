@@ -1,4 +1,4 @@
-name: v30.1.2 corrective release build
+name: v30.1.3 signed corrective release build
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       package_label:
         description: Explicit unpublished prerelease label (must match source RC)
         required: true
-        default: 30.1.2-alpha1
+        default: 30.1.3-alpha1
         type: string
       target:
         description: Build target to run (manual runs never publish)
@@ -27,13 +27,13 @@ on:
           - macos-arm-64-bit
   push:
     tags:
-      - 'v30.1.2'
+      - 'v30.1.3'
 
 permissions:
   contents: read
 
 concurrency:
-  group: v30.1.2-release-${{ github.ref }}
+  group: v30.1.3-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -68,6 +68,7 @@ jobs:
           REQUESTED_TARGET: ${{ inputs.target }}
           CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
           EVENT_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           TARGET_SHA=$(git rev-parse HEAD)
@@ -78,8 +79,8 @@ jobs:
           RC=$(sed -n "s/^define(_CLIENT_VERSION_RC, \([0-9]*\))$/\1/p" configure.ac)
           IS_RELEASE=$(sed -n "s/^define(_CLIENT_VERSION_IS_RELEASE, \(.*\))$/\1/p" configure.ac)
           BASE_VERSION="$MAJOR.$MINOR.$BUILD"
-          test "$BASE_VERSION" = "30.1.2" || {
-            echo "::error::This workflow is locked to the v30.1.2 source line"
+          test "$BASE_VERSION" = "30.1.3" || {
+            echo "::error::This workflow is locked to the v30.1.3 source line"
             exit 1
           }
           [[ "$RC" =~ ^[0-9]+$ ]]
@@ -145,7 +146,42 @@ jobs:
               --require-actor \
               --actor "$GITHUB_ACTOR" \
               --tag "$TAG" \
-              --require-unsigned-objects
+              --require-signatures \
+              --signing-fingerprint 'SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70'
+            TAG_OBJECT_SHA=$(git rev-parse "refs/tags/$TAG^{tag}")
+            [[ "$TAG_OBJECT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/git/commits/$TARGET_SHA" > commit-verification.json
+            gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT_SHA" > tag-verification.json
+            TARGET_SHA="$TARGET_SHA" TAG="$TAG" TAG_OBJECT_SHA="$TAG_OBJECT_SHA" python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          commit = json.loads(Path("commit-verification.json").read_text(encoding="utf-8"))
+          tag = json.loads(Path("tag-verification.json").read_text(encoding="utf-8"))
+          target = os.environ["TARGET_SHA"]
+          tag_name = os.environ["TAG"]
+          tag_object = os.environ["TAG_OBJECT_SHA"]
+          if commit.get("sha") != target:
+              raise SystemExit("GitHub commit verification resolved a different source")
+          if commit.get("verification", {}).get("verified") is not True:
+              raise SystemExit("GitHub does not verify the exact source commit signature")
+          if commit.get("verification", {}).get("reason") != "valid":
+              raise SystemExit("GitHub source commit signature reason is not valid")
+          expected_tag = {
+              "sha": tag_object,
+              "tag": tag_name,
+          }
+          for key, expected in expected_tag.items():
+              if tag.get(key) != expected:
+                  raise SystemExit(f"GitHub tag {key} mismatch")
+          if (tag.get("object", {}).get("type"), tag.get("object", {}).get("sha")) != ("commit", target):
+              raise SystemExit("GitHub annotated tag does not point to the exact source commit")
+          if tag.get("verification", {}).get("verified") is not True:
+              raise SystemExit("GitHub does not verify the exact annotated tag signature")
+          if tag.get("verification", {}).get("reason") != "valid":
+              raise SystemExit("GitHub annotated tag signature reason is not valid")
+          PY
           fi
 
           test "$VERSION" = "$BASE_VERSION"
@@ -190,7 +226,8 @@ jobs:
     env:
       TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
       PUBLISH: ${{ needs.resolve-target.outputs.publish }}
-      BASE_SHA: dffb457650f48848794120ef4661f0a8f0187e05
+      PARENT_SHA: b3223d3230f15ba3a7c55376ff7d1f06265feb05
+      CORE_BASE_SHA: dffb457650f48848794120ef4661f0a8f0187e05
       PRIOR_RUN_ID: '29552432859'
       PRIOR_WORKFLOW_ID: '307671160'
       GH_TOKEN: ${{ github.token }}
@@ -207,7 +244,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-          test "$(git rev-parse "$TARGET_SHA^")" = "$BASE_SHA"
+          test "$(git rev-parse "$TARGET_SHA^")" = "$PARENT_SHA"
+          test "$(git rev-parse "$PARENT_SHA^")" = "$CORE_BASE_SHA"
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PRIOR_RUN_ID" > prior-run.json
           gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PRIOR_RUN_ID/jobs?per_page=100" > prior-jobs.json
           python3 - <<'PY'
@@ -216,7 +254,8 @@ jobs:
           from pathlib import Path
           import subprocess
 
-          base = os.environ["BASE_SHA"]
+          parent = os.environ["PARENT_SHA"]
+          base = os.environ["CORE_BASE_SHA"]
           target = os.environ["TARGET_SHA"]
           run_id = int(os.environ["PRIOR_RUN_ID"])
           workflow_id = int(os.environ["PRIOR_WORKFLOW_ID"])
@@ -262,6 +301,7 @@ jobs:
               "Exact-SHA prerelease or production safety gate / measured worst-case quantum crypto resources (Linux x86_64)",
               "Exact-SHA prerelease or production safety gate / critical Gold Rush, lifecycle, wallet, and recovery tests",
               "Exact-SHA prerelease or production safety gate / complete extended functional suite",
+              "Verify independent byte-for-byte rebuilds",
           }
           by_name = {job.get("name"): job for job in jobs}
           missing = sorted(required_successes - set(by_name))
@@ -283,7 +323,10 @@ jobs:
               "configure.ac",
               "ci/release/generate_resource_benchmark_evidence.py",
               "ci/release/generate_unsigned_release_metadata.py",
+              "ci/release/blackcoin-dev-release-signing.allowed_signers",
+              "ci/release/test_shadow_resource_production.py",
               "ci/release/test_release_tools.py",
+              "ci/release/verify_source_identity.py",
               "ci/release/verify_resource_benchmark_bundle.py",
               "doc/man/blackcoin-cli.1",
               "doc/man/blackcoin-qt.1",
@@ -293,8 +336,10 @@ jobs:
               "doc/man/blackcoind.1",
               "doc/release-notes.md",
               "doc/release-notes/release-notes-30.1.2.md",
+              "doc/release-notes/release-notes-30.1.3.md",
               "doc/release-process.md",
               "doc/v30.1.2-corrective-release.md",
+              "doc/v30.1.3-corrective-release.md",
           }
           lines = subprocess.run(
               ["git", "diff", "--name-status", "--no-renames", f"{base}..{target}"],
@@ -338,13 +383,14 @@ jobs:
               },
               "corrective_candidate": {
                   "source_sha": target,
+                  "required_parent_sha": parent,
                   "changed_paths": sorted(changed),
                   "runtime_or_consensus_source_changed": False,
               },
               "limitations": {
                   "historical_results_are_not_candidate_sha_results": True,
-                  "prior_windows_resource_bundle_reused": False,
-                  "fresh_platform_packages_and_resource_evidence_required": True,
+                  "historical_resource_and_reproducibility_results_are_not_candidate_sha_results": True,
+                  "fresh_platform_packages_required": True,
               },
           }
           Path("inherited-core-evidence.json").write_text(
@@ -356,7 +402,7 @@ jobs:
         if: ${{ needs.resolve-target.outputs.publish == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: inherited-core-gate-30.1.2-${{ needs.resolve-target.outputs.target_sha }}
+          name: inherited-core-gate-30.1.3-${{ needs.resolve-target.outputs.target_sha }}
           path: inherited-core-evidence.json
           if-no-files-found: error
           retention-days: 30
@@ -373,9 +419,10 @@ jobs:
       target_sha: ${{ needs.resolve-target.outputs.target_sha }}
       # Alpha artifacts wait for the core gate. A beta adds native-platform,
       # sanitizer, pinned-fuzz, and complete extended functional evidence.
-      # The one-time v30.1.2 production correction reuses the exact recorded
-      # dffb457 core results while regenerating candidate-bound platform,
-      # provenance, package, and reproducibility evidence.
+      # The one-time v30.1.3 signed correction reuses the exact recorded
+      # dffb457 runtime, consensus, sanitizer, fuzz, interoperability, native,
+      # resource, and reproducibility evidence. It freshly runs the release
+      # tooling and builds one candidate-bound package set for every platform.
       release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
       run_extended_functional: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
       corrective_fast_path: ${{ needs.resolve-target.outputs.publish == 'true' }}
@@ -388,6 +435,7 @@ jobs:
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
+      macos_matrix: ${{ steps.matrix.outputs.macos_matrix }}
       macos_selected: ${{ steps.matrix.outputs.macos_selected }}
       macos_intel_selected: ${{ steps.matrix.outputs.macos_intel_selected }}
       macos_arm_selected: ${{ steps.matrix.outputs.macos_arm_selected }}
@@ -397,6 +445,7 @@ jobs:
         shell: bash
         env:
           TARGET: ${{ needs.resolve-target.outputs.target }}
+          PUBLISH: ${{ needs.resolve-target.outputs.publish }}
         run: |
           set -euo pipefail
           linux_64='{"name":"linux-64-bit","host":"x86_64-pc-linux-gnu","os":"ubuntu-22.04","packages":"python3","dep-opts":"","config-opts":"--enable-sse2 --enable-glibc-back-compat LDFLAGS=-static-libstdc++","goal":"install"}'
@@ -418,9 +467,10 @@ jobs:
           import json
           import os
 
+          builders = ("primary",) if os.environ["PUBLISH"] == "true" else ("primary", "verifier")
           result = []
           for target in json.loads(os.environ["BASE_MATRIX"]):
-              for builder in ("primary", "verifier"):
+              for builder in builders:
                   entry = dict(target)
                   entry["builder"] = builder
                   result.append(entry)
@@ -428,6 +478,32 @@ jobs:
           PY
           )
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          macos_matrix=$(BUILD_MATRIX="$matrix" python3 - <<'PY'
+          import json
+          import os
+
+          metadata = {
+              "macos-64-bit": {
+                  "target": "macos-64-bit",
+                  "label": "Intel-x86_64",
+                  "arch": "x86_64",
+                  "runner": "macos-15-intel",
+              },
+              "macos-arm-64-bit": {
+                  "target": "macos-arm-64-bit",
+                  "label": "Apple-Silicon-ARM64",
+                  "arch": "arm64",
+                  "runner": "macos-15",
+              },
+          }
+          include = []
+          for target in json.loads(os.environ["BUILD_MATRIX"]):
+              if target["name"] in metadata:
+                  include.append({**metadata[target["name"]], "builder": target["builder"]})
+          print(json.dumps({"include": include}, separators=(",", ":")))
+          PY
+          )
+          echo "macos_matrix=$macos_matrix" >> "$GITHUB_OUTPUT"
           if [[ "$matrix" == *macos-64-bit* || "$matrix" == *macos-arm-64-bit* ]]; then
             echo "macos_selected=true" >> "$GITHUB_OUTPUT"
           else
@@ -593,7 +669,7 @@ jobs:
           fi
 
       - name: Build and execute target crypto vectors
-        if: ${{ !startsWith(matrix.name, 'macos-') }}
+        if: ${{ needs.resolve-target.outputs.publish != 'true' && !startsWith(matrix.name, 'macos-') }}
         shell: bash
         run: |
           set -euo pipefail
@@ -784,42 +860,15 @@ jobs:
       PUBLISH: ${{ needs.resolve-target.outputs.publish }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: macos-64-bit
-            label: Intel-x86_64
-            arch: x86_64
-            runner: macos-15-intel
-            builder: primary
-            selected: ${{ needs.select-targets.outputs.macos_intel_selected }}
-          - target: macos-64-bit
-            label: Intel-x86_64
-            arch: x86_64
-            runner: macos-15-intel
-            builder: verifier
-            selected: ${{ needs.select-targets.outputs.macos_intel_selected }}
-          - target: macos-arm-64-bit
-            label: Apple-Silicon-ARM64
-            arch: arm64
-            runner: macos-15
-            builder: primary
-            selected: ${{ needs.select-targets.outputs.macos_arm_selected }}
-          - target: macos-arm-64-bit
-            label: Apple-Silicon-ARM64
-            arch: arm64
-            runner: macos-15
-            builder: verifier
-            selected: ${{ needs.select-targets.outputs.macos_arm_selected }}
+      matrix: ${{ fromJSON(needs.select-targets.outputs.macos_matrix) }}
     steps:
       - name: Download one exact isolated raw macOS cross-build
-        if: ${{ matrix.selected == 'true' }}
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: raw-release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.target }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
           path: raw-artifact
 
       - name: Ad-hoc sign, execute, deterministically repack, and reverify
-        if: ${{ matrix.selected == 'true' }}
         shell: bash
         env:
           EXPECTED_ARCH: ${{ matrix.arch }}
@@ -1045,7 +1094,6 @@ jobs:
           printf '%s\n' "$TARGET_SHA" > "release-assets/$ASSET_PREFIX-$TARGET_NAME-SOURCE_COMMIT.txt"
 
       - name: Upload only native-validated macOS artifacts
-        if: ${{ matrix.selected == 'true' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.target }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
@@ -1083,6 +1131,7 @@ jobs:
       - select-targets
       - build
       - macos-adhoc-gate
+    if: ${{ needs.resolve-target.outputs.publish != 'true' }}
     runs-on: ubuntu-22.04
     env:
       TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
@@ -1246,8 +1295,8 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  unsigned-final-preflight:
-    name: Require explicit publisher-unsigned final acknowledgement
+  signed-final-preflight:
+    name: Require explicit v30.1.3 signed-source publication acknowledgement
     needs:
       - resolve-target
       - safety-gate
@@ -1257,13 +1306,13 @@ jobs:
     env:
       UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}
     steps:
-      - name: Fail closed without the exact unsigned-final acknowledgement
+      - name: Fail closed without the exact publication acknowledgement
         shell: bash
         run: |
           set -euo pipefail
-          expected='V30.1.2'
+          expected='V30.1.3'
           test "$UNSIGNED_FINAL_ACK" = "$expected" || {
-            echo '::error::Protected UNSIGNED_FINAL_ACK does not authorize this publisher-unsigned final release'
+            echo '::error::Protected UNSIGNED_FINAL_ACK does not authorize this v30.1.3 release'
             exit 1
           }
 
@@ -1273,8 +1322,8 @@ jobs:
       - resolve-target
       - select-targets
       - build
-      - reproducibility
-      - unsigned-final-preflight
+      - macos-adhoc-gate
+      - signed-final-preflight
     if: ${{ needs.resolve-target.outputs.publish == 'true' && needs.resolve-target.outputs.target == 'all' && needs.select-targets.outputs.macos_selected == 'true' && needs.select-targets.outputs.windows_selected == 'true' }}
     runs-on: ubuntu-22.04
     environment: production-release
@@ -1302,38 +1351,25 @@ jobs:
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
-          pattern: release-${{ needs.resolve-target.outputs.package_label }}-*-${{ needs.resolve-target.outputs.target_sha }}
-
-      - name: Download exact-SHA quantum crypto provenance evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          path: gate-evidence/quantum-crypto
-          name: quantum-crypto-provenance-${{ needs.resolve-target.outputs.target_sha }}
-
-      - name: Download exact-SHA resource benchmark evidence
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          path: gate-evidence/resource-benchmarks
-          pattern: quantum-resource-benchmarks-*-${{ needs.resolve-target.outputs.target_sha }}
-          merge-multiple: true
+          pattern: release-${{ needs.resolve-target.outputs.package_label }}-*-primary-${{ needs.resolve-target.outputs.target_sha }}
 
       - name: Download inherited unchanged-core evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: gate-evidence/inherited-core
-          name: inherited-core-gate-30.1.2-${{ needs.resolve-target.outputs.target_sha }}
+          name: inherited-core-gate-30.1.3-${{ needs.resolve-target.outputs.target_sha }}
 
       - name: Install final release verification tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends p7zip-full unzip
 
-      - name: Assemble exact-SHA publisher-unsigned release
+      - name: Assemble exact-SHA signed-source release
         shell: bash
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-          expected_ack='V30.1.2'
+          expected_ack='V30.1.3'
           test "$UNSIGNED_FINAL_ACK" = "$expected_ack"
           mkdir -p dist
           shopt -s nullglob
@@ -1346,14 +1382,6 @@ jobs:
               cp "$source" "$destination"
             done < <(find "$primary" -mindepth 1 -maxdepth 1 -type f -print0)
           done
-          reproducibility=(artifacts/release-"$PACKAGE_LABEL"-reproducibility-"$TARGET_SHA")
-          test "${#reproducibility[@]}" -eq 1
-          while IFS= read -r -d '' source; do
-            destination="dist/$(basename "$source")"
-            test ! -e "$destination"
-            cp "$source" "$destination"
-          done < <(find "${reproducibility[0]}" -mindepth 1 -maxdepth 1 -type f -print0)
-
           test -s "dist/$ASSET_PREFIX-Linux-x86_64.tar.gz"
           test -s "dist/$ASSET_PREFIX-Linux-ARM64.tar.gz"
           test -s "dist/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
@@ -1362,7 +1390,6 @@ jobs:
           test -s "dist/$ASSET_PREFIX-macOS-Intel-x86_64-Qt-app.tar.gz"
           test -s "dist/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.zip"
           test -s "dist/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz"
-          test -s "dist/$ASSET_PREFIX-REPRODUCIBILITY.txt"
           python3 ci/release/verify_windows_payload.py unsigned-archive \
             "dist/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
           python3 ci/release/verify_windows_payload.py unsigned-file \
@@ -1374,30 +1401,9 @@ jobs:
             "dist/$ASSET_PREFIX-Windows-x86_64-Installer.exe" >/dev/null
           python3 ci/release/verify_windows_payload.py installer \
             work/windows-installer --portable-dir work/windows-portable >/dev/null
-          test -s gate-evidence/quantum-crypto/quantum-crypto-provenance-evidence.json
-          cp gate-evidence/quantum-crypto/quantum-crypto-provenance-evidence.json \
-            "dist/Blackcoin-$VERSION-quantum-crypto-provenance.json"
-          cp contrib/devtools/quantum-crypto-provenance.json \
-            "dist/Blackcoin-$VERSION-quantum-crypto-manifest.json"
           test -s gate-evidence/inherited-core/inherited-core-evidence.json
           cp gate-evidence/inherited-core/inherited-core-evidence.json \
             "dist/Blackcoin-$VERSION-INHERITED-CORE-EVIDENCE.json"
-          python3 ci/release/verify_resource_benchmark_bundle.py \
-            --directory gate-evidence/resource-benchmarks \
-            --source-sha "$TARGET_SHA" \
-            --repository "$GITHUB_REPOSITORY" \
-            --provenance-manifest contrib/devtools/quantum-crypto-provenance.json
-          mapfile -t resource_evidence < <(
-            find gate-evidence/resource-benchmarks -maxdepth 1 -type f \
-              -name 'quantum-resource-*-evidence.json' -print | sort
-          )
-          mapfile -t resource_raw < <(
-            find gate-evidence/resource-benchmarks -maxdepth 1 -type f \
-              -name 'quantum-resource-*-nanobench.json' -print | sort
-          )
-          test "${#resource_evidence[@]}" -eq 5
-          test "${#resource_raw[@]}" -eq 5
-          cp "${resource_evidence[@]}" "${resource_raw[@]}" dist/
           printf '%s\n' "$TARGET_SHA" > dist/SOURCE_COMMIT.txt
 
           python3 ci/release/verify_dependency_security.py
@@ -1426,12 +1432,11 @@ jobs:
           (cd dist && sha256sum --check --strict SHA256SUMS.txt)
 
           {
-            echo '# Publisher-unsigned production release'
+            echo '# Blackcoin-Dev source-signed production release'
             echo
-            echo "Blackcoin-Dev has no release-signing certificates for v$VERSION."
+            echo "The exact v$VERSION source commit and annotated tag are SSH-signed by Blackcoin-Dev and verified by GitHub."
             echo 'Windows packages are not Authenticode-signed. macOS applications carry only identity-free ad-hoc launch signatures and are not notarized.'
-            echo 'The source commit, annotated tag, checksums, and in-toto statement have no Blackcoin-Dev OpenPGP signature.'
-            echo 'Verify the unsigned notice and manifest, SHA256 checksums, exact source commit, reproducibility report, SBOM, provenance, and GitHub attestations before installing.'
+            echo 'Verify the platform-signing notice, SHA256 checksums, exact signed source commit and tag, SBOM, provenance, and GitHub attestations before installing.'
             echo
             cat "doc/release-notes/release-notes-$VERSION.md"
             echo "## Source commit"
@@ -1458,7 +1463,7 @@ jobs:
           subject-checksums: dist/SHA256SUMS.txt
           sbom-path: dist/Blackcoin-${{ needs.resolve-target.outputs.version }}-SBOM.spdx.json
 
-      - name: Create an immutable release at the annotated unsigned tag
+      - name: Create an immutable release at the annotated SSH-signed tag
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash

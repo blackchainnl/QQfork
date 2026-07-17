@@ -593,6 +593,16 @@ class ShadowResourceProductionTest(unittest.TestCase):
         path.chmod(0o700)
         return path
 
+    def commit_fixture_change(self, repo: Path, relative: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), "add", "--", relative], check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(repo), "commit", "-q", "-m",
+             f"mutate {relative}"],
+            check=True,
+        )
+
     def test_current_hashes_cannot_mask_epoch_source_model_drift(self):
         with tempfile.TemporaryDirectory() as temporary_raw:
             temporary = Path(temporary_raw)
@@ -605,6 +615,7 @@ class ShadowResourceProductionTest(unittest.TestCase):
                 "sizes.coins_db = nTotalCache;",
             )
             cache_source.write_text(source, encoding="utf-8")
+            self.commit_fixture_change(repo, "src/node/caches.cpp")
             hashes["src/node/caches.cpp"] = sha256(cache_source)
             with self.assertRaisesRegex(
                     RuntimeError, "epoch-bound source contract changed"):
@@ -623,6 +634,7 @@ class ShadowResourceProductionTest(unittest.TestCase):
                 "static constexpr uint32_t SHADOW_POW_LATE_ORIGIN_WINDOW = 65;",
             )
             shadow_header.write_text(source, encoding="utf-8")
+            self.commit_fixture_change(repo, "src/shadow.h")
             hashes["src/shadow.h"] = sha256(shadow_header)
             with self.assertRaisesRegex(
                     RuntimeError, "epoch-bound source contract changed"):
