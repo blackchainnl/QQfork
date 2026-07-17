@@ -1,3 +1,4 @@
+// Copyright (c) 2021-2022 The Bitcoin Core developers
 // Copyright (c) 2021-2022 Blackcoin Core Developers
 // Copyright (c) 2021-2022 Blackcoin More Developers
 // Copyright (c) 2021-2022 Quantum Quasar Developers
@@ -11,6 +12,7 @@
 #include <wallet/db.h>
 
 #include <memory>
+#include <optional>
 
 class ArgsManager;
 class CChain;
@@ -66,11 +68,17 @@ public:
     Status Next(DataStream& key, DataStream& value) override;
 };
 
+class MockableDatabase;
+
 class MockableBatch : public DatabaseBatch
 {
 private:
-    MockableData& m_records;
-    bool m_pass;
+    MockableDatabase& m_database;
+    std::optional<MockableData> m_transaction_records;
+
+    MockableData& Records();
+    const MockableData& Records() const;
+    bool ShouldFailWrite();
 
     bool ReadKey(DataStream&& key, DataStream& value) override;
     bool WriteKey(DataStream&& key, DataStream&& value, bool overwrite=true) override;
@@ -79,22 +87,17 @@ private:
     bool ErasePrefix(Span<const std::byte> prefix) override;
 
 public:
-    explicit MockableBatch(MockableData& records, bool pass) : m_records(records), m_pass(pass) {}
+    explicit MockableBatch(MockableDatabase& database) : m_database(database) {}
     ~MockableBatch() {}
 
     void Flush() override {}
     void Close() override {}
 
-    std::unique_ptr<DatabaseCursor> GetNewCursor() override
-    {
-        return std::make_unique<MockableCursor>(m_records, m_pass);
-    }
-    std::unique_ptr<DatabaseCursor> GetNewPrefixCursor(Span<const std::byte> prefix) override {
-        return std::make_unique<MockableCursor>(m_records, m_pass, prefix);
-    }
-    bool TxnBegin() override { return m_pass; }
-    bool TxnCommit() override { return m_pass; }
-    bool TxnAbort() override { return m_pass; }
+    std::unique_ptr<DatabaseCursor> GetNewCursor() override;
+    std::unique_ptr<DatabaseCursor> GetNewPrefixCursor(Span<const std::byte> prefix) override;
+    bool TxnBegin(bool durable = false) override;
+    bool TxnCommit() override;
+    bool TxnAbort() override;
 };
 
 /** A WalletDatabase whose contents and return values can be modified as needed for testing
@@ -104,6 +107,12 @@ class MockableDatabase : public WalletDatabase
 public:
     MockableData m_records;
     bool m_pass{true};
+    bool m_fail_begin{false};
+    std::optional<size_t> m_fail_write_at;
+    size_t m_write_calls{0};
+    bool m_fail_commit{false};
+    bool m_fail_rewrite{false};
+    bool m_last_txn_durable{false};
 
     MockableDatabase(MockableData records = {}) : WalletDatabase(), m_records(records) {}
     ~MockableDatabase() {};
@@ -112,7 +121,7 @@ public:
     void AddRef() override {}
     void RemoveRef() override {}
 
-    bool Rewrite(const char* pszSkip=nullptr) override { return m_pass; }
+    bool Rewrite(const char* pszSkip=nullptr) override { return m_pass && !m_fail_rewrite; }
     bool Backup(const std::string& strDest) const override { return m_pass; }
     void Flush() override {}
     void Close() override {}
@@ -123,7 +132,7 @@ public:
     std::string Filename() override { return "mockable"; }
     std::vector<fs::path> Files() override { return {fs::PathFromString(Filename())}; }
     std::string Format() override { return "mock"; }
-    std::unique_ptr<DatabaseBatch> MakeBatch(bool flush_on_close = true) override { return std::make_unique<MockableBatch>(m_records, m_pass); }
+    std::unique_ptr<DatabaseBatch> MakeBatch(bool flush_on_close = true) override { return std::make_unique<MockableBatch>(*this); }
 };
 
 std::unique_ptr<WalletDatabase> CreateMockableWalletDatabase(MockableData records = {});

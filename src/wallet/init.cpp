@@ -5,11 +5,13 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <addresstype.h>
 #include <common/args.h>
 #include <init.h>
 #include <interfaces/chain.h>
 #include <interfaces/init.h>
 #include <interfaces/wallet.h>
+#include <key_io.h>
 #include <net.h>
 #include <node/context.h>
 #include <node/interface_ui.h>
@@ -26,6 +28,8 @@
 #include <wallet/coincontrol.h>
 #include <wallet/wallet.h>
 #include <walletinitinterface.h>
+
+#include <optional>
 
 using node::NodeContext;
 
@@ -66,7 +70,7 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
         CURRENCY_UNIT, FormatMoney(DEFAULT_TRANSACTION_MAXFEE)), ArgsManager::ALLOW_ANY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-paytxfee=<amt>", strprintf("Fee rate (in %s/kvB) to add to transactions you send (default: %s)",
                                                             CURRENCY_UNIT, FormatMoney(CFeeRate{DEFAULT_PAY_TX_FEE}.GetFeePerK())), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
-    argsman.AddArg("-txversion=<n>", strprintf("Set transaction version to <n> (default: %u)", std::to_string(CTransaction::CURRENT_VERSION)), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-txversion=<n>", strprintf("Set transaction version to <n> (default: %d)", int{CTransaction::CURRENT_VERSION}), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
 
 #ifdef ENABLE_EXTERNAL_SIGNER
     argsman.AddArg("-signer=<cmd>", "External signing tool, see doc/external-signer.md", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
@@ -92,21 +96,34 @@ void WalletInit::AddWalletOptions(ArgsManager& argsman) const
 #else
     argsman.AddHiddenArgs({"-unsafesqlitesync"});
 #endif
-    argsman.AddArg("-staking=<true/false>", strprintf("Enables or disables staking (default: %u)", node::DEFAULT_STAKE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
-    argsman.AddArg("-autostartstaking=<true/false>", "Automatically start wallet staking when a wallet is loaded (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-staking=<true/false>", strprintf("Permit or prohibit Proof-of-Stake workers (default: %u). For upgrade compatibility, an explicitly configured -staking=1 also preserves staking autostart unless -autostartstaking is set separately; an implicit default never grants autostart consent.", node::DEFAULT_STAKE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-autostartstaking=<true/false>", strprintf("Automatically start staking for every eligible private-key wallet loaded by this process (default: %u). This explicit process-wide setting takes precedence over legacy -staking autostart consent and does not unlock encrypted wallets.", wallet::DEFAULT_AUTOSTART_STAKING), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqautoshadowsignal=<true/false>", strprintf("Automatically submit eligible fee-paying Gold Rush PoS QQSIGNAL transactions from every eligible loaded wallet (default: %u). This is process-wide optional wallet automation, not a consensus activation switch, and does not unlock wallets.", wallet::DEFAULT_AUTO_SHADOW_SIGNAL), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqautodemurrageattest=<true/false>", strprintf("Automatically submit eligible fee-paying demurrage liveness attestations from every eligible loaded wallet after Final activation (default: %u). This is process-wide optional wallet automation. Consensus demurrage and its burn activate independently and cannot be disabled by this option.", wallet::DEFAULT_AUTO_DEMURRAGE_ATTEST), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-stakecache=<true/false>", strprintf("Enables or disables the staking cache; significantly improves staking performance, but can use a lot of memory (default: %u)", node::DEFAULT_STAKE_CACHE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-staketimio=<n>", strprintf("Proof of stake timeout. (default: %u)", node::DEFAULT_STAKETIMIO), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-solostaking=<true/false>", strprintf("Stake on an isolated private chain without peers or a public-chain sync estimate (testnet/regtest only on this branch) (default: %u)", node::DEFAULT_SOLO_STAKING), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);
-    argsman.AddArg("-powmining=<true/false>", "Auto-start the built-in (in-process) Gold Rush Proof-of-Work miner at startup. Requires an unlocked wallet with private keys (default: false)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-powmining=<true/false>", "Auto-start one built-in Gold Rush Proof-of-Work miner for every eligible private-key wallet loaded by this process (default: false). Each wallet uses the configured thread and per-core CPU limits, must be normally unlocked, needs a spendable legacy fee UTXO, and must already own a payout key unless -qqallowautokeycreation=1 was separately authorized.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingthreads=<n>", "Worker threads (CPU cores) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-powminingcpu=<n>", "Per-core CPU utilization target (1-100) for the built-in Gold Rush PoW miner (default: 1)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqallowautokeycreation=<true/false>", strprintf("Allow background automation in every loaded wallet to generate new non-HD ML-DSA keys (default: %u). This is process-wide consent and requires a new backup of each affected wallet after every generated key. Prefer existing -qqpowpayoutaddress and -qqpospayoutaddress bindings. Demurrage attestations reuse an existing wallet-owned fee-input address for change and never require hidden key creation. This option does not disable user-requested address creation.", wallet::DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqpowpayoutaddress=<address>", "Bind automatic Gold Rush PoW rewards to one existing, durably stored ordinary direct (non-tiered, non-cold-stake) quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqpospayoutaddress=<address>", "Bind automatic Gold Rush PoS signal rewards to one existing, durably stored ordinary direct (non-tiered, non-cold-stake) quantum address owned by the loaded wallet", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqdemurragechangeaddress=<address>", "Optionally bind automatic demurrage-attestation change to one existing, durably stored ordinary direct (non-tiered, non-cold-stake) quantum address owned by the loaded wallet. When omitted, change returns to the selected wallet-owned direct quantum fee-input address; no new key is created.", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqshadowsignalmaxretryfailures=<n>", "Regtest/testnet-only Gold Rush PoS signal retry ceiling (default: 6)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqshadowsignalretrybasemillis=<n>", "Regtest/testnet-only Gold Rush PoS signal retry base delay in milliseconds (default: 1000)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqshadowsignalcleanupdelaymillis=<n>", "Regtest/testnet-only cleanup race-test barrier delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqshadowsignalsubmissiondelaymillis=<n>", "Regtest/testnet-only automatic QQSIGNAL single-flight race-test delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqshadowsignalbroadcastthrowwallet=<name>", "Regtest/testnet-only wallet name whose automatic QQSIGNAL broadcast throws after wallet persistence", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqshadowpowclaimsubmissiondelaymillis=<n>", "Regtest/testnet-only PoW claim single-flight race-test delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
+    argsman.AddArg("-qqshadowpowbroadcastthrow=<true/false>", "Regtest/testnet-only injected QQSPROOF broadcast exception after wallet persistence (default: false)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET_DEBUG_TEST);
 
     argsman.AddArg("-minstakingamount=<amt>", strprintf("Minimum input value to be used for staking (default: %u)", wallet::DEFAULT_MIN_STAKING_AMOUNT), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-reservebalance=<amt>", strprintf("Reserved balance not used for staking (default: %u)", wallet::DEFAULT_RESERVE_BALANCE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-donatetodevfund=<n>", strprintf("Percentage of staking rewards contributed to the dev treasury (%u to %u, default: %u). Set 0 to opt out at any time. The GUI suggests %u%% before wallet migration is complete and defaults to %u%% after wallet migration is complete unless the user chooses otherwise.",
         wallet::MIN_DONATION_PERCENTAGE, wallet::MAX_DONATION_PERCENTAGE, wallet::DEFAULT_DONATION_PERCENTAGE,
         wallet::DEFAULT_DONATION_SUGGESTED_PERCENTAGE, wallet::DEFAULT_POST_MIGRATION_DONATION_PERCENTAGE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
-    argsman.AddArg("-qqautoredelegate=<true/false>", "Enable autonomous Quantum cold-stake redelegation in unlocked owner wallets (default: true)", ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
+    argsman.AddArg("-qqautoredelegate=<true/false>", strprintf("Enable process-wide autonomous fee-paying Quantum cold-stake redelegation in every eligible normally unlocked owner wallet (default: %u). This can move delegated funds to a new owner-controlled delegation, generates a new non-HD owner key, and requires separate -qqallowautokeycreation=1 consent plus a new backup of every affected wallet.", wallet::DEFAULT_AUTO_REDELEGATE), ArgsManager::ALLOW_ANY, OptionsCategory::WALLET);
     argsman.AddArg("-qqredelegationtriggermultiplier=<n>", "Autonomous redelegation trigger multiplier over expected zero-win interval (default: 6)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);
     argsman.AddArg("-qqredelegationmaxpatienceblocks=<n>", "Autonomous redelegation maximum zero-win patience in blocks (default: 4050)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);
     argsman.AddArg("-qqredelegationmintriggerblocks=<n>", "Autonomous redelegation absolute minimum zero-win trigger in blocks (default: 300)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::WALLET);
@@ -153,6 +170,38 @@ bool WalletInit::ParameterInteraction() const
         if (pow_cpu < 1 || pow_cpu > 100) {
             return InitError(Untranslated("-powminingcpu must be between 1 and 100."));
         }
+    }
+
+    for (const std::string& option : {
+             "-qqpowpayoutaddress",
+             "-qqpospayoutaddress",
+             "-qqdemurragechangeaddress"}) {
+        const std::vector<std::string> bindings = gArgs.GetArgs(option);
+        if (bindings.size() > 1) {
+            return InitError(Untranslated(strprintf(
+                "%s is ambiguous: specify exactly one wallet-owned quantum address.", option)));
+        }
+        if (!bindings.empty() && bindings.front().empty()) {
+            return InitError(Untranslated(strprintf(
+                "%s requires a non-empty wallet-owned quantum address.", option)));
+        }
+        if (!bindings.empty()) {
+            const CTxDestination candidate = DecodeDestination(bindings.front());
+            const std::optional<QuantumStakeTierProgram> tier = IsValidDestination(candidate)
+                ? GetQuantumStakeTierProgram(GetScriptForDestination(candidate))
+                : std::nullopt;
+            if (!tier || tier->tiered || tier->cold_stake) {
+                return InitError(Untranslated(strprintf(
+                    "%s must be an ordinary direct (non-tiered, non-cold-stake) "
+                    "Quantum Quasar ML-DSA address for the active network.", option)));
+            }
+        }
+    }
+
+    if (gArgs.GetBoolArg("-qqautoredelegate", wallet::DEFAULT_AUTO_REDELEGATE) &&
+        !gArgs.GetBoolArg("-qqallowautokeycreation", wallet::DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)) {
+        return InitError(Untranslated(
+            "-qqautoredelegate=1 requires explicit -qqallowautokeycreation=1 because each automatic redelegation generates a new non-HD quantum owner key that must be backed up."));
     }
 
     if (gArgs.IsArgSet("-zapwallettxes")) {

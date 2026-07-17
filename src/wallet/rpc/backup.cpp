@@ -99,8 +99,9 @@ static void RescanWallet(CWallet& wallet, const WalletRescanReserver& reserver, 
     }
 }
 
-static void EnsureBlockDataFromTime(const CWallet& wallet, int64_t timestamp)
+static void EnsureBlockDataFromTime(const CWallet& wallet, int64_t timestamp) LOCKS_EXCLUDED(wallet.cs_wallet)
 {
+    AssertLockNotHeld(wallet.cs_wallet);
     auto& chain{wallet.chain()};
 
     int height{0};
@@ -234,6 +235,8 @@ RPCHelpMan importquantumkey()
                         {RPCResult::Type::STR_HEX, "public_key", "The imported ML-DSA-44 public key"},
                         {RPCResult::Type::NUM_TIME, "timestamp", "The stored key creation time"},
                         {RPCResult::Type::BOOL, "encrypted", "Whether the wallet stores this key encrypted"},
+                        {RPCResult::Type::BOOL, "stored_in_wallet", "Whether the key was durably committed to the wallet database"},
+                        {RPCResult::Type::BOOL, "backup_verified", "Whether this wallet recorded a completed reopen-and-sign backup verification event for this key. External backup-file existence is not tracked."},
                         {RPCResult::Type::BOOL, "rescan", "Whether a rescan was requested"},
                         {RPCResult::Type::STR, "warning", "Backup warning"},
                     }},
@@ -314,6 +317,8 @@ RPCHelpMan importquantumkey()
         result.pushKV("public_key", HexStr(info->public_key));
         result.pushKV("timestamp", info->creation_time);
         result.pushKV("encrypted", info->encrypted);
+        result.pushKV("stored_in_wallet", info->durably_stored);
+        result.pushKV("backup_verified", info->backup_verified);
         result.pushKV("rescan", rescan);
         result.pushKV("warning", "Back up the wallet after importing quantum migration keys.");
         return result;
@@ -525,8 +530,10 @@ RPCHelpMan importwallet()
 
     int64_t nTimeBegin = 0;
     bool fGood = true;
+    const uint256 last_block_hash = WITH_LOCK(pwallet->cs_wallet, return pwallet->GetLastBlockHash());
+    CHECK_NONFATAL(pwallet->chain().findBlock(last_block_hash, FoundBlock().time(nTimeBegin)));
     {
-        LOCK(pwallet->cs_wallet);
+        WAIT_LOCK(pwallet->cs_wallet, wallet_lock);
 
         EnsureWalletIsUnlocked(*pwallet);
 
@@ -535,8 +542,6 @@ RPCHelpMan importwallet()
         if (!file.is_open()) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Cannot open wallet dump file");
         }
-        CHECK_NONFATAL(pwallet->chain().findBlock(pwallet->GetLastBlockHash(), FoundBlock().time(nTimeBegin)));
-
         int64_t nFilesize = std::max((int64_t)1, (int64_t)file.tellg());
         file.seekg(0, file.beg);
 
@@ -621,7 +626,14 @@ RPCHelpMan importwallet()
             }
         }
         file.close();
-        EnsureBlockDataFromTime(*pwallet, nTimeBegin);
+        {
+            // Chain queries acquire cs_main. Drop cs_wallet so this follows
+            // the global cs_main -> cs_wallet order instead of inverting it.
+            REVERSE_LOCK(wallet_lock);
+            EnsureBlockDataFromTime(*pwallet, nTimeBegin);
+        }
+        // The wallet may have been relocked while cs_wallet was released.
+        EnsureWalletIsUnlocked(*pwallet);
         // We now know whether we are importing private keys, so we can error if private keys are disabled
         if ((keys.size() > 0 || quantum_keys.size() > 0) && pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
             pwallet->chain().showProgress("", 100, false); // hide progress dialog in GUI
@@ -777,7 +789,7 @@ RPCHelpMan dumpwallet()
     // the user could have gotten from another RPC command prior to now
     wallet.BlockUntilSyncedToCurrentChain();
 
-    LOCK(wallet.cs_wallet);
+    LOCK2(::cs_main, wallet.cs_wallet);
 
     EnsureWalletIsUnlocked(wallet);
 
@@ -1438,7 +1450,7 @@ RPCHelpMan importmulti()
     int64_t nLowestTimestamp = 0;
     UniValue response(UniValue::VARR);
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
 
         // Check all requests are watchonly
         bool is_watchonly{true};
@@ -1761,7 +1773,7 @@ RPCHelpMan importdescriptors()
     bool rescan = false;
     UniValue response(UniValue::VARR);
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         EnsureWalletIsUnlocked(*pwallet);
 
         CHECK_NONFATAL(pwallet->chain().findBlock(pwallet->GetLastBlockHash(), FoundBlock().time(lowest_timestamp).mtpTime(now)));
@@ -1951,7 +1963,11 @@ RPCHelpMan listdescriptors()
 RPCHelpMan backupwallet()
 {
     return RPCHelpMan{"backupwallet",
-                "\nSafely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n",
+                "\nSafely copies the current wallet file to the specified destination, which can either be a directory or a path with a filename.\n"
+                "Wallets with non-HD quantum keys are staged separately, reopened, and required to sign and verify a fresh challenge with every key before the verified copy is atomically installed.\n"
+                "Quantum keys are not derived from the wallet seed; an older backup cannot recover a key created later.\n"
+                "The wallet records that verification event, but cannot detect if the external backup file is later moved or deleted.\n"
+                "An encrypted wallet must be unlocked so this private-material check can run.\n",
                 {
                     {"destination", RPCArg::Type::STR, RPCArg::Optional::NO, "The destination directory or file"},
                 },
@@ -1962,18 +1978,17 @@ RPCHelpMan backupwallet()
                 },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
+    const std::shared_ptr<CWallet> pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
     // Make sure the results are valid at least up to the most recent block
     // the user could have gotten from another RPC command prior to now
     pwallet->BlockUntilSyncedToCurrentChain();
 
-    LOCK(pwallet->cs_wallet);
-
     std::string strDest = request.params[0].get_str();
-    if (!pwallet->BackupWallet(strDest)) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet backup failed!");
+    bilingual_str error;
+    if (!pwallet->BackupWallet(strDest, &error)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, error.empty() ? "Error: Wallet backup failed!" : error.original);
     }
 
     return UniValue::VNULL;

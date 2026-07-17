@@ -41,6 +41,9 @@
 
 #include <fcntl.h>
 #include <sys/resource.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 #include <unistd.h>
 #else
 #include <io.h> /* For _get_osfhandle, _chsize */
@@ -151,14 +154,28 @@ bool FileCommit(FILE* file)
     return true;
 }
 
-void DirectoryCommit(const fs::path& dirname)
+bool DirectoryCommit(const fs::path& dirname)
 {
 #ifndef WIN32
     FILE* file = fsbridge::fopen(dirname, "r");
-    if (file) {
-        fsync(fileno(file));
-        fclose(file);
+    if (file == nullptr) {
+        LogPrintf("Unable to open directory %s for durable commit: %s\n", fs::PathToString(dirname), SysErrorString(errno));
+        return false;
     }
+    bool committed = true;
+    if (fsync(fileno(file)) != 0) {
+        const int sync_error = errno;
+        LogPrintf("Unable to durably commit directory %s: %s\n", fs::PathToString(dirname), SysErrorString(sync_error));
+        committed = false;
+    }
+    if (fclose(file) != 0) {
+        const int close_error = errno;
+        LogPrintf("Unable to close directory %s after durable commit: %s\n", fs::PathToString(dirname), SysErrorString(close_error));
+        committed = false;
+    }
+    return committed;
+#else
+    return true;
 #endif
 }
 
@@ -263,19 +280,51 @@ fs::path GetSpecialFolderPath(int nFolder, bool fCreate)
 
 bool RenameOver(fs::path src, fs::path dest)
 {
-#ifdef __MINGW64__
-    // This is a workaround for a bug in libstdc++ which
-    // implements std::filesystem::rename with _wrename function.
-    // This bug has been fixed in upstream:
-    //  - GCC 10.3: 8dd1c1085587c9f8a21bb5e588dfe1e8cdbba79e
-    //  - GCC 11.1: 1dfd95f0a0ca1d9e6cbc00e6cbfd1fa20a98f312
-    // For more details see the commits mentioned above.
+#ifdef WIN32
+    // Use the native write-through replacement on every supported Windows
+    // toolchain. DirectoryCommit() cannot independently flush a Windows
+    // directory handle, so falling back to std::filesystem::rename here would
+    // allow callers to report a durable replacement without any durability
+    // barrier.
     return MoveFileExW(src.wstring().c_str(), dest.wstring().c_str(),
-                       MOVEFILE_REPLACE_EXISTING) != 0;
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
     std::error_code error;
     fs::rename(src, dest, error);
     return !error;
+#endif
+}
+
+bool RenameNoReplace(fs::path src, fs::path dest)
+{
+#ifdef WIN32
+    // Omitting MOVEFILE_REPLACE_EXISTING is part of the recovery contract.
+    // MOVEFILE_WRITE_THROUGH is the Windows durability barrier because
+    // DirectoryCommit() cannot flush a directory handle on this platform.
+    return MoveFileExW(src.wstring().c_str(), dest.wstring().c_str(),
+                       MOVEFILE_WRITE_THROUGH) != 0;
+#elif defined(MAC_OSX)
+    return ::renamex_np(src.c_str(), dest.c_str(), RENAME_EXCL) == 0;
+#elif defined(__linux__) && defined(SYS_renameat2)
+    // RENAME_NOREPLACE is Linux renameat2 flag bit 0. Fail closed when the
+    // running kernel or filesystem does not implement the operation.
+    constexpr unsigned int RENAME_NOREPLACE_FLAG{1U};
+    return ::syscall(SYS_renameat2, AT_FDCWD, src.c_str(), AT_FDCWD,
+                     dest.c_str(), RENAME_NOREPLACE_FLAG) == 0;
+#else
+    // Some less common POSIX targets lack an atomic exclusive-rename API.
+    // Preserve their existing rename behavior, but reject every observable
+    // destination first, including dangling symlinks.
+    std::error_code exists_error;
+    const fs::file_status destination_status =
+        fs::symlink_status(dest, exists_error);
+    if ((!exists_error && destination_status.type() != fs::file_type::not_found) ||
+        (exists_error && exists_error != std::errc::no_such_file_or_directory)) {
+        return false;
+    }
+    std::error_code rename_error;
+    fs::rename(src, dest, rename_error);
+    return !rename_error;
 #endif
 }
 

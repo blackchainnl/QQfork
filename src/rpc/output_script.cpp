@@ -7,23 +7,30 @@
 
 #include <key_io.h>
 #include <addresstype.h>
+#include <chain.h>
+#include <chainparams.h>
+#include <common/system.h>
 #include <crypto/mldsa.h>
-#include <crypto/sha256.h>
+#include <kernel/cs_main.h>
 #include <outputtype.h>
 #include <pubkey.h>
 #include <rpc/protocol.h>
 #include <rpc/request.h>
 #include <rpc/server.h>
+#include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
 #include <script/script.h>
 #include <script/signingprovider.h>
 #include <script/solver.h>
+#include <shadow.h>
+#include <sync.h>
 #include <tinyformat.h>
 #include <univalue.h>
 #include <uint256.h>
 #include <util/check.h>
 #include <util/strencodings.h>
+#include <validation.h>
 
 #include <cstdint>
 #include <memory>
@@ -120,7 +127,7 @@ static RPCHelpMan createquantummigrationaddress()
                 {RPCResult::Type::STR_HEX, "witness_program", "The 32-byte migration commitment"},
                 {RPCResult::Type::BOOL, "fundable_now", "Whether ordinary wallet/RPC policy currently permits funding this address type"},
                 {RPCResult::Type::BOOL, "spendable_now", "Whether this node can currently sign/spend this address type"},
-                {RPCResult::Type::BOOL, "consensus_spend_guard_active", "Whether this node still treats migration spends as permanently disabled"},
+                {RPCResult::Type::BOOL, "consensus_spend_guard_active", "Whether the scheduled phase gate currently disables migration funding and spending"},
                 {RPCResult::Type::STR, "warning", "Migration warning"},
             }},
         RPCExamples{
@@ -140,15 +147,28 @@ static RPCHelpMan createquantummigrationaddress()
 
     const CTxDestination dest = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, commitment};
 
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    bool quantum_spend_active{false};
+    {
+        LOCK(cs_main);
+        const CBlockIndex* tip = chainman.ActiveChain().Tip();
+        if (tip) {
+            quantum_spend_active = IsQuantumWitnessSpendActive(
+                chainman.GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1);
+        }
+    }
+
     UniValue ret(UniValue::VOBJ);
     ret.pushKV("address", EncodeDestination(dest));
     ret.pushKV("isvalid_destination", IsValidDestination(dest));
     ret.pushKV("witness_version", QUANTUM_MIGRATION_WITNESS_VERSION);
     ret.pushKV("witness_program", HexStr(commitment));
-    ret.pushKV("fundable_now", true);
-    ret.pushKV("spendable_now", false);
-    ret.pushKV("consensus_spend_guard_active", false);
-    ret.pushKV("warning", "Address is fundable. It is spendable only by the ML-DSA private key whose public key hashes to this witness program once quantum witness spending is active.");
+    ret.pushKV("fundable_now", quantum_spend_active);
+    ret.pushKV("spendable_now", quantum_spend_active);
+    ret.pushKV("consensus_spend_guard_active", !quantum_spend_active);
+    ret.pushKV("warning", quantum_spend_active
+        ? "Quantum funding is active. Spending requires the ML-DSA private key whose public key hashes to this witness program."
+        : "Address construction is available for planning, but base-chain funding and spending are disabled until Gold Rush ends.");
     return ret;
 },
     };
@@ -158,46 +178,20 @@ static RPCHelpMan createquantumkey()
 {
     return RPCHelpMan{
         "createquantumkey",
-        "\nGenerates an ML-DSA-44 keypair and its Blackcoin witness-v16 migration address.\n"
-        "The returned private key is raw hex and is not stored in the wallet.\n",
+        "\nDeprecated fail-closed compatibility stub.\n"
+        "v30.1.1 no longer generates unstored raw ML-DSA private keys. Use wallet-scoped getnewquantumaddress,\n"
+        "then verify getquantumkeyinventory and complete backupwallet before using the address.\n",
         {},
-        RPCResult{
-            RPCResult::Type::OBJ, "", "", {
-                {RPCResult::Type::STR, "address", "The Blackcoin migration address"},
-                {RPCResult::Type::STR_HEX, "public_key", "The ML-DSA-44 public key"},
-                {RPCResult::Type::STR_HEX, "private_key", "The ML-DSA-44 private key. Back it up immediately."},
-                {RPCResult::Type::NUM, "witness_version", "The witness version used for quantum migration"},
-                {RPCResult::Type::STR_HEX, "witness_program", "SHA256(public_key)"},
-                {RPCResult::Type::BOOL, "stored_in_wallet", "Whether this key was inserted into the wallet database"},
-                {RPCResult::Type::STR, "warning", "Key storage warning"},
-            }},
+        RPCResult{RPCResult::Type::NONE, "", "No result; raw unstored key generation was removed in v30.1.1"},
         RPCExamples{
             HelpExampleCli("createquantumkey", "")
             + HelpExampleRpc("createquantumkey", "")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
-    std::vector<uint8_t> pubkey;
-    std::vector<uint8_t> privkey;
-    if (!ML_DSA::KeyGen(pubkey, privkey)) {
-        throw JSONRPCError(RPC_MISC_ERROR, "ML-DSA key generation failed");
-    }
-
-    std::vector<unsigned char> program(QUANTUM_MIGRATION_PROGRAM_SIZE);
-    CSHA256().Write(pubkey.data(), pubkey.size()).Finalize(program.data());
-    const CTxDestination dest = WitnessUnknown{QUANTUM_MIGRATION_WITNESS_VERSION, program};
-
-    UniValue ret(UniValue::VOBJ);
-    ret.pushKV("address", EncodeDestination(dest));
-    ret.pushKV("public_key", HexStr(pubkey));
-    ret.pushKV("private_key", HexStr(privkey));
-    ret.pushKV("witness_version", QUANTUM_MIGRATION_WITNESS_VERSION);
-    ret.pushKV("witness_program", HexStr(program));
-    ret.pushKV("stored_in_wallet", false);
-    ret.pushKV("warning", "This key is not stored in the wallet database. Loss of the private_key permanently loses funds sent to this address.");
-    // Wipe the raw ML-DSA secret from the heap before the buffer is freed.
-    memory_cleanse(privkey.data(), privkey.size());
-    return ret;
+    throw JSONRPCError(RPC_METHOD_DEPRECATED,
+        "createquantumkey was removed in v30.1.1 because it returned an unstored private key. "
+        "Use wallet-scoped getnewquantumaddress, verify getquantumkeyinventory, and complete backupwallet before using the address.");
 },
     };
 }

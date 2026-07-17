@@ -1,3 +1,4 @@
+// Copyright (c) 2011-2022 The Bitcoin Core developers
 // Copyright (c) 2011-2022 Blackcoin Core Developers
 // Copyright (c) 2011-2022 Blackcoin More Developers
 // Copyright (c) 2011-2022 Blackcoin Developers
@@ -20,6 +21,26 @@
 
 
 namespace wallet {
+static UniValue WalletLifecycleAmountsToJSON(const WalletLifecycleAmounts& amounts)
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("ordinary_available", ValueFromAmount(amounts.ordinary_available));
+    result.pushKV("spendable_legacy", ValueFromAmount(amounts.spendable_legacy));
+    result.pushKV("spendable_quantum", ValueFromAmount(amounts.spendable_quantum));
+    UniValue categories(UniValue::VOBJ);
+    for (size_t i = 0; i < WalletLifecycleAmounts::CATEGORY_COUNT; ++i) {
+        UniValue category(UniValue::VOBJ);
+        category.pushKV("count", amounts.outputs[i]);
+        category.pushKV("nominal_amount", ValueFromAmount(amounts.nominal[i]));
+        category.pushKV("effective_amount", ValueFromAmount(amounts.effective[i]));
+        category.pushKV("burned_amount", ValueFromAmount(amounts.burned[i]));
+        categories.pushKV(ValueLifecycleCategoryName(static_cast<ValueLifecycleCategory>(i)),
+                          std::move(category));
+    }
+    result.pushKV("categories", std::move(categories));
+    return result;
+}
+
 static CAmount GetReceived(const CWallet& wallet, const UniValue& params, bool by_label) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
     std::vector<CTxDestination> addresses;
@@ -190,11 +211,14 @@ RPCHelpMan getbalance()
     const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
+    for (;;) {
     // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now
+    // the user could have gotten from another RPC command prior to now. Retry
+    // if chainstate advances before the wallet and chain locks are acquired.
     pwallet->BlockUntilSyncedToCurrentChain();
 
-    LOCK(pwallet->cs_wallet);
+    LOCK2(::cs_main, pwallet->cs_wallet);
+    if (!WalletLifecycleViewIsSynchronized(*pwallet)) continue;
 
     const auto dummy_value{self.MaybeArg<std::string>(0)};
     if (dummy_value && *dummy_value != "*") {
@@ -210,9 +234,16 @@ RPCHelpMan getbalance()
 
     bool avoid_reuse = GetAvoidReuseFlag(*pwallet, request.params[3]);
 
-    const auto bal = GetBalance(*pwallet, min_depth, avoid_reuse);
+    Balance bal;
+    WalletLifecycleSummary lifecycle;
+    std::string lifecycle_error;
+    if (!GetLifecycleAdjustedBalance(*pwallet, min_depth, avoid_reuse,
+                                     bal, lifecycle, lifecycle_error)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, lifecycle_error);
+    }
 
     return ValueFromAmount(bal.m_mine_trusted + (include_watchonly ? bal.m_watchonly_trusted : 0));
+    }
 },
     };
 }
@@ -445,6 +476,19 @@ RPCHelpMan getbalances()
                     {RPCResult::Type::STR_AMOUNT, "immature", "balance from immature coinbase outputs"},
                     {RPCResult::Type::STR_AMOUNT, "stake", "balance from immature coinstake outputs"},
                     {RPCResult::Type::STR_AMOUNT, "used", /*optional=*/true, "(only present if avoid_reuse is set) balance from coins sent to addresses that were previously spent from (potentially privacy violating)"},
+                    {RPCResult::Type::OBJ, "lifecycle", "trusted wallet UTXOs classified for the candidate next block", {
+                        {RPCResult::Type::STR_AMOUNT, "ordinary_available", "effective value available to ordinary sends"},
+                        {RPCResult::Type::STR_AMOUNT, "spendable_legacy", "effective ordinary-spendable legacy value"},
+                        {RPCResult::Type::STR_AMOUNT, "spendable_quantum", "effective ordinary-spendable direct quantum value"},
+                        {RPCResult::Type::OBJ_DYN, "categories", "mutually exclusive lifecycle categories", {
+                            {RPCResult::Type::OBJ, "category", "one lifecycle category", {
+                                {RPCResult::Type::NUM, "count", "wallet UTXO count"},
+                                {RPCResult::Type::STR_AMOUNT, "nominal_amount", "nominal value"},
+                                {RPCResult::Type::STR_AMOUNT, "effective_amount", "demurrage-adjusted value"},
+                                {RPCResult::Type::STR_AMOUNT, "burned_amount", "value removed by demurrage"},
+                            }},
+                        }},
+                    }},
                 }},
                 {RPCResult::Type::OBJ, "watchonly", /*optional=*/true, "watchonly balances (not present if wallet does not watch anything)",
                 {
@@ -452,7 +496,22 @@ RPCHelpMan getbalances()
                     {RPCResult::Type::STR_AMOUNT, "untrusted_pending", "untrusted pending balance (outputs created by others that are in the mempool)"},
                     {RPCResult::Type::STR_AMOUNT, "immature", "balance from immature coinbase outputs"},
                     {RPCResult::Type::STR_AMOUNT, "stake", "balance from immature coinstake outputs"},
+                    {RPCResult::Type::OBJ, "lifecycle", "trusted watch-only UTXOs classified for the candidate next block", {
+                        {RPCResult::Type::STR_AMOUNT, "ordinary_available", "effective value available under consensus"},
+                        {RPCResult::Type::STR_AMOUNT, "spendable_legacy", "effective ordinary-spendable legacy value"},
+                        {RPCResult::Type::STR_AMOUNT, "spendable_quantum", "effective ordinary-spendable direct quantum value"},
+                        {RPCResult::Type::OBJ_DYN, "categories", "mutually exclusive lifecycle categories", {
+                            {RPCResult::Type::OBJ, "category", "one lifecycle category", {
+                                {RPCResult::Type::NUM, "count", "watch-only UTXO count"},
+                                {RPCResult::Type::STR_AMOUNT, "nominal_amount", "nominal value"},
+                                {RPCResult::Type::STR_AMOUNT, "effective_amount", "demurrage-adjusted value"},
+                                {RPCResult::Type::STR_AMOUNT, "burned_amount", "value removed by demurrage"},
+                            }},
+                        }},
+                    }},
                 }},
+                {RPCResult::Type::NUM, "lifecycle_evaluation_height", "candidate next-block height used for lifecycle classification"},
+                {RPCResult::Type::NUM_TIME, "lifecycle_evaluation_mtp", "tip median-time-past used for lifecycle classification"},
                 RESULT_LAST_PROCESSED_BLOCK,
             }
             },
@@ -465,13 +524,22 @@ RPCHelpMan getbalances()
     if (!rpc_wallet) return UniValue::VNULL;
     const CWallet& wallet = *rpc_wallet;
 
+    for (;;) {
     // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now
+    // the user could have gotten from another RPC command prior to now. Retry
+    // if chainstate advances before the wallet and chain locks are acquired.
     wallet.BlockUntilSyncedToCurrentChain();
 
-    LOCK(wallet.cs_wallet);
+    LOCK2(::cs_main, wallet.cs_wallet);
+    if (!WalletLifecycleViewIsSynchronized(wallet)) continue;
 
-    const auto bal = GetBalance(wallet);
+    Balance bal;
+    WalletLifecycleSummary lifecycle;
+    std::string lifecycle_error;
+    if (!GetLifecycleAdjustedBalance(wallet, 0, /*avoid_reuse=*/true,
+                                     bal, lifecycle, lifecycle_error)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, lifecycle_error);
+    }
     UniValue balances{UniValue::VOBJ};
     {
         UniValue balances_mine{UniValue::VOBJ};
@@ -479,10 +547,16 @@ RPCHelpMan getbalances()
         balances_mine.pushKV("untrusted_pending", ValueFromAmount(bal.m_mine_untrusted_pending));
         balances_mine.pushKV("immature", ValueFromAmount(bal.m_mine_immature));
         balances_mine.pushKV("stake", ValueFromAmount(bal.m_mine_stake));
+        balances_mine.pushKV("lifecycle", WalletLifecycleAmountsToJSON(lifecycle.mine));
         if (wallet.IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE)) {
             // If the AVOID_REUSE flag is set, bal has been set to just the un-reused address balance. Get
             // the total balance, and then subtract bal to get the reused address balance.
-            const auto full_bal = GetBalance(wallet, 0, false);
+            Balance full_bal;
+            WalletLifecycleSummary full_lifecycle;
+            if (!GetLifecycleAdjustedBalance(wallet, 0, /*avoid_reuse=*/false,
+                                             full_bal, full_lifecycle, lifecycle_error)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, lifecycle_error);
+            }
             balances_mine.pushKV("used", ValueFromAmount(full_bal.m_mine_trusted + full_bal.m_mine_untrusted_pending - bal.m_mine_trusted - bal.m_mine_untrusted_pending));
         }
         balances.pushKV("mine", balances_mine);
@@ -494,11 +568,15 @@ RPCHelpMan getbalances()
         balances_watchonly.pushKV("untrusted_pending", ValueFromAmount(bal.m_watchonly_untrusted_pending));
         balances_watchonly.pushKV("immature", ValueFromAmount(bal.m_watchonly_immature));
         balances_watchonly.pushKV("stake", ValueFromAmount(bal.m_watchonly_stake));
+        balances_watchonly.pushKV("lifecycle", WalletLifecycleAmountsToJSON(lifecycle.watchonly));
         balances.pushKV("watchonly", balances_watchonly);
     }
 
+    balances.pushKV("lifecycle_evaluation_height", lifecycle.evaluation_height);
+    balances.pushKV("lifecycle_evaluation_mtp", lifecycle.evaluation_mtp);
     AppendLastProcessedBlock(balances, wallet);
     return balances;
+    }
 },
     };
 }
@@ -547,7 +625,27 @@ RPCHelpMan listunspent()
                             {RPCResult::Type::STR_AMOUNT, "ancestorfees", /*optional=*/true, "The total fees of in-mempool ancestors (including this one) with fee deltas used for mining priority in " + CURRENCY_ATOM + " (if transaction is in the mempool)"},
                             {RPCResult::Type::STR_HEX, "redeemScript", /*optional=*/true, "The redeemScript if scriptPubKey is P2SH"},
                             {RPCResult::Type::STR, "witnessScript", /*optional=*/true, "witnessScript if the scriptPubKey is P2WSH or P2SH-P2WSH"},
-                            {RPCResult::Type::BOOL, "spendable", "Whether we have the private keys to spend this output"},
+                            {RPCResult::Type::BOOL, "spendable", "Whether the wallet can sign and consensus permits this output in an ordinary next-block spend"},
+                            {RPCResult::Type::BOOL, "wallet_signable", "Whether the wallet has the keys needed to sign this output, independent of lifecycle locks"},
+                            {RPCResult::Type::BOOL, "consensus_spendable", "Whether consensus permits some valid next-block spend path"},
+                            {RPCResult::Type::BOOL, "ordinary_spendable", "Whether this output is available to ordinary wallet sends in the next block"},
+                            {RPCResult::Type::STR, "spendability_state", "Authoritative mutually exclusive lifecycle category"},
+                            {RPCResult::Type::BOOL, "synthetic", "Whether this is an authenticated synthetic Gold Rush payout"},
+                            {RPCResult::Type::BOOL, "merkle_included", "Whether this UTXO originated in an ordinary transaction Merkle tree"},
+                            {RPCResult::Type::BOOL, "mature", "Whether generated-output maturity is satisfied for the next block"},
+                            {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal value before demurrage"},
+                            {RPCResult::Type::STR_AMOUNT, "effective_amount", "Value available after demurrage"},
+                            {RPCResult::Type::STR_AMOUNT, "burned_amount", "Value removed by demurrage"},
+                            {RPCResult::Type::NUM, "maturity_height", /*optional=*/true, "First height satisfying generated-output maturity"},
+                            {RPCResult::Type::NUM, "earliest_spend_height", /*optional=*/true, "Earliest exact height at which an ordinary spend can be valid"},
+                            {RPCResult::Type::NUM_TIME, "earliest_spend_mtp", /*optional=*/true, "Earliest median-time-past at which an ordinary spend can be valid"},
+                            {RPCResult::Type::BOOL, "permanently_locked", "Whether this output has no future spend path"},
+                            {RPCResult::Type::BOOL, "legacy_scheduled_final_lockout", "Whether this legacy output is scheduled to lock at Final activation"},
+                            {RPCResult::Type::BOOL, "requires_quantum_migration", "Whether this legacy value requires its first migration before Final"},
+                            {RPCResult::Type::BOOL, "demurrage_active", "Whether demurrage applies at the evaluation height"},
+                            {RPCResult::Type::BOOL, "demurrage_exempt", "Whether this output is exempt from demurrage"},
+                            {RPCResult::Type::BOOL, "demurrage_locked", "Whether demurrage reduced effective value to zero and permanently locked the output"},
+                            {RPCResult::Type::STR, "demurrage_exemption", "Consensus exemption reason, or an empty string"},
                             {RPCResult::Type::BOOL, "solvable", "Whether we know how to spend this output, ignoring the lack of keys"},
                             {RPCResult::Type::BOOL, "reused", /*optional=*/true, "(only present if avoid_reuse is set) Whether this output is reused/dirty (sent to an address that was previously spent from)"},
                             {RPCResult::Type::STR, "desc", /*optional=*/true, "(only when solvable) A descriptor for spending this output"},
@@ -635,27 +733,45 @@ RPCHelpMan listunspent()
         }
     }
 
-    // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now
-    pwallet->BlockUntilSyncedToCurrentChain();
-
     UniValue results(UniValue::VARR);
     std::vector<COutput> vecOutputs;
+    std::vector<ValueLifecycleClassification> lifecycles;
+    for (;;) {
+    // Make sure the results are valid at least up to the most recent block
+    // the user could have gotten from another RPC command prior to now. Retry
+    // if chainstate advances before the wallet and chain locks are acquired.
+    pwallet->BlockUntilSyncedToCurrentChain();
+
     {
+        LOCK2(::cs_main, pwallet->cs_wallet);
+        if (!WalletLifecycleViewIsSynchronized(*pwallet)) continue;
         CCoinControl cctl;
         cctl.m_avoid_address_reuse = false;
         cctl.m_min_depth = nMinDepth;
         cctl.m_max_depth = nMaxDepth;
         cctl.m_include_unsafe_inputs = include_unsafe;
-        LOCK(pwallet->cs_wallet);
         vecOutputs = AvailableCoinsListUnspent(*pwallet, &cctl, filter_coins).All();
+
+        lifecycles.reserve(vecOutputs.size());
+        for (const COutput& out : vecOutputs) {
+            ValueLifecycleClassification lifecycle;
+            std::string lifecycle_error;
+            if (!GetWalletOutputLifecycle(*pwallet, out.outpoint, out.txout,
+                                          lifecycle, lifecycle_error)) {
+                throw JSONRPCError(RPC_WALLET_ERROR, lifecycle_error);
+            }
+            lifecycles.push_back(std::move(lifecycle));
+        }
+    }
+    break;
     }
 
     LOCK(pwallet->cs_wallet);
-
     const bool avoid_reuse = pwallet->IsWalletFlagSet(WALLET_FLAG_AVOID_REUSE);
 
-    for (const COutput& out : vecOutputs) {
+    for (size_t output_index = 0; output_index < vecOutputs.size(); ++output_index) {
+        const COutput& out = vecOutputs[output_index];
+        const ValueLifecycleClassification& lifecycle = lifecycles[output_index];
         CTxDestination address;
         const CScript& scriptPubKey = out.txout.scriptPubKey;
         bool fValidAddress = ExtractDestination(scriptPubKey, address);
@@ -721,7 +837,33 @@ RPCHelpMan listunspent()
                 entry.pushKV("ancestorfees", uint64_t(ancestor_fees));
             }
         }
-        entry.pushKV("spendable", out.spendable);
+        entry.pushKV("spendable", out.spendable && lifecycle.ordinary_spendable);
+        entry.pushKV("wallet_signable", out.spendable);
+        entry.pushKV("consensus_spendable", lifecycle.consensus_spendable);
+        entry.pushKV("ordinary_spendable", lifecycle.ordinary_spendable);
+        entry.pushKV("spendability_state", ValueLifecycleCategoryName(lifecycle.category));
+        entry.pushKV("synthetic", lifecycle.synthetic);
+        entry.pushKV("merkle_included", lifecycle.merkle_included);
+        entry.pushKV("mature", lifecycle.mature);
+        entry.pushKV("nominal_amount", ValueFromAmount(lifecycle.nominal_amount));
+        entry.pushKV("effective_amount", ValueFromAmount(lifecycle.effective_amount));
+        entry.pushKV("burned_amount", ValueFromAmount(lifecycle.burned_amount));
+        if (lifecycle.maturity_height >= 0) {
+            entry.pushKV("maturity_height", lifecycle.maturity_height);
+        }
+        if (lifecycle.earliest_spend_height >= 0) {
+            entry.pushKV("earliest_spend_height", lifecycle.earliest_spend_height);
+        }
+        if (lifecycle.earliest_spend_mtp >= 0) {
+            entry.pushKV("earliest_spend_mtp", lifecycle.earliest_spend_mtp);
+        }
+        entry.pushKV("permanently_locked", lifecycle.permanently_locked);
+        entry.pushKV("legacy_scheduled_final_lockout", lifecycle.legacy_scheduled_final_lockout);
+        entry.pushKV("requires_quantum_migration", lifecycle.requires_quantum_migration);
+        entry.pushKV("demurrage_active", lifecycle.demurrage_active);
+        entry.pushKV("demurrage_exempt", lifecycle.demurrage_exempt);
+        entry.pushKV("demurrage_locked", lifecycle.demurrage_locked);
+        entry.pushKV("demurrage_exemption", lifecycle.demurrage_exemption);
         entry.pushKV("solvable", out.solvable);
         if (out.solvable) {
             std::unique_ptr<SigningProvider> provider = pwallet->GetSolvingProvider(scriptPubKey);

@@ -15,7 +15,9 @@ the wallet's authoritative IsSpent() view.
 
 Part A verifies the spend direction (-> spent=true); Part B verifies the
 abandon/un-spend direction (-> spent=false), which is the core desync harm.
-Part C verifies the same reconciliation runs after an explicit rescan.
+Part C verifies the same reconciliation runs after an explicit rescan. Part D
+verifies that a transient negative lookup cannot erase externally anchored RGB
+proofs that the wallet cannot reconstruct.
 """
 
 from decimal import Decimal
@@ -169,8 +171,8 @@ class WalletRGBReconcileTest(BitcoinTestFramework):
         node.rescanblockchain(spend_height_a, spend_height_a)
         assert_equal(self._assignment_spent(node, cid_c, seal_a), True)
 
-        # ---- Part D: a checked transition with an unprovable external anchor is pruned ----
-        self.log.info("Part D: unprovable checked RGB anchor -> transition and output assignment are pruned")
+        # ---- Part D: a checked transition with an external anchor is retained ----
+        self.log.info("Part D: absent external RGB anchor lookup -> metadata is retained non-destructively")
         self.restart_node(0, extra_args=self.extra_args[0])
         node = self.nodes[0]
         external_input = self._fake_seal(0xD0)
@@ -201,12 +203,12 @@ class WalletRGBReconcileTest(BitcoinTestFramework):
 
         self.generatetoaddress(node, 1, node.getnewaddress(), sync_fun=self.no_op)
         asset_d = self._asset(node, cid_d)
-        assert_equal(asset_d["balance"], 0)
-        assert_equal(asset_d["proof_transition_count"], 0)
-        assert_equal(asset_d["transitions"], [])
-        assert_equal(asset_d["assignments"], [])
+        assert_equal(asset_d["balance"], 500)
+        assert_equal(asset_d["proof_transition_count"], 1)
+        assert_equal(len(asset_d["transitions"]), 1)
+        assert_equal(len(asset_d["assignments"]), 1)
 
-        self.log.info("PASS: RGB ledger self-heals on out-of-band spend (A), abandon (B), rescan (C), and unprovable anchors (D).")
+        self.log.info("PASS: RGB ledger self-heals on out-of-band spend (A), abandon (B), rescan (C), and preserves external anchors on negative lookup (D).")
 
 
 if __name__ == "__main__":

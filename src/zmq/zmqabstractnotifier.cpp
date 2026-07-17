@@ -1,3 +1,4 @@
+// Copyright (c) 2015-2020 The Bitcoin Core developers
 // Copyright (c) 2015-2020 Blackcoin Core Developers
 // Copyright (c) 2015-2020 Blackcoin More Developers
 // Copyright (c) 2015-2020 Quantum Quasar Developers
@@ -31,6 +32,11 @@ bool CZMQAbstractNotifier::NotifyBlockConnect(const CBlockIndex * /*CBlockIndex*
 }
 
 bool CZMQAbstractNotifier::NotifyBlockDisconnect(const CBlockIndex * /*CBlockIndex*/)
+{
+    return true;
+}
+
+bool CZMQAbstractNotifier::NotifyShadowBlock(bool /*connected*/, const ShadowIndexBlockEvent& /*event*/)
 {
     return true;
 }

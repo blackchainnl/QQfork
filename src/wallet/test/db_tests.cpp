@@ -61,6 +61,24 @@ static void CheckPrefix(DatabaseBatch& batch, Span<const std::byte> prefix, Mock
 
 BOOST_FIXTURE_TEST_SUITE(db_tests, BasicTestingSetup)
 
+#ifdef USE_SQLITE
+BOOST_AUTO_TEST_CASE(list_databases_top_level_sqlite_wallet)
+{
+    const fs::path wallet_dir = m_path_root / "wallets";
+    DatabaseOptions options;
+    DatabaseStatus status;
+    bilingual_str error;
+
+    auto database = MakeSQLiteDatabase(wallet_dir, options, status, error);
+    BOOST_REQUIRE_MESSAGE(database, error.original);
+    database.reset();
+
+    const auto wallets = ListDatabases(wallet_dir);
+    BOOST_REQUIRE_EQUAL(wallets.size(), 1U);
+    BOOST_CHECK(wallets.front().empty());
+}
+#endif
+
 static std::shared_ptr<BerkeleyEnvironment> GetWalletEnv(const fs::path& path, fs::path& database_filename)
 {
     fs::path data_file = BDBDataFile(path);

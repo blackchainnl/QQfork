@@ -64,6 +64,7 @@ Currently, the following notifications are supported:
     -zmqpubrawblock=address
     -zmqpubrawtx=address
     -zmqpubsequence=address
+    -zmqpubshadow=address
 
 The socket type is PUB and the address must be a valid ZeroMQ socket
 address. The same address can be used in more than one notification.
@@ -77,6 +78,7 @@ The option to set the PUB socket's outbound message high water mark
     -zmqpubrawblockhwm=n
     -zmqpubrawtxhwm=n
     -zmqpubsequencehwm=n
+    -zmqpubshadowhwm=n
 
 The high water mark value must be an integer greater than or equal to 0.
 
@@ -88,12 +90,53 @@ For instance:
                -zmqpubrawtx=ipc:///tmp/blackcoind.tx.raw \
                -zmqpubhashtxhwm=10000
 
+The `shadow` notifier additionally requires the persisted explorer index:
+
+    $ blackcoind -shadowindex=1 -prune=0 \
+               -zmqpubshadow=tcp://127.0.0.1:28334
+
+Startup fails if `-zmqpubshadow` is configured without `-shadowindex=1`.
+
 Each PUB notification has a topic and body, where the header
 corresponds to the notification type. For instance, for the
 notification `-zmqpubhashtx` the topic is `hashtx` (no null
 terminator). These options can also be provided in blackcoin.conf.
 
 The topics are:
+
+`shadow`: Publishes one deterministic UTF-8 JSON delta after `shadowindex` has
+atomically applied or rewound an active-chain block at or above the configured
+Gold Rush reward start. Messages have three parts:
+
+    | shadow | <blackcoin.shadow.event.v1 JSON> | <uint32 sequence number in Little Endian>
+
+The top-level `event` is `shadow.block.connected` or
+`shadow.block.disconnected`. Both directions carry the same deterministic
+payload except for that field, so a disconnect is the exact inverse of the
+corresponding connect. The payload identifies the block height, hash, parent
+hash and time, declares `synthetic: true` and `merkle_included: false`, and
+contains ordered `credits` and `spends`. Credits are ordered by synthetic claim
+index. Spends are ordered by base transaction position and input position.
+Every amount has a BLK JSON value and an exact base-10 atomic-unit string.
+For canonical PoW credits, `pow_claim_source` includes `proof_version`, the
+`input_bound` flag, and `claim_outpoint`. The outpoint is null for the active
+QQP3 rule. It is populated only after a separately scheduled QQP4 activation;
+QQP4 is disabled on mainnet in v30.1.1.
+
+During a reorganization, disconnect messages are published from the former tip
+down to the common ancestor. Connect messages then run from the ancestor's
+child up to the replacement tip. Startup, initial index construction,
+`-reindex`, and `-reindex-chainstate` do not replay historical shadow events.
+Bootstrap and recovery must use the versioned `getshadow*` RPCs described in
+[`shadow-explorer-rpc.md`](shadow-explorer-rpc.md).
+
+Event construction is bounded to 4,096 combined credit and spend records and a
+16 MiB JSON body. It uses persisted ordered spend anchors and performs only
+point lookups for the shadow records in the delta; it does not rescan the UTXO
+set or the historical index. If an event exceeds a transport bound or cannot be
+constructed from a consistent index, the node logs the omission and remains
+valid. Consumers must periodically reconcile block anchors and cumulative
+supply by RPC even when ZMQ sequence numbers are contiguous.
 
 `sequence`: the body is structured as the following based on the type of message:
 
@@ -171,6 +214,14 @@ There are several possibilities that ZMQ notification can get lost
 during transmission depending on the communication type you are
 using. Bitcoind appends an up-counting sequence number to each
 notification which allows listeners to detect lost notifications.
+
+A shadow publish failure shuts down only the failed notifier. It does not roll
+back the already committed shadow index, reject a base block, or change
+consensus state. A restarted notifier begins with a new in-memory sequence and
+does not replay the gap. Treat a sequence discontinuity, socket reconnect,
+daemon restart, explicit omission log, or periodic anchor mismatch as a signal
+to reconcile from the last common block through `getshadowblock` and
+`getshadowsupply`.
 
 The `sequence` topic refers specifically to the mempool sequence
 number, which is also published along with all mempool events. This

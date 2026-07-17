@@ -10,12 +10,15 @@ so live testnet wallets can exercise the whitelist and Gold Rush paths without
 waiting for mainnet heights.
 """
 
+from decimal import Decimal
 import os
 import subprocess
 
+from test_framework.blocktools import create_block, create_coinbase
+from test_framework.script import CScript, OP_16
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.test_node import ErrorMatch
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 class GoldRushScheduleControlsTest(BitcoinTestFramework):
@@ -38,6 +41,13 @@ class GoldRushScheduleControlsTest(BitcoinTestFramework):
                 "-shadowgoldrushblocks=10",
             ],
             expected_msg="-shadowgoldrushstartheight must be greater than -shadowwhitelistheight",
+            match=ErrorMatch.PARTIAL_REGEX,
+        )
+
+        self.log.info("Rejecting the compressed competing-claim boundary outside regtest")
+        node.assert_start_raises_init_error(
+            extra_args=["-shadowcompetingclaimsheight=110"],
+            expected_msg="-shadowcompetingclaimsheight is only supported on regtest",
             match=ErrorMatch.PARTIAL_REGEX,
         )
 
@@ -91,6 +101,7 @@ class GoldRushScheduleControlsTest(BitcoinTestFramework):
                 "-shadowgoldrushstartheight=110",
                 "-shadowgoldrushendheight=119",
                 "-qqgoldrushendheight=115",
+                "-qqmigrationendheight=215",
             ],
             expected_msg="must not be below the shadow reward end height",
             match=ErrorMatch.PARTIAL_REGEX,
@@ -108,8 +119,11 @@ class GoldRushScheduleControlsTest(BitcoinTestFramework):
         assert_equal(info["shadow_reward_end_height"], 119)
         assert_equal(info["shadow_reward_next_height"], 1)
         assert_equal(info["shadow_reward_height_active"], False)
-        assert_equal(info["gold_rush_end_height"], 0)
-        assert_equal(info["quantum_migration_end_height"], 0)
+        # A shadow-window override without separate phase controls derives a
+        # complete height-authoritative lifecycle from that reward window.
+        assert_equal(info["gold_rush_end_height"], 119)
+        assert info["quantum_migration_end_height"] > info["gold_rush_end_height"]
+        assert_equal(info["height_boundaries_authoritative"], True)
         self.stop_node(0)
 
         self.log.info("Starting testnet with the height-based phase boundaries")
@@ -127,6 +141,38 @@ class GoldRushScheduleControlsTest(BitcoinTestFramework):
         assert_equal(info["gold_rush_end_height"], 119)
         assert_equal(info["quantum_migration_end_height"], 219)
         assert_equal(info["phase"], "gold_rush")
+
+        self.log.info("Rejecting raw generateblock transaction injection outside regtest")
+        address = node.get_deterministic_priv_key().address
+        raw_tx = node.createrawtransaction(
+            [{"txid": "00" * 32, "vout": 0}],
+            [{address: Decimal("1")}],
+        )
+        assert_raises_rpc_error(
+            -8,
+            "Raw transaction injection through generateblock is only available on regtest",
+            node.generateblock,
+            address,
+            [raw_tx],
+            False,
+            invalid_call=False,
+        )
+
+        self.log.info("Rejecting a known-parent future-witness coinbase through submitblock")
+        tip = node.getbestblockhash()
+        coinbase = create_coinbase(
+            node.getblockcount() + 1,
+            script_pubkey=CScript([OP_16, bytes([16]) * 32]),
+        )
+        block = create_block(
+            int(tip, 16),
+            coinbase,
+            node.getblockheader(tip)["time"] + 1,
+        )
+        assert_equal(
+            node.submitblock(block.serialize().hex()),
+            "goldrush-future-witness-coinbase",
+        )
 
 
 if __name__ == "__main__":

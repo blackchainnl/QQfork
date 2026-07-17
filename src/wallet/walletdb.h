@@ -98,6 +98,7 @@ extern const std::string RGB_GENESIS_PROOF;
 extern const std::string RGB_TRANSITION;
 extern const std::string RGB_TRANSITION_PROOF;
 extern const std::string QUANTUM_COLDSTAKE;
+extern const std::string QUANTUM_KEY_BACKUP_STATE;
 extern const std::string QUANTUM_KEY;
 extern const std::string QUANTUM_REDELEGATION_AUTO_SCAN;
 extern const std::string QUANTUM_REDELEGATION_LAST_ATTEMPT;
@@ -262,6 +263,7 @@ public:
     bool WriteCryptedKey(const CPubKey& vchPubKey, const std::vector<unsigned char>& vchCryptedSecret, const CKeyMetadata &keyMeta);
     bool WriteQuantumKey(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, const CKeyMetadata& keyMeta);
     bool WriteCryptedQuantumKey(const std::vector<unsigned char>& public_key, const std::vector<unsigned char>& crypted_private_key, const CKeyMetadata& keyMeta);
+    bool WriteQuantumKeyBackupState(const std::vector<unsigned char>& witness_program, bool verified);
     bool WriteQuantumColdStakeDelegation(const std::vector<unsigned char>& witness_program, const QuantumColdStakeDelegationRecord& record);
     bool WriteQuantumRedelegationAutoScanHeight(int height);
     bool WriteQuantumRedelegationLastAttemptHeight(const std::vector<unsigned char>& witness_program, int height);
@@ -326,7 +328,7 @@ public:
 
     bool WriteWalletFlags(const uint64_t flags);
     //! Begin a new transaction
-    bool TxnBegin();
+    bool TxnBegin(bool durable = false);
     //! Commit current transaction
     bool TxnCommit();
     //! Abort current transaction

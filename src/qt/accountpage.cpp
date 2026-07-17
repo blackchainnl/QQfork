@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <limits>
 #include <map>
+#include <set>
 #include <vector>
 
 #include <QAbstractItemView>
@@ -34,6 +35,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
+#include <QPalette>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QTextEdit>
@@ -86,9 +88,7 @@ QLabel* makeCard(const QString& text, QWidget* parent)
     label->setWordWrap(true);
     label->setTextFormat(Qt::RichText);
     label->setMinimumHeight(78);
-    label->setStyleSheet(QStringLiteral(
-        "QLabel { background: #ffffff; border: 1px solid #cfd8e3; border-radius: 6px; padding: 10px; }"
-        "QLabel[attention=\"true\"] { background: #fff7e6; border-color: #d8a441; }"));
+    GUIUtil::ConfigureThemedLabelPanel(label, QPalette::Base, QPalette::Text, 10);
     return label;
 }
 
@@ -223,7 +223,7 @@ OutputRowDetail describeOutput(const CTxDestination& dest,
     if (detail.family == QObject::tr("Legacy")) {
         detail.notes = QObject::tr("Legacy spend path. Use for current-chain fees, sends, and legacy staking.");
     } else if (detail.family == QObject::tr("EUTXO")) {
-        detail.notes = QObject::tr("Extended UTXO state. Do not spend as ordinary BLK unless a guided workflow says to.");
+        detail.notes = QObject::tr("EUTXO v15 is frozen in v30.1.1. This row is inspection-only; funding and spending are disabled. Do not send BLK to it.");
     }
     return detail;
 }
@@ -245,9 +245,9 @@ QString minDepthText(int min_depth)
 QString addressNote(const QString& family)
 {
     if (family == QObject::tr("Legacy")) return QObject::tr("Legacy spend path. Use for current-chain fees, sends, and legacy staking.");
-    if (family == QObject::tr("Quantum")) return QObject::tr("Direct quantum spend path. Gold Rush rewards may require one fresh move before normal use.");
+    if (family == QObject::tr("Quantum")) return QObject::tr("Direct quantum spend path. Gold Rush rewards remain locked until Gold Rush ends, then require no preliminary move after maturity.");
     if (family == QObject::tr("Cold stake")) return QObject::tr("Cold-stake contract path. Owner and staker authority are separated.");
-    if (family == QObject::tr("EUTXO")) return QObject::tr("Extended UTXO state. Do not spend as ordinary BLK unless a guided workflow says to.");
+    if (family == QObject::tr("EUTXO")) return QObject::tr("EUTXO v15 is frozen in v30.1.1. This row is inspection-only; funding and spending are disabled. Do not send BLK to it.");
     return QObject::tr("Nonstandard or wallet-internal script group.");
 }
 
@@ -289,10 +289,14 @@ void AccountPage::setupUi()
     cards->setHorizontalSpacing(8);
     cards->setVerticalSpacing(8);
     m_total_card = makeCard(tr("Wallet totals will appear here."), this);
+    m_total_card->setObjectName(QStringLiteral("accountTotalCard"));
     m_legacy_card = makeCard(tr("Legacy balance will appear here."), this);
+    m_legacy_card->setObjectName(QStringLiteral("accountLegacyCard"));
     m_quantum_card = makeCard(tr("Quantum balance will appear here."), this);
+    m_quantum_card->setObjectName(QStringLiteral("accountQuantumCard"));
     m_attention_card = makeCard(tr("Migration and staking attention items will appear here."), this);
-    m_attention_card->setProperty("attention", true);
+    m_attention_card->setObjectName(QStringLiteral("accountAttentionCard"));
+    GUIUtil::ConfigureThemedLabelPanel(m_attention_card, QPalette::Highlight, QPalette::HighlightedText, 10);
     cards->addWidget(m_total_card, 0, 0);
     cards->addWidget(m_legacy_card, 0, 1);
     cards->addWidget(m_quantum_card, 1, 0);
@@ -463,7 +467,9 @@ void AccountPage::refresh()
     const interfaces::Wallet::CoinsList coins = wallet.listCoins();
     AccountOutputMetadata metadata;
     const std::vector<interfaces::WalletQuantumAddressInfo> quantum_addresses = wallet.listQuantumAddresses();
+    std::set<std::string> unverified_quantum_keys;
     for (const interfaces::WalletQuantumAddressInfo& info : quantum_addresses) {
+        if (!info.backup_verified) unverified_quantum_keys.insert(info.public_key);
         if (!info.tiered) continue;
         StakeOutputDetail detail;
         detail.operator_bond = info.label == "coldstake-operator" && info.unbonding_blocks == OPERATOR_COMMITMENT_BLOCKS;
@@ -485,22 +491,40 @@ void AccountPage::refresh()
         metadata.coldstake_addresses[QString::fromStdString(info.address)] = detail;
     }
 
-    m_total_card->setText(tr("<b>Total wallet balance</b><br>Available: %1<br>Pending: %2<br>Immature: %3")
+    const CAmount lifecycle_locked = balances.synthetic_mature_locked_balance +
+        balances.direct_quantum_phase_locked_balance +
+        balances.quantum_contract_restricted_balance +
+        balances.final_locked_legacy_balance + balances.demurrage_locked_balance;
+    m_total_card->setText(tr("<b>Wallet lifecycle totals</b><br>Ordinary available: %1<br>Pending: %2<br>Immature: %3<br>Locked/restricted: %4")
         .arg(formatBLK(balances.balance))
         .arg(formatBLK(balances.unconfirmed_balance))
-        .arg(formatBLK(balances.immature_balance)));
-    m_legacy_card->setText(tr("<b>Legacy spend path</b><br>%1<br>Use for current-chain fees, legacy sends, and legacy staking.")
-        .arg(formatBLK(balances.legacy_balance)));
-    m_quantum_card->setText(tr("<b>Quantum-controlled balance</b><br>%1<br>Includes wallet-owned quantum outputs; bonded, delegated, or Gold Rush outputs may need a guided move before ordinary spending.")
-        .arg(formatBLK(balances.quantum_balance)));
+        .arg(formatBLK(balances.immature_balance))
+        .arg(formatBLK(lifecycle_locked)));
+    m_legacy_card->setText(tr("<b>Legacy lifecycle</b><br>Spendable now: %1<br>Final-locked: %2<br>Spendable legacy value must migrate before Final activation.")
+        .arg(formatBLK(balances.legacy_balance))
+        .arg(formatBLK(balances.final_locked_legacy_balance)));
+    m_quantum_card->setText(tr("<b>Quantum lifecycle</b><br>Direct spendable: %1<br>Gold Rush immature: %2<br>Gold Rush mature/phase-locked: %3<br>Other phase/contract restricted: %4")
+        .arg(formatBLK(balances.quantum_balance))
+        .arg(formatBLK(balances.synthetic_immature_balance))
+        .arg(formatBLK(balances.synthetic_mature_locked_balance))
+        .arg(formatBLK(balances.direct_quantum_phase_locked_balance +
+                       balances.quantum_contract_restricted_balance)));
+    QString attention;
     if (migration.available) {
-        m_attention_card->setText(tr("<b>Attention</b><br>Legacy to migrate: %1<br>Gold Rush rewards to move: %2<br>Staked/delegated quantum: %3")
+        attention = tr("<b>Attention</b><br>Legacy to migrate: %1<br>Gold Rush rewards phase-locked: %2<br>Staked/delegated quantum: %3<br>Demurrage locked: %4<br>Demurrage burned: %5")
             .arg(formatBLK(migration.eligible_legacy_amount))
             .arg(formatBLK(migration.goldrush_reward_amount_needing_move))
-            .arg(formatBLK(migration.staked_quantum_amount)));
+            .arg(formatBLK(migration.staked_quantum_amount))
+            .arg(formatBLK(balances.demurrage_locked_balance))
+            .arg(formatBLK(balances.demurrage_burned_balance));
     } else {
-        m_attention_card->setText(tr("<b>Attention</b><br>Migration status is busy; refresh shortly."));
+        attention = tr("<b>Attention</b><br>Migration status is busy; refresh shortly.");
     }
+    if (!unverified_quantum_keys.empty()) {
+        attention += tr("<br><b>Backup required:</b> %1 non-HD quantum key(s) do not have a completed reopen-and-sign backup verification event. Unlock the wallet and use Backup Wallet now. The wallet cannot track whether an external backup file is later moved or deleted.")
+            .arg(static_cast<int>(unverified_quantum_keys.size()));
+    }
+    m_attention_card->setText(attention);
 
     QSignalBlocker tree_blocker(m_tree);
     m_tree->clear();
@@ -603,17 +627,17 @@ void AccountPage::refresh()
 
     if (migration.available && migration.goldrush_reward_outputs_needing_move > 0) {
         const QString family = tr("Quantum");
-        const QString searchable = tr("Gold Rush needs move aggregate quantum reward migration");
+        const QString searchable = tr("Gold Rush locked aggregate quantum reward phase lock");
         if (rowMatchesFilter(family, searchable, QString())) {
             auto* item = new QTreeWidgetItem(m_tree);
-            item->setText(Type, tr("Gold Rush needs move"));
+            item->setText(Type, tr("Gold Rush locked"));
             item->setText(Address, tr("(aggregate)"));
             item->setText(Label, QString());
             item->setText(Amount, formatBLK(migration.goldrush_reward_amount_needing_move));
             item->setText(Outputs, QString::number(migration.goldrush_reward_outputs_needing_move));
             item->setText(Confirmations, QStringLiteral("-"));
-            item->setText(Status, tr("move first"));
-            item->setText(Notes, tr("Wallet migration status reports these Gold Rush reward output(s) need one fresh move before ordinary sends, staking, node bonds, or delegation. Exact outpoints are not exposed to this account view, so this aggregate row is not added to the visible balance total."));
+            item->setText(Status, tr("phase locked"));
+            item->setText(Notes, tr("These Gold Rush reward outputs remain unspendable until Gold Rush ends and normal maturity is satisfied. They then become ordinary direct quantum outputs without a required fresh-address move. Exact outpoints are not exposed to this account view, so this aggregate row is not added to the visible balance total."));
             item->setToolTip(Notes, item->text(Notes));
         }
     }

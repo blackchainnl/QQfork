@@ -1,3 +1,4 @@
+// Copyright (c) 2020-2022 The Bitcoin Core developers
 // Copyright (c) 2020-2022 Blackcoin Core Developers
 // Copyright (c) 2020-2022 Blackcoin More Developers
 // Copyright (c) 2020-2022 Quantum Quasar Developers
@@ -6,6 +7,7 @@
 //
 #include <chainparams.h>
 #include <consensus/validation.h>
+#include <node/chainstate.h>
 #include <random.h>
 #include <rpc/blockchain.h>
 #include <sync.h>
@@ -21,6 +23,62 @@
 #include <boost/test/unit_test.hpp>
 
 BOOST_FIXTURE_TEST_SUITE(validation_chainstate_tests, ChainTestingSetup)
+
+BOOST_AUTO_TEST_CASE(chainstate_rebuild_block_data_preflight)
+{
+    LOCK(::cs_main);
+    CBlockIndex genesis;
+    CBlockIndex middle;
+    CBlockIndex tip;
+    uint256 genesis_hash = uint256::ONE;
+    genesis.phashBlock = &genesis_hash;
+    genesis.nHeight = 0;
+    middle.nHeight = 1;
+    tip.nHeight = 2;
+    middle.pprev = &genesis;
+    tip.pprev = &middle;
+    genesis.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_TRANSACTIONS;
+    middle.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_TRANSACTIONS;
+    tip.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_TRANSACTIONS;
+
+    BOOST_CHECK(!node::FindChainstateRebuildPreflightFailureHeight(
+        nullptr, genesis_hash));
+    BOOST_CHECK(!node::FindChainstateRebuildPreflightFailureHeight(
+        &tip, genesis_hash));
+
+    middle.nStatus &= ~BLOCK_HAVE_DATA;
+    const auto missing_middle = node::FindChainstateRebuildPreflightFailureHeight(
+        &tip, genesis_hash);
+    BOOST_REQUIRE(missing_middle);
+    BOOST_CHECK_EQUAL(*missing_middle, 1);
+    middle.nStatus |= BLOCK_HAVE_DATA;
+
+    middle.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_TREE | BLOCK_ASSUMED_VALID;
+    const auto assumed_middle = node::FindChainstateRebuildPreflightFailureHeight(
+        &tip, genesis_hash);
+    BOOST_REQUIRE(assumed_middle);
+    BOOST_CHECK_EQUAL(*assumed_middle, 1);
+    middle.nStatus = BLOCK_HAVE_DATA | BLOCK_VALID_TRANSACTIONS;
+
+    tip.nStatus &= ~BLOCK_HAVE_DATA;
+    const auto missing_tip = node::FindChainstateRebuildPreflightFailureHeight(
+        &tip, genesis_hash);
+    BOOST_REQUIRE(missing_tip);
+    BOOST_CHECK_EQUAL(*missing_tip, 2);
+    tip.nStatus |= BLOCK_HAVE_DATA;
+
+    tip.pprev = nullptr;
+    const auto broken_ancestry = node::FindChainstateRebuildPreflightFailureHeight(
+        &tip, genesis_hash);
+    BOOST_REQUIRE(broken_ancestry);
+    BOOST_CHECK_EQUAL(*broken_ancestry, 1);
+
+    tip.pprev = &middle;
+    const auto wrong_genesis = node::FindChainstateRebuildPreflightFailureHeight(
+        &tip, uint256::ZERO);
+    BOOST_REQUIRE(wrong_genesis);
+    BOOST_CHECK_EQUAL(*wrong_genesis, 0);
+}
 
 //! Test resizing coins-related Chainstate caches during runtime.
 //!

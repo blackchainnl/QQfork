@@ -20,6 +20,7 @@ static constexpr bool DEFAULT_DAEMONWAIT = false;
 class ArgsManager;
 namespace interfaces {
 struct BlockAndHeaderTipInfo;
+enum class AppInitResult;
 }
 namespace kernel {
 struct Context;
@@ -68,7 +69,9 @@ bool AppInitInterfaces(node::NodeContext& node);
  * @note This should only be done after daemonization. Call Shutdown() if this function fails.
  * @pre Parameters should be parsed and config file should be read, AppInitLockDataDirectory should have been called.
  */
-bool AppInitMain(node::NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info = nullptr);
+interfaces::AppInitResult AppInitMain(
+    node::NodeContext& node,
+    interfaces::BlockAndHeaderTipInfo* tip_info = nullptr);
 
 /**
  * Register all arguments with the ArgsManager

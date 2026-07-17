@@ -15,7 +15,7 @@ from test_framework.messages import COIN, COutPoint, CTransaction, CTxIn, CTxOut
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 from test_framework.address import key_to_p2pkh
-from test_framework.script import CScript, OP_FALSE, OP_RETURN
+from test_framework.script import CScript, OP_2, OP_15, OP_16, OP_FALSE, OP_RETURN
 from test_framework.script_util import key_to_p2pkh_script
 from test_framework.wallet_util import generate_keypair
 
@@ -35,8 +35,8 @@ class BlackcoinPhaseTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.extra_args = [
             ["-shadowwhitelistheight=1", "-shadowgoldrushblocks=500"],
-            ["-shadowwhitelistheight=1", "-shadowgoldrushblocks=1", "-qqgoldrushendtime=1"],
-            ["-shadowwhitelistheight=1", "-shadowgoldrushblocks=1", "-qqgoldrushendtime=1", "-qqmigrationdeadlinetime=2"],
+            ["-shadowwhitelistheight=1", "-shadowgoldrushblocks=1", "-qqgoldrushendheight=2", "-qqmigrationendheight=500"],
+            ["-shadowwhitelistheight=1", "-shadowgoldrushblocks=1", "-qqgoldrushendheight=2", "-qqmigrationendheight=3"],
         ]
 
     def setup_network(self):
@@ -71,13 +71,17 @@ class BlackcoinPhaseTest(BitcoinTestFramework):
         coinbase_txid = node.getblock(block_hashes[0])["tx"][0]
         coinbase = node.getrawtransaction(coinbase_txid, True, block_hashes[0])
         value = Decimal(str(coinbase["vout"][0]["value"]))
-        spend_value = value - Decimal("0.001")
-        raw = node.createrawtransaction(
-            [{"txid": coinbase_txid, "vout": 0}],
-            [{"eutxo": {"amount": spend_value, "datum": "01", "validator": "51"}}],
-        )
+        # Construct the exact v15 witness shape directly. The public raw-transaction
+        # helper intentionally refuses to create disabled EUTXO outputs in v30.1.1,
+        # while this phase test still needs to exercise block/mempool rejection.
+        tx = CTransaction()
+        tx.vin = [CTxIn(COutPoint(int(coinbase_txid, 16), 0))]
+        tx.vout = [CTxOut(
+            int((value - Decimal("0.001")) * COIN),
+            CScript([OP_15, bytes([0x55]) * 32]),
+        )]
         signed = node.signrawtransactionwithkey(
-            raw,
+            tx.serialize().hex(),
             [privkey],
             [{"txid": coinbase_txid, "vout": 0, "scriptPubKey": script_pub_key, "amount": value}],
         )
@@ -96,6 +100,55 @@ class BlackcoinPhaseTest(BitcoinTestFramework):
         tx = CTransaction()
         tx.vin = [CTxIn(COutPoint(int(coinbase_txid, 16), 0))]
         tx.vout = [CTxOut(int((value - Decimal("0.001")) * COIN), CScript([OP_FALSE, OP_RETURN, b"QQPOOL"]))]
+        signed = node.signrawtransactionwithkey(
+            tx.serialize().hex(),
+            [privkey],
+            [{"txid": coinbase_txid, "vout": 0, "scriptPubKey": script_pub_key, "amount": value}],
+        )
+        assert signed["complete"]
+        return signed["hex"]
+
+    def _signed_unknown_quantum_output_tx(self, node):
+        privkey, pubkey = generate_keypair(wif=True)
+        address = key_to_p2pkh(pubkey)
+        script_pub_key = key_to_p2pkh_script(pubkey).hex()
+        block_hashes = self.generatetoaddress(node, 101, address, sync_fun=self.no_op)
+        coinbase_txid = node.getblock(block_hashes[0])["tx"][0]
+        coinbase = node.getrawtransaction(coinbase_txid, True, block_hashes[0])
+        value = Decimal(str(coinbase["vout"][0]["value"]))
+
+        tx = CTransaction()
+        tx.vin = [CTxIn(COutPoint(int(coinbase_txid, 16), 0))]
+        tx.vout = [CTxOut(
+            int((value - Decimal("0.001")) * COIN),
+            CScript([OP_2, bytes([0x42]) * 32]),
+        )]
+        signed = node.signrawtransactionwithkey(
+            tx.serialize().hex(),
+            [privkey],
+            [{"txid": coinbase_txid, "vout": 0, "scriptPubKey": script_pub_key, "amount": value}],
+        )
+        assert signed["complete"]
+        return signed["hex"]
+
+    def _signed_tiered_quantum_output_tx(self, node):
+        privkey, pubkey = generate_keypair(wif=True)
+        address = key_to_p2pkh(pubkey)
+        script_pub_key = key_to_p2pkh_script(pubkey).hex()
+        block_hashes = self.generatetoaddress(node, 101, address, sync_fun=self.no_op)
+        coinbase_txid = node.getblock(block_hashes[0])["tx"][0]
+        coinbase = node.getrawtransaction(coinbase_txid, True, block_hashes[0])
+        value = Decimal(str(coinbase["vout"][0]["value"]))
+
+        # Valid bonded v16 tier program: tag, state, 1350-block unbonding,
+        # zero unlock height, and a 32-byte commitment.
+        tier_program = bytes([1, 1, 0x46, 0x05, 0, 0, 0, 0]) + bytes([0x33]) * 32
+        tx = CTransaction()
+        tx.vin = [CTxIn(COutPoint(int(coinbase_txid, 16), 0))]
+        tx.vout = [CTxOut(
+            int((value - Decimal("0.001")) * COIN),
+            CScript([OP_16, tier_program]),
+        )]
         signed = node.signrawtransactionwithkey(
             tx.serialize().hex(),
             [privkey],
@@ -145,23 +198,30 @@ class BlackcoinPhaseTest(BitcoinTestFramework):
         assert_equal(gold_rush["new_network_stake_only"], False)
         assert_equal(gold_rush["replay_protection_active"], False)
         assert_equal(gold_rush["quantum_spend_enforcement_active"], False)
+        assert_equal(gold_rush["quantum_migration_outputs_fundable"], False)
+        gold_rush_address = self.nodes[0].createquantummigrationaddress("11" * 32)
+        assert_equal(gold_rush_address["fundable_now"], False)
+        assert_equal(gold_rush_address["spendable_now"], False)
+        assert_equal(gold_rush_address["consensus_spend_guard_active"], True)
         assert_equal(self._default_signature_has_forkid(self.nodes[0]), False)
         gold_rush_template = self.nodes[0].getblocktemplate({"rules": ["segwit"]})
         assert_equal(gold_rush_template["weightlimit"], LEGACY_BLOCK_WEIGHT)
         assert_equal(gold_rush_template["sigoplimit"], LEGACY_BLOCK_SIGOPS)
+        assert_equal(gold_rush_template["quantumquasar"]["quantum_migration_outputs_fundable"], False)
         self._assert_goldrush_info_rpc(self.nodes[0])
         self._assert_rgb_commitment_rpc(self.nodes[0])
-        assert_raises_rpc_error(
-            -25,
-            "TestBlockValidity failed: shadow-marker-output",
-            self.generateblock,
+        # Marker-shaped user outputs are refused by v30 node policy, but a
+        # block containing one remains valid under the v26.2-compatible Gold
+        # Rush consensus rules.
+        self.generateblock(
             self.nodes[0],
             self.nodes[0].get_deterministic_priv_key().address,
             [self._signed_shadow_marker_output_tx(self.nodes[0])],
+            sync_fun=self.no_op,
         )
         gold_rush_eutxo = self.nodes[0].testmempoolaccept([self._signed_eutxo_output_tx(self.nodes[0])])[0]
         assert_equal(gold_rush_eutxo["allowed"], False)
-        assert_equal(gold_rush_eutxo["reject-reason"], "eutxo-output-premature")
+        assert_equal(gold_rush_eutxo["reject-reason"], "quantum-output-premature")
 
         self.log.info("Migration phase activates quantum spends while legacy staking remains accepted")
         self.generatetoaddress(self.nodes[1], 3, self.nodes[1].get_deterministic_priv_key().address, sync_fun=self.no_op)
@@ -170,16 +230,32 @@ class BlackcoinPhaseTest(BitcoinTestFramework):
         assert_equal(migration["base_network_stake_compatible"], True)
         assert_equal(migration["shadow_merge_mining_active"], False)
         assert_equal(migration["new_network_stake_only"], False)
-        assert_equal(migration["replay_protection_active"], False)
+        assert_equal(migration["replay_protection_active"], True)
         assert_equal(migration["quantum_spend_enforcement_active"], True)
-        assert_equal(self._default_signature_has_forkid(self.nodes[1]), False)
+        assert_equal(migration["quantum_migration_outputs_fundable"], True)
+        migration_address = self.nodes[1].createquantummigrationaddress("22" * 32)
+        assert_equal(migration_address["fundable_now"], True)
+        assert_equal(migration_address["spendable_now"], True)
+        assert_equal(migration_address["consensus_spend_guard_active"], False)
+        assert_equal(self._default_signature_has_forkid(self.nodes[1]), True)
         migration_template = self.nodes[1].getblocktemplate({"rules": ["segwit"]})
         assert_equal(migration_template["weightlimit"], V4_BLOCK_WEIGHT)
         assert_equal(migration_template["sigoplimit"], V4_BLOCK_SIGOPS)
+        assert_equal(migration_template["quantumquasar"]["quantum_migration_outputs_fundable"], True)
         migration_eutxo = self.nodes[1].testmempoolaccept([self._signed_eutxo_output_tx(self.nodes[1])])[0]
-        assert_equal(migration_eutxo["allowed"], True)
+        assert_equal(migration_eutxo["allowed"], False)
+        assert_equal(migration_eutxo["reject-reason"], "eutxo-output-disabled")
+        unknown_quantum = self.nodes[1].testmempoolaccept([self._signed_unknown_quantum_output_tx(self.nodes[1])])[0]
+        assert_equal(unknown_quantum["allowed"], False)
+        assert_equal(unknown_quantum["reject-reason"], "unknown-quantum-witness-output")
+        tiered_quantum = self.nodes[1].testmempoolaccept([self._signed_tiered_quantum_output_tx(self.nodes[1])])[0]
+        assert_equal(tiered_quantum["allowed"], False)
+        assert_equal(tiered_quantum["reject-reason"], "quantum-tier-output-premature")
 
         self.log.info("Final lockout keeps new-network-only staking and requires quantum addresses")
+        final_address = self.nodes[2].createquantummigrationaddress("33" * 32)["address"]
+        self.generatetoaddress(self.nodes[2], 3, self.nodes[2].get_deterministic_priv_key().address, sync_fun=self.no_op)
+        self.generatetoaddress(self.nodes[2], 1, final_address, sync_fun=self.no_op)
         final_lockout = self.nodes[2].getquantumquasarinfo()
         assert_equal(final_lockout["phase"], "final_lockout")
         assert_equal(final_lockout["base_network_stake_compatible"], False)

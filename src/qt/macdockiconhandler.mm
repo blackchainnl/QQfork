@@ -1,3 +1,4 @@
+// Copyright (c) 2011-2019 The Bitcoin Core developers
 // Copyright (c) 2011-2019 Blackcoin Core Developers
 // Copyright (c) 2011-2019 Blackcoin More Developers
 // Copyright (c) 2011-2019 Blackcoin Developers

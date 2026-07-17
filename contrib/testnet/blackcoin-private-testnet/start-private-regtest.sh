@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+export LC_ALL=C
+
 set -euo pipefail
 
 usage() {

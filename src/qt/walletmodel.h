@@ -17,6 +17,9 @@
 #include <support/allocators/secure.h>
 
 #include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string>
 #include <vector>
 
 #include <QObject>
@@ -79,12 +82,71 @@ public:
         Unlocked      // wallet->IsCrypted() && !wallet->IsLocked()
     };
 
+    /**
+     * Inputs captured on the GUI thread before building the expensive
+     * Staking & Mining detail snapshot on WalletWorker's managed thread.
+     */
+    struct StakingMiningSnapshotRequest
+    {
+        uint64_t request_id{0};
+        uint64_t generation{0};
+        std::string expected_tip;
+        std::string selfstake_address;
+        std::string operator_address;
+        std::string coldstake_address;
+    };
+
+    struct StakingMiningColdStakeBalance
+    {
+        std::string address;
+        interfaces::WalletQuantumColdStakeBalanceInfo balance;
+    };
+
+    /** Immutable worker result. Views must reject mismatched generations/tips. */
+    struct StakingMiningSnapshot
+    {
+        StakingMiningSnapshotRequest request;
+        bool cancelled{false};
+        bool stale_tip{false};
+        std::string error;
+        std::string start_tip;
+        std::string end_tip;
+
+        interfaces::WalletPowMiningInfo pow;
+        interfaces::WalletMigrationStatus migration;
+        interfaces::WalletDemurrageInfo demurrage;
+        std::vector<interfaces::WalletRGBAssetInfo> rgb_assets;
+        std::vector<interfaces::WalletEUTXOStateInfo> eutxo_states;
+        std::vector<interfaces::WalletQuantumAddressInfo> quantum_addresses;
+        std::vector<interfaces::WalletQuantumColdStakeInfo> coldstake_delegations;
+        std::vector<interfaces::WalletQuantumStakeOutputInfo> selfstake_outputs;
+        interfaces::WalletQuantumOperatorBondInfo selfstake_bond;
+        interfaces::WalletQuantumOperatorBondInfo operator_bond;
+        std::vector<StakingMiningColdStakeBalance> coldstake_balances;
+        interfaces::WalletQuantumColdStakeBalanceInfo selected_coldstake_balance;
+        interfaces::WalletQuantumPoolInfo pool;
+        bool selfstake_queried{false};
+        bool operator_queried{false};
+        bool selected_coldstake_queried{false};
+        std::string selfstake_query_address;
+        std::string operator_query_address;
+        std::string selected_coldstake_query_address;
+    };
+
     OptionsModel* getOptionsModel() const;
     AddressTableModel* getAddressTableModel() const;
     TransactionTableModel* getTransactionTableModel() const;
     RecentRequestsTableModel* getRecentRequestsTableModel() const;
 
     EncryptionStatus getEncryptionStatus() const;
+    /**
+     * Return the last encryption state published to the GUI thread.
+     *
+     * Unlike getEncryptionStatus(), this never enters cs_wallet. Views that
+     * refresh on a timer must use the cached value so a staking/signing pass
+     * cannot park the Qt event loop while it owns the wallet mutex.
+     */
+    EncryptionStatus getCachedEncryptionStatus() const { return cachedEncryptionStatus.load(std::memory_order_acquire); }
 
     // Check address for validity
     bool validateAddress(const QString& address) const;
@@ -162,6 +224,13 @@ public:
     // Retrieve the cached wallet balance
     interfaces::WalletBalances getCachedBalance() const;
 
+    /** Queue one full-detail snapshot on the existing wallet worker thread. */
+    void requestStakingMiningSnapshot(const StakingMiningSnapshotRequest& request);
+    /** Cooperatively cancel the current snapshot without waiting for teardown. */
+    void cancelStakingMiningSnapshot(uint64_t request_id = 0);
+    /** Take the completed immutable result after stakingMiningSnapshotReady. */
+    std::shared_ptr<const StakingMiningSnapshot> takeStakingMiningSnapshot(uint64_t request_id);
+
     // If coin control has selected outputs, searches the total amount inside the wallet.
     // Otherwise, uses the wallet's cached available balance.
     CAmount getAvailableBalance(const wallet::CCoinControl* control);
@@ -195,18 +264,22 @@ private:
 
     // Cache some values to be able to detect changes
     interfaces::WalletBalances m_cached_balances;
-    EncryptionStatus cachedEncryptionStatus{Unencrypted};
+    std::atomic<EncryptionStatus> cachedEncryptionStatus{Unencrypted};
+    bool m_status_update_retry_scheduled{false};
     QTimer* timer;
 
     // Block hash denoting when the last balance update was done.
     uint256 m_cached_last_update_tip{};
 
     int pollNum = 0;
-    uint64_t nWeight;
+    std::atomic<uint64_t> nWeight;
     std::atomic<bool> updateStakeWeight;
 
     QThread t;
     WalletWorker *worker;
+    std::shared_ptr<std::atomic<bool>> m_staking_snapshot_cancel;
+    uint64_t m_staking_snapshot_request_id{0};
+    std::shared_ptr<const StakingMiningSnapshot> m_completed_staking_snapshot;
 
     void subscribeToCoreSignals();
     void unsubscribeFromCoreSignals();
@@ -246,6 +319,9 @@ Q_SIGNALS:
     void canGetAddressesChanged();
 
     void timerTimeout();
+
+    /** Emitted on the GUI thread after a worker request completes or cancels. */
+    void stakingMiningSnapshotReady(quint64 request_id, quint64 generation);
 
 public Q_SLOTS:
     /* Starts a timer to periodically update the balance */

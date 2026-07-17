@@ -22,6 +22,7 @@ from test_framework.util import (
 )
 
 RAW_TX_FEE = Decimal("0.001")
+HIGH_MIN_RELAY_TX_FEE = "0.01"
 
 
 class AbandonConflictTest(BitcoinTestFramework):
@@ -111,7 +112,7 @@ class AbandonConflictTest(BitcoinTestFramework):
 
         # Restart the node with a higher min relay fee so the parent tx is no longer in mempool
         # TODO: redo with eviction
-        self.restart_node(0, extra_args=["-minrelaytxfee=0.0001"])
+        self.restart_node(0, extra_args=[f"-minrelaytxfee={HIGH_MIN_RELAY_TX_FEE}"])
         alice = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
         assert self.nodes[0].getmempoolinfo()['loaded']
 
@@ -169,7 +170,7 @@ class AbandonConflictTest(BitcoinTestFramework):
         balance = newbalance
 
         # Remove using high relay fee again
-        self.restart_node(0, extra_args=["-minrelaytxfee=0.0001"])
+        self.restart_node(0, extra_args=[f"-minrelaytxfee={HIGH_MIN_RELAY_TX_FEE}"])
         alice = self.nodes[0].get_wallet_rpc(self.default_wallet_name)
         assert self.nodes[0].getmempoolinfo()['loaded']
         assert_equal(len(self.nodes[0].getrawmempool()), 0)

@@ -154,6 +154,7 @@ BITCOIN_CORE_H = \
   eutxo/transition.h \
   core_io.h \
   core_memusage.h \
+  crypto/argon2_selftest.h \
   crypto/mldsa.h \
   hash.h \
   cuckoocache.h \
@@ -169,6 +170,7 @@ BITCOIN_CORE_H = \
   index/base.h \
   index/blockfilterindex.h \
   index/coinstatsindex.h \
+  index/shadowindex.h \
   index/disktxpos.h \
   index/txindex.h \
   indirectmap.h \
@@ -180,6 +182,7 @@ BITCOIN_CORE_H = \
   interfaces/init.h \
   interfaces/ipc.h \
   interfaces/node.h \
+  interfaces/pow_mining.h \
   interfaces/wallet.h \
   kernel/blockmanager_opts.h \
   kernel/chain.h \
@@ -218,6 +221,7 @@ BITCOIN_CORE_H = \
   node/blockstorage.h \
   node/caches.h \
   node/chainstate.h \
+  node/chainstate_rebuild.h \
   node/chainstatemanager_args.h \
   node/coin.h \
   node/coins_view_args.h \
@@ -235,6 +239,7 @@ BITCOIN_CORE_H = \
   node/peerman_args.h \
   node/psbt.h \
   node/quantum_pool.h \
+  node/shadow_resource_monitor.h \
   node/transaction.h \
   node/txreconciliation.h \
   node/utxo_snapshot.h \
@@ -386,6 +391,7 @@ obj/build.h: FORCE
 	$(AM_V_GEN) $(top_srcdir)/share/genbuild.sh "$(abs_top_builddir)/src/obj/build.h" \
 	  "$(abs_top_srcdir)"
 libbitcoin_util_a-clientversion.$(OBJEXT): obj/build.h
+bitcoind-res.$(OBJEXT): obj/build.h
 
 # node #
 libbitcoin_node_a_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(LEVELDB_CPPFLAGS) $(BOOST_CPPFLAGS) $(MINIUPNPC_CPPFLAGS) $(NATPMP_CPPFLAGS) $(EVENT_CFLAGS) $(EVENT_PTHREADS_CFLAGS)
@@ -410,6 +416,7 @@ libbitcoin_node_a_SOURCES = \
   index/base.cpp \
   index/blockfilterindex.cpp \
   index/coinstatsindex.cpp \
+  index/shadowindex.cpp \
   index/txindex.cpp \
   init.cpp \
   kernel/chain.cpp \
@@ -446,6 +453,7 @@ libbitcoin_node_a_SOURCES = \
   node/peerman_args.cpp \
   node/psbt.cpp \
   node/quantum_pool.cpp \
+  node/shadow_resource_monitor.cpp \
   node/transaction.cpp \
   node/txreconciliation.cpp \
   node/utxo_snapshot.cpp \
@@ -456,6 +464,7 @@ libbitcoin_node_a_SOURCES = \
   policy/packages.cpp \
   policy/settings.cpp \
   pos.cpp \
+  test/data/staking_mr_table.h \
   pow.cpp \
   shadow.cpp \
   rest.cpp \
@@ -469,6 +478,7 @@ libbitcoin_node_a_SOURCES = \
   rpc/rawtransaction.cpp \
   rpc/server.cpp \
   rpc/server_util.cpp \
+  rpc/shadow.cpp \
   rpc/signmessage.cpp \
   rpc/txoutproof.cpp \
   script/sigcache.cpp \
@@ -584,6 +594,7 @@ crypto_libbitcoin_crypto_base_la_SOURCES = \
   crypto/argon2/blake2/blake2b.c \
   crypto/argon2/blake2/blamka-round-opt.h \
   crypto/argon2/blake2/blamka-round-ref.h \
+  crypto/argon2_selftest.cpp \
   crypto/aes.cpp \
   crypto/aes.h \
   crypto/chacha20.h \
@@ -602,6 +613,7 @@ crypto_libbitcoin_crypto_base_la_SOURCES = \
   crypto/muhash.h \
   crypto/muhash.cpp \
   crypto/mldsa.cpp \
+  crypto/mldsa_kat.h \
   crypto/ripemd160.cpp \
   crypto/ripemd160.h \
   crypto/scrypt.cpp \
@@ -683,6 +695,7 @@ libbitcoin_consensus_a_SOURCES = \
   pubkey.cpp \
   pubkey.h \
   script/bitcoinconsensus.cpp \
+  script/bitcoinconsensus.h \
   script/interpreter.cpp \
   script/interpreter.h \
   script/script.cpp \

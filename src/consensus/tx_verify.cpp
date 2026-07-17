@@ -18,6 +18,8 @@
 #include <util/check.h>
 #include <util/moneystr.h>
 
+#include <limits>
+
 bool IsFinalTx(const CTransaction &tx, int nBlockHeight, int64_t nBlockTime)
 {
     if (tx.nLockTime == 0)
@@ -169,7 +171,17 @@ int64_t GetTransactionSigOpCost(const CTransaction& tx, const CCoinsViewCache& i
     return nSigOps;
 }
 
-bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, int64_t nSpendTime, int64_t nDemurrageTime, CAmount& txfee)
+namespace {
+
+enum class V2InputTimePolicy {
+    ENFORCE,
+    DEFER,
+};
+
+bool CheckTxInputsImpl(const CTransaction& tx, TxValidationState& state,
+                       const CCoinsViewCache& inputs, int nSpendHeight,
+                       int64_t nSpendTime, int64_t nDemurrageTime,
+                       CAmount& txfee, V2InputTimePolicy v2_time_policy)
 {
     // are the actual inputs available?
     if (!inputs.HaveInputs(tx)) {
@@ -177,12 +189,15 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
                          strprintf("%s: inputs missing/spent", __func__));
     }
 
-    // Blackcoin: v2+ transactions do not serialize nTime. Consensus callers must
+    // Blackcoin v2+ transactions do not serialize nTime. Consensus callers must
     // supply a deterministic spend time (for blocks, the block time) instead of
     // using local adjusted time, or block validity can depend on verifier clock.
     int64_t nTimeTx = tx.nTime;
-    if (!nTimeTx && tx.nVersion >= 2)
+    if (tx.nVersion >= 2)
         nTimeTx = nSpendTime;
+
+    const int coinbase_maturity =
+        ::Params().GetConsensus().CoinbaseMaturityForSpendTime(nTimeTx);
 
     CAmount nValueIn = 0;
     for (unsigned int i = 0; i < tx.vin.size(); ++i) {
@@ -191,13 +206,16 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         assert(!coin.IsSpent());
 
         // If prev is coinbase or coinstake, check that it's matured
-        if ((coin.IsCoinBase() || coin.IsCoinStake()) && nSpendHeight - coin.nHeight < (::Params().GetConsensus().IsProtocolV3_1(nTimeTx) ? ::Params().GetConsensus().nCoinbaseMaturity : Params().nCoinbaseMaturity)) {
+        if ((coin.IsCoinBase() || coin.IsCoinStake()) &&
+            nSpendHeight - coin.nHeight < coinbase_maturity) {
             return state.Invalid(TxValidationResult::TX_PREMATURE_SPEND, "bad-txns-premature-spend-of-coinbase",
                 strprintf("tried to spend coinbase at depth %d", nSpendHeight - coin.nHeight));
         }
 
-        // Check transaction timestamp
-        if (coin.nTime > nTimeTx)
+        // Check transaction timestamp. This inherited legacy consensus rule
+        // applies to every spending transaction version.
+        if (coin.nTime > nTimeTx &&
+            (tx.nVersion < 2 || v2_time_policy == V2InputTimePolicy::ENFORCE))
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-time-earlier-than-input");
 
         // Check for negative or overflow input values. demurrage realizes
@@ -206,8 +224,12 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
         if (!MoneyRange(coin.out.nValue)) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-inputvalues-outofrange");
         }
-        const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(inputs, coin.out.scriptPubKey);
-        const Consensus::DemurrageEvaluation demurrage = Consensus::EvaluateDemurrage(coin, ::Params().GetConsensus(), nSpendHeight, nDemurrageTime, latest_attestation);
+        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+            Consensus::LatestDemurrageAttestationStateForScript(inputs, coin.out.scriptPubKey);
+        const Consensus::DemurrageEvaluation demurrage = Consensus::EvaluateDemurrage(
+            coin, ::Params().GetConsensus(), nSpendHeight, nDemurrageTime,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
         if (demurrage.locked) {
             return state.Invalid(TxValidationResult::TX_CONSENSUS, "bad-txns-spends-locked-coin");
         }
@@ -241,6 +263,28 @@ bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state, 
     return true;
 }
 
+} // namespace
+
+bool Consensus::CheckTxInputs(const CTransaction& tx, TxValidationState& state,
+                              const CCoinsViewCache& inputs, int nSpendHeight,
+                              int64_t nSpendTime, int64_t nDemurrageTime,
+                              CAmount& txfee)
+{
+    return CheckTxInputsImpl(tx, state, inputs, nSpendHeight, nSpendTime,
+                             nDemurrageTime, txfee,
+                             V2InputTimePolicy::ENFORCE);
+}
+
+bool Consensus::CheckTxInputsForMempoolReorg(
+    const CTransaction& tx, TxValidationState& state,
+    const CCoinsViewCache& inputs, int nSpendHeight,
+    int64_t nEarliestSpendTime, int64_t nDemurrageTime, CAmount& txfee)
+{
+    return CheckTxInputsImpl(tx, state, inputs, nSpendHeight,
+                             nEarliestSpendTime, nDemurrageTime, txfee,
+                             V2InputTimePolicy::DEFER);
+}
+
 // Blackcoin: GetMinFee
 CAmount GetMinFee(const CTransaction& tx, uint32_t nTimeTx)
 {
@@ -250,16 +294,23 @@ CAmount GetMinFee(const CTransaction& tx, uint32_t nTimeTx)
 
 CAmount GetMinFee(size_t nBytes, uint32_t nTime)
 {
+    // CFeeRate stores byte counts as uint32_t. Real transactions are already
+    // bounded far below that limit, but callers and tests may supply an
+    // arbitrary size_t. Refuse to truncate an out-of-domain value into a
+    // smaller, apparently affordable transaction.
+    if (nBytes > std::numeric_limits<uint32_t>::max()) return MAX_MONEY;
+    const uint32_t fee_bytes{static_cast<uint32_t>(nBytes)};
+
     CAmount nMinFee;
     CFeeRate nMinFeeRate;
 
     if (Params().GetConsensus().IsProtocolV3_1(nTime)) {
         nMinFeeRate = CFeeRate{TX_FEE_PER_KB};
-        nMinFee = (nBytes <= 100) ? MIN_TX_FEE : nMinFeeRate.GetFee(nBytes);
+        nMinFee = (fee_bytes <= 100) ? MIN_TX_FEE : nMinFeeRate.GetFee(fee_bytes);
     }
     else {
         nMinFeeRate = CFeeRate{DEFAULT_MIN_RELAY_TX_FEE};
-        nMinFee = nMinFeeRate.GetFee(nBytes);
+        nMinFee = nMinFeeRate.GetFee(fee_bytes);
     }
 
     if (!MoneyRange(nMinFee))

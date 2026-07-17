@@ -1,7 +1,7 @@
 AC_PREREQ([2.69])
 define(_CLIENT_VERSION_MAJOR, 30)
 define(_CLIENT_VERSION_MINOR, 1)
-define(_CLIENT_VERSION_BUILD, 0)
+define(_CLIENT_VERSION_BUILD, 1)
 define(_CLIENT_VERSION_RC, 0)
 define(_CLIENT_VERSION_IS_RELEASE, true)
 define(_COPYRIGHT_YEAR, 2026)
@@ -1385,15 +1385,20 @@ fi
 PKG_CHECK_MODULES([LIBOQS], [liboqs = 0.15.0], [
   LIBOQS_LIBS="$($PKG_CONFIG --static --libs liboqs)"
   LIBOQS_PC_DIR="$($PKG_CONFIG --variable=pcfiledir liboqs 2>/dev/null)"
-  case "$LIBOQS_PC_DIR" in
-    "$prefix"/*) ;;
-    *)
-      if test "$with_system_liboqs" != "yes"; then
-        AC_MSG_ERROR([Blackcoin V4 consensus requires the pinned depends liboqs 0.15.0 build. Build depends and configure with --prefix=\$PWD/depends/<host>, or pass --with-system-liboqs only for local development.])
-      fi
-      AC_MSG_WARN([using host liboqs outside the configured prefix; do not use this build for release binaries])
-      ;;
-  esac
+  liboqs_is_pinned=no
+  if test -n "${depends_prefix:-}"; then
+    case "$LIBOQS_PC_DIR" in
+      "$depends_prefix"/lib/pkgconfig|"$depends_prefix"/share/pkgconfig)
+        liboqs_is_pinned=yes
+        ;;
+    esac
+  fi
+  if test "$liboqs_is_pinned" != "yes"; then
+    if test "$with_system_liboqs" != "yes"; then
+      AC_MSG_ERROR([Blackcoin V4 consensus requires the pinned depends liboqs 0.15.0 build. Build depends and configure with --prefix=\$PWD/depends/<host>, or pass --with-system-liboqs only for local development.])
+    fi
+    AC_MSG_WARN([using host liboqs outside the pinned depends prefix; do not use this build for release binaries])
+  fi
 ], [AC_MSG_ERROR([liboqs exactly 0.15.0 not found. Build the pinned depends liboqs package before configuring Blackcoin post-quantum consensus support.])])
 if test "$suppress_external_warnings" != "no" ; then
   LIBOQS_CFLAGS=SUPPRESS_WARNINGS($LIBOQS_CFLAGS)

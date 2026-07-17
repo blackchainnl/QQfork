@@ -24,12 +24,14 @@
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
 #include <kernel/coinstats.h>
+#include <key_io.h>
 #include <logging/timer.h>
 #include <net.h>
 #include <net_processing.h>
 #include <node/blockstorage.h>
 #include <node/context.h>
 #include <node/quantum_pool.h>
+#include <node/shadow_resource_monitor.h>
 #include <node/transaction.h>
 #include <node/utxo_snapshot.h>
 #include <primitives/transaction.h>
@@ -37,6 +39,7 @@
 #include <rpc/server_util.h>
 #include <rpc/util.h>
 #include <script/descriptor.h>
+#include <serialize.h>
 #include <streams.h>
 #include <sync.h>
 #include <txdb.h>
@@ -56,7 +59,11 @@
 
 #include <stdint.h>
 
+#include <algorithm>
+#include <array>
 #include <condition_variable>
+#include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -998,33 +1005,432 @@ static RPCHelpMan gettxoutsetinfo()
     };
 }
 
+struct CirculatingSupplyBucket {
+    uint64_t count{0};
+    CAmount nominal{0};
+    CAmount effective{0};
+    CAmount burned{0};
+};
+
+static bool AddCirculatingSupplyAmount(CAmount& total, CAmount amount)
+{
+    if (!MoneyRange(total) || !MoneyRange(amount) || total > MAX_MONEY - amount) {
+        return false;
+    }
+    total += amount;
+    return true;
+}
+
+static bool AddCirculatingSupplyCount(uint64_t& total, uint64_t count = 1)
+{
+    if (total > std::numeric_limits<uint64_t>::max() - count) return false;
+    total += count;
+    return true;
+}
+
+static uint64_t LevelDbVarintSize(uint64_t value)
+{
+    uint64_t bytes{1};
+    while (value >= 128) {
+        value >>= 7;
+        ++bytes;
+    }
+    return bytes;
+}
+
+static std::optional<uint64_t> ActiveCoinBatchPayloadBytes(
+    const COutPoint& key, const Coin& coin)
+{
+    // Match the logical WriteBatch payload measured by the exact fixture:
+    // one value tag, LevelDB varint lengths, serialized CoinEntry key, and
+    // serialized Coin value. This active logical metric is stable across
+    // compaction and tombstone history; it is not a physical-byte claim.
+    const uint64_t key_bytes = 1 + uint256::size() +
+        ::GetSerializeSize(VARINT(key.n));
+    const uint64_t value_bytes = ::GetSerializeSize(coin);
+    uint64_t record_bytes{1};
+    for (const uint64_t component : {
+             LevelDbVarintSize(key_bytes), key_bytes,
+             LevelDbVarintSize(value_bytes), value_bytes}) {
+        if (!AddCirculatingSupplyCount(record_bytes, component)) {
+            return std::nullopt;
+        }
+    }
+    return record_bytes;
+}
+
+static bool AddCirculatingSupplyBucket(CirculatingSupplyBucket& bucket,
+                                       const ValueLifecycleClassification& classification)
+{
+    return AddCirculatingSupplyCount(bucket.count) &&
+        AddCirculatingSupplyAmount(bucket.nominal, classification.nominal_amount) &&
+        AddCirculatingSupplyAmount(bucket.effective, classification.effective_amount) &&
+        AddCirculatingSupplyAmount(bucket.burned, classification.burned_amount);
+}
+
+static UniValue CirculatingSupplyBucketToJSON(const CirculatingSupplyBucket& bucket)
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("count", bucket.count);
+    result.pushKV("nominal_amount", ValueFromAmount(bucket.nominal));
+    result.pushKV("effective_amount", ValueFromAmount(bucket.effective));
+    result.pushKV("burned_amount", ValueFromAmount(bucket.burned));
+    return result;
+}
+
+static UniValue ShadowResourceStatusToJSON(
+    const node::ShadowResourceStatus& status)
+{
+    const node::ShadowSupplyScanProgress scan =
+        node::GetShadowSupplyScanProgress();
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("schema", "blackcoin.shadow.resource_operational.v1");
+    result.pushKV("scope", "scoped_mainnet_operating_envelope_not_consensus_bound");
+    result.pushKV("model_class", "scoped_operational");
+    result.pushKV("universal_consensus_bound", false);
+    result.pushKV("production_evidence_authorization", "external_exact_sha_report_required");
+    result.pushKV("applicable", status.applicable);
+    result.pushKV("measurements_available", status.measurements_available);
+    result.pushKV("status", node::ShadowResourceStatusName(status.level));
+    result.pushKV("height", status.height >= 0 ? UniValue(status.height) : UniValue{});
+    result.pushKV("bestblock", status.best_block.empty()
+        ? UniValue{} : UniValue(status.best_block));
+    result.pushKV("chainstate_estimated_bytes", status.estimated_chainstate_bytes);
+    result.pushKV("filesystem_available_bytes", status.filesystem_available_bytes);
+    result.pushKV("modeled_shadow_logical_bytes",
+                  node::SHADOW_RESOURCE_MODELED_SHADOW_LOGICAL_BYTES);
+    result.pushKV("policy_disk_amplification_factor",
+                  node::SHADOW_RESOURCE_POLICY_DISK_AMPLIFICATION_FACTOR);
+    result.pushKV("modeled_shadow_physical_reserve_bytes",
+                  node::SHADOW_RESOURCE_MODELED_SHADOW_PHYSICAL_RESERVE_BYTES);
+    result.pushKV("current_chainstate_estimate_allowance_bytes",
+                  node::SHADOW_RESOURCE_CURRENT_CHAINSTATE_ESTIMATE_ALLOWANCE_BYTES);
+    result.pushKV("background_physical_reserve_bytes_per_block",
+                  node::SHADOW_RESOURCE_BACKGROUND_PHYSICAL_RESERVE_BYTES_PER_BLOCK);
+    result.pushKV("background_growth_records_per_block",
+                  node::SHADOW_RESOURCE_BACKGROUND_GROWTH_RECORDS_PER_BLOCK);
+    result.pushKV("maximum_synthetic_records",
+                  node::SHADOW_RESOURCE_MAX_SYNTHETIC_RECORDS);
+    result.pushKV("maximum_modeled_shadow_logical_bytes_per_block",
+                  node::SHADOW_RESOURCE_MAX_MODELED_SHADOW_LOGICAL_BYTES_PER_BLOCK);
+    result.pushKV("maximum_modeled_shadow_physical_bytes_per_block",
+                  node::SHADOW_RESOURCE_MAX_MODELED_SHADOW_PHYSICAL_BYTES_PER_BLOCK);
+    result.pushKV("maximum_modeled_shadow_records_per_block",
+                  node::SHADOW_RESOURCE_MAX_MODELED_SHADOW_RECORDS_PER_BLOCK);
+    result.pushKV("modeled_legacy_shadow_records_per_block",
+                  node::SHADOW_RESOURCE_MODELED_LEGACY_SHADOW_RECORDS_PER_BLOCK);
+    result.pushKV("modeled_legacy_shadow_logical_bytes_per_block",
+                  node::SHADOW_RESOURCE_MODELED_LEGACY_SHADOW_LOGICAL_BYTES_PER_BLOCK);
+    result.pushKV("remaining_gold_rush_blocks", status.remaining_gold_rush_blocks);
+    result.pushKV("projected_remaining_shadow_physical_bytes",
+                  status.projected_remaining_shadow_physical_bytes);
+    result.pushKV("projected_background_growth_bytes",
+                  status.projected_background_growth_bytes);
+    result.pushKV("minimum_free_bytes", status.minimum_free_bytes);
+    result.pushKV("required_free_bytes", status.required_free_bytes);
+    result.pushKV("warning_free_bytes", status.warning_free_bytes);
+    result.pushKV("immediate_scan_free_bytes", status.immediate_scan_free_bytes);
+    result.pushKV("critical_free_bytes", status.critical_free_bytes);
+    result.pushKV("maximum_estimated_chainstate_bytes",
+                  status.maximum_estimated_chainstate_bytes);
+    result.pushKV("maximum_records_per_cursor",
+                  status.maximum_records_per_cursor);
+    result.pushKV("maximum_sequential_visits",
+                  status.maximum_sequential_visits);
+    result.pushKV("maximum_point_seeks", status.maximum_point_seeks);
+    result.pushKV("absolute_records_per_cursor",
+                  status.absolute_records_per_cursor);
+    result.pushKV("absolute_point_seeks", status.absolute_point_seeks);
+    result.pushKV("support_through_height", status.support_through_height);
+    result.pushKV("within_supported_height", status.within_supported_height);
+    result.pushKV("within_chainstate_size", status.within_chainstate_size);
+    result.pushKV("within_immediate_scan_free_space",
+                  status.within_immediate_scan_free_space);
+    result.pushKV("within_projected_free_space",
+                  status.within_projected_free_space);
+    result.pushKV("critical_free_space_satisfied",
+                  status.critical_free_space_satisfied);
+    result.pushKV("operational_envelope_satisfied",
+                  status.operational_envelope_satisfied);
+    result.pushKV("diagnostic_scan_default_authorized",
+                  status.diagnostic_scan_default_authorized);
+    result.pushKV("consensus_behavior_changed", false);
+    result.pushKV("automatic_shutdown", false);
+    result.pushKV("automatic_network_disable", false);
+    result.pushKV("warning", status.warning);
+    result.pushKV("operator_action", status.operator_action);
+
+    UniValue scan_json(UniValue::VOBJ);
+    scan_json.pushKV("active", scan.active);
+    scan_json.pushKV("scan_id", scan.scan_id);
+    scan_json.pushKV("height", scan.height >= 0
+        ? UniValue(scan.height) : UniValue{});
+    scan_json.pushKV("bestblock", scan.best_block.empty()
+        ? UniValue{} : UniValue(scan.best_block));
+    scan_json.pushKV("stage", scan.stage);
+    scan_json.pushKV("abort_requested", scan.abort_requested);
+    scan_json.pushKV("marker_records_scanned", scan.marker_records_scanned);
+    scan_json.pushKV("utxo_records_scanned", scan.utxo_records_scanned);
+    scan_json.pushKV("active_coin_batch_payload_bytes_scanned",
+                     scan.active_coin_batch_payload_bytes_scanned);
+    scan_json.pushKV("authenticated_shadow_records_scanned",
+                     scan.authenticated_shadow_records_scanned);
+    scan_json.pushKV("authenticated_shadow_batch_payload_bytes_scanned",
+                     scan.authenticated_shadow_batch_payload_bytes_scanned);
+    scan_json.pushKV("provenance_point_seeks", scan.provenance_point_seeks);
+    scan_json.pushKV("demurrage_point_seeks", scan.demurrage_point_seeks);
+    scan_json.pushKV("elapsed_milliseconds", scan.elapsed_milliseconds);
+    scan_json.pushKV("started_at_unix", scan.started_at_unix);
+    scan_json.pushKV("completed_at_unix", scan.completed_at_unix);
+    scan_json.pushKV("last_outcome", scan.last_outcome);
+    scan_json.pushKV("last_reason", scan.last_reason);
+    result.pushKV("supply_scan", std::move(scan_json));
+    return result;
+}
+
+static RPCHelpMan getshadowresourceinfo()
+{
+    return RPCHelpMan{"getshadowresourceinfo",
+        "\nReturns the source-bound v30.1.1 mainnet operating-envelope measurement and operator guidance.\n"
+        "The measurement covers the combined Coin chainstate, not only shadow records.\n"
+        "This is not a consensus limit. Crossing it never rejects a block, disables networking, staking or mining, or starts shutdown.\n"
+        "The same warning is exposed by blackcoind RPC/CLI and the GUI warning area.\n",
+        {},
+        RPCResult{RPCResult::Type::OBJ, "", "Operational resource status", {
+            {RPCResult::Type::STR, "schema", "Versioned resource-status schema"},
+            {RPCResult::Type::STR, "scope", "Explicitly scoped non-consensus qualification"},
+            {RPCResult::Type::STR, "model_class", "scoped_operational"},
+            {RPCResult::Type::BOOL, "universal_consensus_bound", "Always false for this operating model"},
+            {RPCResult::Type::STR, "production_evidence_authorization", "External exact-SHA verifier requirement"},
+            {RPCResult::Type::BOOL, "applicable", "Whether the mainnet envelope applies"},
+            {RPCResult::Type::BOOL, "measurements_available", "Whether both chainstate and filesystem measurements succeeded"},
+            {RPCResult::Type::STR, "status", "not_applicable, unavailable, healthy, warning, or outside_operational_envelope"},
+            {RPCResult::Type::NUM, "height", /*optional=*/true, "Measured active height"},
+            {RPCResult::Type::STR_HEX, "bestblock", /*optional=*/true, "Measured active block hash"},
+            {RPCResult::Type::NUM, "chainstate_estimated_bytes", "LevelDB estimate for current chainstate key space"},
+            {RPCResult::Type::NUM, "filesystem_available_bytes", "Bytes currently available on the chainstate filesystem"},
+            {RPCResult::Type::NUM, "modeled_shadow_logical_bytes", "Completed-epoch modeled logical shadow payload"},
+            {RPCResult::Type::NUM, "policy_disk_amplification_factor", "Reviewed physical-reserve multiplier; an operating assumption, not a consensus bound"},
+            {RPCResult::Type::NUM, "modeled_shadow_physical_reserve_bytes", "Logical shadow payload multiplied by the policy disk factor"},
+            {RPCResult::Type::NUM, "current_chainstate_estimate_allowance_bytes", "Allowance for LevelDB's approximate active Coin-key-range size; not a physical-directory measurement"},
+            {RPCResult::Type::NUM, "background_physical_reserve_bytes_per_block", "Policy reserve for non-shadow physical growth; an operating assumption, not a measured maximum"},
+            {RPCResult::Type::NUM, "background_growth_records_per_block", "Empirical background record-growth operating allowance"},
+            {RPCResult::Type::NUM, "maximum_synthetic_records", "Exact completed-epoch synthetic fixture records"},
+            {RPCResult::Type::NUM, "maximum_modeled_shadow_logical_bytes_per_block", "Exact maximum canonical fixture block logical payload"},
+            {RPCResult::Type::NUM, "maximum_modeled_shadow_physical_bytes_per_block", "Maximum canonical fixture block logical payload multiplied by the policy disk factor"},
+            {RPCResult::Type::NUM, "maximum_modeled_shadow_records_per_block", "Exact maximum canonical fixture records per block"},
+            {RPCResult::Type::NUM, "modeled_legacy_shadow_records_per_block", "Exact pre-canonical-boundary shadow-family records per fixture block"},
+            {RPCResult::Type::NUM, "modeled_legacy_shadow_logical_bytes_per_block", "Exact pre-canonical-boundary logical WriteBatch payload per fixture block"},
+            {RPCResult::Type::NUM, "remaining_gold_rush_blocks", "Unmeasured blocks remaining in the fixed operating horizon"},
+            {RPCResult::Type::NUM, "projected_remaining_shadow_physical_bytes", "Modeled physical shadow reserve for remaining heights"},
+            {RPCResult::Type::NUM, "projected_background_growth_bytes", "Empirical combined-chainstate growth reserve for remaining heights"},
+            {RPCResult::Type::NUM, "minimum_free_bytes", "Free-space reserve retained after projected growth"},
+            {RPCResult::Type::NUM, "required_free_bytes", "Conservative remaining shadow, background-growth, and reserve projection"},
+            {RPCResult::Type::NUM, "warning_free_bytes", "Advisory headroom threshold"},
+            {RPCResult::Type::NUM, "immediate_scan_free_bytes", "Default full-scan free-space requirement"},
+            {RPCResult::Type::NUM, "critical_free_bytes", "Non-overridable current integrity reserve"},
+            {RPCResult::Type::NUM, "maximum_estimated_chainstate_bytes", "Reviewed current-chainstate operating limit"},
+            {RPCResult::Type::NUM, "maximum_records_per_cursor", "Default per-cursor limit for an optional full supply scan"},
+            {RPCResult::Type::NUM, "maximum_sequential_visits", "Reviewed combined sequential-visit limit"},
+            {RPCResult::Type::NUM, "maximum_point_seeks", "Reviewed default point-seek limit for an optional full supply scan"},
+            {RPCResult::Type::NUM, "absolute_records_per_cursor", "Non-overridable per-cursor protection limit"},
+            {RPCResult::Type::NUM, "absolute_point_seeks", "Non-overridable combined point-seek protection limit"},
+            {RPCResult::Type::NUM, "support_through_height", "Last height in this fixed operating horizon"},
+            {RPCResult::Type::BOOL, "within_supported_height", "Whether the measurement is inside the fixed horizon"},
+            {RPCResult::Type::BOOL, "within_chainstate_size", "Whether current estimated chainstate is inside the operating limit"},
+            {RPCResult::Type::BOOL, "within_immediate_scan_free_space", "Whether default full-scan free space is present"},
+            {RPCResult::Type::BOOL, "within_projected_free_space", "Whether projected remaining growth plus reserve fits"},
+            {RPCResult::Type::BOOL, "critical_free_space_satisfied", "Whether the non-overridable integrity reserve is present"},
+            {RPCResult::Type::BOOL, "operational_envelope_satisfied", "Whether current size and projected free space remain inside the scoped envelope"},
+            {RPCResult::Type::BOOL, "diagnostic_scan_default_authorized", "Whether a full supply scan is inside the current reviewed size"},
+            {RPCResult::Type::BOOL, "consensus_behavior_changed", "Always false"},
+            {RPCResult::Type::BOOL, "automatic_shutdown", "Always false"},
+            {RPCResult::Type::BOOL, "automatic_network_disable", "Always false"},
+            {RPCResult::Type::STR, "warning", "Persistent operator warning, or an empty string"},
+            {RPCResult::Type::STR, "operator_action", "Explicit next action without automatic consent"},
+            {RPCResult::Type::OBJ, "supply_scan", "Single-flight scan progress and last outcome", {
+                {RPCResult::Type::BOOL, "active", "Whether a full supply scan is active"},
+                {RPCResult::Type::NUM, "scan_id", "Process-local scan identifier"},
+                {RPCResult::Type::NUM, "height", /*optional=*/true, "Immutable snapshot height"},
+                {RPCResult::Type::STR_HEX, "bestblock", /*optional=*/true, "Immutable snapshot block hash"},
+                {RPCResult::Type::STR, "stage", "preparing_snapshot, scanning_markers, scanning_utxos, or idle"},
+                {RPCResult::Type::BOOL, "abort_requested", "Whether an operator requested cooperative cancellation"},
+                {RPCResult::Type::NUM, "marker_records_scanned", "Marker cursor progress"},
+                {RPCResult::Type::NUM, "utxo_records_scanned", "Monetary cursor progress"},
+                {RPCResult::Type::NUM, "active_coin_batch_payload_bytes_scanned", "Active logical Coin WriteBatch payload visited; independent of LevelDB compaction history"},
+                {RPCResult::Type::NUM, "authenticated_shadow_records_scanned", "Active authenticated append-only shadow-model records or synthetic payouts; rolling state remains background"},
+                {RPCResult::Type::NUM, "authenticated_shadow_batch_payload_bytes_scanned", "Logical WriteBatch payload in the authenticated append-only shadow-model subset or synthetic payouts; rolling state remains background"},
+                {RPCResult::Type::NUM, "provenance_point_seeks", "Payout-provenance seek progress"},
+                {RPCResult::Type::NUM, "demurrage_point_seeks", "Demurrage-state seek progress"},
+                {RPCResult::Type::NUM, "elapsed_milliseconds", "Current or last scan duration"},
+                {RPCResult::Type::NUM_TIME, "started_at_unix", "Start time for the current or last scan, or zero before any scan"},
+                {RPCResult::Type::NUM_TIME, "completed_at_unix", "Completion time for the last scan, or zero before completion"},
+                {RPCResult::Type::STR, "last_outcome", "never_run, running, complete, or aborted"},
+                {RPCResult::Type::STR, "last_reason", "Completion or cancellation reason"},
+            }},
+        }},
+        RPCExamples{
+            HelpExampleCli("getshadowresourceinfo", "") +
+            HelpExampleRpc("getshadowresourceinfo", "")
+        },
+        [&](const RPCHelpMan&, const JSONRPCRequest& request) -> UniValue {
+            NodeContext& node = EnsureAnyNodeContext(request.context);
+            return ShadowResourceStatusToJSON(
+                ::node::GetShadowResourceStatus(EnsureChainman(node)));
+        },
+    };
+}
+
+class ShadowSupplyScanGuard
+{
+public:
+    explicit ShadowSupplyScanGuard(uint64_t scan_id) : m_scan_id(scan_id) {}
+    ~ShadowSupplyScanGuard()
+    {
+        if (!m_finished) {
+            const bool cancelled =
+                node::ShadowSupplyScanAbortRequested(m_scan_id);
+            node::FinishShadowSupplyScan(
+                m_scan_id, "aborted",
+                cancelled
+                    ? "Operator cancellation completed; no partial monetary result was returned"
+                    : "RPC interrupted or failed; no partial monetary result was returned");
+        }
+    }
+    ShadowSupplyScanGuard(const ShadowSupplyScanGuard&) = delete;
+    ShadowSupplyScanGuard& operator=(const ShadowSupplyScanGuard&) = delete;
+
+    void Complete()
+    {
+        node::FinishShadowSupplyScan(
+            m_scan_id, "complete",
+            "Full immutable-snapshot scan completed");
+        m_finished = true;
+    }
+
+private:
+    const uint64_t m_scan_id;
+    bool m_finished{false};
+};
+
+static RPCHelpMan abortcirculatingsupplyscan()
+{
+    return RPCHelpMan{"abortcirculatingsupplyscan",
+        "\nRequests cooperative cancellation of the active getcirculatingsupply scan.\n"
+        "The scan checks this request between records, returns no partial monetary result, and does not stop the daemon or change validation, networking, staking, mining, wallet, or consensus behavior.\n",
+        {},
+        RPCResult{RPCResult::Type::BOOL, "cancel_requested", "True when a scan was active and received the request"},
+        RPCExamples{
+            HelpExampleCli("abortcirculatingsupplyscan", "") +
+            HelpExampleRpc("abortcirculatingsupplyscan", "")
+        },
+        [&](const RPCHelpMan&, const JSONRPCRequest&) -> UniValue {
+            return node::RequestShadowSupplyScanAbort();
+        },
+    };
+}
+
 static RPCHelpMan getcirculatingsupply()
 {
     return RPCHelpMan{"getcirculatingsupply",
-        "\nScans the current UTXO set and returns the demurrage-adjusted circulating supply.\n"
-        "This is computed on demand and may take some time. It does not use or maintain an in-block accumulator.\n",
-        {},
+        "\nScans a consistent UTXO-set snapshot and returns the demurrage-adjusted supply spendable in the next block.\n"
+        "This is computed on demand and may take some time. It does not use or maintain an in-block accumulator.\n"
+        "To make the immutable snapshot complete, the call first flushes already-accepted pending chainstate data to disk. It does not create or spend coins, select a chain, or change consensus rules.\n"
+        "If that flush reports a fatal storage or database error, existing node-integrity handling may request daemon shutdown; this RPC returns no monetary result.\n"
+        "The scan streams production Coin records and is single-flight. Pass allow_unqualified_resource_scan=true only to authorize this one diagnostic call outside the reviewed soft envelope. That consent never persists, never suppresses warnings, and cannot bypass critical disk, absolute record/seek, snapshot, overflow, shutdown, or cancellation protections.\n"
+        "Demurrage decay realized by a spend is permanently burned; it is not a transaction fee and is never paid to a miner, staker, treasury, shadow pool, or claim participant.\n",
+        {
+            {"allow_unqualified_resource_scan", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicitly authorize this one snapshot scan outside the reviewed soft height or size envelope; this cannot bypass storage, integrity, or absolute work limits"},
+        },
         RPCResult{
             RPCResult::Type::OBJ, "", "",
             {
+                {RPCResult::Type::STR, "schema", "Versioned lifecycle-accounting schema"},
                 {RPCResult::Type::NUM, "height", "The active-chain height used for the scan"},
+                {RPCResult::Type::NUM, "evaluation_height", "The next-block height used for consensus spendability and demurrage"},
                 {RPCResult::Type::STR_HEX, "bestblock", "The active-chain block hash used for the scan"},
                 {RPCResult::Type::BOOL, "demurrage_active", "Whether demurrage is active at this height"},
                 {RPCResult::Type::NUM, "demurrage_activation_height", "The configured demurrage activation height"},
                 {RPCResult::Type::NUM, "demurrage_effective_activation_height", "The demurrage activation height after the post-Gold-Rush clamp"},
-                {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "Final quantum migration deadline time used by the demurrage post-migration guard"},
+                {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "Forecast final migration time; non-authoritative when height boundaries are enabled"},
+                {RPCResult::Type::NUM, "quantum_migration_end_height", "Authoritative last Migration block height, or 0 for a time-only test schedule"},
+                {RPCResult::Type::BOOL, "height_boundaries_authoritative", "Whether exact heights govern Final Lockout and demurrage"},
                 {RPCResult::Type::BOOL, "demurrage_height_guard_satisfied", "Whether the height is at or above demurrage_effective_activation_height"},
-                {RPCResult::Type::BOOL, "demurrage_post_migration_guard_satisfied", "Whether MedianTimePast is after quantum_migration_deadline_time"},
+                {RPCResult::Type::BOOL, "demurrage_post_migration_guard_satisfied", "Whether the authoritative migration-end boundary has passed"},
                 {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal UTXO-set amount before demurrage"},
-                {RPCResult::Type::STR_AMOUNT, "circulating_amount", "Demurrage-adjusted effective circulating amount"},
-                {RPCResult::Type::STR_AMOUNT, "decayed_amount", "Nominal minus effective amount"},
+                {RPCResult::Type::STR_AMOUNT, "circulating_amount", "Consensus-spendable, demurrage-adjusted circulating amount"},
+                {RPCResult::Type::STR_AMOUNT, "decayed_amount", "Amount removed from effective value by demurrage"},
+                {RPCResult::Type::STR_AMOUNT, "merkle_included_nominal_amount", "Nominal value represented by ordinary transaction-Merkle UTXOs"},
+                {RPCResult::Type::STR_AMOUNT, "synthetic_non_merkle_nominal_amount", "Unspent synthetic Gold Rush value outside transaction Merkle trees"},
+                {RPCResult::Type::STR_AMOUNT, "goldrush_synthetic_immature_amount", "Synthetic Gold Rush value awaiting generated-output maturity"},
+                {RPCResult::Type::STR_AMOUNT, "goldrush_locked_payout_amount", "Mature synthetic Gold Rush payout value still phase-locked before Migration"},
+                {RPCResult::Type::STR_AMOUNT, "immature_amount", "Non-synthetic coinbase/coinstake value not mature for the next block"},
+                {RPCResult::Type::STR_AMOUNT, "final_conditional_eutxo_amount", "Final-phase reserved-v15 value excluded from circulation because EUTXO funding and spending are frozen in v30.1.1"},
+                {RPCResult::Type::STR_AMOUNT, "final_locked_legacy_amount", "Nominal legacy UTXO value permanently locked after Final activation"},
+                {RPCResult::Type::STR_AMOUNT, "final_locked_unmoved_goldrush_amount", "Deprecated compatibility field; always zero because matured Gold Rush payouts remain ordinary quantum UTXOs"},
+                {RPCResult::Type::STR_AMOUNT, "permanently_locked_amount", "Nominal UTXO value permanently locked by Final legacy lockout or zero-effective demurrage"},
+                {RPCResult::Type::STR_AMOUNT, "legacy_scheduled_final_lockout_amount", "Current legacy value scheduled for Final lockout"},
+                {RPCResult::Type::STR_AMOUNT, "requires_quantum_migration_amount", "Current legacy value requiring a first move to quantum before Final"},
+                {RPCResult::Type::STR_AMOUNT, "noncirculating_amount", "Nominal amount excluded from circulation by demurrage or Final legacy lockout"},
                 {RPCResult::Type::NUM, "txouts", "The number of scanned UTXOs"},
                 {RPCResult::Type::NUM, "decayed_txouts", "The number of non-exempt UTXOs with realized decay at this height"},
                 {RPCResult::Type::NUM, "locked_txouts", "The number of non-exempt UTXOs that have reached the 24-month lock"},
+                {RPCResult::Type::NUM, "goldrush_synthetic_immature_txouts", "The number of immature synthetic Gold Rush payout UTXOs"},
+                {RPCResult::Type::NUM, "goldrush_locked_payout_txouts", "The number of mature synthetic Gold Rush payout UTXOs still phase-locked before Migration"},
+                {RPCResult::Type::NUM, "immature_txouts", "The number of non-synthetic coinbase/coinstake UTXOs not mature for the next block"},
+                {RPCResult::Type::NUM, "final_conditional_eutxo_txouts", "The number of Final-phase reserved-v15 outputs excluded from circulation because v30.1.1 freezes their funding and spending"},
+                {RPCResult::Type::NUM, "final_locked_legacy_txouts", "The number of legacy UTXOs permanently locked by Final consensus"},
+                {RPCResult::Type::NUM, "final_locked_unmoved_goldrush_txouts", "Deprecated compatibility field; always zero"},
+                {RPCResult::Type::OBJ_DYN, "categories", "Mutually exclusive next-block lifecycle buckets", {
+                    {RPCResult::Type::OBJ, "category", "One lifecycle category", {
+                        {RPCResult::Type::NUM, "count", "UTXO count"},
+                        {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal value"},
+                        {RPCResult::Type::STR_AMOUNT, "effective_amount", "Demurrage-adjusted value"},
+                        {RPCResult::Type::STR_AMOUNT, "burned_amount", "Value removed by demurrage"},
+                    }},
+                }},
+                {RPCResult::Type::OBJ, "shadow", "Authenticated non-Merkle issuance, schedule, and outstanding-pool reconciliation", {
+                    {RPCResult::Type::BOOL, "synthetic", "Always true for Gold Rush shadow payouts"},
+                    {RPCResult::Type::BOOL, "merkle_included", "Always false for Gold Rush shadow payouts"},
+                    {RPCResult::Type::NUM, "issued_count", "Authenticated issued payout count"},
+                    {RPCResult::Type::STR_AMOUNT, "issued_nominal_amount", "Authenticated issued payout value"},
+                    {RPCResult::Type::NUM, "spent_count", "Authenticated spent payout count"},
+                    {RPCResult::Type::STR_AMOUNT, "spent_nominal_amount", "Authenticated spent payout nominal value"},
+                    {RPCResult::Type::NUM, "unspent_count", "Authenticated unspent payout count"},
+                    {RPCResult::Type::STR_AMOUNT, "unspent_nominal_amount", "Authenticated unspent payout value"},
+                    {RPCResult::Type::STR_AMOUNT, "scheduled_total_amount", "Exact total Gold Rush schedule"},
+                    {RPCResult::Type::STR_AMOUNT, "scheduled_through_height_amount", "Exact schedule accrued through the snapshot height"},
+                    {RPCResult::Type::STR_AMOUNT, "claimed_amount", "Issued payout value removed from the reward pool"},
+                    {RPCResult::Type::STR_AMOUNT, "pow_outstanding_amount", "Outstanding proof-of-work pool"},
+                    {RPCResult::Type::STR_AMOUNT, "pos_outstanding_amount", "Outstanding proof-of-stake pool"},
+                    {RPCResult::Type::STR_AMOUNT, "outstanding_amount", "Combined outstanding proof-of-work and proof-of-stake pools"},
+                    {RPCResult::Type::BOOL, "claimable_next_block", "Whether outstanding pool value remains claimable in the next block"},
+                    {RPCResult::Type::STR_AMOUNT, "claimable_outstanding_amount", "Pool value claimable in the next block"},
+                    {RPCResult::Type::STR_AMOUNT, "expired_unissued_amount", "Unclaimed pool value permanently expired after the reward window"},
+                    {RPCResult::Type::STR, "payout_expiration_policy", "Issued-payout expiration policy"},
+                    {RPCResult::Type::STR, "pool_expiration_policy", "Unclaimed-pool expiration policy"},
+                }},
+                {RPCResult::Type::OBJ, "operational_resource", "Source-bound scan scope and exact work performed", {
+                    {RPCResult::Type::NUM, "maximum_records_per_cursor", "Reviewed default record limit for each immutable LevelDB cursor"},
+                    {RPCResult::Type::NUM, "absolute_records_per_cursor", "Non-overridable protection limit for each immutable LevelDB cursor"},
+                    {RPCResult::Type::NUM, "maximum_point_seeks", "Reviewed default combined provenance and demurrage point-seek limit"},
+                    {RPCResult::Type::NUM, "absolute_point_seeks", "Non-overridable combined point-seek protection limit"},
+                    {RPCResult::Type::BOOL, "explicit_override", "Whether the caller explicitly authorized this one scan outside that limit"},
+                    {RPCResult::Type::NUM, "scan_id", "Process-local single-flight scan identifier"},
+                    {RPCResult::Type::NUM, "marker_records_scanned", "Records streamed by the marker/inventory cursor"},
+                    {RPCResult::Type::NUM, "utxo_records_scanned", "Records streamed by the monetary UTXO cursor"},
+                    {RPCResult::Type::NUM, "active_coin_batch_payload_bytes_scanned", "Active logical Coin WriteBatch payload visited; not a physical-byte measurement"},
+                    {RPCResult::Type::NUM, "authenticated_shadow_records_scanned", "Active authenticated append-only shadow-model records or synthetic payouts; rolling state remains background"},
+                    {RPCResult::Type::NUM, "authenticated_shadow_batch_payload_bytes_scanned", "Logical WriteBatch payload in the authenticated append-only shadow-model subset or synthetic payouts; rolling state remains background"},
+                    {RPCResult::Type::NUM, "provenance_point_seeks", "Authenticated payout-provenance seeks"},
+                    {RPCResult::Type::NUM, "demurrage_point_seeks", "Authenticated demurrage-state seeks"},
+                    {RPCResult::Type::BOOL, "consensus_behavior_changed", "Always false"},
+                }},
             }
         },
         RPCExamples{
             HelpExampleCli("getcirculatingsupply", "") +
+            HelpExampleCli("getcirculatingsupply", "true") +
             HelpExampleRpc("getcirculatingsupply", "")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
@@ -1033,56 +1439,639 @@ static RPCHelpMan getcirculatingsupply()
     ChainstateManager& chainman = EnsureChainman(node);
     Chainstate& active_chainstate = chainman.ActiveChainstate();
     const Consensus::Params& consensus = chainman.GetConsensus();
+    const bool allow_unqualified_resource_scan =
+        !request.params[0].isNull() && request.params[0].get_bool();
+    const ::node::ShadowResourceStatus resource_status =
+        ::node::GetShadowResourceStatus(chainman);
+    if (resource_status.applicable &&
+        (!resource_status.measurements_available ||
+         !resource_status.within_immediate_scan_free_space ||
+         !resource_status.critical_free_space_satisfied)) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "The current chainstate filesystem cannot be safely measured or is below the non-overridable 64 GiB pre-flush scan reserve. No scan was started. Add storage or retry after chainstate initialization; explicit consent cannot bypass this protection.");
+    }
+    if (resource_status.applicable &&
+        !resource_status.diagnostic_scan_default_authorized &&
+        !allow_unqualified_resource_scan) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "The current chainstate is outside the reviewed height, size, or immediate-storage scan envelope. "
+            "No scan was started. Inspect getshadowresourceinfo, then pass true only if you explicitly authorize this one unqualified height or size envelope.");
+    }
+
+    const std::optional<uint64_t> scan_id = ::node::TryBeginShadowSupplyScan(
+        resource_status.height, resource_status.best_block);
+    if (!scan_id) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            "A full supply scan is already active. Inspect getshadowresourceinfo for its immutable snapshot and progress; concurrent scans are not permitted.");
+    }
+    ShadowSupplyScanGuard scan_guard{*scan_id};
+
+    auto count_scan_record = [&](uint64_t& count, const char* cursor_name) {
+        if (count == std::numeric_limits<uint64_t>::max()) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Supply scan record count overflow");
+        }
+        ++count;
+        if (count > ::node::SHADOW_RESOURCE_ABSOLUTE_RECORDS_PER_CURSOR) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                strprintf("The %s cursor reached the non-overridable per-call protection limit of %u records. "
+                          "The snapshot scan stopped and returned no partial monetary result.",
+                          cursor_name,
+                          ::node::SHADOW_RESOURCE_ABSOLUTE_RECORDS_PER_CURSOR));
+        }
+        if (!allow_unqualified_resource_scan &&
+            count > ::node::SHADOW_RESOURCE_MAX_RECORDS_PER_CURSOR) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                strprintf("The %s cursor exceeded the reviewed operational limit of %u records. "
+                          "The snapshot scan stopped without changing consensus rules, chain selection, or wallet state. "
+                          "Retry with true only if you explicitly authorize this one out-of-envelope scan.",
+                          cursor_name,
+                          ::node::SHADOW_RESOURCE_MAX_RECORDS_PER_CURSOR));
+        }
+    };
+
+    auto count_point_seek = [&](uint64_t& count, uint64_t other_count,
+                                const char* seek_name) {
+        if (count == std::numeric_limits<uint64_t>::max()) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Supply scan point-seek count overflow");
+        }
+        ++count;
+        if (count > std::numeric_limits<uint64_t>::max() - other_count) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Supply scan combined point-seek count overflow");
+        }
+        const uint64_t combined = count + other_count;
+        if (combined > ::node::SHADOW_RESOURCE_ABSOLUTE_POINT_SEEKS) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                strprintf("The %s lookup reached the non-overridable per-call protection limit of %u combined point seeks. "
+                          "The snapshot scan stopped and returned no partial monetary result.",
+                          seek_name,
+                          ::node::SHADOW_RESOURCE_ABSOLUTE_POINT_SEEKS));
+        }
+        if (!allow_unqualified_resource_scan &&
+            combined > ::node::SHADOW_RESOURCE_MAX_POINT_SEEKS) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                strprintf("The supply scan exceeded the reviewed operational limit of %u combined point seeks. "
+                          "Retry with true only if you explicitly authorize this one unqualified scan.",
+                          ::node::SHADOW_RESOURCE_MAX_POINT_SEEKS));
+        }
+    };
+
+    auto check_scan_integrity_reserve = [&] {
+        const ::node::ShadowResourceStatus current =
+            ::node::GetShadowResourceStatus(chainman);
+        if (current.applicable &&
+            (!current.measurements_available ||
+             !current.critical_free_space_satisfied)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "The chainstate filesystem became unmeasurable or fell below the non-overridable 50 MiB integrity reserve. The scan stopped and returned no partial monetary result.");
+        }
+    };
+
+    auto scan_interruption_point = [&] {
+        node.rpc_interruption_point();
+        if (::node::ShadowSupplyScanAbortRequested(*scan_id)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "Supply scan cancellation requested; the scan stopped and returned no partial monetary result.");
+        }
+    };
 
     const CBlockIndex* tip{nullptr};
     std::unique_ptr<CCoinsViewCursor> cursor;
-    std::unique_ptr<CCoinsViewCache> lookup_view;
+    std::unique_ptr<CCoinsViewCursor> marker_cursor;
+    std::unique_ptr<CCoinsViewCursor> attestation_cursor;
     {
         LOCK(::cs_main);
-        active_chainstate.ForceFlushStateToDisk();
+        BlockValidationState flush_state;
+        if (!active_chainstate.FlushStateToDisk(
+                flush_state, FlushStateMode::ALWAYS)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                strprintf(
+                    "The immutable supply snapshot could not be flushed to disk (%s). The scan stopped and returned no partial monetary result.",
+                    flush_state.ToString()));
+        }
         CCoinsView& coins_db = active_chainstate.CoinsDB();
         tip = CHECK_NONFATAL(active_chainstate.m_blockman.LookupBlockIndex(coins_db.GetBestBlock()));
+        const ::node::ShadowResourceStatus post_flush_status =
+            ::node::GetShadowResourceStatus(chainman);
+        if (post_flush_status.applicable &&
+            (!post_flush_status.measurements_available ||
+             !post_flush_status.critical_free_space_satisfied)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "The completed chainstate flush left the filesystem unmeasurable or below the non-overridable 50 MiB integrity reserve. The scan stopped and returned no partial monetary result.");
+        }
+        if (post_flush_status.applicable &&
+            !allow_unqualified_resource_scan &&
+            (!post_flush_status.within_supported_height ||
+             !post_flush_status.within_chainstate_size)) {
+            throw JSONRPCError(
+                RPC_MISC_ERROR,
+                "The completed chainstate flush moved the immutable snapshot outside the reviewed height or size envelope. No records were scanned. Inspect getshadowresourceinfo, then pass true only if you explicitly authorize this one out-of-envelope diagnostic scan.");
+        }
+        if (post_flush_status.height != tip->nHeight ||
+            post_flush_status.best_block != tip->GetBlockHash().GetHex()) {
+            throw JSONRPCError(
+                RPC_INTERNAL_ERROR,
+                "Post-flush resource measurements do not match the immutable chainstate snapshot");
+        }
+        // LevelDB cursors own immutable snapshots. Create both under cs_main so
+        // marker classification and monetary UTXOs come from the same tip even
+        // while the lengthy scan proceeds without blocking validation.
+        marker_cursor = coins_db.Cursor();
+        attestation_cursor = coins_db.Cursor();
         cursor = coins_db.Cursor();
-        lookup_view = std::make_unique<CCoinsViewCache>(&coins_db);
+    }
+    // The snapshot flush can itself consume space. Recheck the non-overridable
+    // integrity floor after that I/O and before visiting any record.
+    check_scan_integrity_reserve();
+
+    if (tip->nHeight == std::numeric_limits<int>::max()) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Active chain height cannot be evaluated safely");
+    }
+    const int64_t tip_mtp = tip->GetMedianTimePast();
+    const int evaluation_height = tip->nHeight + 1;
+    ::node::SetShadowSupplyScanAnchor(
+        *scan_id, tip->nHeight, tip->GetBlockHash().GetHex());
+
+    std::optional<GoldRushInventoryInfo> inventory;
+    std::optional<ShadowGoldRushInfo> pool;
+    uint64_t payout_marker_count{0};
+    CAmount payout_marker_nominal{0};
+    uint64_t marker_records_scanned{0};
+    uint64_t provenance_point_seeks{0};
+    uint64_t demurrage_point_seeks{0};
+    COutPoint marker_key;
+    Coin marker_coin;
+    ::node::UpdateShadowSupplyScan(
+        *scan_id, "scanning_markers", 0, 0, 0, 0, 0, 0, 0);
+    while (marker_cursor->Valid()) {
+        scan_interruption_point();
+        count_scan_record(marker_records_scanned, "marker");
+        if ((marker_records_scanned & 4095U) == 0) {
+            ::node::UpdateShadowSupplyScan(
+                *scan_id, "scanning_markers", marker_records_scanned, 0,
+                0, 0, 0, provenance_point_seeks,
+                demurrage_point_seeks);
+        }
+        if ((marker_records_scanned & 1048575U) == 0) {
+            check_scan_integrity_reserve();
+        }
+        if (!marker_cursor->GetKey(marker_key) || !marker_cursor->GetValue(marker_coin)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read lifecycle marker snapshot");
+        }
+        if (!marker_coin.IsSpent()) {
+            GoldRushPayoutMarkerInfo payout_info;
+            if (DecodeAuthenticatedGoldRushPayoutMarker(
+                    marker_key, marker_coin, tip, payout_info)) {
+                if (!AddCirculatingSupplyCount(payout_marker_count) ||
+                    !AddCirculatingSupplyAmount(payout_marker_nominal,
+                                                payout_info.nominal_amount)) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                       "Gold Rush payout-marker inventory is inconsistent");
+                }
+            }
+
+            if (IsGoldRushInventoryMarkerOutpoint(marker_key)) {
+                GoldRushInventoryInfo decoded;
+                if (inventory || !DecodeAuthenticatedGoldRushInventory(
+                        marker_key, marker_coin, tip, decoded)) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                       "Gold Rush inventory checkpoint is corrupt");
+                }
+                inventory = decoded;
+            }
+            if (IsShadowPoolMarkerOutpoint(marker_key)) {
+                ShadowGoldRushInfo decoded;
+                if (pool || !DecodeAuthenticatedShadowPool(
+                        marker_key, marker_coin, tip, decoded)) {
+                    throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                       "Gold Rush reward-pool checkpoint is corrupt");
+                }
+                pool = decoded;
+            }
+        }
+        marker_cursor->Next();
     }
 
+    constexpr size_t CATEGORY_COUNT =
+        static_cast<size_t>(ValueLifecycleCategory::COUNT);
+    std::array<CirculatingSupplyBucket, CATEGORY_COUNT> buckets{};
+    auto bucket = [&](ValueLifecycleCategory category) -> CirculatingSupplyBucket& {
+        return buckets.at(static_cast<size_t>(category));
+    };
+
     CAmount nominal{0};
+    CAmount total_effective{0};
+    CAmount demurrage_decayed{0};
     CAmount circulating{0};
-    int64_t txouts{0};
-    int64_t decayed_txouts{0};
-    int64_t locked_txouts{0};
-    const int64_t tip_mtp = tip->GetMedianTimePast();
+    CAmount merkle_included_nominal{0};
+    CAmount synthetic_unspent_nominal{0};
+    CAmount permanently_locked{0};
+    CAmount legacy_scheduled_final_lockout{0};
+    CAmount requires_quantum_migration{0};
+    uint64_t txouts{0};
+    uint64_t utxo_records_scanned{0};
+    uint64_t active_coin_batch_payload_bytes_scanned{0};
+    uint64_t authenticated_shadow_records_scanned{0};
+    uint64_t authenticated_shadow_batch_payload_bytes_scanned{0};
+    uint64_t synthetic_unspent_count{0};
+    uint64_t decayed_txouts{0};
     COutPoint key;
     Coin coin;
+    ::node::UpdateShadowSupplyScan(
+        *scan_id, "scanning_utxos", marker_records_scanned, 0,
+        0, 0, 0, provenance_point_seeks, demurrage_point_seeks);
     while (cursor->Valid()) {
-        node.rpc_interruption_point();
-        if (cursor->GetKey(key) && cursor->GetValue(coin)) {
-            ++txouts;
-            nominal += coin.out.nValue;
-            const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(*lookup_view, coin.out.scriptPubKey);
-            const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin, consensus, tip->nHeight, tip_mtp, latest_attestation);
-            circulating += eval.effective_value;
-            if (eval.locked) ++locked_txouts;
-            if (eval.burned_value > 0) ++decayed_txouts;
+        scan_interruption_point();
+        count_scan_record(utxo_records_scanned, "UTXO");
+        if ((utxo_records_scanned & 1048575U) == 0) {
+            check_scan_integrity_reserve();
+        }
+        if (!cursor->GetKey(key) || !cursor->GetValue(coin)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Unable to read lifecycle UTXO snapshot");
+        }
+        const std::optional<uint64_t> record_payload_bytes =
+            ActiveCoinBatchPayloadBytes(key, coin);
+        if (!record_payload_bytes ||
+            !AddCirculatingSupplyCount(
+                active_coin_batch_payload_bytes_scanned,
+                *record_payload_bytes)) {
+            throw JSONRPCError(
+                RPC_INTERNAL_ERROR,
+                "Active Coin logical payload byte count overflow");
+        }
+        const bool authenticated_shadow_marker =
+            !coin.IsSpent() && coin.out.nValue == 0 &&
+            IsAuthenticatedShadowMarkerOutpoint(key, coin, tip);
+        const bool modeled_shadow_resource_marker =
+            authenticated_shadow_marker &&
+            IsModeledShadowResourceMarkerOutpoint(key, coin, tip);
+        if (modeled_shadow_resource_marker &&
+            (!AddCirculatingSupplyCount(
+                 authenticated_shadow_records_scanned) ||
+             !AddCirculatingSupplyCount(
+                 authenticated_shadow_batch_payload_bytes_scanned,
+                 *record_payload_bytes))) {
+            throw JSONRPCError(
+                RPC_INTERNAL_ERROR,
+                "Authenticated shadow logical payload count overflow");
+        }
+        if ((utxo_records_scanned & 4095U) == 0) {
+            ::node::UpdateShadowSupplyScan(
+                *scan_id, "scanning_utxos", marker_records_scanned,
+                utxo_records_scanned,
+                active_coin_batch_payload_bytes_scanned,
+                authenticated_shadow_records_scanned,
+                authenticated_shadow_batch_payload_bytes_scanned,
+                provenance_point_seeks, demurrage_point_seeks);
+        }
+        if (coin.IsSpent()) {
+            cursor->Next();
+            continue;
+        }
+        if (coin.out.nValue == 0 &&
+            (authenticated_shadow_marker ||
+             Consensus::IsAuthenticatedDemurrageStateOutpoint(key, coin, tip))) {
+            cursor->Next();
+            continue;
+        }
+
+        GoldRushPayoutMarkerInfo payout;
+        GoldRushPayoutMarkerLookupResult payout_lookup{
+            GoldRushPayoutMarkerLookupResult::MISSING};
+        if (HasGoldRushPayoutShape(coin)) {
+            count_point_seek(provenance_point_seeks,
+                             demurrage_point_seeks, "provenance");
+            payout_lookup = LookupAuthenticatedGoldRushPayoutMarker(
+                *marker_cursor, key, tip, payout);
+        }
+        if (payout_lookup == GoldRushPayoutMarkerLookupResult::CORRUPT) {
+            throw JSONRPCError(
+                RPC_INTERNAL_ERROR,
+                "Gold Rush payout candidate has corrupt authenticated provenance");
+        }
+        const bool candidate = IsGoldRushPayoutCandidateCoin(coin, consensus);
+        const bool authenticated_synthetic =
+            payout_lookup == GoldRushPayoutMarkerLookupResult::AUTHENTICATED;
+        if (candidate && !authenticated_synthetic) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Gold Rush payout candidate lacks authenticated provenance");
+        }
+        if (authenticated_synthetic) {
+            if (!AddCirculatingSupplyCount(
+                    authenticated_shadow_records_scanned) ||
+                !AddCirculatingSupplyCount(
+                    authenticated_shadow_batch_payload_bytes_scanned,
+                    *record_payload_bytes)) {
+                throw JSONRPCError(
+                    RPC_INTERNAL_ERROR,
+                    "Authenticated synthetic payout payload count overflow");
+            }
+            if (payout.nominal_amount != coin.out.nValue ||
+                payout.payout_script != coin.out.scriptPubKey ||
+                payout.origin_height != coin.nHeight ||
+                payout.origin_block_time != coin.nTime) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                   "Gold Rush payout coin disagrees with authenticated provenance");
+            }
+        }
+
+        std::optional<Consensus::DemurrageAttestationState> latest_attestation;
+        if (const std::optional<uint256> controlling_key =
+                Consensus::DemurrageControllingKeyHashForScript(coin.out.scriptPubKey)) {
+            count_point_seek(demurrage_point_seeks,
+                             provenance_point_seeks, "demurrage");
+            Consensus::DemurrageAttestationState state;
+            const Consensus::DemurrageLatestStateLookupResult result =
+                Consensus::LookupAuthenticatedDemurrageLatestState(
+                    *attestation_cursor, *controlling_key, tip, state);
+            if (result == Consensus::DemurrageLatestStateLookupResult::CORRUPT) {
+                throw JSONRPCError(
+                    RPC_INTERNAL_ERROR,
+                    "Quantum output has corrupt authenticated demurrage state");
+            }
+            if (result == Consensus::DemurrageLatestStateLookupResult::AUTHENTICATED) {
+                latest_attestation = state;
+            }
+        }
+        ValueLifecycleClassification classification;
+        const ValueLifecycleResult classification_result = ClassifyValueLifecycle(
+            coin, authenticated_synthetic, consensus, evaluation_height, tip_mtp,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation
+                ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)}
+                : std::nullopt,
+            classification);
+        if (classification_result != ValueLifecycleResult::OK ||
+            static_cast<size_t>(classification.category) >= CATEGORY_COUNT ||
+            !AddCirculatingSupplyCount(txouts) ||
+            !AddCirculatingSupplyAmount(nominal, classification.nominal_amount) ||
+            !AddCirculatingSupplyAmount(total_effective, classification.effective_amount) ||
+            !AddCirculatingSupplyAmount(demurrage_decayed, classification.burned_amount) ||
+            !AddCirculatingSupplyBucket(bucket(classification.category), classification)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "UTXO lifecycle classification is out of range");
+        }
+        if (classification.ordinary_spendable &&
+            !AddCirculatingSupplyAmount(circulating, classification.effective_amount)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Circulating supply is out of range");
+        }
+        if (classification.synthetic) {
+            if (classification.merkle_included ||
+                !AddCirculatingSupplyCount(synthetic_unspent_count) ||
+                !AddCirculatingSupplyAmount(synthetic_unspent_nominal,
+                                            classification.nominal_amount)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR,
+                                   "Synthetic payout classification is inconsistent");
+            }
+        } else if (!classification.merkle_included ||
+                   !AddCirculatingSupplyAmount(merkle_included_nominal,
+                                               classification.nominal_amount)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Merkle-included supply classification is inconsistent");
+        }
+        if (classification.permanently_locked &&
+            !AddCirculatingSupplyAmount(permanently_locked,
+                                        classification.nominal_amount)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Permanent lock total is out of range");
+        }
+        if (classification.legacy_scheduled_final_lockout &&
+            !AddCirculatingSupplyAmount(legacy_scheduled_final_lockout,
+                                        classification.nominal_amount)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Scheduled Final lockout total is out of range");
+        }
+        if (classification.requires_quantum_migration &&
+            !AddCirculatingSupplyAmount(requires_quantum_migration,
+                                        classification.nominal_amount)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Required quantum migration total is out of range");
+        }
+        if (classification.burned_amount > 0 &&
+            !AddCirculatingSupplyCount(decayed_txouts)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR, "Decayed UTXO count overflow");
         }
         cursor->Next();
     }
+    scan_interruption_point();
+    if (marker_records_scanned != utxo_records_scanned) {
+        throw JSONRPCError(
+            RPC_INTERNAL_ERROR,
+            "Immutable supply-scan cursors visited different record counts");
+    }
+    if (authenticated_shadow_records_scanned > utxo_records_scanned ||
+        authenticated_shadow_batch_payload_bytes_scanned >
+            active_coin_batch_payload_bytes_scanned) {
+        throw JSONRPCError(
+            RPC_INTERNAL_ERROR,
+            "Authenticated shadow work exceeds the active Coin snapshot");
+    }
+
+    CAmount reconciled_value{0};
+    if (!AddCirculatingSupplyAmount(reconciled_value, total_effective) ||
+        !AddCirculatingSupplyAmount(reconciled_value, demurrage_decayed) ||
+        reconciled_value != nominal) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Nominal, effective, and demurrage-burn totals do not reconcile");
+    }
+    CAmount represented_nominal{0};
+    if (!AddCirculatingSupplyAmount(represented_nominal, merkle_included_nominal) ||
+        !AddCirculatingSupplyAmount(represented_nominal, synthetic_unspent_nominal) ||
+        represented_nominal != nominal || circulating > nominal) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Merkle and synthetic UTXO totals do not reconcile");
+    }
+
+    GoldRushInventoryInfo exact_inventory;
+    ShadowGoldRushInfo exact_pool;
+    if (tip->nHeight >= SHADOW_REWARD_START_HEIGHT) {
+        if (!inventory) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "Gold Rush inventory checkpoint is missing");
+        }
+        exact_inventory = *inventory;
+        if (pool) exact_pool = *pool;
+    } else if (inventory || pool || payout_marker_count != 0) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Gold Rush accounting exists before its reward schedule");
+    }
+    if (exact_inventory.spent_count > exact_inventory.issued_count ||
+        exact_inventory.spent_nominal > exact_inventory.issued_nominal ||
+        payout_marker_count != exact_inventory.issued_count ||
+        payout_marker_nominal != exact_inventory.issued_nominal ||
+        synthetic_unspent_count != exact_inventory.issued_count - exact_inventory.spent_count ||
+        synthetic_unspent_nominal != exact_inventory.issued_nominal - exact_inventory.spent_nominal ||
+        exact_pool.claimed_amount != exact_inventory.issued_nominal) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Gold Rush marker, inventory, pool, and UTXO totals do not reconcile");
+    }
+
+    const std::optional<CAmount> scheduled_total =
+        GetScheduledShadowEmissionThrough(SHADOW_REWARD_END_HEIGHT);
+    const std::optional<CAmount> scheduled_through =
+        GetScheduledShadowEmissionThrough(tip->nHeight);
+    CAmount outstanding_pool{0};
+    CAmount accrued{0};
+    if (!scheduled_total || !scheduled_through || *scheduled_total > SHADOW_MAX_EMISSION ||
+        !AddCirculatingSupplyAmount(outstanding_pool, exact_pool.pow_amount) ||
+        !AddCirculatingSupplyAmount(outstanding_pool, exact_pool.pos_amount) ||
+        !AddCirculatingSupplyAmount(accrued, exact_pool.claimed_amount) ||
+        !AddCirculatingSupplyAmount(accrued, outstanding_pool) ||
+        accrued != *scheduled_through || *scheduled_through > *scheduled_total) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Gold Rush reward schedule and outstanding pools do not reconcile");
+    }
+    const bool pool_claimable_next_block = IsShadowGoldRushRewardActive(
+        consensus, tip_mtp, evaluation_height);
+    const bool reward_window_ended = evaluation_height > SHADOW_REWARD_END_HEIGHT;
+    const CAmount claimable_pool = pool_claimable_next_block ? outstanding_pool : 0;
+    const CAmount expired_pool = reward_window_ended ? outstanding_pool : 0;
+
+    auto summed_bucket = [&](std::initializer_list<ValueLifecycleCategory> categories) {
+        CirculatingSupplyBucket result;
+        for (const ValueLifecycleCategory category : categories) {
+            const CirculatingSupplyBucket& source = bucket(category);
+            if (!AddCirculatingSupplyCount(result.count, source.count) ||
+                !AddCirculatingSupplyAmount(result.nominal, source.nominal) ||
+                !AddCirculatingSupplyAmount(result.effective, source.effective) ||
+                !AddCirculatingSupplyAmount(result.burned, source.burned)) {
+                throw JSONRPCError(RPC_INTERNAL_ERROR, "Lifecycle bucket sum is out of range");
+            }
+        }
+        return result;
+    };
+    const CirculatingSupplyBucket immature = summed_bucket({
+        ValueLifecycleCategory::IMMATURE_LEGACY,
+        ValueLifecycleCategory::IMMATURE_OTHER});
+    const CirculatingSupplyBucket& synthetic_immature =
+        bucket(ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_IMMATURE);
+    const CirculatingSupplyBucket& synthetic_locked =
+        bucket(ValueLifecycleCategory::GOLD_RUSH_SYNTHETIC_MATURE_LOCKED);
+    const CirculatingSupplyBucket& final_conditional =
+        bucket(ValueLifecycleCategory::FINAL_CONDITIONAL_EUTXO);
+    const CirculatingSupplyBucket& final_legacy =
+        bucket(ValueLifecycleCategory::FINAL_LOCKED_LEGACY);
+    const CirculatingSupplyBucket& demurrage_locked =
+        bucket(ValueLifecycleCategory::DEMURRAGE_LOCKED);
+    const CAmount noncirculating = nominal - circulating;
 
     UniValue ret(UniValue::VOBJ);
+    ret.pushKV("schema", "blackcoin.supply.lifecycle.v2");
     ret.pushKV("height", tip->nHeight);
+    ret.pushKV("evaluation_height", evaluation_height);
     ret.pushKV("bestblock", tip->GetBlockHash().GetHex());
-    ret.pushKV("demurrage_active", consensus.IsDemurrageActive(tip->nHeight, tip_mtp));
+    ret.pushKV("demurrage_active", consensus.IsDemurrageActive(evaluation_height, tip_mtp));
     ret.pushKV("demurrage_activation_height", consensus.nDemurrageActivationHeight);
     ret.pushKV("demurrage_effective_activation_height", consensus.EffectiveDemurrageActivationHeight());
     ret.pushKV("quantum_migration_deadline_time", consensus.nQuantumMigrationDeadlineTime);
-    ret.pushKV("demurrage_height_guard_satisfied", tip->nHeight >= consensus.EffectiveDemurrageActivationHeight());
-    ret.pushKV("demurrage_post_migration_guard_satisfied", consensus.IsMigrationEndScheduled() && consensus.MigrationDeadlinePassed(tip_mtp, tip->nHeight));
+    ret.pushKV("quantum_migration_end_height", consensus.nQuantumMigrationEndHeight);
+    ret.pushKV("height_boundaries_authoritative", consensus.UsesHeightLifecycle());
+    ret.pushKV("demurrage_height_guard_satisfied", evaluation_height >= consensus.EffectiveDemurrageActivationHeight());
+    ret.pushKV("demurrage_post_migration_guard_satisfied", consensus.IsMigrationEndScheduled() && consensus.MigrationDeadlinePassed(tip_mtp, evaluation_height));
     ret.pushKV("nominal_amount", ValueFromAmount(nominal));
     ret.pushKV("circulating_amount", ValueFromAmount(circulating));
-    ret.pushKV("decayed_amount", ValueFromAmount(nominal - circulating));
+    ret.pushKV("decayed_amount", ValueFromAmount(demurrage_decayed));
+    ret.pushKV("merkle_included_nominal_amount", ValueFromAmount(merkle_included_nominal));
+    ret.pushKV("synthetic_non_merkle_nominal_amount", ValueFromAmount(synthetic_unspent_nominal));
+    ret.pushKV("goldrush_synthetic_immature_amount", ValueFromAmount(synthetic_immature.nominal));
+    ret.pushKV("goldrush_locked_payout_amount", ValueFromAmount(synthetic_locked.nominal));
+    ret.pushKV("immature_amount", ValueFromAmount(immature.nominal));
+    ret.pushKV("final_conditional_eutxo_amount", ValueFromAmount(final_conditional.nominal));
+    ret.pushKV("final_locked_legacy_amount", ValueFromAmount(final_legacy.nominal));
+    ret.pushKV("final_locked_unmoved_goldrush_amount", ValueFromAmount(0));
+    ret.pushKV("permanently_locked_amount", ValueFromAmount(permanently_locked));
+    ret.pushKV("legacy_scheduled_final_lockout_amount", ValueFromAmount(legacy_scheduled_final_lockout));
+    ret.pushKV("requires_quantum_migration_amount", ValueFromAmount(requires_quantum_migration));
+    ret.pushKV("noncirculating_amount", ValueFromAmount(noncirculating));
     ret.pushKV("txouts", txouts);
     ret.pushKV("decayed_txouts", decayed_txouts);
-    ret.pushKV("locked_txouts", locked_txouts);
+    ret.pushKV("locked_txouts", demurrage_locked.count);
+    ret.pushKV("goldrush_synthetic_immature_txouts", synthetic_immature.count);
+    ret.pushKV("goldrush_locked_payout_txouts", synthetic_locked.count);
+    ret.pushKV("immature_txouts", immature.count);
+    ret.pushKV("final_conditional_eutxo_txouts", final_conditional.count);
+    ret.pushKV("final_locked_legacy_txouts", final_legacy.count);
+    ret.pushKV("final_locked_unmoved_goldrush_txouts", 0);
+
+    UniValue category_json(UniValue::VOBJ);
+    for (size_t i = 0; i < CATEGORY_COUNT; ++i) {
+        const auto category = static_cast<ValueLifecycleCategory>(i);
+        category_json.pushKV(ValueLifecycleCategoryName(category),
+                             CirculatingSupplyBucketToJSON(buckets[i]));
+    }
+    ret.pushKV("categories", std::move(category_json));
+
+    UniValue shadow(UniValue::VOBJ);
+    shadow.pushKV("synthetic", true);
+    shadow.pushKV("merkle_included", false);
+    shadow.pushKV("issued_count", exact_inventory.issued_count);
+    shadow.pushKV("issued_nominal_amount", ValueFromAmount(exact_inventory.issued_nominal));
+    shadow.pushKV("spent_count", exact_inventory.spent_count);
+    shadow.pushKV("spent_nominal_amount", ValueFromAmount(exact_inventory.spent_nominal));
+    shadow.pushKV("unspent_count", synthetic_unspent_count);
+    shadow.pushKV("unspent_nominal_amount", ValueFromAmount(synthetic_unspent_nominal));
+    shadow.pushKV("scheduled_total_amount", ValueFromAmount(*scheduled_total));
+    shadow.pushKV("scheduled_through_height_amount", ValueFromAmount(*scheduled_through));
+    shadow.pushKV("claimed_amount", ValueFromAmount(exact_pool.claimed_amount));
+    shadow.pushKV("pow_outstanding_amount", ValueFromAmount(exact_pool.pow_amount));
+    shadow.pushKV("pos_outstanding_amount", ValueFromAmount(exact_pool.pos_amount));
+    shadow.pushKV("outstanding_amount", ValueFromAmount(outstanding_pool));
+    shadow.pushKV("claimable_next_block", pool_claimable_next_block);
+    shadow.pushKV("claimable_outstanding_amount", ValueFromAmount(claimable_pool));
+    shadow.pushKV("expired_unissued_amount", ValueFromAmount(expired_pool));
+    shadow.pushKV("payout_expiration_policy", "issued_gold_rush_payouts_do_not_expire");
+    shadow.pushKV("pool_expiration_policy", "unclaimed_pool_value_expires_after_the_reward_window");
+    ret.pushKV("shadow", std::move(shadow));
+
+    UniValue operational_resource(UniValue::VOBJ);
+    operational_resource.pushKV("maximum_records_per_cursor",
+                                ::node::SHADOW_RESOURCE_MAX_RECORDS_PER_CURSOR);
+    operational_resource.pushKV("absolute_records_per_cursor",
+                                ::node::SHADOW_RESOURCE_ABSOLUTE_RECORDS_PER_CURSOR);
+    operational_resource.pushKV("maximum_point_seeks",
+                                ::node::SHADOW_RESOURCE_MAX_POINT_SEEKS);
+    operational_resource.pushKV("absolute_point_seeks",
+                                ::node::SHADOW_RESOURCE_ABSOLUTE_POINT_SEEKS);
+    operational_resource.pushKV("explicit_override",
+                                allow_unqualified_resource_scan);
+    operational_resource.pushKV("scan_id", *scan_id);
+    operational_resource.pushKV("marker_records_scanned",
+                                marker_records_scanned);
+    operational_resource.pushKV("utxo_records_scanned",
+                                utxo_records_scanned);
+    operational_resource.pushKV("active_coin_batch_payload_bytes_scanned",
+                                active_coin_batch_payload_bytes_scanned);
+    operational_resource.pushKV("authenticated_shadow_records_scanned",
+                                authenticated_shadow_records_scanned);
+    operational_resource.pushKV(
+        "authenticated_shadow_batch_payload_bytes_scanned",
+        authenticated_shadow_batch_payload_bytes_scanned);
+    operational_resource.pushKV("provenance_point_seeks",
+                                provenance_point_seeks);
+    operational_resource.pushKV("demurrage_point_seeks",
+                                demurrage_point_seeks);
+    operational_resource.pushKV("consensus_behavior_changed", false);
+    ret.pushKV("operational_resource", std::move(operational_resource));
+    ::node::UpdateShadowSupplyScan(
+        *scan_id, "complete", marker_records_scanned,
+        utxo_records_scanned, active_coin_batch_payload_bytes_scanned,
+        authenticated_shadow_records_scanned,
+        authenticated_shadow_batch_payload_bytes_scanned,
+        provenance_point_seeks,
+        demurrage_point_seeks);
+    scan_guard.Complete();
     return ret;
 },
     };
@@ -1326,6 +2315,12 @@ static int64_t SecondsUntilAfterBoundary(int64_t now, int64_t boundary)
     return boundary - now + 1;
 }
 
+static int BlocksUntilAfterBoundary(int next_height, int boundary_height)
+{
+    if (boundary_height <= 0 || next_height > boundary_height) return 0;
+    return boundary_height - next_height + 1;
+}
+
 static const char* QuantumReadinessStateName(const ThresholdState state)
 {
     switch (state) {
@@ -1365,45 +2360,86 @@ static UniValue QuantumQuasarStatus(const CBlockIndex& tip, const ChainstateMana
 {
     const Consensus::Params& consensus = chainman.GetConsensus();
     const int64_t mtp = tip.GetMedianTimePast();
+    const int64_t tip_validation_mtp = tip.pprev ? tip.pprev->GetMedianTimePast() : tip.GetBlockTime();
     const int next_height = tip.nHeight + 1;
     const Consensus::QuantumQuasarPhase phase = consensus.GetQuantumQuasarPhase(mtp, next_height);
+    const Consensus::QuantumQuasarPhase active_tip_phase = consensus.GetQuantumQuasarPhase(tip_validation_mtp, tip.nHeight);
     const bool quantum_spend_active = IsQuantumWitnessSpendActive(consensus, mtp, next_height);
     const bool new_network_stake_only = consensus.IsNewNetworkStakeOnly(mtp, next_height);
     const bool base_network_stake_compatible = consensus.IsBaseNetworkStakeCompatible(mtp, next_height);
     const bool shadow_merge_mining_active = IsShadowGoldRushRewardActive(consensus, mtp, next_height);
     const bool final_lockout_active = consensus.IsQuantumFinalLockout(mtp, next_height);
     const bool shadow_reward_height_active = IsShadowGoldRushRewardHeight(next_height);
+    const auto lifecycle = consensus.GetQuantumLifecycleState(mtp, next_height);
+    const bool qqp4_disabled =
+        consensus.nShadowQQP4ActivationHeight ==
+        std::numeric_limits<int>::max();
 
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("phase", QuantumQuasarPhaseName(phase));
+    obj.pushKV("phase_context", "next_block");
+    obj.pushKV("active_tip_height", tip.nHeight);
+    obj.pushKV("active_tip_phase", QuantumQuasarPhaseName(active_tip_phase));
+    obj.pushKV("next_block_height", next_height);
+    obj.pushKV("next_block_phase", QuantumQuasarPhaseName(phase));
+    obj.pushKV("lifecycle_schedule_valid", lifecycle.schedule_valid);
     obj.pushKV("mediantime", mtp);
     obj.pushKV("v4_activation_time", consensus.nProtocolV4Time);
+    obj.pushKV("v4_activation_height", consensus.nQuantumLifecycleStartHeight);
     obj.pushKV("gold_rush_end_time", consensus.nGoldRushEndTime);
     obj.pushKV("quantum_migration_deadline_time", consensus.nQuantumMigrationDeadlineTime);
     obj.pushKV("gold_rush_end_height", consensus.nGoldRushEndHeight);
     obj.pushKV("quantum_migration_end_height", consensus.nQuantumMigrationEndHeight);
+    obj.pushKV("height_boundaries_authoritative", lifecycle.height_authoritative);
+    obj.pushKV("time_boundaries_are_estimates", consensus.UsesHeightLifecycle());
     obj.pushKV("seconds_until_v4", SecondsUntilAfterBoundary(mtp, consensus.nProtocolV4Time));
     obj.pushKV("seconds_until_gold_rush_end", SecondsUntil(mtp, consensus.nGoldRushEndTime));
     obj.pushKV("seconds_until_quantum_migration_deadline", SecondsUntil(mtp, consensus.nQuantumMigrationDeadlineTime));
+    obj.pushKV("blocks_until_gold_rush_end", BlocksUntilAfterBoundary(next_height, consensus.nGoldRushEndHeight));
+    obj.pushKV("blocks_until_quantum_migration_end", BlocksUntilAfterBoundary(next_height, consensus.nQuantumMigrationEndHeight));
     obj.pushKV("base_network_stake_compatible", base_network_stake_compatible);
     obj.pushKV("shadow_merge_mining_active", shadow_merge_mining_active);
     obj.pushKV("shadow_reward_height_active", shadow_reward_height_active);
     obj.pushKV("shadow_reward_next_height", next_height);
     obj.pushKV("shadow_reward_start_height", SHADOW_REWARD_START_HEIGHT);
     obj.pushKV("shadow_reward_end_height", SHADOW_REWARD_END_HEIGHT);
+    // Keep QQP3 canonical accounting and the future QQP4 exact-input fork
+    // visibly distinct. Versionbits readiness is deliberately not an
+    // activation mechanism for either field.
+    obj.pushKV("qqp4_activation_disabled", qqp4_disabled);
+    obj.pushKV("qqp4_activation_height", qqp4_disabled
+        ? 0 : consensus.nShadowQQP4ActivationHeight);
+    obj.pushKV("qqp4_active_at_tip",
+               consensus.IsShadowQQP4Active(tip.nHeight));
+    obj.pushKV("qqp4_active_next_block",
+               consensus.IsShadowQQP4Active(next_height));
+    obj.pushKV("qqp4_exact_input_required_next_block",
+               consensus.IsShadowQQP4Active(next_height));
     obj.pushKV("new_network_stake_only", new_network_stake_only);
-    obj.pushKV("replay_protection_active", new_network_stake_only);
+    obj.pushKV("replay_protection_active", quantum_spend_active);
+    obj.pushKV("sighash_forkid_active", quantum_spend_active);
+    obj.pushKV("quantum_signature_domain_separation_active", quantum_spend_active);
+    obj.pushKV("replay_protection_scope", "post-Gold-Rush signature digests; shared pre-migration future-witness lineage still requires an anchored first move");
+    obj.pushKV("legacy_unknown_witness_replay_protected", false);
     obj.pushKV("legacy_address_lockout_scheduled", consensus.IsMigrationEndScheduled());
     obj.pushKV("quantum_address_required_by_schedule", final_lockout_active);
     obj.pushKV("legacy_addresses_accepted", !final_lockout_active);
     obj.pushKV("quantum_address_required", final_lockout_active);
     obj.pushKV("quantum_spend_enforcement_active", quantum_spend_active);
-    obj.pushKV("quantum_migration_outputs_fundable", true);
+    obj.pushKV("quantum_migration_outputs_fundable", quantum_spend_active);
+    obj.pushKV("eutxo_enabled", false);
+    obj.pushKV("eutxo_policy", "v15 EUTXO commitments are frozen/disabled in v30.1.1 because they lack quantum ownership authorization");
     UniValue readiness(UniValue::VOBJ);
     readiness.pushKV(VersionBitsDeploymentInfo[Consensus::DEPLOYMENT_QUANTUM_QUASAR].name, QuantumReadinessStatus(tip, chainman, Consensus::DEPLOYMENT_QUANTUM_QUASAR));
     readiness.pushKV(VersionBitsDeploymentInfo[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].name, QuantumReadinessStatus(tip, chainman, Consensus::DEPLOYMENT_QUANTUM_MIGRATION));
     obj.pushKV("readiness_signalling", readiness);
-    obj.pushKV("migration_policy", "Quantum witness-v16 addresses are fundable now. Gold Rush credits accrue in the upgraded shadow ledger while legacy nodes can still follow the base chain. ML-DSA spends activate after the Gold Rush reward-height window during migration/final lockout. After the migration deadline, consensus rejects non-quantum spends and value-bearing non-quantum outputs.");
+    if (!quantum_spend_active) {
+        obj.pushKV("migration_policy", "Quantum address generation and dry-run planning are available, but base-chain funding and spending of v14/v16 outputs are disabled until Gold Rush ends. Gold Rush credits accrue only in the upgraded shadow ledger while legacy nodes follow the same base chain. v15 EUTXO is disabled.");
+    } else if (!final_lockout_active) {
+        obj.pushKV("migration_policy", "The migration window is active. Exact Blackcoin v14/v16 outputs may be funded and spent; v15 EUTXO and unknown future-witness program shapes are rejected. Legacy coins remain spendable for migration until the scheduled deadline.");
+    } else {
+        obj.pushKV("migration_policy", "Final lockout is active. Consensus rejects legacy spends and value-bearing legacy outputs; exact Blackcoin v14/v16 quantum programs remain enabled, v15 EUTXO remains frozen, and demurrage applies automatically.");
+    }
     return obj;
 }
 
@@ -1419,30 +2455,52 @@ static const std::vector<RPCResult> RPCHelpForQuantumReadiness{
 };
 
 static const std::vector<RPCResult> RPCHelpForQuantumQuasar{
-    {RPCResult::Type::STR, "phase", "current Blackcoin upgrade phase"},
-    {RPCResult::Type::NUM_TIME, "mediantime", "current tip median time used for schedule state"},
-    {RPCResult::Type::NUM_TIME, "v4_activation_time", "first V4 hard-fork activation boundary"},
-    {RPCResult::Type::NUM_TIME, "gold_rush_end_time", "end of the Gold Rush phase"},
-    {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "planned final post-quantum migration deadline"},
-    {RPCResult::Type::NUM, "gold_rush_end_height", "height-based Gold Rush end boundary override, or 0 when the boundary is time-based"},
-    {RPCResult::Type::NUM, "quantum_migration_end_height", "height-based migration end boundary override, or 0 when the boundary is time-based"},
-    {RPCResult::Type::NUM, "seconds_until_v4", "seconds until V4 rules become active, or 0 if reached"},
-    {RPCResult::Type::NUM, "seconds_until_gold_rush_end", "seconds until Gold Rush end, or 0 if reached"},
-    {RPCResult::Type::NUM, "seconds_until_quantum_migration_deadline", "seconds until final migration deadline, or 0 if reached"},
+    {RPCResult::Type::STR, "phase", "Blackcoin upgrade phase governing the next candidate block (compatibility alias)"},
+    {RPCResult::Type::STR, "phase_context", "explicit context for the compatibility phase field"},
+    {RPCResult::Type::NUM, "active_tip_height", "current connected tip height"},
+    {RPCResult::Type::STR, "active_tip_phase", "phase under which the connected tip was validated"},
+    {RPCResult::Type::NUM, "next_block_height", "next candidate block height"},
+    {RPCResult::Type::STR, "next_block_phase", "phase governing the next candidate block"},
+    {RPCResult::Type::BOOL, "lifecycle_schedule_valid", "whether the configured lifecycle boundaries are complete and ordered"},
+    {RPCResult::Type::NUM_TIME, "mediantime", "current tip median time retained for forecasts and time-only test schedules; not mainnet phase authority"},
+    {RPCResult::Type::NUM_TIME, "v4_activation_time", "nominal V4 time forecast, or the boundary for a time-only test schedule"},
+    {RPCResult::Type::NUM, "v4_activation_height", "authoritative first Gold Rush lifecycle height, or 0 for a time-only test schedule"},
+    {RPCResult::Type::NUM_TIME, "gold_rush_end_time", "forecast Gold Rush end time; non-authoritative when height boundaries are enabled"},
+    {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "forecast final migration time; non-authoritative when height boundaries are enabled"},
+    {RPCResult::Type::NUM, "gold_rush_end_height", "authoritative last Gold Rush block height, or 0 for a time-only test schedule"},
+    {RPCResult::Type::NUM, "quantum_migration_end_height", "authoritative last Migration block height, or 0 for a time-only test schedule"},
+    {RPCResult::Type::BOOL, "height_boundaries_authoritative", "whether exact block heights govern both lifecycle boundaries"},
+    {RPCResult::Type::BOOL, "time_boundaries_are_estimates", "whether the time fields and second countdowns are forecasts only"},
+    {RPCResult::Type::NUM, "seconds_until_v4", "forecast seconds until the nominal V4 time, or 0 if reached; non-authoritative when height boundaries are enabled"},
+    {RPCResult::Type::NUM, "seconds_until_gold_rush_end", "forecast seconds until the Gold Rush end time, or 0 if reached"},
+    {RPCResult::Type::NUM, "seconds_until_quantum_migration_deadline", "forecast seconds until the final migration time, or 0 if reached"},
+    {RPCResult::Type::NUM, "blocks_until_gold_rush_end", "exact remaining Gold Rush blocks when height boundaries are authoritative"},
+    {RPCResult::Type::NUM, "blocks_until_quantum_migration_end", "exact remaining Migration blocks when height boundaries are authoritative"},
     {RPCResult::Type::BOOL, "base_network_stake_compatible", "whether stakers should keep producing base-network-compatible coinstakes"},
     {RPCResult::Type::BOOL, "shadow_merge_mining_active", "whether Gold Rush shadow proof merge-mining is active"},
     {RPCResult::Type::BOOL, "shadow_reward_height_active", "whether the next block is inside the deterministic height-based Gold Rush payout window"},
     {RPCResult::Type::NUM, "shadow_reward_next_height", "height of the next block checked against the deterministic payout window"},
     {RPCResult::Type::NUM, "shadow_reward_start_height", "first deterministic Gold Rush payout height"},
     {RPCResult::Type::NUM, "shadow_reward_end_height", "last deterministic Gold Rush payout height"},
+    {RPCResult::Type::BOOL, "qqp4_activation_disabled", "whether QQP4 is disabled by the consensus schedule; readiness signalling cannot enable it"},
+    {RPCResult::Type::NUM, "qqp4_activation_height", "separately scheduled QQP4 activation height, or 0 when disabled"},
+    {RPCResult::Type::BOOL, "qqp4_active_at_tip", "whether the connected tip was validated after the separately scheduled QQP4 activation"},
+    {RPCResult::Type::BOOL, "qqp4_active_next_block", "whether the next block requires QQP4 rather than the scheduled v30.1.1 QQP2/QQP3 rules"},
+    {RPCResult::Type::BOOL, "qqp4_exact_input_required_next_block", "whether the next block requires an exact fee-input-bound QQP4 proof"},
     {RPCResult::Type::BOOL, "new_network_stake_only", "whether staking has crossed the final quantum-only lockout cutover"},
-    {RPCResult::Type::BOOL, "replay_protection_active", "whether SIGHASH_FORKID replay protection is enforced by schedule"},
+    {RPCResult::Type::BOOL, "replay_protection_active", "whether post-Gold-Rush signature replay protection is active"},
+    {RPCResult::Type::BOOL, "sighash_forkid_active", "whether legacy ECDSA signatures must use the fork-protected digest"},
+    {RPCResult::Type::BOOL, "quantum_signature_domain_separation_active", "whether ML-DSA signatures use the configured chain domain"},
+    {RPCResult::Type::STR, "replay_protection_scope", "scope of the reported replay protection"},
+    {RPCResult::Type::BOOL, "legacy_unknown_witness_replay_protected", "whether legacy clients that ignore future witnesses reject replayed quantum transactions"},
     {RPCResult::Type::BOOL, "legacy_address_lockout_scheduled", "whether the upgrade schedule contains a final legacy lockout deadline"},
     {RPCResult::Type::BOOL, "quantum_address_required_by_schedule", "whether the upgrade schedule has reached the scheduled quantum-address phase"},
     {RPCResult::Type::BOOL, "legacy_addresses_accepted", "whether this node currently accepts legacy addresses under implemented rules"},
     {RPCResult::Type::BOOL, "quantum_address_required", "whether this node currently enforces quantum-only destinations"},
     {RPCResult::Type::BOOL, "quantum_spend_enforcement_active", "whether ML-DSA spend enforcement is implemented and active"},
     {RPCResult::Type::BOOL, "quantum_migration_outputs_fundable", "whether ordinary wallet/RPC policy permits funding reserved migration outputs"},
+    {RPCResult::Type::BOOL, "eutxo_enabled", "false in v30.1.1; v15 commitments are frozen pending a quantum-authenticated design"},
+    {RPCResult::Type::STR, "eutxo_policy", "human-readable v15 safety status"},
     {RPCResult::Type::OBJ_DYN, "readiness_signalling", "versionbits readiness signals keyed by deployment name", {
         {RPCResult::Type::OBJ, "deployment", "readiness signal", RPCHelpForQuantumReadiness},
     }},
@@ -1467,6 +2525,7 @@ RPCHelpMan getblockchaininfo()
                 {RPCResult::Type::NUM_TIME, "mediantime", "The median block time expressed in " + UNIX_EPOCH_TIME},
                 {RPCResult::Type::NUM, "verificationprogress", "estimate of verification progress [0..1]"},
                 {RPCResult::Type::BOOL, "initialblockdownload", "(debug information) estimate of whether this node is in Initial Block Download mode"},
+                {RPCResult::Type::BOOL, "pruned", "Whether this node is in prune mode"},
                 {RPCResult::Type::STR_HEX, "chainwork", "total amount of work in active chain, in hexadecimal"},
                 {RPCResult::Type::NUM, "size_on_disk", "the estimated size of the block and undo files on disk"},
                 {RPCResult::Type::OBJ, "quantumquasar", "Blackcoin V4 and migration schedule state", RPCHelpForQuantumQuasar},
@@ -1494,6 +2553,7 @@ RPCHelpMan getblockchaininfo()
     obj.pushKV("mediantime", tip.GetMedianTimePast());
     obj.pushKV("verificationprogress", GuessVerificationProgress(chainman.GetParams().TxData(), &tip));
     obj.pushKV("initialblockdownload", chainman.IsInitialBlockDownload());
+    obj.pushKV("pruned", chainman.m_blockman.IsPruneMode());
     obj.pushKV("chainwork", tip.nChainWork.GetHex());
     obj.pushKV("size_on_disk", chainman.m_blockman.CalculateCurrentUsage());
     obj.pushKV("quantumquasar", QuantumQuasarStatus(tip, chainman));
@@ -1857,6 +2917,28 @@ static RPCHelpMan getgoldrushstate()
                         {RPCResult::Type::NUM, "last_pos_height", "Block height of the last PoS"},
                         {RPCResult::Type::NUM, "recent_count", "Recent Shadow claim samples tracked for PoW retargeting"},
                         {RPCResult::Type::NUM, "pow_target_bits", "Current PoW target bits"},
+                        {RPCResult::Type::NUM, "height", "Active chainstate height"},
+                        {RPCResult::Type::STR_HEX, "bestblock", "Active chainstate tip hash"},
+                        {RPCResult::Type::NUM, "competing_claim_rule_activation_height", "First block using canonical order-independent competing-claim allocation"},
+                        {RPCResult::Type::BOOL, "competing_claim_rule_active", "Whether the active tip uses canonical competing-claim allocation"},
+                        {RPCResult::Type::BOOL, "competing_claim_rule_active_next_block", "Whether the next block uses canonical competing-claim allocation"},
+                        {RPCResult::Type::NUM, "blocks_until_competing_claim_rule", "Blocks from the active tip through the activation block; zero once active"},
+                        {RPCResult::Type::BOOL, "qqp4_activation_disabled", "Whether the separately scheduled QQP4 exact-input fork is disabled; readiness signalling cannot enable it"},
+                        {RPCResult::Type::NUM, "qqp4_activation_height", "Separately scheduled QQP4 activation height, or 0 when disabled"},
+                        {RPCResult::Type::BOOL, "qqp4_active", "Whether the active tip uses QQP4 exact-input proof rules"},
+                        {RPCResult::Type::BOOL, "qqp4_active_next_block", "Whether the next block requires QQP4 exact-input proof rules"},
+                        {RPCResult::Type::OBJ, "replay_state", "Authenticated auxiliary-state rebuild commitment",
+                            {
+                                {RPCResult::Type::NUM, "schema", "Required replay schema version"},
+                                {RPCResult::Type::BOOL, "required_for_tip", "Whether this tip must contain the replay marker"},
+                                {RPCResult::Type::BOOL, "present", "Whether the reserved replay marker exists"},
+                                {RPCResult::Type::BOOL, "marker_valid", "Whether the marker has canonical structure and matches candidate active-chain height/time metadata"},
+                                {RPCResult::Type::BOOL, "valid_for_tip", "Whether the commitment exactly authenticates this tip and schedule; this is the authoritative acceptance field"},
+                                {RPCResult::Type::NUM, "marker_height", "Marker anchor height, or 0 when absent"},
+                                {RPCResult::Type::NUM_TIME, "marker_time", "Marker anchor block time, or 0 when absent"},
+                                {RPCResult::Type::STR_HEX, "marker_blockhash", "Candidate active-chain anchor hash at marker_height, empty when unavailable"},
+                                {RPCResult::Type::STR_HEX, "commitment", "Raw 32-byte replay commitment, authoritative only when valid_for_tip is true; empty when malformed or absent"},
+                            }},
                     }},
                 RPCExamples{
                     HelpExampleCli("getgoldrushstate", "")
@@ -1885,8 +2967,239 @@ static RPCHelpMan getgoldrushstate()
     obj.pushKV("last_pos_height", info.last_pos_height);
     obj.pushKV("recent_count", info.recent_count);
     obj.pushKV("pow_target_bits", (uint64_t)info.pow_target_bits);
+    obj.pushKV("height", pindex->nHeight);
+    obj.pushKV("bestblock", pindex->GetBlockHash().GetHex());
+    const Consensus::Params& consensus = chainman.GetConsensus();
+    const int competing_claim_height = consensus.nShadowCompetingClaimsActivationHeight;
+    obj.pushKV("competing_claim_rule_activation_height", competing_claim_height);
+    obj.pushKV("competing_claim_rule_active",
+               consensus.IsShadowCompetingClaimsActive(pindex->nHeight));
+    obj.pushKV("competing_claim_rule_active_next_block",
+               consensus.IsShadowCompetingClaimsActive(pindex->nHeight + 1));
+    obj.pushKV("blocks_until_competing_claim_rule",
+               std::max(0, competing_claim_height - pindex->nHeight));
+    const bool qqp4_disabled = consensus.nShadowQQP4ActivationHeight ==
+        std::numeric_limits<int>::max();
+    obj.pushKV("qqp4_activation_disabled", qqp4_disabled);
+    obj.pushKV("qqp4_activation_height", qqp4_disabled
+        ? 0 : consensus.nShadowQQP4ActivationHeight);
+    obj.pushKV("qqp4_active", consensus.IsShadowQQP4Active(pindex->nHeight));
+    obj.pushKV("qqp4_active_next_block",
+               consensus.IsShadowQQP4Active(pindex->nHeight + 1));
+
+    const ShadowReplayStateInfo replay = GetShadowReplayStateInfo(
+        active_chainstate.CoinsTip(), consensus, pindex);
+    UniValue replay_obj(UniValue::VOBJ);
+    replay_obj.pushKV("schema", replay.schema);
+    replay_obj.pushKV("required_for_tip", replay.required_for_tip);
+    replay_obj.pushKV("present", replay.present);
+    replay_obj.pushKV("marker_valid", replay.marker_valid);
+    replay_obj.pushKV("valid_for_tip", replay.valid_for_tip);
+    replay_obj.pushKV("marker_height", replay.marker_height);
+    replay_obj.pushKV("marker_time", replay.marker_time);
+    replay_obj.pushKV("marker_blockhash", replay.marker_block_hash.IsNull()
+        ? std::string{} : replay.marker_block_hash.GetHex());
+    replay_obj.pushKV("commitment", replay.commitment.empty()
+        ? std::string{} : HexStr(replay.commitment));
+    obj.pushKV("replay_state", std::move(replay_obj));
 
     return obj;
+},
+    };
+}
+
+static RPCHelpMan getgoldrushblock()
+{
+    return RPCHelpMan{"getgoldrushblock",
+        "\nReturns block-scoped, explorer-ready Gold Rush shadow-ledger payouts.\n"
+        "Synthetic payout transaction IDs are deterministic upgraded-ledger identifiers; they are not entries in the legacy block transaction array.\n",
+        {
+            {"hash_or_height", RPCArg::Type::NUM, RPCArg::Optional::NO, "Block hash or height",
+                RPCArgOptions{.skip_type_check = true, .type_str = {"", "string or numeric"}}},
+            {"offset", RPCArg::Type::NUM, RPCArg::Default{0}, "Zero-based payout offset"},
+            {"count", RPCArg::Type::NUM, RPCArg::Default{100}, "Maximum payouts to return (1-1000)"},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "",
+            {
+                {RPCResult::Type::NUM, "height", "Active-chain block height"},
+                {RPCResult::Type::STR_HEX, "blockhash", "Active-chain block hash"},
+                {RPCResult::Type::NUM_TIME, "time", "Block timestamp"},
+                {RPCResult::Type::NUM_TIME, "mediantime", "Parent MedianTimePast retained for forecast/time-only schedule context; mainnet Gold Rush membership is height-based"},
+                {RPCResult::Type::BOOL, "gold_rush_reward_active", "Whether this block accrued the deterministic shadow reward"},
+                {RPCResult::Type::STR_AMOUNT, "scheduled_reward", "Scheduled shadow reward for this block"},
+                {RPCResult::Type::NUM, "confirmations", "Active-chain confirmations"},
+                {RPCResult::Type::BOOL, "quantum_spends_active", "Whether synthetic payouts are spendable in the next block"},
+                {RPCResult::Type::NUM, "total_payouts", "Total synthetic payouts recorded for this block"},
+                {RPCResult::Type::NUM, "offset", "Returned page offset"},
+                {RPCResult::Type::NUM, "count", "Number of payouts in this page"},
+                {RPCResult::Type::STR_AMOUNT, "pow_payout_total", "Total PoW payout value in this block"},
+                {RPCResult::Type::STR_AMOUNT, "pos_payout_total", "Total PoS payout value in this block"},
+                {RPCResult::Type::ARR, "observed_pow_claim_txids", "Bounded base-block-order sample (maximum 64) of fee-paying transactions carrying exactly one PoW-mode QQSPROOF note; inclusion does not imply proof validity or credit",
+                    {{RPCResult::Type::STR_HEX, "txid", "Base transaction id"}}},
+                {RPCResult::Type::ARR, "proof_observations", "Bounded byte-level sample of QQSPROOF notes in base-block order (maximum 64); use the counts and commitment to audit omitted notes",
+                    {{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::STR_HEX, "txid", "Base transaction id"},
+                            {RPCResult::Type::NUM, "vout", "Base transaction output containing the note"},
+                            {RPCResult::Type::STR, "mode", "pow, pos, unknown, or malformed"},
+                            {RPCResult::Type::STR, "credit_channel", "pow for a structurally eligible PoW-mode note, otherwise none"},
+                            {RPCResult::Type::BOOL, "fee_paying_location", "Whether the note is in a regular fee-paying transaction inside a PoS block"},
+                            {RPCResult::Type::BOOL, "duplicate_in_transaction", "Whether its transaction contains multiple QQSPROOF notes"},
+                            {RPCResult::Type::STR, "non_credit_reason", "Exact structural reason this note cannot receive credit, empty when full proof/accounting validation is still required"},
+                        }}}},
+                {RPCResult::Type::NUM, "proof_observation_count", "Total QQSPROOF-shaped outputs in the block"},
+                {RPCResult::Type::NUM, "proof_observation_returned", "Bounded detailed observations returned (maximum 64)"},
+                {RPCResult::Type::NUM, "proof_observation_omitted", "Observations represented only by the deterministic commitment"},
+                {RPCResult::Type::STR_HEX, "proof_observation_commitment", "Deterministic commitment to every exact QQSPROOF-shaped output and structural context"},
+                {RPCResult::Type::ARR, "observed_signal_txids", "Base-block transactions carrying QQSIGNAL data",
+                    {{RPCResult::Type::STR_HEX, "txid", "Base transaction id"}}},
+                {RPCResult::Type::ARR, "payouts", "Synthetic upgraded-ledger payouts",
+                    {{RPCResult::Type::OBJ, "", "",
+                        {
+                            {RPCResult::Type::NUM, "index", "Deterministic payout index in this block"},
+                            {RPCResult::Type::STR_HEX, "synthetic_txid", "Deterministic synthetic payout transaction id"},
+                            {RPCResult::Type::NUM, "vout", "Synthetic payout output index"},
+                            {RPCResult::Type::STR, "mode", "pow or pos"},
+                            {RPCResult::Type::STR_AMOUNT, "amount", "Payout value"},
+                            {RPCResult::Type::STR, "address", /*optional=*/true, "Quantum destination address"},
+                            {RPCResult::Type::STR_HEX, "scriptPubKey", "Quantum destination script"},
+                            {RPCResult::Type::BOOL, "unspent", "Whether the synthetic payout remains unspent"},
+                        }}}},
+            }},
+        RPCExamples{
+            HelpExampleCli("getgoldrushblock", "5950003") +
+            HelpExampleRpc("getgoldrushblock", "5950003, 0, 100")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    const int offset = request.params[1].isNull() ? 0 : request.params[1].getInt<int>();
+    const int count = request.params[2].isNull() ? 100 : request.params[2].getInt<int>();
+    if (offset < 0) throw JSONRPCError(RPC_INVALID_PARAMETER, "offset must be non-negative");
+    if (count < 1 || count > 1000) throw JSONRPCError(RPC_INVALID_PARAMETER, "count must be between 1 and 1000");
+
+    ChainstateManager& chainman = EnsureAnyChainman(request.context);
+    const CBlockIndex* pindex = ParseHashOrHeight(request.params[0], chainman);
+    LOCK(::cs_main);
+    Chainstate& chainstate = chainman.ActiveChainstate();
+    if (!chainstate.m_chain.Contains(pindex)) {
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block is not in the active chain");
+    }
+    const CBlock block = GetBlockChecked(chainman.m_blockman, pindex);
+    const Consensus::Params& consensus = chainman.GetConsensus();
+    const int64_t block_mtp = pindex->pprev ? pindex->pprev->GetMedianTimePast() : pindex->GetBlockTime();
+    const bool reward_active = IsShadowGoldRushRewardActive(consensus, block_mtp, pindex->nHeight);
+    const CAmount scheduled_reward = reward_active ? ShadowBaseReward(pindex->nHeight) : 0;
+    const CBlockIndex* tip = chainstate.m_chain.Tip();
+    const int64_t tip_mtp = tip ? tip->GetMedianTimePast() : block_mtp;
+    const bool quantum_spends_active = tip &&
+        IsQuantumWitnessSpendActive(consensus, tip_mtp, tip->nHeight + 1);
+
+    const std::vector<ShadowSyntheticPayoutTransaction> payouts =
+        GetAppliedShadowClaimPayoutTransactionRecords(chainstate.CoinsTip(), pindex->nHeight,
+                                                      pindex->GetBlockHash(), pindex->GetBlockTime());
+    CAmount pow_total{0};
+    CAmount pos_total{0};
+    for (const auto& payout : payouts) {
+        (payout.proof_of_work ? pow_total : pos_total) += payout.amount;
+    }
+
+    UniValue observed_pow(UniValue::VARR);
+    UniValue proof_observations(UniValue::VARR);
+    UniValue observed_signals(UniValue::VARR);
+    ShadowProofObservationSummary proof_summary;
+    for (const ShadowProofObservation& observation :
+            GetShadowProofObservations(block, consensus, pindex->nHeight,
+                                       proof_summary)) {
+        std::string mode;
+        std::string non_credit_reason;
+        switch (observation.mode) {
+        case ShadowProofPayloadMode::POW:
+            mode = "pow";
+            break;
+        case ShadowProofPayloadMode::POS:
+            mode = "pos";
+            non_credit_reason = "wrong_mode_pos";
+            break;
+        case ShadowProofPayloadMode::UNKNOWN:
+            mode = "unknown";
+            non_credit_reason = "unknown_mode";
+            break;
+        case ShadowProofPayloadMode::MALFORMED:
+            mode = "malformed";
+            non_credit_reason = "malformed_proof";
+            break;
+        }
+        if (!observation.fee_paying_location) {
+            non_credit_reason = "invalid_location";
+        } else if (observation.duplicate_in_transaction) {
+            non_credit_reason = "duplicate_proof_payload";
+        }
+        const bool pow_channel_candidate =
+            observation.mode == ShadowProofPayloadMode::POW &&
+            observation.fee_paying_location &&
+            !observation.duplicate_in_transaction;
+        if (pow_channel_candidate) {
+            observed_pow.push_back(observation.source_txid.GetHex());
+        }
+
+        UniValue item(UniValue::VOBJ);
+        item.pushKV("txid", observation.source_txid.GetHex());
+        item.pushKV("vout", observation.source_vout);
+        item.pushKV("mode", mode);
+        item.pushKV("credit_channel", pow_channel_candidate ? "pow" : "none");
+        item.pushKV("fee_paying_location", observation.fee_paying_location);
+        item.pushKV("duplicate_in_transaction", observation.duplicate_in_transaction);
+        item.pushKV("non_credit_reason", non_credit_reason);
+        proof_observations.push_back(std::move(item));
+    }
+    for (const CTransactionRef& tx : block.vtx) {
+        if (TransactionHasShadowSignal(*tx)) observed_signals.push_back(tx->GetHash().GetHex());
+    }
+
+    UniValue payout_values(UniValue::VARR);
+    const size_t page_begin = std::min<size_t>(static_cast<size_t>(offset), payouts.size());
+    const size_t page_end = std::min<size_t>(page_begin + static_cast<size_t>(count), payouts.size());
+    for (size_t i = page_begin; i < page_end; ++i) {
+        const ShadowSyntheticPayoutTransaction& payout = payouts[i];
+        const COutPoint outpoint{payout.tx->GetHash(), 0};
+        UniValue item(UniValue::VOBJ);
+        item.pushKV("index", static_cast<uint64_t>(i));
+        item.pushKV("synthetic_txid", outpoint.hash.GetHex());
+        item.pushKV("vout", outpoint.n);
+        item.pushKV("mode", payout.proof_of_work ? "pow" : "pos");
+        item.pushKV("amount", ValueFromAmount(payout.amount));
+        CTxDestination destination;
+        if (ExtractDestination(payout.target, destination)) {
+            item.pushKV("address", EncodeDestination(destination));
+        }
+        item.pushKV("scriptPubKey", HexStr(payout.target));
+        item.pushKV("unspent", chainstate.CoinsTip().HaveCoin(outpoint));
+        payout_values.push_back(std::move(item));
+    }
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("height", pindex->nHeight);
+    result.pushKV("blockhash", pindex->GetBlockHash().GetHex());
+    result.pushKV("time", pindex->GetBlockTime());
+    result.pushKV("mediantime", block_mtp);
+    result.pushKV("gold_rush_reward_active", reward_active);
+    result.pushKV("scheduled_reward", ValueFromAmount(scheduled_reward));
+    result.pushKV("confirmations", tip->nHeight - pindex->nHeight + 1);
+    result.pushKV("quantum_spends_active", quantum_spends_active);
+    result.pushKV("total_payouts", static_cast<uint64_t>(payouts.size()));
+    result.pushKV("offset", offset);
+    result.pushKV("count", static_cast<uint64_t>(page_end - page_begin));
+    result.pushKV("pow_payout_total", ValueFromAmount(pow_total));
+    result.pushKV("pos_payout_total", ValueFromAmount(pos_total));
+    result.pushKV("observed_pow_claim_txids", std::move(observed_pow));
+    result.pushKV("proof_observations", std::move(proof_observations));
+    result.pushKV("proof_observation_count", proof_summary.observed_count);
+    result.pushKV("proof_observation_returned", proof_summary.returned_count);
+    result.pushKV("proof_observation_omitted", proof_summary.omitted_count);
+    result.pushKV("proof_observation_commitment", proof_summary.commitment.GetHex());
+    result.pushKV("observed_signal_txids", std::move(observed_signals));
+    result.pushKV("payouts", std::move(payout_values));
+    return result;
 },
     };
 }
@@ -3114,6 +4427,16 @@ static RPCHelpMan dumptxoutset()
     // to avoid confusion due to an interruption.
     const fs::path temppath = fsbridge::AbsPathJoin(args.GetDataDirNet(), fs::u8path(request.params[0].get_str() + ".incomplete"));
 
+    NodeContext& node = EnsureAnyNodeContext(request.context);
+    const int snapshot_height = WITH_LOCK(::cs_main, return node.chainman->ActiveChain().Height());
+    if (snapshot_height >= SHADOW_WHITELIST_HEIGHT) {
+        throw JSONRPCError(
+            RPC_MISC_ERROR,
+            strprintf("Quantum Quasar snapshots are disabled at and after shadow whitelist height %d in v30.1.1. "
+                      "The current snapshot format cannot carry authenticated shadow-state markers safely.",
+                      SHADOW_WHITELIST_HEIGHT));
+    }
+
     if (fs::exists(path)) {
         throw JSONRPCError(
             RPC_INVALID_PARAMETER,
@@ -3129,7 +4452,6 @@ static RPCHelpMan dumptxoutset()
             "Couldn't open file " + temppath.u8string() + " for writing.");
     }
 
-    NodeContext& node = EnsureAnyNodeContext(request.context);
     UniValue result = CreateUTXOSnapshot(
         node, node.chainman->ActiveChainstate(), afile, path, temppath);
     fs::rename(temppath, path);
@@ -3166,6 +4488,11 @@ UniValue CreateUTXOSnapshot(
         //
         LOCK(::cs_main);
 
+        if (chainstate.m_chain.Height() >= SHADOW_WHITELIST_HEIGHT) {
+            throw JSONRPCError(RPC_MISC_ERROR,
+                "Quantum Quasar post-whitelist snapshots require a versioned authenticated shadow-state section");
+        }
+
         chainstate.ForceFlushStateToDisk();
 
         maybe_stats = GetUTXOStats(&chainstate.CoinsDB(), chainstate.m_blockman, CoinStatsHashType::HASH_SERIALIZED, node.rpc_interruption_point);
@@ -3194,10 +4521,9 @@ UniValue CreateUTXOSnapshot(
         if (iter % 5000 == 0) node.rpc_interruption_point();
         ++iter;
         if (pcursor->GetKey(key) && pcursor->GetValue(coin)) {
-            if (kernel::IsQuantumQuasarInternalMarkerScript(coin.out.scriptPubKey)) {
-                pcursor->Next();
-                continue;
-            }
+            // Preserve the complete physical chainstate. Quantum Quasar
+            // markers authenticate included synthetic payout coins and are
+            // required for deterministic replay and spend classification.
             afile << key;
             afile << coin;
             ++coins_written;
@@ -3401,6 +4727,7 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
     static const CRPCCommand commands[]{
         {"blockchain", &getblockchaininfo},
         {"blockchain", &getgoldrushstate},
+        {"blockchain", &getgoldrushblock},
         {"blockchain", &submitquantumpoolclaim},
         {"blockchain", &getquantumpoolinfo},
         {"blockchain", &getchaintxstats},
@@ -3415,6 +4742,8 @@ void RegisterBlockchainRPCCommands(CRPCTable& t)
         {"blockchain", &getdifficulty},
         {"blockchain", &getdeploymentinfo},
         {"blockchain", &getquantumquasarinfo},
+        {"blockchain", &getshadowresourceinfo},
+        {"blockchain", &abortcirculatingsupplyscan},
         {"blockchain", &gettxout},
         {"blockchain", &gettxoutsetinfo},
         {"blockchain", &getcirculatingsupply},

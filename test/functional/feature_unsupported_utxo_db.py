@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2022 The Bitcoin Core developers
 # Copyright (c) 2022 Blackcoin Core Developers
 # Copyright (c) 2022 Blackcoin More Developers
 # Copyright (c) 2022 Blackcoin Developers
@@ -54,7 +55,9 @@ class UnsupportedUtxoDbTest(BitcoinTestFramework):
         )
 
         self.log.info("Drop legacy utxo db")
-        self.start_node(1, extra_args=["-reindex-chainstate"])
+        self.run_chainstate_rebuild_first_pass(
+            self.nodes[1], ["-reindex-chainstate"])
+        self.restart_after_chainstate_rebuild(1)
         assert_equal(self.nodes[1].getbestblockhash(), block)
         assert_equal(self.nodes[1].gettxoutsetinfo()["total_amount"], 50)
 

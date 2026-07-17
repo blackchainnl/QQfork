@@ -4,6 +4,7 @@
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <chainparams.h>
 #include <policy/feerate.h>
 #include <policy/policy.h>
 #include <primitives/transaction.h>
@@ -13,9 +14,16 @@
 #include <test/util/setup_common.h>
 #include <wallet/coinselection.h>
 
+#include <util/chaintype.h>
+
 #include <vector>
 
 namespace wallet {
+
+void initialize_coinselection()
+{
+    SelectParams(ChainType::REGTEST);
+}
 
 static void AddCoin(const CAmount& value, int n_input, int n_input_bytes, int locktime, std::vector<COutput>& coins, CFeeRate fee_rate)
 {
@@ -79,7 +87,7 @@ static SelectionResult ManualSelection(std::vector<COutput>& utxos, const CAmoun
 // Returns true if the result contains an error and the message is not empty
 static bool HasErrorMsg(const util::Result<SelectionResult>& res) { return !util::ErrorString(res).empty(); }
 
-FUZZ_TARGET(coinselection)
+FUZZ_TARGET(coinselection, .init = initialize_coinselection)
 {
     FuzzedDataProvider fuzzed_data_provider{buffer.data(), buffer.size()};
     std::vector<COutput> utxo_pool;

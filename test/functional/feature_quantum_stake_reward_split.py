@@ -13,7 +13,8 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal
 
 
-MIGRATION_DEADLINE_TIME = 2_200_000_000
+GOLD_RUSH_END_HEIGHT = 2
+MIGRATION_END_HEIGHT = 1000
 SELF_STAKE_AMOUNT = Decimal("12000")
 COLD_STAKE_AMOUNT = Decimal("9000")
 BASE_POS_SUBSIDY = Decimal("1.5")
@@ -29,15 +30,16 @@ class QuantumStakeRewardSplitTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.num_nodes = 2
         args = [
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
             "-donatetodevfund=0",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=1",
-            "-qqgoldrushendtime=1",
-            f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
-            "-qqstaketierheight=1",
-            "-qqstakesplitheight=1",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
+            f"-qqstaketierheight={GOLD_RUSH_END_HEIGHT + 1}",
+            f"-qqstakesplitheight={GOLD_RUSH_END_HEIGHT + 1}",
         ]
         self.extra_args = [args, args]
 
@@ -195,10 +197,10 @@ class QuantumStakeRewardSplitTest(BitcoinTestFramework):
         node = self.nodes[0]
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
         for node_rpc in self.nodes:
-            assert_equal(node_rpc.getquantumquasarinfo()["phase"], "migration")
-
-        for node_rpc in self.nodes:
             node_rpc.get_wallet_rpc(self.default_wallet_name).staking(False)
+        self._generate(GOLD_RUSH_END_HEIGHT, node.get_deterministic_priv_key().address)
+        for node_rpc in self.nodes:
+            assert_equal(node_rpc.getquantumquasarinfo()["phase"], "migration")
 
         self.log.info("Creating funder and stake-reward split staking wallets")
         node.createwallet(wallet_name="b4_funder")

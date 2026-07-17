@@ -6,6 +6,10 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 
 QQSPROOF_HEX = "51515350524f4f46"
+GOLD_RUSH_END_HEIGHT = 501
+MIGRATION_END_HEIGHT = 700
+QQP3_LATE_ORIGIN_WINDOW = 64
+POW_WALLET_PASSPHRASE = "goldrush-pow-state-test"
 
 class GoldRushInfoTest(BitcoinTestFramework):
     def add_options(self, parser):
@@ -14,9 +18,15 @@ class GoldRushInfoTest(BitcoinTestFramework):
     def set_test_params(self):
         self.num_nodes = 2
         self.setup_clean_chain = True
+        args = [
+            "-shadowwhitelistheight=1",
+            "-shadowgoldrushblocks=500",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
+        ]
         self.extra_args = [
-            ["-shadowwhitelistheight=1", "-shadowgoldrushblocks=500"],
-            ["-shadowwhitelistheight=1", "-shadowgoldrushblocks=500"],
+            args,
+            args,
         ]
 
     def _sync_mocktime_to_tip(self):
@@ -27,6 +37,25 @@ class GoldRushInfoTest(BitcoinTestFramework):
         for node in self.nodes:
             node.setmocktime((tip_time & ~0xf) + 16)
 
+    def _generate_with_peer_offline(self, node, blocks, address):
+        """Generate a large batch without making the idle peer time out."""
+        self.disconnect_nodes(0, 1)
+        try:
+            hashes = self.generatetoaddress(node, blocks, address, sync_fun=self.no_op)
+        finally:
+            self.connect_nodes(0, 1)
+        self.sync_blocks()
+        return hashes
+
+    @staticmethod
+    def _mempool_pow_claims(node):
+        claims = []
+        for txid in node.getrawmempool():
+            tx = node.getrawtransaction(txid, True)
+            if any(QQSPROOF_HEX in output["scriptPubKey"]["hex"] for output in tx["vout"]):
+                claims.append(txid)
+        return claims
+
     def _assert_builtin_pow_miner_lifecycle(self):
         node = self.nodes[0]
         wallet_name = "goldrush_pow_builtin"
@@ -34,8 +63,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
         wallet = node.get_wallet_rpc(wallet_name)
         target = wallet.getnewaddress()
 
-        self.generatetoaddress(node, 101, target, sync_fun=self.no_op)
-        self.sync_blocks()
+        self._generate_with_peer_offline(node, 101, target)
         self._sync_mocktime_to_tip()
 
         if not self.is_cli_compiled():
@@ -46,6 +74,9 @@ class GoldRushInfoTest(BitcoinTestFramework):
         cli_wallet = node.cli(f"-rpcwallet={wallet_name}")
         legacy_payout = wallet.getnewquantumaddress("goldrush-pow")["address"]
         assert_equal(wallet.getaddressinfo(legacy_payout)["labels"], ["goldrush-pow"])
+        assert_equal(wallet.getpowmininginfo()["state"], "disabled")
+        wallet.encryptwallet(POW_WALLET_PASSPHRASE)
+        wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
         # Use real clock time while the worker runs. The hashrate meter is wall-clock based,
         # while epoch activity is derived from the already-connected chain tip.
         node.setmocktime(0)
@@ -53,6 +84,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
         try:
             started = cli_wallet.setpowmining(True, 1, 100)
             assert_equal(started["enabled"], True)
+            assert_equal(started["created_payout_key"], False)
             assert_equal(started["threads"], 1)
             assert_equal(started["cpu_percent"], 100)
             payout = started["payout_address"]
@@ -62,7 +94,13 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(node.validateaddress(payout)["isvalid"], True)
             assert_equal(wallet.getpowmininginfo()["payout_address"], payout)
 
-            self.wait_until(lambda: wallet.getpowmininginfo()["hashrate"] > 0, timeout=60)
+            self.wait_until(
+                lambda: (
+                    wallet.getpowmininginfo()["hashrate"] > 0
+                    and wallet.getpowmininginfo()["state"] in ("ready", "hashing", "claim_in_flight")
+                ),
+                timeout=60,
+            )
             info = cli_wallet.getpowmininginfo()
             assert_equal(info["enabled"], True)
             assert_equal(info["threads"], 1)
@@ -70,6 +108,27 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert_equal(info["epoch_active"], True)
             assert_equal(info["payout_address"], payout)
             assert info["hashrate"] > 0
+
+            self.log.info("Locking an enabled miner reports a fail-soft waiting state")
+            wallet.walletlock()
+            self._generate_with_peer_offline(node, 1, node.get_deterministic_priv_key().address)
+            self.wait_until(
+                lambda: wallet.getpowmininginfo()["state"] == "wallet_locked_or_staking_only",
+                timeout=10,
+            )
+            locked = wallet.getpowmininginfo()
+            assert_equal(locked["enabled"], True)
+            assert_equal(locked["state"], "wallet_locked_or_staking_only")
+            assert_equal(locked["hashrate"], 0)
+
+            wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
+            self.wait_until(
+                lambda: (
+                    wallet.getpowmininginfo()["hashrate"] > 0
+                    and wallet.getpowmininginfo()["state"] in ("ready", "hashing", "claim_in_flight")
+                ),
+                timeout=60,
+            )
         finally:
             try:
                 cli_wallet.setpowmining(False)
@@ -78,6 +137,7 @@ class GoldRushInfoTest(BitcoinTestFramework):
 
         stopped = wallet.getpowmininginfo()
         assert_equal(stopped["enabled"], False)
+        assert_equal(stopped["state"], "disabled")
         assert_equal(stopped["hashrate"], 0)
         if payout:
             assert_equal(stopped["payout_address"], payout)
@@ -95,12 +155,34 @@ class GoldRushInfoTest(BitcoinTestFramework):
         wallet_name = "goldrush_pow"
         node.createwallet(wallet_name=wallet_name)
         wallet = node.get_wallet_rpc(wallet_name)
+        cli_wallet_name = "goldrush_pow_cli"
+        node.createwallet(wallet_name=cli_wallet_name)
+        cli_rpc_wallet = node.get_wallet_rpc(cli_wallet_name)
+
+        self.log.info("Optional wallet automation is visible and fail-closed by default")
+        staking_info = wallet.getstakinginfo()
+        assert_equal(staking_info["autostart_staking"], False)
+        assert_equal(staking_info["autostart_staking_source"], "autostartstaking")
+        assert_equal(staking_info["automatic_qqsignal"], False)
+        assert_equal(staking_info["automatic_demurrage_attestation"], False)
+        assert_equal(staking_info["automatic_redelegation"], False)
+        assert_equal(staking_info["allow_automatic_quantum_key_creation"], False)
+        assert_equal(staking_info["consensus_demurrage_automatic"], True)
+        pow_info = wallet.getpowmininginfo()
+        assert_equal(pow_info["autostart"], False)
+        assert_equal(pow_info["allow_automatic_quantum_key_creation"], False)
+        assert_equal(pow_info["current_height"], node.getblockcount())
+        assert_equal(pow_info["shadow_reward_next_height"], node.getblockcount() + 1)
+        assert pow_info["shadow_reward_start_height"] <= pow_info["shadow_reward_next_height"]
+        assert pow_info["shadow_reward_next_height"] <= pow_info["shadow_reward_end_height"]
+        pow_help = wallet.help("setpowmining")
+        assert "allow_new_payout_key" in pow_help
+        assert "Back up the wallet immediately" in pow_help
 
         rpc_target = wallet.getnewaddress()
-        cli_target = wallet.getnewaddress()
-        self.generatetoaddress(node, 101, rpc_target, sync_fun=self.no_op)
-        self.generatetoaddress(node, 101, cli_target, sync_fun=self.no_op)
-        self.sync_blocks()
+        cli_target = cli_rpc_wallet.getnewaddress()
+        self._generate_with_peer_offline(node, 101, rpc_target)
+        self._generate_with_peer_offline(node, 101, cli_target)
         self._sync_mocktime_to_tip()
 
         self.log.info("Checking miner work RPC for a non-whitelisted PoW target")
@@ -108,6 +190,8 @@ class GoldRushInfoTest(BitcoinTestFramework):
         work = node.getshadowpowwork(rpc_target, rpc_quantum)
         assert_equal(work["active"], True)
         assert_equal(work["prefix"], "QQSPROOF")
+        assert_equal(work["proof_mode"], "pow")
+        assert_equal(work["proof_mode_byte"], 0)
         assert "target_whitelisted" not in work
         assert "target_script" in work
         assert_equal(work["quantum_address"], rpc_quantum)
@@ -125,6 +209,8 @@ class GoldRushInfoTest(BitcoinTestFramework):
         wallet_help = wallet.help("sendshadowpowclaim")
         assert "PoW claims are NOT whitelist-gated" in wallet_help
         assert "Quantum migration address" in wallet_help
+        assert "QQP2/QQP3 do not bind an exact fee input" in wallet_help
+        assert "Never reuse one externally supplied proof" in wallet_help
         assert "proof" in wallet_help
 
         self.log.info("Rejecting invalid built-in PoW miner configuration")
@@ -134,51 +220,159 @@ class GoldRushInfoTest(BitcoinTestFramework):
 
         self._assert_builtin_pow_miner_lifecycle()
 
+        # The built-in worker can win while its lifecycle telemetry is sampled.
+        # QQP3 claims target the height after the current tip and remain
+        # eligible through origin_age == QQP3_LATE_ORIGIN_WINDOW. Advance one
+        # additional block so the next mempool evaluation is strictly beyond
+        # that inclusive window before beginning the manual claim checks.
+        if self._mempool_pow_claims(node):
+            self.log.info("Advancing the tip to expire a claim found by the built-in PoW miner")
+            self._generate_with_peer_offline(
+                node,
+                QQP3_LATE_ORIGIN_WINDOW + 1,
+                node.get_deterministic_priv_key().address,
+            )
+            self._sync_mocktime_to_tip()
+        assert_equal(self._mempool_pow_claims(node), [])
+
         self.disconnect_nodes(0, 1)
 
         self.log.info("Broadcasting non-whitelisted PoW claim via RPC")
+        claim_origin_height = node.getblockcount() + 1
         stale_claim = wallet.sendshadowpowclaim(rpc_target, rpc_quantum, 200000)
         assert_equal(stale_claim["address"], rpc_target)
         assert_equal(stale_claim["quantum_address"], rpc_quantum)
         assert_equal(stale_claim["external_proof"], False)
+        assert_equal(stale_claim["proof_mode"], "pow")
+        assert_equal(stale_claim["proof_mode_byte"], 0)
         assert stale_claim["proof"].startswith(QQSPROOF_HEX)
         assert stale_claim["txid"] in node.getrawmempool()
         rpc_decoded = node.decoderawtransaction(stale_claim["hex"])
         assert any(QQSPROOF_HEX in vout["scriptPubKey"]["hex"] for vout in rpc_decoded["vout"])
         assert all(vout["scriptPubKey"].get("address") != rpc_quantum for vout in rpc_decoded["vout"] if "scriptPubKey" in vout)
-        proof_mismatch_error = "proof does not match the current tip, target address, and quantum payout address"
+        proof_mismatch_error = "proof does not match the current tip, target address, quantum payout address, and PoW channel"
         assert_raises_rpc_error(-8, proof_mismatch_error, wallet.sendshadowpowclaim, rpc_target, rpc_quantum, 1, None, QQSPROOF_HEX + "00")
+        pos_proof = bytearray.fromhex(stale_claim["proof"])
+        pos_proof[len(bytes.fromhex(QQSPROOF_HEX)) + 4] = 1
+        assert_raises_rpc_error(
+            -8,
+            "proof encodes PoS mode; fee-paying QQSPROOF claims require PoW mode byte 0",
+            wallet.sendshadowpowclaim,
+            rpc_target,
+            rpc_quantum,
+            1,
+            None,
+            pos_proof.hex(),
+        )
+        unknown_proof = bytearray.fromhex(stale_claim["proof"])
+        unknown_proof[len(bytes.fromhex(QQSPROOF_HEX)) + 4] = 0x7f
+        assert_raises_rpc_error(
+            -8,
+            "proof encodes an unknown mode; fee-paying QQSPROOF claims require PoW mode byte 0",
+            wallet.sendshadowpowclaim,
+            rpc_target,
+            rpc_quantum,
+            1,
+            None,
+            unknown_proof.hex(),
+        )
         stolen_quantum = wallet.getnewquantumaddress()["address"]
         assert_raises_rpc_error(-8, proof_mismatch_error, wallet.sendshadowpowclaim, rpc_target, stolen_quantum, 1, None, stale_claim["proof"])
-        assert_raises_rpc_error(-26, "shadow-proof-mempool-conflict", wallet.sendshadowpowclaim, rpc_target, rpc_quantum, 1, None, stale_claim["proof"])
+        self.log.info("Rejecting a second fee-paying carrier for the same logical QQP3 proof")
+        assert_raises_rpc_error(
+            -26,
+            "shadow-proof-mempool-duplicate",
+            wallet.sendshadowpowclaim,
+            rpc_target,
+            rpc_quantum,
+            1,
+            None,
+            stale_claim["proof"],
+        )
+        assert_equal(self._mempool_pow_claims(node), [stale_claim["txid"]])
 
-        self.log.info("Expiring unmined next-block-only PoW claims when the tip advances")
+        self.log.info("Retaining QQP3 claims through the bounded late-origin window")
         stale_parent = node.getbestblockhash()
         self.generatetoaddress(self.nodes[1], 3, self.nodes[1].get_deterministic_priv_key().address, sync_fun=self.no_op)
         self.connect_nodes(0, 1)
         self.sync_blocks()
         assert node.getbestblockhash() != stale_parent
+        assert_equal(self._mempool_pow_claims(node), [stale_claim["txid"]])
+
+        self.log.info("Expiring QQP3 claims only after their 64-block late-origin window")
+        blocks_to_expire = claim_origin_height + QQP3_LATE_ORIGIN_WINDOW - node.getblockcount()
+        assert blocks_to_expire > 0
+        self._generate_with_peer_offline(
+            self.nodes[1],
+            blocks_to_expire,
+            self.nodes[1].get_deterministic_priv_key().address,
+        )
         self.wait_until(lambda: stale_claim["txid"] not in node.getrawmempool(), timeout=10)
         stale_accept = node.testmempoolaccept([stale_claim["hex"]])[0]
         assert_equal(stale_accept["allowed"], False)
-        assert_equal(stale_accept["reject-reason"], "shadow-proof-invalid")
+        assert_equal(stale_accept["reject-reason"], "shadow-proof-origin-expired")
 
         if self.is_cli_compiled():
             self.log.info("Checking miner work and broadcasting non-whitelisted PoW claim via CLI")
-            cli_quantum = wallet.getnewquantumaddress()["address"]
+            cli_quantum = cli_rpc_wallet.getnewquantumaddress()["address"]
             cli_work = node.cli.getshadowpowwork(cli_target, cli_quantum)
             assert_equal(cli_work["prefix"], "QQSPROOF")
+            assert_equal(cli_work["proof_mode"], "pow")
+            assert_equal(cli_work["proof_mode_byte"], 0)
             assert "target_whitelisted" not in cli_work
             assert_equal(cli_work["quantum_address"], cli_quantum)
             assert_equal(cli_work["quantum_payout_script"], node.validateaddress(cli_quantum)["scriptPubKey"])
 
-            cli_wallet = node.cli("-rpcwallet={}".format(wallet_name))
+            cli_wallet = node.cli("-rpcwallet={}".format(cli_wallet_name))
             cli_claim = cli_wallet.sendshadowpowclaim(cli_target, cli_quantum, 200000)
             assert_equal(cli_claim["address"], cli_target)
             assert_equal(cli_claim["quantum_address"], cli_quantum)
             assert_equal(cli_claim["external_proof"], False)
+            assert_equal(cli_claim["proof_mode"], "pow")
+            assert_equal(cli_claim["proof_mode_byte"], 0)
             assert cli_claim["proof"].startswith(QQSPROOF_HEX)
             assert cli_claim["txid"] in node.getrawmempool()
+
+        # The lifecycle wallet can legitimately retain a quarantined claim if
+        # its fast test miner found a proof above.  That safety state has
+        # higher priority than the epoch state because its fee input remains
+        # reserved.  Use a separately funded wallet so this check tests the
+        # inactive-epoch state without depending on whether the earlier
+        # probabilistic miner happened to find a proof.
+        inactive_wallet_name = "goldrush_pow_inactive"
+        node.createwallet(wallet_name=inactive_wallet_name)
+        inactive_wallet = node.get_wallet_rpc(inactive_wallet_name)
+        inactive_target = inactive_wallet.getnewaddress()
+        wallet.sendtoaddress(inactive_target, 1)
+        self._generate_with_peer_offline(
+            node,
+            1,
+            node.get_deterministic_priv_key().address,
+        )
+        assert_equal(len(inactive_wallet.listunspent(1, 9999999, [inactive_target])), 1)
+        inactive_payout = inactive_wallet.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
+
+        self.log.info("An enabled miner reports epoch_inactive after the Gold Rush height window")
+        remaining = GOLD_RUSH_END_HEIGHT - node.getblockcount()
+        if remaining > 0:
+            self._generate_with_peer_offline(node, remaining, node.get_deterministic_priv_key().address)
+        try:
+            started = inactive_wallet.setpowmining(True, 1, 100)
+            assert_equal(started["created_payout_key"], False)
+            assert_equal(started["payout_address"], inactive_payout)
+            self.wait_until(
+                lambda: inactive_wallet.getpowmininginfo()["state"] == "epoch_inactive",
+                timeout=10,
+            )
+            inactive = inactive_wallet.getpowmininginfo()
+            assert_equal(inactive["enabled"], True)
+            assert_equal(inactive["state"], "epoch_inactive")
+            assert_equal(inactive["epoch_active"], False)
+            assert_equal(inactive["quarantined_claims"], 0)
+            assert_equal(inactive["hashrate"], 0)
+        finally:
+            inactive_wallet.setpowmining(False)
+        assert_equal(inactive_wallet.getpowmininginfo()["state"], "disabled")
 
     def run_test(self):
         node = self.nodes[0]
@@ -193,7 +387,11 @@ class GoldRushInfoTest(BitcoinTestFramework):
         assert "last_pos_height" in info
         assert "recent_count" in info
         assert "pow_target_bits" in info
-        
+        assert_equal(info["competing_claim_rule_activation_height"], 2)
+        assert_equal(info["competing_claim_rule_active"], info["height"] >= 2)
+        assert_equal(info["competing_claim_rule_active_next_block"], info["height"] + 1 >= 2)
+        assert_equal(info["blocks_until_competing_claim_rule"], max(0, 2 - info["height"]))
+
         # Verify pow_target_bits is a valid positive integer
         assert isinstance(info["pow_target_bits"], int)
         assert info["pow_target_bits"] >= 0
@@ -206,6 +404,10 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert "wallet_scripts" in wallet_info
             assert "pow_amount" in wallet_info
             assert "pos_amount" in wallet_info
+            assert_equal(wallet_info["competing_claim_rule_activation_height"], 2)
+            assert_equal(wallet_info["competing_claim_rule_active"], wallet_info["height"] >= 2)
+            assert_equal(wallet_info["competing_claim_rule_active_next_block"], wallet_info["height"] + 1 >= 2)
+            assert_equal(wallet_info["blocks_until_competing_claim_rule"], max(0, 2 - wallet_info["height"]))
 
         self._assert_pow_claim_from_non_whitelisted_address()
 

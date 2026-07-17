@@ -93,6 +93,7 @@ BITCOIN_TESTS =\
   test/coldstake_tests.cpp \
   test/compilerbug_tests.cpp \
   test/compress_tests.cpp \
+  test/crypto_hardening_tests.cpp \
   test/crypto_tests.cpp \
   test/cuckoocache_tests.cpp \
   test/dbwrapper_tests.cpp \
@@ -130,7 +131,6 @@ BITCOIN_TESTS =\
   test/raii_event_tests.cpp \
   test/random_tests.cpp \
   test/quantum_pool_tests.cpp \
-  test/quantum_redelegation_tests.cpp \
   test/blackcoin_tests.cpp \
   test/rgb_tests.cpp \
   test/rest_tests.cpp \
@@ -150,6 +150,7 @@ BITCOIN_TESTS =\
   test/serfloat_tests.cpp \
   test/serialize_tests.cpp \
   test/settings_tests.cpp \
+  test/shadow_resource_monitor_tests.cpp \
   test/shadow_tests.cpp \
   test/sighash_tests.cpp \
   test/sigopcount_tests.cpp \
@@ -178,11 +179,13 @@ BITCOIN_TESTS =\
   test/validation_flush_tests.cpp \
   test/validation_tests.cpp \
   test/validationinterface_tests.cpp \
+  test/v2_block_time_tests.cpp \
   test/versionbits_tests.cpp \
   test/xoroshiro128plusplus_tests.cpp
 
 if ENABLE_WALLET
 BITCOIN_TESTS += \
+  test/quantum_redelegation_tests.cpp \
   wallet/test/psbt_wallet_tests.cpp \
   wallet/test/spend_tests.cpp \
   wallet/test/wallet_tests.cpp \
@@ -224,7 +227,7 @@ BITCOIN_TEST_SUITE += \
 endif # ENABLE_WALLET
 
 test_test_blackcoin_SOURCES = $(BITCOIN_TEST_SUITE) $(BITCOIN_TESTS) $(JSON_TEST_FILES) $(RAW_TEST_FILES)
-test_test_blackcoin_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(TESTDEFS) $(BOOST_CPPFLAGS) $(EVENT_CFLAGS) $(LIBOQS_CFLAGS)
+test_test_blackcoin_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(CRC32C_CPPFLAGS_INT) -I$(srcdir)/crc32c/src $(TESTDEFS) $(BOOST_CPPFLAGS) $(EVENT_CFLAGS) $(LIBOQS_CFLAGS)
 test_test_blackcoin_LDADD = $(LIBTEST_UTIL)
 if ENABLE_WALLET
 test_test_blackcoin_LDADD += $(LIBBITCOIN_WALLET)
@@ -324,6 +327,7 @@ test_fuzz_fuzz_SOURCES = \
  test/fuzz/process_messages.cpp \
  test/fuzz/protocol.cpp \
  test/fuzz/psbt.cpp \
+ test/fuzz/quantum_crypto.cpp \
  test/fuzz/random.cpp \
  test/fuzz/rolling_bloom_filter.cpp \
  test/fuzz/rpc.cpp \

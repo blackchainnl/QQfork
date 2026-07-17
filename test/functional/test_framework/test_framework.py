@@ -593,6 +593,78 @@ class BitcoinTestFramework(metaclass=BitcoinTestMetaClass):
         self.stop_node(i)
         self.start_node(i, extra_args)
 
+    def run_chainstate_rebuild_first_pass(self, node, extra_args):
+        """Run the isolated BUILDING pass of -reindex-chainstate.
+
+        A protected rebuild intentionally exits successfully after durable
+        COMMIT_READY. Callers must then start the node normally to exercise the
+        separate verification-and-cleanup startup.
+        """
+        journal = node.chain_path / "chainstate-rebuild.journal"
+        backup = node.chain_path / "chainstate.rebuild-backup"
+        log_offset = node.debug_log_path.stat().st_size if node.debug_log_path.exists() else 0
+
+        def commit_ready():
+            try:
+                return journal.is_file() and "phase=commit-ready\n" in journal.read_text(encoding="utf-8")
+            except OSError:
+                return False
+
+        node.start(extra_args=extra_args)
+        self.wait_until(commit_ready, timeout=60)
+        assert backup.is_dir()
+        node.wait_until_stopped()
+
+        with open(node.debug_log_path, encoding="utf-8", errors="replace") as debug_log:
+            debug_log.seek(log_offset)
+            bootstrap_log = debug_log.read()
+        for service_marker in (
+            "Done loading",
+            "Starting RPC",
+            "Bound to",
+            "Loading wallet",
+            "Starting initial sync",
+            "Loaded mempool",
+            "Gold Rush PoW miner started",
+        ):
+            assert service_marker not in bootstrap_log, node._node_msg(
+                f"isolated chainstate rebuild started normal service: {service_marker}")
+        assert "Skipping -shutdownnotify for planned chainstate rebuild restart" in bootstrap_log, node._node_msg(
+            "isolated chainstate rebuild did not suppress shutdown automation")
+
+    def restart_after_chainstate_rebuild(self, i, extra_args=None):
+        """Start the mandatory COMMIT_READY verification-and-cleanup pass."""
+        node = self.nodes[i]
+        journal = node.chain_path / "chainstate-rebuild.journal"
+        backup = node.chain_path / "chainstate.rebuild-backup"
+        assert journal.is_file()
+        assert backup.is_dir()
+        log_offset = node.debug_log_path.stat().st_size
+
+        self.start_node(i, extra_args=extra_args)
+
+        assert not journal.exists()
+        assert not backup.exists()
+        with open(node.debug_log_path, encoding="utf-8", errors="replace") as debug_log:
+            debug_log.seek(log_offset)
+            verification_log = debug_log.read()
+        cleanup_marker = "Verified the rebuilt chainstate after restart and retired preserved databases"
+        cleanup_offset = verification_log.find(cleanup_marker)
+        assert cleanup_offset >= 0, node._node_msg(
+            "normal startup did not record protected chainstate cleanup")
+        for service_marker in (
+            "Done loading",
+            "Starting RPC",
+            "Bound to",
+            "Loading wallet",
+            "Starting initial sync",
+            "Loaded mempool",
+            "Gold Rush PoW miner started",
+        ):
+            service_offset = verification_log.find(service_marker)
+            assert service_offset < 0 or cleanup_offset < service_offset, node._node_msg(
+                f"normal service started before protected chainstate cleanup: {service_marker}")
+
     def wait_for_node_exit(self, i, timeout):
         self.nodes[i].process.wait(timeout)
 

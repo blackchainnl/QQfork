@@ -1,3 +1,4 @@
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 // Copyright (c) 2009-2022 Blackcoin Core Developers
 // Copyright (c) 2009-2022 Blackcoin More Developers
 // Copyright (c) 2009-2022 Quantum Quasar Developers
@@ -20,6 +21,7 @@ void RegisterNetRPCCommands(CRPCTable&);
 void RegisterOutputScriptRPCCommands(CRPCTable&);
 void RegisterRawTransactionRPCCommands(CRPCTable &tableRPC);
 void RegisterSignMessageRPCCommands(CRPCTable&);
+void RegisterShadowRPCCommands(CRPCTable&);
 void RegisterSignerRPCCommands(CRPCTable &tableRPC);
 void RegisterTxoutProofRPCCommands(CRPCTable&);
 
@@ -34,6 +36,7 @@ static inline void RegisterAllCoreRPCCommands(CRPCTable &t)
     RegisterOutputScriptRPCCommands(t);
     RegisterRawTransactionRPCCommands(t);
     RegisterSignMessageRPCCommands(t);
+    RegisterShadowRPCCommands(t);
 #ifdef ENABLE_EXTERNAL_SIGNER
     RegisterSignerRPCCommands(t);
 #endif // ENABLE_EXTERNAL_SIGNER

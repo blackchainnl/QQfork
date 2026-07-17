@@ -1,3 +1,4 @@
+// Copyright (c) 2017-2021 The Bitcoin Core developers
 // Copyright (c) 2017-2021 Blackcoin Core Developers
 // Copyright (c) 2017-2021 Blackcoin More Developers
 // Copyright (c) 2017-2021 Quantum Quasar Developers
@@ -28,6 +29,19 @@ namespace Consensus {
  * Preconditions: tx.IsCoinBase() is false.
  */
 [[nodiscard]] bool CheckTxInputs(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, int64_t nSpendTime, int64_t nDemurrageTime, CAmount& txfee);
+
+/**
+ * Recheck an already-admitted transaction when a local clock anomaly leaves
+ * no legal next-block header time. This applies every ordinary input check at
+ * nEarliestSpendTime, but defers only the inherited input-timestamp ordering
+ * rule for version-2 transactions, whose spend time is supplied by a block
+ * header rather than serialized in the transaction.
+ *
+ * This function is for mempool retention after a reorganization only. New
+ * admission, template assembly, and block validation must use CheckTxInputs
+ * with an actual candidate header time.
+ */
+[[nodiscard]] bool CheckTxInputsForMempoolReorg(const CTransaction& tx, TxValidationState& state, const CCoinsViewCache& inputs, int nSpendHeight, int64_t nEarliestSpendTime, int64_t nDemurrageTime, CAmount& txfee);
 } // namespace Consensus
 
 /** Auxiliary functions for transaction validation (ideally should not be exposed) */

@@ -48,6 +48,7 @@ bench_bench_blackcoin_SOURCES = \
   bench/poly1305.cpp \
   bench/pool.cpp \
   bench/prevector.cpp \
+  bench/quantum_crypto.cpp \
   bench/rollingbloom.cpp \
   bench/rpc_blockchain.cpp \
   bench/rpc_mempool.cpp \

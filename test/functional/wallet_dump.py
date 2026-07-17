@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2016-2022 The Bitcoin Core developers
 # Copyright (c) 2016-2022 Blackcoin Core Developers
 # Copyright (c) 2016-2022 Blackcoin More Developers
 # Copyright (c) 2016-2022 Blackcoin Developers
@@ -75,7 +76,7 @@ def read_dump(file_name, addrs, script_addrs, hd_master_addr_old):
                         elif addr.startswith('2'):
                             # P2SH-segwit address
                             found_p2sh_segwit_addr += 1
-                        elif addr.startswith('bcrt1'):
+                        elif addr.startswith('blrt1'):
                             found_bech32_addr += 1
                         break
                     elif keytype == "change=1":
@@ -198,6 +199,10 @@ class WalletDumpTest(BitcoinTestFramework):
 
         # Restart node with new wallet, and test importwallet
         self.restart_node(0)
+        # The scheduler's periodic wallet flush is elapsed-time based. Resume
+        # real time after the earlier timestamped dump assertions so its
+        # two-second threshold can advance after restart.
+        self.nodes[0].setmocktime(0)
         self.nodes[0].createwallet("w2")
 
         # Make sure the address is not IsMine before import

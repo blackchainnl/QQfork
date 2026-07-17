@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # Copyright 2014 BitPay Inc.
+# Copyright 2016-2017 The Bitcoin Core developers
 # Copyright 2016-2017 Blackcoin Core Developers
 # Copyright 2016-2017 Blackcoin More Developers
 # Copyright 2016-2017 Blackcoin Developers

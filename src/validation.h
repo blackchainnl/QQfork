@@ -47,6 +47,7 @@
 #include <set>
 #include <stdint.h>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -61,6 +62,7 @@ using wallet::CWallet;
 class Chainstate;
 class CTxMemPool;
 class CTxUndo;
+class CScriptCheck;
 class ChainstateManager;
 struct ChainTxData;
 class DisconnectedBlockTransactions;
@@ -118,6 +120,51 @@ extern const std::vector<std::string> CHECKLEVEL_DOC;
 void StartScriptCheckWorkerThreads(int threads_num);
 /** Stop all of the script checking worker threads */
 void StopScriptCheckWorkerThreads();
+
+unsigned int GetNextBlockScriptFlags(const CBlockIndex* active_tip, const ChainstateManager& chainman);
+/** Exact next-block mempool/tooling flags, including deployment gating and
+ * Quantum Quasar lifecycle flags. */
+unsigned int GetNextBlockPolicyScriptFlags(const CBlockIndex* active_tip, const ChainstateManager& chainman);
+/**
+ * Return the earliest representable next-block header time at adjusted_time.
+ * The result respects the previous block's MTP and the active chainstate's
+ * future-drift limit. nullopt means no legal next-block header can be made
+ * yet. This is a generic PoW/PoS policy helper; it does not change consensus
+ * validation of a received block.
+ */
+std::optional<int64_t> GetNextBlockHeaderTime(Chainstate& active_chainstate,
+                                              const CBlockIndex* pindex_prev,
+                                              int64_t adjusted_time);
+/**
+ * Return the earliest timestamp that a proof-of-stake block built on
+ * pindex_prev can use at adjusted_time without exceeding the active
+ * chainstate's header future-drift limit. The result respects the previous
+ * block's MTP and is rounded up, never down, to the configured stake-time
+ * granularity. nullopt means that no legal PoS header time exists yet. This
+ * is a candidate-time policy/template helper; it does not change consensus
+ * validation of a received block.
+ */
+std::optional<int64_t> GetNextBlockPoSTime(Chainstate& active_chainstate,
+                                           const CBlockIndex* pindex_prev,
+                                           const Consensus::Params& consensus_params,
+                                           int64_t adjusted_time);
+/** Output-only lifecycle rules, usable by offline signing/PSBT workflows that
+ * do not have authoritative input provenance. */
+bool CheckQuantumQuasarOutputs(const CTransaction& tx, unsigned int flags,
+                               std::string& reject_reason);
+/** Full non-script Quantum Quasar transaction rules shared by mempool,
+ * assembler, and block connection. */
+bool CheckQuantumQuasarTransaction(const CTransaction& tx, const CCoinsViewCache& inputs,
+                                   unsigned int flags, int spend_height,
+                                   const Consensus::Params& consensus_params,
+                                   int64_t spend_time, std::string& reject_reason);
+bool CheckInputScripts(const CTransaction& tx, TxValidationState& state,
+                       const CCoinsViewCache& inputs, unsigned int flags,
+                       bool cacheSigStore, bool cacheFullScriptStore,
+                       PrecomputedTransactionData& txdata,
+                       std::vector<CScriptCheck>* pvChecks = nullptr,
+                       std::atomic_bool* mldsa_internal_error = nullptr)
+                       EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
 CAmount GetBlockSubsidy(int nHeight, const Consensus::Params& consensusParams, bool fProofOfStake = false);
 CAmount GetProofOfWorkSubsidy();
@@ -348,10 +395,11 @@ private:
     bool cacheStore;
     ScriptError error{SCRIPT_ERR_UNKNOWN_ERROR};
     PrecomputedTransactionData *txdata;
+    std::atomic_bool* mldsa_internal_error;
 
 public:
-    CScriptCheck(const CTxOut& outIn, const CTransaction& txToIn, unsigned int nInIn, unsigned int nFlagsIn, bool cacheIn, PrecomputedTransactionData* txdataIn) :
-        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), txdata(txdataIn) { }
+    CScriptCheck(const CTxOut& outIn, const CTransaction& txToIn, unsigned int nInIn, unsigned int nFlagsIn, bool cacheIn, PrecomputedTransactionData* txdataIn, std::atomic_bool* mldsaInternalError = nullptr) :
+        m_tx_out(outIn), ptxTo(&txToIn), nIn(nInIn), nFlags(nFlagsIn), cacheStore(cacheIn), txdata(txdataIn), mldsa_internal_error(mldsaInternalError) { }
 
     CScriptCheck(const CScriptCheck&) = delete;
     CScriptCheck& operator=(const CScriptCheck&) = delete;
@@ -391,7 +439,10 @@ bool CheckTieredStakePrincipalCovenant(const CTransaction& tx, const CCoinsViewC
  *  quantum cold-staking output must return at least the spent principal to the
  *  same scriptPubKey. Shadow/dev emissions do not count as returned principal.
  *  Exposed for unit testing; ConnectBlock calls it for coinstakes once V4 is active. */
-bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinstake_undo, const std::map<CScript, CAmount>& shadow_direct_payouts, const CScript& dev_reward_script, std::string& reject_reason);
+bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinstake_undo,
+                            const std::map<CScript, CAmount>& shadow_direct_payouts,
+                            const CScript& dev_reward_script, std::string& reject_reason,
+                            const std::vector<CAmount>* effective_principals = nullptr);
 bool CheckColdStakeCovenant(const CTransaction& coinstake, const CTxUndo& coinstake_undo, std::string& reject_reason);
 
 /** Check a block is completely valid from start to finish (only works on top of our current best block) */
@@ -712,8 +763,11 @@ public:
         LOCKS_EXCLUDED(::cs_main);
 
     // Block (dis)connection on a given view:
-    DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view)
+    DisconnectResult DisconnectBlock(const CBlock& block, const CBlockIndex* pindex, CCoinsViewCache& view,
+                                     bool disconnect_auxiliary_state = true)
         EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    /** The supplied view is a transaction-local overlay. On any false return
+     *  the caller must discard it rather than inspect, reuse, or flush it. */
     bool ConnectBlock(const CBlock& block, BlockValidationState& state, CBlockIndex* pindex,
                       CCoinsViewCache& view, bool fJustCheck = false, bool fCheckBlockSig = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
@@ -738,10 +792,16 @@ public:
     void ResetBlockFailureFlags(CBlockIndex* pindex) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     /** Replay blocks that aren't fully applied to the database. */
-    bool ReplayBlocks();
+    enum class ReplayResult {
+        SUCCESS,
+        FAILURE,
+        CHAINSTATE_REBUILD_REQUIRED,
+    };
+
+    ReplayResult ReplayBlocks();
 
     /** Replay locally stored Gold Rush blocks if the shadow ledger is missing or stale. */
-    bool ReplayShadowBlocks();
+    ReplayResult ReplayShadowBlocks();
 
     /** Whether the chain state needs to be redownloaded due to lack of witness data */
     [[nodiscard]] bool NeedsRedownload() const EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -784,7 +844,10 @@ private:
     void InvalidBlockFound(CBlockIndex* pindex, const BlockValidationState& state) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     CBlockIndex* FindMostWorkChain() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
-    bool RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& inputs) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
+    /** If auxiliary state is requested, inputs must be a disposable overlay
+     *  and must be discarded after a false return. */
+    bool RollforwardBlock(const CBlockIndex* pindex, CCoinsViewCache& inputs,
+                          bool apply_auxiliary_state = true) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
 
     void CheckForkWarningConditions() EXCLUSIVE_LOCKS_REQUIRED(cs_main);
     void InvalidChainFound(CBlockIndex* pindexNew) EXCLUSIVE_LOCKS_REQUIRED(cs_main);
@@ -982,6 +1045,31 @@ public:
     RecursiveMutex& GetMutex() const LOCK_RETURNED(::cs_main) { return ::cs_main; }
 
     const util::SignalInterrupt& m_interrupt;
+    //! Latches an interrupted staged rebuild so resetting the process signal
+    //! cannot authorize a later commit in the same ChainstateManager.
+    std::atomic<bool> m_chainstate_rebuild_interrupted{false};
+    //! Set only after the BUILDING journal transition is durable. The
+    //! rebuilding process must complete in isolation before normal services
+    //! can start.
+    std::atomic<bool> m_chainstate_rebuild_staged_this_process{false};
+    //! Prevents a second finalizer call in the building process from treating
+    //! COMMIT_READY as proof that a separate process reopened the replacement.
+    std::atomic<bool> m_chainstate_rebuild_committed_this_process{false};
+    //! Set only after recovery has validated the COMMIT_READY journal and its
+    //! preserved-source topology in this process.
+    std::atomic<bool> m_chainstate_rebuild_reopened_committed_this_process{false};
+    //! Set only after VerifyLoadedChainstate completes successfully for the
+    //! current load. A COMMIT_READY replacement may not retire preserved
+    //! backups without this explicit same-process verification proof.
+    std::atomic<bool> m_chainstate_rebuild_verified_this_process{false};
+    //! Set only after the committed replacement and its preserved backups have
+    //! been durably retired in this process.
+    std::atomic<bool> m_chainstate_rebuild_cleanup_completed_this_process{false};
+    //! Test-only observer installed by LoadChainstate for exact durable-phase
+    //! crash injection. Empty in production. It is stored on the manager
+    //! because COMMIT_READY and CLEANUP_READY are written by the asynchronous
+    //! import/finalization path after LoadChainstate returns.
+    std::function<void(std::string_view)> m_chainstate_rebuild_transition_cb;
     const Options m_options;
     std::thread m_thread_load;
     //! A single BlockManager instance is shared across each constructed
@@ -1256,8 +1344,12 @@ public:
 
     void ResetChainstates() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
-    //! Remove the snapshot-based chainstate and all on-disk artifacts.
-    //! Used when reindex{-chainstate} is called during snapshot use.
+    //! Move a snapshot chainstate out of the active path without destroying
+    //! its files, then return mempool ownership to the background chainstate.
+    void DetachSnapshotChainstateForRebuild() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+
+    //! Quarantine the snapshot-based chainstate and detach it. Quarantined
+    //! files are preserved for recovery instead of being destroyed in place.
     [[nodiscard]] bool DeleteSnapshotChainstate() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     //! Switch the active chainstate to one based on a UTXO snapshot that was loaded

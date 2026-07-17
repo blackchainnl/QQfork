@@ -1,3 +1,4 @@
+// Copyright (c) 2018-2021 The Bitcoin Core developers
 // Copyright (c) 2018-2021 Blackcoin Core Developers
 // Copyright (c) 2018-2021 Blackcoin More Developers
 // Copyright (c) 2018-2021 Quantum Quasar Developers
@@ -53,6 +54,39 @@ void DummyWalletInit::AddWalletOptions(ArgsManager& argsman) const
         "-walletrejectlongchains",
         "-walletcrosschain",
         "-unsafesqlitesync",
+        "-staking=<true/false>",
+        "-autostartstaking=<true/false>",
+        "-qqautoshadowsignal=<true/false>",
+        "-qqautodemurrageattest=<true/false>",
+        "-stakecache=<true/false>",
+        "-staketimio=<n>",
+        "-solostaking=<true/false>",
+        "-powmining=<true/false>",
+        "-powminingthreads=<n>",
+        "-powminingcpu=<n>",
+        "-qqallowautokeycreation=<true/false>",
+        "-qqpowpayoutaddress=<address>",
+        "-qqpospayoutaddress=<address>",
+        "-qqdemurragechangeaddress=<address>",
+        "-qqshadowsignalmaxretryfailures=<n>",
+        "-qqshadowsignalretrybasemillis=<n>",
+        "-qqshadowsignalcleanupdelaymillis=<n>",
+        "-qqshadowsignalsubmissiondelaymillis=<n>",
+        "-qqshadowsignalbroadcastthrowwallet=<name>",
+        "-qqshadowpowclaimsubmissiondelaymillis=<n>",
+        "-qqshadowpowbroadcastthrow=<true/false>",
+        "-minstakingamount=<amt>",
+        "-reservebalance=<amt>",
+        "-donatetodevfund=<n>",
+        "-qqautoredelegate=<true/false>",
+        "-qqredelegationtriggermultiplier=<n>",
+        "-qqredelegationmaxpatienceblocks=<n>",
+        "-qqredelegationmintriggerblocks=<n>",
+        "-qqredelegationratelimitblocks=<n>",
+        "-qqredelegationprobationblocks=<n>",
+        "-qqredelegationjitterblocks=<n>",
+        "-qqredelegationlivenessimprovementblocks=<n>",
+        "-qqredelegationtopcandidates=<n>",
     });
 }
 

@@ -85,8 +85,31 @@ BOOST_AUTO_TEST_CASE(GetFeeTest)
     // some more integer checks
     BOOST_CHECK(CFeeRate(CAmount(26), 789) == CFeeRate(32));
     BOOST_CHECK(CFeeRate(CAmount(27), 789) == CFeeRate(34));
-    // Maximum size in bytes, should not crash
-    CFeeRate(MAX_MONEY, std::numeric_limits<uint32_t>::max()).GetFeePerK();
+    // Large fees must retain exact integer semantics without overflowing the
+    // intermediate multiplication.
+    BOOST_CHECK(CFeeRate(MAX_MONEY, 1000) == CFeeRate(MAX_MONEY));
+    BOOST_CHECK(CFeeRate(-MAX_MONEY, 1000) == CFeeRate(-MAX_MONEY));
+    BOOST_CHECK(CFeeRate(MAX_MONEY, std::numeric_limits<uint32_t>::max()) == CFeeRate(465661287416LL));
+    BOOST_CHECK(CFeeRate(-MAX_MONEY, std::numeric_limits<uint32_t>::max()) == CFeeRate(-465661287416LL));
+    // Saturate when the fee rate itself cannot be represented by CAmount.
+    BOOST_CHECK(CFeeRate(MAX_MONEY, 1) == CFeeRate(std::numeric_limits<CAmount>::max()));
+    BOOST_CHECK(CFeeRate(-MAX_MONEY, 1) == CFeeRate(std::numeric_limits<CAmount>::min()));
+
+    // GetFee must also avoid overflowing its intermediate multiplication.
+    // This is the exact rate/size pair reached by the pinned mini_miner fuzz
+    // corpus that originally exposed the undefined behavior.
+    BOOST_CHECK_EQUAL(CFeeRate(1385444832771040LL).GetFee(7675), 10633289091517732LL);
+
+    const CAmount max_amount{std::numeric_limits<CAmount>::max()};
+    const CAmount min_amount{std::numeric_limits<CAmount>::min()};
+    BOOST_CHECK_EQUAL(CFeeRate(max_amount).GetFee(999), 9214148664817921032LL);
+    BOOST_CHECK_EQUAL(CFeeRate(min_amount).GetFee(999), -9214148664817921032LL);
+    BOOST_CHECK_EQUAL(CFeeRate(max_amount).GetFee(1000), max_amount);
+    BOOST_CHECK_EQUAL(CFeeRate(min_amount).GetFee(1000), min_amount);
+    BOOST_CHECK_EQUAL(CFeeRate(max_amount).GetFee(1001), max_amount);
+    BOOST_CHECK_EQUAL(CFeeRate(min_amount).GetFee(1001), min_amount);
+    BOOST_CHECK_EQUAL(CFeeRate(max_amount).GetFee(std::numeric_limits<uint32_t>::max()), max_amount);
+    BOOST_CHECK_EQUAL(CFeeRate(min_amount).GetFee(std::numeric_limits<uint32_t>::max()), min_amount);
 }
 
 BOOST_AUTO_TEST_CASE(BinaryOperatorTest)

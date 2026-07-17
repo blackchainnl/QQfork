@@ -1,3 +1,4 @@
+// Copyright (c) 2015-2022 The Bitcoin Core developers
 // Copyright (c) 2015-2022 Blackcoin Core Developers
 // Copyright (c) 2015-2022 Blackcoin More Developers
 // Copyright (c) 2015-2022 Quantum Quasar Developers
@@ -15,6 +16,7 @@
 class CBlockIndex;
 class CTransaction;
 class CZMQAbstractNotifier;
+struct ShadowIndexBlockEvent;
 
 using CZMQNotifierFactory = std::function<std::unique_ptr<CZMQAbstractNotifier>()>;
 
@@ -52,6 +54,8 @@ public:
     virtual bool NotifyBlockConnect(const CBlockIndex *pindex);
     // Notifies of every block disconnection
     virtual bool NotifyBlockDisconnect(const CBlockIndex *pindex);
+    // Notifies of one persisted shadow-ledger block delta or its exact inverse
+    virtual bool NotifyShadowBlock(bool connected, const ShadowIndexBlockEvent& event);
     // Notifies of every mempool acceptance
     virtual bool NotifyTransactionAcceptance(const CTransaction &transaction, uint64_t mempool_sequence);
     // Notifies of every mempool removal, except inclusion in blocks

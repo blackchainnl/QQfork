@@ -26,7 +26,7 @@ const std::vector<std::shared_ptr<CBlock>>* g_chain;
 void initialize_chain()
 {
     const auto params{CreateChainParams(ArgsManager{}, ChainType::REGTEST)};
-    static const auto chain{CreateBlockChain(2 * Params().GetConsensus().nCoinbaseMaturity, *params)};
+    static const auto chain{CreateBlockChain(2 * params->GetConsensus().nCoinbaseMaturity, *params)};
     g_chain = &chain;
 }
 

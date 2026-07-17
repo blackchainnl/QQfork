@@ -5,13 +5,16 @@
 #ifndef BITCOIN_QT_STAKINGMININGPAGE_H
 #define BITCOIN_QT_STAKINGMININGPAGE_H
 
+#include <qt/walletmodel.h>
+
+#include <cstdint>
+#include <string>
 #include <QPointer>
 #include <QSize>
 #include <QString>
 #include <QWidget>
 
 class ClientModel;
-class WalletModel;
 class PlatformStyle;
 class BitcoinAmountField;
 
@@ -30,13 +33,13 @@ QT_END_NAMESPACE
 /**
  * "Staking & Mining" tab.
  *
- * Top section  - Staking: one master toggle that enables legacy PoS staking and, automatically,
- *                Gold Rush PoS signalling/claims when the wallet is whitelisted during the epoch.
+ * Top section  - Staking: one master toggle that enables legacy PoS staking. Fee-paying
+ *                Gold Rush PoS signalling remains a separate explicit automation choice.
  *                Wired to the existing interfaces::Wallet staking enable.
  * Bottom section - Gold Rush Proof-of-Work: a separate opt-in for the in-process (fully integrated,
  *                no external miner) Argon2id solver, with CPU-core and CPU-% throttle controls,
- *                an auto-created quantum payout address, live status, and the 18-month
- *                lock-or-forfeit warning. Wired to interfaces::Wallet PoW-mining methods.
+ *                an explicitly confirmed quantum payout address, live status, and the Gold Rush
+ *                phase-lock warning. Wired to interfaces::Wallet PoW-mining methods.
  */
 class StakingMiningPage : public QWidget
 {
@@ -91,6 +94,7 @@ private Q_SLOTS:
     void onRedelegateColdStake();
     void onOptimizeUTXOSet();
     void updateStatus();
+    void onStakingMiningSnapshotReady(quint64 request_id, quint64 generation);
 
 private:
     const PlatformStyle* m_platform_style{nullptr};
@@ -110,6 +114,11 @@ private:
     // when the user presses "Refresh details" (or after a wallet-changing
     // action), keeping the first click on this tab instant.
     bool m_force_full_refresh{false};
+    bool m_detail_refresh_in_flight{false};
+    bool m_detail_refresh_pending{false};
+    uint64_t m_wallet_generation{0};
+    uint64_t m_detail_request_sequence{0};
+    uint64_t m_detail_request_in_flight{0};
     bool m_selfstake_withdraw_available{false};
     bool m_operator_withdraw_available{false};
     bool m_coldstake_fund_available{false};
@@ -144,6 +153,16 @@ private:
     BitcoinAmountField* m_optimize_amount{nullptr};
     QPushButton* m_optimize_button{nullptr};
     QLabel* m_optimize_status{nullptr};
+
+    // Optional persistent automation. Every item is off by default and has a
+    // separate confirmation because the consequences are different.
+    QCheckBox* m_autostart_staking{nullptr};
+    QCheckBox* m_autostart_pow{nullptr};
+    QCheckBox* m_auto_qqsignal{nullptr};
+    QCheckBox* m_auto_demurrage_attest{nullptr};
+    QCheckBox* m_auto_redelegate{nullptr};
+    QCheckBox* m_allow_auto_key_creation{nullptr};
+    QLabel* m_automation_status{nullptr};
 
     // Proof-of-Work section
     QCheckBox* m_pow_enable{nullptr};
@@ -223,12 +242,17 @@ private:
     QLabel* m_coldstake_status{nullptr};
 
     void setupUi();
+    void queueFullDetailRefresh();
+    void startFullDetailRefresh();
+    void applyFullDetailSnapshot(const WalletModel::StakingMiningSnapshot& snapshot);
+    void applyOperatorRegistry(const interfaces::WalletQuantumPoolInfo& pool);
     void refreshControlsEnabled();
-    void refreshOperatorRegistry();
     void resetStatusForNoWallet();
     void applyDonationPercentage(unsigned int percentage);
     void applyDonationDefaults(bool wallet_migration_complete);
     void refreshDonationControls();
+    void onAutomationToggled(QCheckBox* control, const std::string& setting, bool enabled);
+    void refreshAutomationControls();
     bool requestStakingOnlyUnlock();
     bool requestNormalUnlock();
     void showHelpDialog(const QString& title, const QString& html);

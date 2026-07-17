@@ -61,6 +61,7 @@ class ListTransactionsTest(BitcoinTestFramework):
 
         self.log.info("Test send-to-self on node0")
         txid = self.nodes[0].sendtoaddress(self.nodes[0].getnewaddress(), 0.2)
+        submit_wallet_tx(self.nodes[0], self.nodes[1], txid)
         assert_array_result(self.nodes[0].listtransactions(),
                             {"txid": txid, "category": "send"},
                             {"amount": Decimal("-0.2")})

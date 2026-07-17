@@ -304,7 +304,6 @@ class OrphanHandlingTest(BitcoinTestFramework):
 
     @cleanup
     def test_orphans_overlapping_parents(self):
-        node = self.nodes[0]
         # In the process of relaying inflight_parent_AB
         peer_txrequest = self.add_tx_relayer()
         # Sends the orphans
@@ -355,7 +354,6 @@ class OrphanHandlingTest(BitcoinTestFramework):
 
     @cleanup
     def test_orphan_of_orphan(self):
-        node = self.nodes[0]
         peer = self.add_tx_relayer()
 
         self.log.info("Test handling of an orphan with a parent who is another orphan")

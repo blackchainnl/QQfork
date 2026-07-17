@@ -39,6 +39,7 @@
 #include <timedata.h>
 #include <txmempool.h>
 #include <univalue.h>
+#include <util/chaintype.h>
 #include <util/strencodings.h>
 #include <util/string.h>
 #include <util/translation.h>
@@ -49,7 +50,10 @@
 #include <wallet/rpc/util.h>
 #include <wallet/wallet.h>
 #include <wallet/walletdb.h>
+#include <limits>
 #include <memory>
+#include <optional>
+#include <set>
 #include <stdint.h>
 
 using node::BlockAssembler;
@@ -121,6 +125,85 @@ static CScript GetTemplateDummyCoinbaseScript(const Consensus::Params& consensus
     return CScript() << OP_TRUE;
 }
 
+/** A v2 parent receives the block header's timestamp when it is connected.
+ *
+ * A v1 child serializes its own timestamp, so increasing a returned
+ * template's header time can make a previously valid in-template v2 -> v1
+ * edge invalid. Miners must not be told that such a template's time is safely
+ * mutable without also rebuilding and revalidating its transaction set.
+ */
+static bool HasV2ToV1TemplateDependency(const CBlock& block)
+{
+    std::set<uint256> v2_txids;
+    for (const CTransactionRef& txref : block.vtx) {
+        if (txref->nVersion >= 2) v2_txids.insert(txref->GetHash());
+    }
+    if (v2_txids.empty()) return false;
+
+    for (const CTransactionRef& txref : block.vtx) {
+        if (txref->nVersion >= 2) continue;
+        for (const CTxIn& txin : txref->vin) {
+            if (v2_txids.count(txin.prevout.hash)) return true;
+        }
+    }
+    return false;
+}
+
+static bool IsFutureWitnessScript(const CScript& script_pub_key)
+{
+    int witness_version{0};
+    std::vector<unsigned char> witness_program;
+    return script_pub_key.IsWitnessProgram(witness_version, witness_program) && witness_version > 1;
+}
+
+static bool HasFutureWitnessCoinbaseOutput(const CBlock& block)
+{
+    if (block.vtx.empty() || !block.vtx.front()) return false;
+    for (const CTxOut& txout : block.vtx.front()->vout) {
+        if (IsFutureWitnessScript(txout.scriptPubKey)) return true;
+    }
+    return false;
+}
+
+static bool IsGoldRushFutureWitnessCoinbase(const Consensus::Params& consensus,
+                                            const CBlockIndex& pindex_prev,
+                                            const CBlock& block)
+{
+    return consensus.IsGoldRushEpoch(pindex_prev.GetMedianTimePast(), pindex_prev.nHeight + 1) &&
+           HasFutureWitnessCoinbaseOutput(block);
+}
+
+/**
+ * Local convenience mining RPCs must not create a direct future-witness
+ * coinbase while Gold Rush is active. Such an output is not a shadow-ledger
+ * reward, and direct blocks intentionally remain legacy-compatible during the
+ * transition. Keep this at the RPC boundary: it is not a consensus rule.
+ *
+ * The caller must hold cs_main. The phase is evaluated from the template's
+ * actual parent, rather than the current active tip, so a tip change cannot
+ * turn a safe template into an unsafe one (or vice versa) between construction
+ * and this check.
+ */
+static void EnforceGoldRushCoinbaseOutputPolicy(const ChainstateManager& chainman, const CBlock& block)
+{
+    AssertLockHeld(::cs_main);
+
+    if (block.vtx.empty() || !block.vtx.front()) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Generated block template is missing a coinbase transaction");
+    }
+
+    const CBlockIndex* const pindex_prev = chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+    if (!pindex_prev) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR, "Generated block template has an unknown previous block");
+    }
+
+    if (IsGoldRushFutureWitnessCoinbase(chainman.GetConsensus(), *pindex_prev, block)) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "Future-witness coinbase outputs are disabled during the Gold Rush epoch; use a legacy payout address.");
+    }
+}
+
 static RPCHelpMan getnetworkhashps()
 {
     return RPCHelpMan{"getnetworkhashps",
@@ -180,6 +263,11 @@ static UniValue generateBlocks(ChainstateManager& chainman, const CTxMemPool& me
         std::unique_ptr<CBlockTemplate> pblocktemplate(BlockAssembler{chainman.ActiveChainstate(), &mempool}.CreateNewBlock(coinbase_script, nullptr, nullptr));
         if (!pblocktemplate.get())
             throw JSONRPCError(RPC_INTERNAL_ERROR, "Couldn't create new block");
+
+        {
+            LOCK(cs_main);
+            EnforceGoldRushCoinbaseOutputPolicy(chainman, pblocktemplate->block);
+        }
 
         std::shared_ptr<const CBlock> block_out;
         if (!GenerateBlock(chainman, pblocktemplate->block, nMaxTries, block_out, /*process_new_block=*/true)) {
@@ -321,7 +409,7 @@ static RPCHelpMan generateblock()
         {
             {"output", RPCArg::Type::STR, RPCArg::Optional::NO, "The address or descriptor to send the newly generated bitcoin to."},
             {"transactions", RPCArg::Type::ARR, RPCArg::Optional::NO, "An array of hex strings which are either txids or raw transactions.\n"
-                "Txids must reference transactions currently in the mempool.\n"
+                "Txids must reference transactions currently in the mempool. Raw transactions are accepted only on regtest.\n"
                 "All transactions must be valid and in valid order, otherwise the block will be rejected.",
                 {
                     {"rawtx/txid", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED, ""},
@@ -357,6 +445,7 @@ static RPCHelpMan generateblock()
 
     NodeContext& node = EnsureAnyNodeContext(request.context);
     const CTxMemPool& mempool = EnsureMemPool(node);
+    ChainstateManager& chainman = EnsureChainman(node);
 
     std::vector<CTransactionRef> txs;
     const auto raw_txs_or_txids = request.params[1].get_array();
@@ -375,6 +464,11 @@ static RPCHelpMan generateblock()
             txs.emplace_back(tx);
 
         } else if (DecodeHexTx(mtx, str)) {
+            if (chainman.GetParams().GetChainType() != ChainType::REGTEST) {
+                throw JSONRPCError(
+                    RPC_INVALID_PARAMETER,
+                    "Raw transaction injection through generateblock is only available on regtest; submit transactions to the mempool and pass txids instead.");
+            }
             txs.push_back(MakeTransactionRef(std::move(mtx)));
 
         } else {
@@ -385,7 +479,6 @@ static RPCHelpMan generateblock()
     const bool process_new_block{request.params[2].isNull() ? true : request.params[2].get_bool()};
     CBlock block;
 
-    ChainstateManager& chainman = EnsureChainman(node);
     {
         LOCK(cs_main);
 
@@ -393,6 +486,7 @@ static RPCHelpMan generateblock()
         if (!blocktemplate) {
             throw JSONRPCError(RPC_INTERNAL_ERROR, "Couldn't create new block");
         }
+        EnforceGoldRushCoinbaseOutputPolicy(chainman, blocktemplate->block);
         block = blocktemplate->block;
     }
 
@@ -604,17 +698,30 @@ static RPCHelpMan getblocktemplate()
                 {RPCResult::Type::NUM, "weightlimit", /*optional=*/true, "limit of block weight"},
                 {RPCResult::Type::OBJ, "quantumquasar", "Blackcoin V4 roadmap data for miners", {
                     {RPCResult::Type::STR, "phase", "current Blackcoin roadmap phase for the template"},
+                    {RPCResult::Type::BOOL, "lifecycle_schedule_valid", "whether the configured lifecycle boundaries are complete and ordered"},
                     {RPCResult::Type::NUM_TIME, "v4_activation_time", "first V4 hard-fork activation boundary"},
-                    {RPCResult::Type::NUM_TIME, "gold_rush_end_time", "end of the Gold Rush phase"},
-                    {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "planned final post-quantum migration deadline"},
+                    {RPCResult::Type::NUM, "v4_activation_height", "authoritative first Gold Rush lifecycle height, or 0 for a time-only test schedule"},
+                    {RPCResult::Type::NUM_TIME, "gold_rush_end_time", "forecast Gold Rush end time; non-authoritative when height boundaries are enabled"},
+                    {RPCResult::Type::NUM_TIME, "quantum_migration_deadline_time", "forecast final migration time; non-authoritative when height boundaries are enabled"},
+                    {RPCResult::Type::NUM, "gold_rush_end_height", "authoritative last Gold Rush block height, or 0 for a time-only test schedule"},
+                    {RPCResult::Type::NUM, "quantum_migration_end_height", "authoritative last Migration block height, or 0 for a time-only test schedule"},
+                    {RPCResult::Type::BOOL, "height_boundaries_authoritative", "whether exact block heights govern both lifecycle boundaries"},
+                    {RPCResult::Type::BOOL, "time_boundaries_are_estimates", "whether the time fields are forecasts only"},
+                    {RPCResult::Type::NUM, "blocks_until_gold_rush_end", "exact remaining Gold Rush blocks when height boundaries are authoritative"},
+                    {RPCResult::Type::NUM, "blocks_until_quantum_migration_end", "exact remaining Migration blocks when height boundaries are authoritative"},
                     {RPCResult::Type::BOOL, "base_network_stake_compatible", "whether stakers should keep producing base-network-compatible coinstakes"},
                     {RPCResult::Type::BOOL, "shadow_merge_mining_active", "whether Gold Rush shadow proof merge-mining is active"},
                     {RPCResult::Type::BOOL, "shadow_reward_height_active", "whether this template is inside the deterministic height-based Gold Rush payout window"},
                     {RPCResult::Type::NUM, "shadow_reward_height", "template height checked against the deterministic payout window"},
                     {RPCResult::Type::NUM, "shadow_reward_start_height", "first deterministic Gold Rush payout height"},
                     {RPCResult::Type::NUM, "shadow_reward_end_height", "last deterministic Gold Rush payout height"},
+                    {RPCResult::Type::BOOL, "qqp4_activation_disabled", "whether the separately scheduled QQP4 exact-input fork is disabled; readiness signalling cannot enable it"},
+                    {RPCResult::Type::NUM, "qqp4_activation_height", "separately scheduled QQP4 activation height, or 0 when disabled"},
+                    {RPCResult::Type::BOOL, "qqp4_active_next_block", "whether this template requires QQP4 exact-input proofs"},
                     {RPCResult::Type::BOOL, "new_network_stake_only", "whether staking has crossed the final quantum-only lockout cutover"},
                     {RPCResult::Type::BOOL, "replay_protection_active", "whether SIGHASH_FORKID replay protection is enforced by schedule"},
+                    {RPCResult::Type::BOOL, "sighash_forkid_active", "whether legacy ECDSA signatures must use the fork-protected digest"},
+                    {RPCResult::Type::BOOL, "quantum_signature_domain_separation_active", "whether ML-DSA signatures use the configured chain domain"},
                     {RPCResult::Type::BOOL, "legacy_address_lockout_scheduled", "whether the roadmap contains a final legacy lockout deadline"},
                     {RPCResult::Type::BOOL, "quantum_address_required_by_schedule", "whether the roadmap has reached the scheduled quantum-address phase"},
                     {RPCResult::Type::BOOL, "legacy_addresses_accepted", "whether this node currently accepts legacy addresses under implemented rules"},
@@ -780,16 +887,19 @@ static RPCHelpMan getblocktemplate()
 
     // Use the active tip, not the cached template tip, so activation status cannot
     // lag behind a block transition while the template is being refreshed below.
-    const bool fPreSegWit = !DeploymentActiveAfter(active_chain.Tip(), chainman, Consensus::DEPLOYMENT_SEGWIT);
+    const CBlockIndex* active_tip = active_chain.Tip();
+    const int64_t active_tip_mtp = active_tip->GetMedianTimePast();
+    const int active_next_height = active_tip->nHeight + 1;
+    const bool fPreSegWit = !(
+        DeploymentActiveAfter(active_tip, chainman, Consensus::DEPLOYMENT_SEGWIT) ||
+        IsQuantumWitnessSpendActive(consensusParams, active_tip_mtp, active_next_height));
 
     // GBT must be called with 'segwit' set in the rules
     if (!fPreSegWit && setClientRules.count("segwit") != 1) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "getblocktemplate must be called with the segwit rule set (call with {\"rules\": [\"segwit\"]})");
     }
 
-    if (pindexPrev != active_chain.Tip() ||
-        (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - time_start > 5))
-    {
+    const auto rebuild_template = [&] {
         // Clear pindexPrev so future calls make a new block, despite any failures from here on
         pindexPrev = nullptr;
 
@@ -797,6 +907,12 @@ static RPCHelpMan getblocktemplate()
         nTransactionsUpdatedLast = mempool.GetTransactionsUpdated();
         CBlockIndex* pindexPrevNew = active_chain.Tip();
         time_start = GetTime();
+        const int64_t build_adjusted_time = GetAdjustedTimeSeconds();
+        if (!GetNextBlockHeaderTime(active_chainstate, pindexPrevNew,
+                                    build_adjusted_time)) {
+            throw JSONRPCError(RPC_INTERNAL_ERROR,
+                               "No legal next-block header time is currently available");
+        }
 
         // Create new block
         CScript scriptDummy = GetTemplateDummyCoinbaseScript(consensusParams, pindexPrevNew);
@@ -806,12 +922,34 @@ static RPCHelpMan getblocktemplate()
 
         // Need to update only after we know CreateNewBlock succeeded
         pindexPrev = pindexPrevNew;
+    };
+
+    if (pindexPrev != active_chain.Tip() ||
+        (mempool.GetTransactionsUpdated() != nTransactionsUpdatedLast && GetTime() - time_start > 5))
+    {
+        rebuild_template();
     }
     CHECK_NONFATAL(pindexPrev);
     CBlock* pblock = &pblocktemplate->block; // pointer for convenience
 
-    // Update nTime
-    UpdateTime(pblock, consensusParams, pindexPrev);
+    // Do not mutate a cached template's header time after its package was
+    // selected. A version-2 parent is assigned the candidate header time, so
+    // advancing that header can invalidate a version-1 child selected against
+    // the old time. Probe the update on a copy, then rebuild (and therefore
+    // revalidate) the package before returning a fresher header.
+    CBlock updated_header{*pblock};
+    const int64_t adjusted_time = GetAdjustedTimeSeconds();
+    if (!UpdateTime(&updated_header, active_chainstate, consensusParams,
+                    pindexPrev, adjusted_time)) {
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "No legal next-block header time is currently available");
+    }
+    if (updated_header.nTime != pblock->nTime ||
+        updated_header.nBits != pblock->nBits) {
+        rebuild_template();
+        CHECK_NONFATAL(pindexPrev);
+        pblock = &pblocktemplate->block;
+    }
     pblock->nNonce = 0;
 
     UniValue aCaps(UniValue::VARR); aCaps.push_back("proposal");
@@ -859,7 +997,9 @@ static RPCHelpMan getblocktemplate()
     arith_uint256 hashTarget = arith_uint256().SetCompact(pblock->nBits);
 
     UniValue aMutable(UniValue::VARR);
-    aMutable.push_back("time");
+    if (!HasV2ToV1TemplateDependency(*pblock)) {
+        aMutable.push_back("time");
+    }
     aMutable.push_back("transactions");
     aMutable.push_back("prevblock");
 
@@ -955,24 +1095,45 @@ static RPCHelpMan getblocktemplate()
     const bool shadow_merge_mining_active = IsShadowGoldRushRewardActive(consensusParams, template_mtp, template_height);
     const bool final_lockout_active = consensusParams.IsQuantumFinalLockout(template_mtp, template_height);
     const bool shadow_reward_height_active = IsShadowGoldRushRewardHeight(template_height);
+    const auto lifecycle = consensusParams.GetQuantumLifecycleState(template_mtp, template_height);
+    const bool qqp4_disabled =
+        consensusParams.nShadowQQP4ActivationHeight ==
+        std::numeric_limits<int>::max();
     quantumquasar.pushKV("phase", gbt_blackcoin_phase_name(consensusParams.GetQuantumQuasarPhase(template_mtp, template_height)));
+    quantumquasar.pushKV("lifecycle_schedule_valid", lifecycle.schedule_valid);
     quantumquasar.pushKV("v4_activation_time", consensusParams.nProtocolV4Time);
+    quantumquasar.pushKV("v4_activation_height", consensusParams.nQuantumLifecycleStartHeight);
     quantumquasar.pushKV("gold_rush_end_time", consensusParams.nGoldRushEndTime);
     quantumquasar.pushKV("quantum_migration_deadline_time", consensusParams.nQuantumMigrationDeadlineTime);
+    quantumquasar.pushKV("gold_rush_end_height", consensusParams.nGoldRushEndHeight);
+    quantumquasar.pushKV("quantum_migration_end_height", consensusParams.nQuantumMigrationEndHeight);
+    quantumquasar.pushKV("height_boundaries_authoritative", lifecycle.height_authoritative);
+    quantumquasar.pushKV("time_boundaries_are_estimates", consensusParams.UsesHeightLifecycle());
+    quantumquasar.pushKV("blocks_until_gold_rush_end", consensusParams.nGoldRushEndHeight > 0 && template_height <= consensusParams.nGoldRushEndHeight
+        ? consensusParams.nGoldRushEndHeight - template_height + 1 : 0);
+    quantumquasar.pushKV("blocks_until_quantum_migration_end", consensusParams.nQuantumMigrationEndHeight > 0 && template_height <= consensusParams.nQuantumMigrationEndHeight
+        ? consensusParams.nQuantumMigrationEndHeight - template_height + 1 : 0);
     quantumquasar.pushKV("base_network_stake_compatible", base_network_stake_compatible);
     quantumquasar.pushKV("shadow_merge_mining_active", shadow_merge_mining_active);
     quantumquasar.pushKV("shadow_reward_height_active", shadow_reward_height_active);
     quantumquasar.pushKV("shadow_reward_height", template_height);
     quantumquasar.pushKV("shadow_reward_start_height", SHADOW_REWARD_START_HEIGHT);
     quantumquasar.pushKV("shadow_reward_end_height", SHADOW_REWARD_END_HEIGHT);
+    quantumquasar.pushKV("qqp4_activation_disabled", qqp4_disabled);
+    quantumquasar.pushKV("qqp4_activation_height", qqp4_disabled
+        ? 0 : consensusParams.nShadowQQP4ActivationHeight);
+    quantumquasar.pushKV("qqp4_active_next_block",
+                          consensusParams.IsShadowQQP4Active(template_height));
     quantumquasar.pushKV("new_network_stake_only", new_network_stake_only);
-    quantumquasar.pushKV("replay_protection_active", new_network_stake_only);
-    quantumquasar.pushKV("legacy_address_lockout_scheduled", consensusParams.nQuantumMigrationDeadlineTime != 0);
+    quantumquasar.pushKV("replay_protection_active", quantum_spend_active);
+    quantumquasar.pushKV("sighash_forkid_active", quantum_spend_active);
+    quantumquasar.pushKV("quantum_signature_domain_separation_active", quantum_spend_active);
+    quantumquasar.pushKV("legacy_address_lockout_scheduled", consensusParams.IsMigrationEndScheduled());
     quantumquasar.pushKV("quantum_address_required_by_schedule", final_lockout_active);
     quantumquasar.pushKV("legacy_addresses_accepted", !final_lockout_active);
     quantumquasar.pushKV("quantum_address_required", final_lockout_active);
     quantumquasar.pushKV("quantum_spend_enforcement_active", quantum_spend_active);
-    quantumquasar.pushKV("quantum_migration_outputs_fundable", true);
+    quantumquasar.pushKV("quantum_migration_outputs_fundable", quantum_spend_active);
     UniValue readiness_signalling(UniValue::VOBJ);
     readiness_signalling.pushKV(VersionBitsDeploymentInfo[Consensus::DEPLOYMENT_QUANTUM_QUASAR].name, consensusParams.vDeployments[Consensus::DEPLOYMENT_QUANTUM_QUASAR].bit);
     readiness_signalling.pushKV(VersionBitsDeploymentInfo[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].name, consensusParams.vDeployments[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].bit);
@@ -1055,6 +1216,12 @@ static RPCHelpMan submitblock()
             if (pindex->nStatus & BLOCK_FAILED_MASK) {
                 return "duplicate-invalid";
             }
+        }
+
+        const CBlockIndex* const pindex_prev = chainman.m_blockman.LookupBlockIndex(block.hashPrevBlock);
+        if (pindex_prev && chainman.GetParams().GetChainType() != ChainType::REGTEST &&
+            IsGoldRushFutureWitnessCoinbase(chainman.GetConsensus(), *pindex_prev, block)) {
+            return "goldrush-future-witness-coinbase";
         }
     }
 
@@ -1210,6 +1377,10 @@ static RPCHelpMan getshadowpowwork()
              "Optional legacy address to grind for. If given, 'target_script' is its scriptPubKey."},
             {"quantum_address", RPCArg::Type::STR, RPCArg::Optional::OMITTED,
              "Optional Blackcoin migration payout address. If given, 'quantum_payout_script' is the script committed into QQSPROOF."},
+            {"claim_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::OMITTED,
+             "Exact legacy UTXO transaction id committed by QQP4. Required with claim_vout only after the separately scheduled QQP4 activation."},
+            {"claim_vout", RPCArg::Type::NUM, RPCArg::Optional::OMITTED,
+             "Exact legacy UTXO output index committed by QQP4. Required with claim_txid only after the separately scheduled QQP4 activation."},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::BOOL, "active", "Whether the Gold Rush shadow PoW phase is currently claimable."},
@@ -1223,6 +1394,16 @@ static RPCHelpMan getshadowpowwork()
             {RPCResult::Type::NUM, "claimed_amount", "Total Gold Rush amount already materialized to quantum payout coins in satoshis."},
             {RPCResult::Type::NUM, "last_pow_height", "Last accepted PoW claim height (retarget anchor), 0 if none."},
             {RPCResult::Type::STR, "prefix", "ASCII OP_RETURN magic prefix for shadow proofs (\"QQSPROOF\")."},
+            {RPCResult::Type::STR, "proof_mode", "Required fee-paying claim channel (pow)."},
+            {RPCResult::Type::NUM, "proof_mode_byte", "Required serialized PoW mode byte (0)."},
+            {RPCResult::Type::NUM, "proof_version", "Required QQP payload version for this height (2 before the new v30.1.1 QQP3 boundary, 3 through the QQP3 era, and 4 only after separately scheduled QQP4 activation)."},
+            {RPCResult::Type::BOOL, "claim_outpoint_required", "Whether the separately activated QQP4 proof must commit an exact fee input."},
+            {RPCResult::Type::BOOL, "qqp4_activation_disabled", "Whether QQP4 is disabled by consensus schedule; readiness signalling cannot enable it."},
+            {RPCResult::Type::NUM, "qqp4_activation_height", "Separately scheduled QQP4 activation height, or 0 when disabled."},
+            {RPCResult::Type::BOOL, "qqp4_active_next_block", "Whether this returned work height requires QQP4 exact-input proofs."},
+            {RPCResult::Type::STR_HEX, "claim_txid", /*optional=*/true, "Committed fee-input transaction id, if supplied."},
+            {RPCResult::Type::NUM, "claim_vout", /*optional=*/true, "Committed fee-input output index, if supplied."},
+            {RPCResult::Type::STR_HEX, "claim_outpoint_serialized", /*optional=*/true, "Exact 36-byte network serialization committed by QQP4 (internal txid byte order followed by little-endian vout)."},
             {RPCResult::Type::NUM, "reward_start_height", "First height at which PoW claims are valid."},
             {RPCResult::Type::NUM, "reward_end_height", "Last height at which PoW claims are valid."},
             {RPCResult::Type::STR_HEX, "target_script", /*optional=*/true, "scriptPubKey to grind for, if target_address supplied."},
@@ -1260,9 +1441,53 @@ static RPCHelpMan getshadowpowwork()
     obj.pushKV("claimed_amount", info.claimed_amount);
     obj.pushKV("last_pow_height", (uint64_t)info.last_pow_height);
     obj.pushKV("prefix", std::string(GetShadowPrefix().begin(), GetShadowPrefix().end()));
+    obj.pushKV("proof_mode", "pow");
+    obj.pushKV("proof_mode_byte", 0);
+    const bool q3_active = consensus.IsShadowCompetingClaimsActive(next_height);
+    const bool claim_outpoint_required = consensus.IsShadowQQP4Active(next_height);
+    const bool qqp4_disabled = consensus.nShadowQQP4ActivationHeight ==
+        std::numeric_limits<int>::max();
+    obj.pushKV("proof_version", claim_outpoint_required ? 4 : (q3_active ? 3 : 2));
+    obj.pushKV("claim_outpoint_required", claim_outpoint_required);
+    obj.pushKV("qqp4_activation_disabled", qqp4_disabled);
+    obj.pushKV("qqp4_activation_height", qqp4_disabled
+        ? 0 : consensus.nShadowQQP4ActivationHeight);
+    obj.pushKV("qqp4_active_next_block", claim_outpoint_required);
     obj.pushKV("reward_start_height", SHADOW_REWARD_START_HEIGHT);
     obj.pushKV("reward_end_height", SHADOW_REWARD_END_HEIGHT);
 
+    std::optional<COutPoint> requested_claim_outpoint;
+    const bool has_claim_txid = !request.params[2].isNull();
+    const bool has_claim_vout = !request.params[3].isNull();
+    if (has_claim_txid != has_claim_vout) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "claim_txid and claim_vout must be supplied together");
+    }
+    if (has_claim_txid) {
+        const uint256 claim_txid = ParseHashV(request.params[2], "claim_txid");
+        const int64_t claim_vout = request.params[3].getInt<int64_t>();
+        if (claim_txid.IsNull() || claim_vout < 0 ||
+            claim_vout > std::numeric_limits<uint32_t>::max()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "claim outpoint must be non-null and claim_vout must fit uint32");
+        }
+        requested_claim_outpoint = COutPoint{
+            claim_txid, static_cast<uint32_t>(claim_vout)};
+        obj.pushKV("claim_txid", claim_txid.GetHex());
+        obj.pushKV("claim_vout", claim_vout);
+        CDataStream serialized_outpoint{SER_NETWORK};
+        serialized_outpoint.SetVersion(PROTOCOL_VERSION);
+        serialized_outpoint << *requested_claim_outpoint;
+        obj.pushKV("claim_outpoint_serialized",
+                   HexStr(serialized_outpoint));
+    }
+
+    if (requested_claim_outpoint && !claim_outpoint_required) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "claim_txid and claim_vout are only used after separately scheduled QQP4 activation");
+    }
+
+    std::optional<CScript> requested_target;
     if (!request.params[0].isNull()) {
         const CTxDestination dest = DecodeDestination(request.params[0].get_str());
         if (!IsValidDestination(dest))
@@ -1272,6 +1497,7 @@ static RPCHelpMan getshadowpowwork()
             || IsQuantumMigrationScript(target) || IsQuantumColdStakeScript(target) || IsEUTXOScript(target))
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY,
                 "target_address must be a spendable legacy script (not a quantum/EUTXO script)");
+        requested_target = CanonicalizeLegacyStakeScript(target);
         obj.pushKV("target_script", HexStr(target));
     }
     if (!request.params[1].isNull()) {
@@ -1282,6 +1508,30 @@ static RPCHelpMan getshadowpowwork()
         const CScript quantum_payout_script = GetScriptForDestination(quantum_dest);
         obj.pushKV("quantum_address", EncodeDestination(quantum_dest));
         obj.pushKV("quantum_payout_script", HexStr(quantum_payout_script));
+    }
+
+    const bool complete_grind_request = !request.params[0].isNull() &&
+                                        !request.params[1].isNull();
+    if (claim_outpoint_required && complete_grind_request &&
+        !requested_claim_outpoint) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "QQP4 external work requires claim_txid and claim_vout");
+    }
+    if (requested_claim_outpoint) {
+        if (!requested_target) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "target_address is required with a claim outpoint");
+        }
+        Coin coin;
+        if (!view.GetCoin(*requested_claim_outpoint, coin) || coin.IsSpent()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "claim outpoint is missing or already spent");
+        }
+        if (CanonicalizeLegacyStakeScript(coin.out.scriptPubKey) !=
+            *requested_target) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "claim outpoint script does not match target_address");
+        }
     }
     return obj;
 },

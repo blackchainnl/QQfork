@@ -69,10 +69,13 @@
 #include <QUrlQuery>
 #include <QtGlobal>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cmath>
 #include <exception>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -833,6 +836,87 @@ qreal calculateIdealFontSize(int width, const QString& text, QFont font, qreal m
         font_size -= 0.5;
     }
     return font_size;
+}
+
+namespace {
+qreal RelativeLuminance(const QColor& color)
+{
+    const auto linear_channel = [](int value) {
+        const qreal channel = static_cast<qreal>(value) / 255.0;
+        return channel <= 0.04045 ? channel / 12.92 : std::pow((channel + 0.055) / 1.055, 2.4);
+    };
+    return 0.2126 * linear_channel(color.red()) +
+           0.7152 * linear_channel(color.green()) +
+           0.0722 * linear_channel(color.blue());
+}
+
+QColor BlendToward(const QColor& color, const QColor& target, int step)
+{
+    const auto blend_channel = [step](int from, int to) {
+        return (from * (255 - step) + to * step + 127) / 255;
+    };
+    return QColor{
+        blend_channel(color.red(), target.red()),
+        blend_channel(color.green(), target.green()),
+        blend_channel(color.blue(), target.blue())};
+}
+
+int ColorDistanceSquared(const QColor& first, const QColor& second)
+{
+    const int red = first.red() - second.red();
+    const int green = first.green() - second.green();
+    const int blue = first.blue() - second.blue();
+    return red * red + green * green + blue * blue;
+}
+} // namespace
+
+qreal ColorContrastRatio(const QColor& first, const QColor& second)
+{
+    const qreal first_luminance = RelativeLuminance(first);
+    const qreal second_luminance = RelativeLuminance(second);
+    const qreal lighter = std::max(first_luminance, second_luminance);
+    const qreal darker = std::min(first_luminance, second_luminance);
+    return (lighter + 0.05) / (darker + 0.05);
+}
+
+QColor ReadableColor(const QColor& preferred, const QColor& background, const QColor& palette_foreground, qreal minimum_contrast)
+{
+    if (!preferred.isValid() || !background.isValid()) return palette_foreground;
+    if (ColorContrastRatio(preferred, background) >= minimum_contrast) return preferred;
+
+    QColor best;
+    int best_distance = std::numeric_limits<int>::max();
+    for (int step = 1; step <= 255; ++step) {
+        for (const QColor& target : {QColor{Qt::black}, QColor{Qt::white}}) {
+            const QColor candidate = BlendToward(preferred, target, step);
+            if (ColorContrastRatio(candidate, background) < minimum_contrast) continue;
+            const int distance = ColorDistanceSquared(candidate, preferred);
+            if (distance < best_distance) {
+                best = candidate;
+                best_distance = distance;
+            }
+        }
+    }
+    if (best.isValid()) return best;
+    if (palette_foreground.isValid() && ColorContrastRatio(palette_foreground, background) >= minimum_contrast) {
+        return palette_foreground;
+    }
+
+    const QColor black{Qt::black};
+    const QColor white{Qt::white};
+    return ColorContrastRatio(black, background) >= ColorContrastRatio(white, background) ? black : white;
+}
+
+void ConfigureThemedLabelPanel(QLabel* label, QPalette::ColorRole background_role, QPalette::ColorRole foreground_role, int margin)
+{
+    assert(label);
+    label->setAutoFillBackground(true);
+    label->setBackgroundRole(background_role);
+    label->setForegroundRole(foreground_role);
+    label->setFrameShape(QFrame::StyledPanel);
+    label->setFrameShadow(QFrame::Plain);
+    label->setLineWidth(1);
+    label->setMargin(margin);
 }
 
 ThemedLabel::ThemedLabel(const PlatformStyle* platform_style, QWidget* parent)

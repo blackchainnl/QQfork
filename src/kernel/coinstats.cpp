@@ -8,6 +8,7 @@
 
 #include <chain.h>
 #include <coins.h>
+#include <consensus/demurrage.h>
 #include <crypto/muhash.h>
 #include <hash.h>
 #include <logging.h>
@@ -15,6 +16,7 @@
 #include <primitives/transaction.h>
 #include <script/script.h>
 #include <serialize.h>
+#include <shadow.h>
 #include <span.h>
 #include <streams.h>
 #include <sync.h>
@@ -30,6 +32,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -60,6 +63,7 @@ bool IsQuantumQuasarInternalMarkerScript(const CScript& script_pub_key)
     static const valtype marker_gold_rush_payout{'Q', 'Q', 'G', 'R', 'P', 'A', 'Y'};
     static const valtype marker_solver{'Q', 'Q', 'S', 'O', 'L', 'V', 'E'};
     static const valtype marker_active_signal{'Q', 'Q', 'A', 'S', 'I', 'G'};
+    static const valtype marker_replay_state{'Q', 'Q', 'R', 'E', 'P', 'L', 'A', 'Y'};
 
     CScript::const_iterator pc = script_pub_key.begin();
     opcodetype opcode;
@@ -73,7 +77,8 @@ bool IsQuantumQuasarInternalMarkerScript(const CScript& script_pub_key)
         data != marker_direct_claim &&
         data != marker_gold_rush_payout &&
         data != marker_solver &&
-        data != marker_active_signal) {
+        data != marker_active_signal &&
+        data != marker_replay_state) {
         return false;
     }
     if (pc == script_pub_key.end()) return true;
@@ -147,7 +152,9 @@ static void ApplyStats(CCoinsStats& stats, const uint256& hash, const std::map<u
 
 //! Calculate statistics about the unspent transaction output set
 template <typename T>
-static bool ComputeUTXOStats(CCoinsView* view, CCoinsStats& stats, T hash_obj, const std::function<void()>& interruption_point)
+static bool ComputeUTXOStats(CCoinsView* view, CCoinsStats& stats, T hash_obj,
+                             const CBlockIndex* pindex,
+                             const std::function<void()>& interruption_point)
 {
     std::unique_ptr<CCoinsViewCursor> pcursor(view->Cursor());
     assert(pcursor);
@@ -159,7 +166,13 @@ static bool ComputeUTXOStats(CCoinsView* view, CCoinsStats& stats, T hash_obj, c
         COutPoint key;
         Coin coin;
         if (pcursor->GetKey(key) && pcursor->GetValue(coin)) {
-            if (IsQuantumQuasarInternalMarkerScript(coin.out.scriptPubKey)) {
+            // Preserve legacy-valid marker-shaped user outputs. Only
+            // provenance-authenticated zero-value internal state is excluded
+            // from the historical UTXO stats commitment. Positive synthetic
+            // Gold Rush payout coins remain part of supply and the MuHash.
+            if (coin.out.nValue == 0 &&
+                (IsAuthenticatedShadowMarkerOutpoint(key, coin, pindex) ||
+                 Consensus::IsAuthenticatedDemurrageStateOutpoint(key, coin, pindex))) {
                 pcursor->Next();
                 continue;
             }
@@ -192,19 +205,18 @@ std::optional<CCoinsStats> ComputeUTXOStats(CoinStatsHashType hash_type, CCoinsV
 {
     CBlockIndex* pindex = WITH_LOCK(::cs_main, return blockman.LookupBlockIndex(view->GetBestBlock()));
     CCoinsStats stats{Assert(pindex)->nHeight, pindex->GetBlockHash()};
-
     bool success = [&]() -> bool {
         switch (hash_type) {
         case(CoinStatsHashType::HASH_SERIALIZED): {
             HashWriter ss{};
-            return ComputeUTXOStats(view, stats, ss, interruption_point);
+            return ComputeUTXOStats(view, stats, ss, pindex, interruption_point);
         }
         case(CoinStatsHashType::MUHASH): {
             MuHash3072 muhash;
-            return ComputeUTXOStats(view, stats, muhash, interruption_point);
+            return ComputeUTXOStats(view, stats, muhash, pindex, interruption_point);
         }
         case(CoinStatsHashType::NONE): {
-            return ComputeUTXOStats(view, stats, nullptr, interruption_point);
+            return ComputeUTXOStats(view, stats, nullptr, pindex, interruption_point);
         }
         } // no default case, so the compiler can warn about missing cases
         assert(false);

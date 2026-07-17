@@ -610,9 +610,13 @@ bool LegacyScriptPubKeyMan::CanProvide(const CScript& script, SignatureData& sig
     }
 }
 
-bool LegacyScriptPubKeyMan::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const
+bool LegacyScriptPubKeyMan::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins,
+                                            int sighash, std::map<int, bilingual_str>& input_errors,
+                                            uint32_t quantum_chain_id,
+                                            unsigned int extra_verify_flags) const
 {
-    return ::SignTransaction(tx, this, coins, sighash, input_errors);
+    return ::SignTransaction(tx, this, coins, sighash, input_errors,
+                             quantum_chain_id, extra_verify_flags);
 }
 
 SigningResult LegacyScriptPubKeyMan::SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const
@@ -2481,7 +2485,10 @@ bool DescriptorScriptPubKeyMan::CanProvide(const CScript& script, SignatureData&
     return IsMine(script);
 }
 
-bool DescriptorScriptPubKeyMan::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors) const
+bool DescriptorScriptPubKeyMan::SignTransaction(CMutableTransaction& tx, const std::map<COutPoint, Coin>& coins,
+                                                int sighash, std::map<int, bilingual_str>& input_errors,
+                                                uint32_t quantum_chain_id,
+                                                unsigned int extra_verify_flags) const
 {
     std::unique_ptr<FlatSigningProvider> keys = std::make_unique<FlatSigningProvider>();
     for (const auto& coin_pair : coins) {
@@ -2492,7 +2499,8 @@ bool DescriptorScriptPubKeyMan::SignTransaction(CMutableTransaction& tx, const s
         keys->Merge(std::move(*coin_keys));
     }
 
-    return ::SignTransaction(tx, keys.get(), coins, sighash, input_errors);
+    return ::SignTransaction(tx, keys.get(), coins, sighash, input_errors,
+                             quantum_chain_id, extra_verify_flags);
 }
 
 SigningResult DescriptorScriptPubKeyMan::SignMessage(const std::string& message, const PKHash& pkhash, std::string& str_sig) const

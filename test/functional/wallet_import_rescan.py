@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2014-2022 The Bitcoin Core developers
 # Copyright (c) 2014-2022 Blackcoin Core Developers
 # Copyright (c) 2014-2022 Blackcoin More Developers
 # Copyright (c) 2014-2022 Blackcoin Developers
@@ -172,11 +173,13 @@ class ImportRescanTest(BitcoinTestFramework):
         self.add_nodes(self.num_nodes, extra_args=self.extra_args)
 
         # Import keys with pruning disabled
-        self.start_nodes(extra_args=[[]] * self.num_nodes)
+        self.start_nodes(extra_args=[["-autostartstaking=0"]] * self.num_nodes)
         self.import_deterministic_coinbase_privkeys()
         self.stop_nodes()
 
-        self.start_nodes(extra_args=[["-whitelist=noban@127.0.0.1"]] * self.num_nodes)
+        self.start_nodes(extra_args=[["-whitelist=noban@127.0.0.1", "-autostartstaking=0"]] * self.num_nodes)
+        for node in self.nodes:
+            assert_equal(node.get_wallet_rpc("").getstakinginfo()["enabled"], False)
         for i in range(1, self.num_nodes):
             self.connect_nodes(i, 0)
 
@@ -279,6 +282,10 @@ class ImportRescanTest(BitcoinTestFramework):
 
         # Mine a block so these parents are confirmed
         assert_equal(len(self.nodes[0].getrawmempool()), len(mempool_variants))
+        for variant in mempool_variants:
+            raw = self.nodes[0].getrawtransaction(variant.initial_txid)
+            for node in self.nodes[1:]:
+                assert_equal(node.sendrawtransaction(raw), variant.initial_txid)
         self.sync_mempools()
         block_to_disconnect = self.generate(self.nodes[0], 1)[0]
         assert_equal(len(self.nodes[0].getrawmempool()), 0)
@@ -299,7 +306,8 @@ class ImportRescanTest(BitcoinTestFramework):
             )
             variant.child_txid = child["txid"]
             variant.amount_received = 0
-            self.nodes[0].sendrawtransaction(child["hex"])
+            for node in self.nodes:
+                assert_equal(node.sendrawtransaction(child["hex"]), variant.child_txid)
 
         # Mempools should contain the child transactions for each variant.
         assert_equal(len(self.nodes[0].getrawmempool()), len(mempool_variants))

@@ -14,6 +14,7 @@
 #include <wallet/receive.h>
 #include <wallet/rpc/wallet.h>
 #include <wallet/rpc/util.h>
+#include <wallet/spend.h>
 #include <wallet/wallet.h>
 #include <wallet/walletutil.h>
 
@@ -23,6 +24,30 @@
 
 
 namespace wallet {
+
+static UniValue WalletLifecycleInfoToJSON(const WalletLifecycleAmounts& amounts,
+                                          int evaluation_height,
+                                          int64_t evaluation_mtp)
+{
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("evaluation_height", evaluation_height);
+    result.pushKV("evaluation_mtp", evaluation_mtp);
+    result.pushKV("ordinary_available", ValueFromAmount(amounts.ordinary_available));
+    result.pushKV("spendable_legacy", ValueFromAmount(amounts.spendable_legacy));
+    result.pushKV("spendable_quantum", ValueFromAmount(amounts.spendable_quantum));
+    UniValue categories(UniValue::VOBJ);
+    for (size_t i = 0; i < WalletLifecycleAmounts::CATEGORY_COUNT; ++i) {
+        UniValue category(UniValue::VOBJ);
+        category.pushKV("count", amounts.outputs[i]);
+        category.pushKV("nominal_amount", ValueFromAmount(amounts.nominal[i]));
+        category.pushKV("effective_amount", ValueFromAmount(amounts.effective[i]));
+        category.pushKV("burned_amount", ValueFromAmount(amounts.burned[i]));
+        categories.pushKV(ValueLifecycleCategoryName(static_cast<ValueLifecycleCategory>(i)),
+                          std::move(category));
+    }
+    result.pushKV("categories", std::move(categories));
+    return result;
+}
 
 static const std::map<uint64_t, std::string> WALLET_FLAG_CAVEATS{
     {WALLET_FLAG_AVOID_REUSE,
@@ -55,6 +80,21 @@ static RPCHelpMan getwalletinfo()
                         {RPCResult::Type::STR_AMOUNT, "stake", "DEPRECATED. Identical to getbalances().mine.stake"},
                         {RPCResult::Type::STR_AMOUNT, "unconfirmed_balance", "DEPRECATED. Identical to getbalances().mine.untrusted_pending"},
                         {RPCResult::Type::STR_AMOUNT, "immature_balance", "DEPRECATED. Identical to getbalances().mine.immature"},
+                        {RPCResult::Type::OBJ, "lifecycle", "trusted wallet UTXOs classified for the candidate next block", {
+                            {RPCResult::Type::NUM, "evaluation_height", "candidate next-block height"},
+                            {RPCResult::Type::NUM_TIME, "evaluation_mtp", "tip median-time-past used for classification"},
+                            {RPCResult::Type::STR_AMOUNT, "ordinary_available", "effective value available to ordinary sends"},
+                            {RPCResult::Type::STR_AMOUNT, "spendable_legacy", "effective ordinary-spendable legacy value"},
+                            {RPCResult::Type::STR_AMOUNT, "spendable_quantum", "effective ordinary-spendable direct quantum value"},
+                            {RPCResult::Type::OBJ_DYN, "categories", "mutually exclusive lifecycle categories", {
+                                {RPCResult::Type::OBJ, "category", "one lifecycle category", {
+                                    {RPCResult::Type::NUM, "count", "wallet UTXO count"},
+                                    {RPCResult::Type::STR_AMOUNT, "nominal_amount", "nominal value"},
+                                    {RPCResult::Type::STR_AMOUNT, "effective_amount", "demurrage-adjusted value"},
+                                    {RPCResult::Type::STR_AMOUNT, "burned_amount", "value removed by demurrage"},
+                                }},
+                            }},
+                        }},
                         {RPCResult::Type::NUM, "txcount", "the total number of transactions in the wallet"},
                         {RPCResult::Type::NUM_TIME, "keypoololdest", /*optional=*/true, "the " + UNIX_EPOCH_TIME + " of the oldest pre-generated key in the key pool. Legacy wallets only."},
                         {RPCResult::Type::NUM, "keypoolsize", "how many new keys are pre-generated (only counts external keys)"},
@@ -87,16 +127,26 @@ static RPCHelpMan getwalletinfo()
     const std::shared_ptr<const CWallet> pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return UniValue::VNULL;
 
+    for (;;) {
     // Make sure the results are valid at least up to the most recent block
-    // the user could have gotten from another RPC command prior to now
+    // the user could have gotten from another RPC command prior to now. A
+    // block can connect after this wait and before both locks are held, so
+    // retry until wallet transactions and the UTXO set identify the same tip.
     pwallet->BlockUntilSyncedToCurrentChain();
 
-    LOCK(pwallet->cs_wallet);
+    LOCK2(::cs_main, pwallet->cs_wallet);
+    if (!WalletLifecycleViewIsSynchronized(*pwallet)) continue;
 
     UniValue obj(UniValue::VOBJ);
 
     size_t kpExternalSize = pwallet->KeypoolCountExternalKeys();
-    const auto bal = GetBalance(*pwallet);
+    Balance bal;
+    WalletLifecycleSummary lifecycle;
+    std::string lifecycle_error;
+    if (!GetLifecycleAdjustedBalance(*pwallet, 0, /*avoid_reuse=*/true,
+                                     bal, lifecycle, lifecycle_error)) {
+        throw JSONRPCError(RPC_WALLET_ERROR, lifecycle_error);
+    }
     obj.pushKV("walletname", pwallet->GetName());
     obj.pushKV("walletversion", pwallet->GetVersion());
     obj.pushKV("format", pwallet->GetDatabase().Format());
@@ -104,6 +154,8 @@ static RPCHelpMan getwalletinfo()
     obj.pushKV("stake", ValueFromAmount(bal.m_mine_stake));
     obj.pushKV("unconfirmed_balance", ValueFromAmount(bal.m_mine_untrusted_pending));
     obj.pushKV("immature_balance", ValueFromAmount(bal.m_mine_immature));
+    obj.pushKV("lifecycle", WalletLifecycleInfoToJSON(
+        lifecycle.mine, lifecycle.evaluation_height, lifecycle.evaluation_mtp));
     obj.pushKV("txcount",       (int)pwallet->mapWallet.size());
     const auto kp_oldest = pwallet->GetOldestKeyPoolTime();
     if (kp_oldest.has_value()) {
@@ -148,6 +200,7 @@ static RPCHelpMan getwalletinfo()
 
     AppendLastProcessedBlock(obj, *pwallet);
     return obj;
+    }
 },
     };
 }
@@ -677,8 +730,6 @@ RPCHelpMan simulaterawtransaction()
     if (!rpc_wallet) return UniValue::VNULL;
     const CWallet& wallet = *rpc_wallet;
 
-    LOCK(wallet.cs_wallet);
-
     UniValue include_watchonly(UniValue::VNULL);
     if (request.params[1].isObject()) {
         UniValue options = request.params[1];
@@ -691,29 +742,36 @@ RPCHelpMan simulaterawtransaction()
         include_watchonly = options["include_watchonly"];
     }
 
+    const auto& txs = request.params[0].get_array();
+    std::vector<CMutableTransaction> decoded_txs;
+    decoded_txs.reserve(txs.size());
+    std::map<COutPoint, Coin> coins;
+    for (const UniValue& raw_tx : txs.getValues()) {
+        CMutableTransaction mtx;
+        if (!DecodeHexTx(mtx, raw_tx.get_str(), /* try_no_witness */ true, /* try_witness */ true)) {
+            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "Transaction hex string decoding failure.");
+        }
+        for (const CTxIn& txin : mtx.vin) {
+            coins.try_emplace(txin.prevout);
+        }
+        decoded_txs.push_back(std::move(mtx));
+    }
+    // Chain lookup is intentionally outside cs_wallet. The results are a
+    // point-in-time simulation input and need not be held atomically with
+    // wallet ownership accounting.
+    wallet.chain().findCoins(coins);
+
+    LOCK(wallet.cs_wallet);
     isminefilter filter = ISMINE_SPENDABLE;
     if (ParseIncludeWatchonly(include_watchonly, wallet)) {
         filter |= ISMINE_WATCH_ONLY;
     }
 
-    const auto& txs = request.params[0].get_array();
     CAmount changes{0};
     std::map<COutPoint, CAmount> new_utxos; // UTXO:s that were made available in transaction array
     std::set<COutPoint> spent;
 
-    for (size_t i = 0; i < txs.size(); ++i) {
-        CMutableTransaction mtx;
-        if (!DecodeHexTx(mtx, txs[i].get_str(), /* try_no_witness */ true, /* try_witness */ true)) {
-            throw JSONRPCError(RPC_DESERIALIZATION_ERROR, "Transaction hex string decoding failure.");
-        }
-
-        // Fetch previous transactions (inputs)
-        std::map<COutPoint, Coin> coins;
-        for (const CTxIn& txin : mtx.vin) {
-            coins[txin.prevout]; // Create empty map entry keyed by prevout.
-        }
-        wallet.chain().findCoins(coins);
-
+    for (const CMutableTransaction& mtx : decoded_txs) {
         // Fetch debit; we are *spending* these; if the transaction is signed and
         // broadcast, we will lose everything in these
         for (const auto& txin : mtx.vin) {
@@ -829,6 +887,7 @@ RPCHelpMan getnewaddress();
 RPCHelpMan getnewquantumcoldstakingaddress();
 RPCHelpMan getnewquantumaddress();
 RPCHelpMan getnewquantumstakeaddress();
+RPCHelpMan getquantumkeyinventory();
 RPCHelpMan getrawchangeaddress();
 RPCHelpMan setlabel();
 RPCHelpMan deladdressbook();
@@ -941,6 +1000,7 @@ Span<const CRPCCommand> GetWalletRPCCommands()
         {"wallet", &getnewquantumcoldstakingaddress},
         {"wallet", &getnewquantumaddress},
         {"wallet", &getnewquantumstakeaddress},
+        {"wallet", &getquantumkeyinventory},
         {"wallet", &getrawchangeaddress},
         {"wallet", &getreceivedbyaddress},
         {"wallet", &getreceivedbylabel},

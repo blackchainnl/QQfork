@@ -20,6 +20,7 @@
 #include <common/args.h>
 #include <consensus/amount.h>
 #include <consensus/consensus.h>
+#include <consensus/demurrage.h>
 #include <consensus/merkle.h>
 #include <consensus/tx_verify.h>
 #include <consensus/validation.h>
@@ -51,6 +52,7 @@
 #endif
 
 #include <algorithm>
+#include <limits>
 #include <set>
 #include <thread>
 #include <utility>
@@ -73,6 +75,11 @@ static bool IsShadowControlTx(const CTransaction& tx)
     return TransactionHasShadowProof(tx) || TransactionHasShadowSignal(tx);
 }
 
+static bool IsRepresentableHeaderTime(int64_t nTime)
+{
+    return nTime >= 0 && nTime <= std::numeric_limits<uint32_t>::max();
+}
+
 static bool IsPreMigrationQuantumSpendScript(const CScript& script_pub_key)
 {
     return IsQuantumMigrationScript(script_pub_key) ||
@@ -90,10 +97,9 @@ static bool IsFinalLockoutAllowedOutput(const CTransaction& tx, unsigned int out
     const CTxOut& txout = tx.vout[output_index];
     if (tx.IsCoinStake() && output_index == 0 && txout.IsEmpty()) return true;
     if (txout.IsEmpty()) return true;
-    if (IsOpReturnOutput(txout)) return true;
+    if (IsOpReturnOutput(txout)) return txout.nValue == 0;
     return IsQuantumMigrationScript(txout.scriptPubKey) ||
-           IsQuantumColdStakeScript(txout.scriptPubKey) ||
-           IsEUTXOScript(txout.scriptPubKey);
+           IsQuantumColdStakeScript(txout.scriptPubKey);
 }
 
 static bool IsPackageTxAllowedAfterFinalLockout(const CTransaction& tx, CCoinsViewCache& inputs, unsigned int flags, int spend_height, const Consensus::Params& consensus_params, int64_t spend_time)
@@ -105,9 +111,7 @@ static bool IsPackageTxAllowedAfterFinalLockout(const CTransaction& tx, CCoinsVi
         const Coin& coin = inputs.AccessCoin(txin.prevout);
         const bool is_quantum_spend = IsQuantumMigrationScript(coin.out.scriptPubKey) ||
                                       IsQuantumColdStakeScript(coin.out.scriptPubKey);
-        const bool is_eutxo_spend = IsEUTXOScript(coin.out.scriptPubKey);
-        if (!is_quantum_spend && !is_eutxo_spend) return false;
-        if (IsGoldRushDirectPayoutOutput(inputs, txin.prevout)) return false;
+        if (!is_quantum_spend) return false;
     }
 
     for (unsigned int i = 0; i < tx.vout.size(); ++i) {
@@ -118,28 +122,43 @@ static bool IsPackageTxAllowedAfterFinalLockout(const CTransaction& tx, CCoinsVi
     return CheckTieredStakePrincipalCovenant(tx, inputs, flags, spend_height, reject_reason, &consensus_params, spend_time);
 }
 
-int64_t UpdateTime(CBlock* pblock, const Consensus::Params& consensusParams, const CBlockIndex* pindexPrev)
+std::optional<uint32_t> UpdateTime(CBlock* pblock, Chainstate& active_chainstate,
+                                   const Consensus::Params& consensus_params,
+                                   const CBlockIndex* pindex_prev,
+                                   int64_t adjusted_time)
 {
-    int64_t nOldTime = pblock->nTime;
-    int64_t nNewTime{std::max<int64_t>(pindexPrev->GetMedianTimePast() + 1, GetAdjustedTimeSeconds())};
-
-    if (nOldTime < nNewTime) {
-        pblock->nTime = nNewTime;
+    const std::optional<int64_t> next_header_time =
+        GetNextBlockHeaderTime(active_chainstate, pindex_prev, adjusted_time);
+    if (!next_header_time || !IsRepresentableHeaderTime(*next_header_time)) {
+        LogPrintf("UpdateTime: no legal representable next-block header time at adjusted time %d\n",
+                  adjusted_time);
+        return std::nullopt;
     }
+
+    // This is intentionally a canonical assignment rather than an
+    // increment-only mutation. A cached template can be stale in either
+    // direction after adjusted time moves; callers must rebuild its package
+    // when the result differs from the template's selected-header time.
+    pblock->nTime = static_cast<uint32_t>(*next_header_time);
 
     // Updating time can change work required on testnet:
-    if (consensusParams.fPowAllowMinDifficultyBlocks) {
-        pblock->nBits = GetNextTargetRequired(pindexPrev, consensusParams, pblock->IsProofOfStake());
+    if (consensus_params.fPowAllowMinDifficultyBlocks) {
+        pblock->nBits = GetNextTargetRequired(pindex_prev, consensus_params, pblock->IsProofOfStake());
     }
 
-    return nNewTime - nOldTime;
+    return pblock->nTime;
 }
 
 int64_t GetMaxTransactionTime(CBlock* pblock)
 {
     int64_t maxTransactionTime = 0;
-    for (std::vector<CTransactionRef>::const_iterator it(pblock->vtx.begin()); it != pblock->vtx.end(); ++it)
-        maxTransactionTime = std::max(maxTransactionTime, (int64_t)it->get()->nTime);
+    for (std::vector<CTransactionRef>::const_iterator it(pblock->vtx.begin()); it != pblock->vtx.end(); ++it) {
+        // Version-2 transactions omit nTime from their wire encoding. A
+        // locally retained value must not change the header peers validate.
+        if (it->get()->nVersion < 2) {
+            maxTransactionTime = std::max(maxTransactionTime, (int64_t)it->get()->nTime);
+        }
+    }
     return maxTransactionTime;
 }
 
@@ -216,11 +235,20 @@ void BlockAssembler::resetBlock()
     // These counters do not include coinbase tx
     nBlockTx = 0;
     nFees = 0;
-    m_shadow_proof_selected = false;
+    m_shadow_proof_selected = 0;
     m_building_pos_template = false;
+    m_demurrage_attestation_keys.clear();
+    m_demurrage_attestation_targets.clear();
+    m_demurrage_attestation_count = 0;
+    m_next_block_fees.clear();
 }
 
-std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn, CWallet* pwallet, bool* pfPoSCancel, int64_t* pFees, CTxDestination destination)
+std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& scriptPubKeyIn,
+                                                                 CWallet* pwallet,
+                                                                 bool* pfPoSCancel,
+                                                                 int64_t* pFees,
+                                                                 CTxDestination destination,
+                                                                 std::optional<COutPoint> forced_kernel)
 {
     const auto time_start{SteadyClock::now()};
 
@@ -251,9 +279,30 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         pblock->nVersion = gArgs.GetIntArg("-blockversion", pblock->nVersion);
     }
 
-    pblock->nTime = GetAdjustedTimeSeconds();
+    const int64_t adjusted_time = GetAdjustedTimeSeconds();
     if (pwallet) {
-        pblock->nTime &= ~chainparams.GetConsensus().nStakeTimestampMask;
+        const std::optional<int64_t> pos_time = GetNextBlockPoSTime(
+            m_chainstate, pindexPrev, chainparams.GetConsensus(), adjusted_time);
+        if (!pos_time) {
+            if (pfPoSCancel) *pfPoSCancel = true;
+            return nullptr;
+        }
+        pblock->nTime = static_cast<uint32_t>(*pos_time);
+    } else {
+        // Package checks must use the same generic next-header timestamp
+        // retained by the final template. In particular, an accelerated chain
+        // can have MTP ahead of adjusted time while version-2 transactions
+        // carry no nTime. Do not use this non-wallet path to characterize
+        // current-mainnet block production: mainnet block assembly is
+        // proof-of-stake gated.
+        const std::optional<uint32_t> header_time = UpdateTime(
+            pblock, m_chainstate, chainparams.GetConsensus(), pindexPrev,
+            adjusted_time);
+        if (!header_time) {
+            LogPrintf("CreateNewBlock: no legal generic next-block header time at adjusted time %d\n",
+                      adjusted_time);
+            return nullptr;
+        }
     }
     m_lock_time_cutoff = pindexPrev->GetMedianTimePast();
 
@@ -266,7 +315,8 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     // not activated.
     // TODO: replace this with a call to main to assess validity of a mempool
     // transaction (which in most cases can be a no-op).
-    fIncludeWitness = DeploymentActiveAfter(pindexPrev, m_chainstate.m_chainman, Consensus::DEPLOYMENT_SEGWIT);
+    fIncludeWitness = DeploymentActiveAfter(pindexPrev, m_chainstate.m_chainman, Consensus::DEPLOYMENT_SEGWIT) ||
+        IsQuantumWitnessSpendActive(chainparams.GetConsensus(), pindexPrev->GetMedianTimePast(), nHeight);
 
     int nPackagesSelected = 0;
     int nDescendantsUpdated = 0;
@@ -292,9 +342,12 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         coinbaseTx.vout[0].scriptPubKey = scriptPubKeyIn;
         coinbaseTx.vout[0].nValue = nFees + GetBlockSubsidy(nHeight, chainparams.GetConsensus());
         const int64_t transition_mtp = pindexPrev->GetMedianTimePast();
+        const auto transition = chainparams.GetConsensus().GetQuantumLifecycleState(
+            transition_mtp, nHeight);
         const bool notice_window = nHeight >= SHADOW_REWARD_START_HEIGHT &&
-                                   chainparams.GetConsensus().IsProtocolV4(transition_mtp) &&
-                                   !chainparams.GetConsensus().IsQuantumFinalLockout(transition_mtp, nHeight);
+                                   transition.schedule_valid &&
+                                   transition.phase != Consensus::QuantumQuasarPhase::LEGACY &&
+                                   transition.phase != Consensus::QuantumQuasarPhase::FINAL_LOCKOUT;
         if (notice_window) {
             coinbaseTx.vout.push_back(CTxOut(0, BuildQuantumQuasarBlockNoticeScript()));
         }
@@ -311,27 +364,53 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
         txCoinStake.nTime = pblock->nTime;
 
         int64_t nSearchTime = txCoinStake.nTime; // search to current time
-        if (pwallet->m_last_coin_stake_search_time == 0) {
-            pwallet->m_last_coin_stake_search_time = nSearchTime - 1;
-        }
+        int64_t last_search_time{0};
+        uint256 last_search_tip;
+        // cs_main is already held by BlockAssembler. Never wait on the wallet
+        // here: an RPC may have a wallet snapshot in progress and must be
+        // allowed to finish without stalling block processing. Keep the
+        // successful try-lock through kernel selection so telemetry cannot be
+        // published for a search that lost a wallet-lock race and never ran.
+        TRY_LOCK(pwallet->cs_wallet, wallet_lock);
+        if (!wallet_lock) return nullptr;
+        last_search_time = pwallet->m_last_coin_stake_search_time;
+        last_search_tip = pwallet->m_last_coin_stake_search_tip;
+        if (last_search_time == 0) last_search_time = nSearchTime - 1;
 
-        if (nSearchTime > pwallet->m_last_coin_stake_search_time) {
+        const uint256 current_tip_hash = pindexPrev->GetBlockHash();
+        if (nSearchTime > last_search_time ||
+            (nSearchTime == last_search_time && current_tip_hash != last_search_tip)) {
             std::vector<CTransactionRef> selected_txs;
             selected_txs.reserve(pblock->vtx.size() > 0 ? pblock->vtx.size() - 1 : 0);
             for (size_t i = 1; i < pblock->vtx.size(); ++i) {
                 selected_txs.push_back(pblock->vtx[i]);
             }
-            if (wallet::CreateCoinStake(*pwallet, pblock->nBits, 1, txCoinStake, nFees, destination, selected_txs)) {
+            if (wallet::CreateCoinStake(*pwallet, pblock->nBits, 1, txCoinStake,
+                                         nFees, destination, selected_txs,
+                                         forced_kernel)) {
                 if (txCoinStake.nTime >= pindexPrev->GetMedianTimePast()+1) {
+                    // Packages were checked against the preselected aligned
+                    // header time. Do not let a wallet-side kernel search
+                    // advance that header after package selection: a v2
+                    // parent would then gain a newer UTXO timestamp than a
+                    // selected legacy descendant. A retry will build and
+                    // recheck a fresh template at the new time instead.
+                    if (txCoinStake.nVersion < 2 && txCoinStake.nTime != pblock->nTime) {
+                        pwallet->WalletLogPrintf(
+                            "CreateNewBlock: refusing coinstake time %u that differs from selected header time %u\n",
+                            txCoinStake.nTime, pblock->nTime);
+                        return nullptr;
+                    }
                     // Make the coinbase tx empty in case of proof of stake
                     coinbaseTx.vout[0].SetEmpty();
-                    pblock->nTime = coinbaseTx.nTime = txCoinStake.nTime;
+                    coinbaseTx.nTime = pblock->nTime;
                     pblock->vtx.insert(pblock->vtx.begin() + 1, MakeTransactionRef(CTransaction(txCoinStake)));
                     *pfPoSCancel = false;
                 }
             }
-            pwallet->m_last_coin_stake_search_interval = nSearchTime - pwallet->m_last_coin_stake_search_time;
+            pwallet->m_last_coin_stake_search_interval = nSearchTime - last_search_time;
             pwallet->m_last_coin_stake_search_time = nSearchTime;
+            pwallet->m_last_coin_stake_search_tip = current_tip_hash;
         }
         if (*pfPoSCancel)
             return nullptr; // peercoin: there is no point to continue if we failed to create coinstake
@@ -354,10 +433,35 @@ std::unique_ptr<CBlockTemplate> BlockAssembler::CreateNewBlock(const CScript& sc
     // Fill in header
     pblock->hashPrevBlock  = pindexPrev->GetBlockHash();
     if (pblock->IsProofOfStake()) {
-        pblock->nTime = pblock->vtx[1]->nTime ? pblock->vtx[1]->nTime : pblock->nTime;
+        // Only v1 carries an authoritative transaction timestamp. A v2
+        // coinstake's hidden local nTime disappears on the wire. The wallet
+        // must have used the header time selected before package checks.
+        if (pblock->vtx[1]->nVersion < 2 && pblock->vtx[1]->nTime) {
+            const int64_t coinstake_time = pblock->vtx[1]->nTime;
+            if (!IsRepresentableHeaderTime(coinstake_time)) {
+                LogPrintf("CreateNewBlock: refusing unrepresentable PoS header time %d\n",
+                          coinstake_time);
+                return nullptr;
+            }
+            if (coinstake_time != pblock->nTime) {
+                LogPrintf("CreateNewBlock: coinstake time %d differs from selected PoS header time %d\n",
+                          coinstake_time, pblock->nTime);
+                return nullptr;
+            }
+        }
     } else {
-        pblock->nTime = std::max(pindexPrev->GetMedianTimePast()+1, GetMaxTransactionTime(pblock));
-        UpdateTime(pblock, chainparams.GetConsensus(), pindexPrev);
+        // `addPackageTxs()` checked every package at the preselected generic
+        // header time. Mutating that time after selection can make a v2 parent
+        // acquire a later UTXO timestamp than a selected legacy child. Keep
+        // the selected header immutable; this is an invariant check only.
+        const int64_t required_header_time = std::max<int64_t>(
+            pindexPrev->GetMedianTimePast() + 1, GetMaxTransactionTime(pblock));
+        if (!IsRepresentableHeaderTime(required_header_time) ||
+            required_header_time > pblock->nTime) {
+            LogPrintf("CreateNewBlock: selected package requires header time %d, but candidate is %d\n",
+                      required_header_time, pblock->nTime);
+            return nullptr;
+        }
     }
     pblock->nNonce         = 0;
     pblocktemplate->vTxSigOpsCost[0] = WITNESS_SCALE_FACTOR * GetLegacySigOpCount(*pblock->vtx[0]);
@@ -406,7 +510,7 @@ bool BlockAssembler::TestPackage(uint64_t packageSize, int64_t packageSigOpsCost
 // - premature witness (in case segwit transactions are added to mempool before
 //   segwit activation)
 // - transaction timestamp limit
-bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package, uint32_t nTime) const
+bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& package, uint32_t nTime)
 {
     CBlockIndex* tip{Assert(m_chainstate.m_chain.Tip())};
     CCoinsViewMemPool view_mempool{&m_chainstate.CoinsTip(), *Assert(m_mempool)};
@@ -419,13 +523,37 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
         !IsQuantumWitnessSpendActive(chainparams.GetConsensus(), next_block_mtp, next_height);
     const bool final_quantum_lockout =
         chainparams.GetConsensus().IsQuantumFinalLockout(next_block_mtp, next_height);
+    std::set<uint256> attested_keys{m_demurrage_attestation_keys};
+    std::set<COutPoint> attestation_targets{m_demurrage_attestation_targets};
+    size_t attestation_count{m_demurrage_attestation_count};
+    std::map<uint256, CAmount> package_fees;
     unsigned int final_lockout_flags = SCRIPT_VERIFY_LEGACY_ECDSA_LOCKOUT |
                                        SCRIPT_VERIFY_QUANTUM_ML_DSA |
-                                       SCRIPT_VERIFY_QUANTUM_COLDSTAKE |
-                                       SCRIPT_VERIFY_EUTXO |
-                                       SCRIPT_VERIFY_V4_LARGE_SCRIPT_ELEMENT;
-    if (chainparams.GetConsensus().IsStakeTiersActive(next_height)) {
+                                       SCRIPT_VERIFY_QUANTUM_COLDSTAKE;
+    if (IsQuantumStakeTiersActive(chainparams.GetConsensus(), next_block_mtp, next_height)) {
         final_lockout_flags |= SCRIPT_VERIFY_QUANTUM_STAKE_TIERS;
+    }
+
+    // CCoinsViewMemPool intentionally gives a version-2 mempool output a
+    // non-authoritative zero timestamp: it has not yet been assigned a block
+    // header time. A template, however, is evaluating a concrete candidate
+    // header. Overlay every v2 output in its ancestor closure at that exact
+    // candidate time before checking any input. Prepopulating both already
+    // selected transactions and this candidate package keeps the result
+    // independent of the container's iteration order and avoids changing the
+    // global CCoinsViewMemPool semantics.
+    const auto overlay_v2_outputs = [&](const CTransaction& candidate_tx) {
+        if (candidate_tx.nVersion >= 2 &&
+            !candidate_tx.IsCoinBase() && !candidate_tx.IsCoinStake()) {
+            AddCoins(package_view, candidate_tx, next_height,
+                     /*check=*/true, nTime);
+        }
+    };
+    for (CTxMemPool::txiter selected : inBlock) {
+        overlay_v2_outputs(selected->GetTx());
+    }
+    for (CTxMemPool::txiter candidate : package) {
+        overlay_v2_outputs(candidate->GetTx());
     }
 
     for (CTxMemPool::txiter selected : inBlock) {
@@ -440,7 +568,8 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
             return false;
         }
         for (const CTxIn& txin : tx.vin) {
-            if (txin.prevout.IsNull() || !spent_outpoints.insert(txin.prevout).second) {
+            if (txin.prevout.IsNull() || attestation_targets.count(txin.prevout) ||
+                !spent_outpoints.insert(txin.prevout).second) {
                 return false;
             }
         }
@@ -469,24 +598,84 @@ bool BlockAssembler::TestPackageTransactions(const CTxMemPool::setEntries& packa
             !IsPackageTxAllowedAfterFinalLockout(tx, package_view, final_lockout_flags, next_height, chainparams.GetConsensus(), next_block_mtp)) {
             return false;
         }
-        // peercoin: timestamp limit
-        if (tx.nTime > GetAdjustedTimeSeconds() || (nTime && tx.nTime > nTime)) {
+        std::string demurrage_reject_reason;
+        const std::vector<Consensus::DemurrageAttestation> demurrage_attestations =
+            Consensus::ExtractDemurrageAttestations(tx);
+        if (!chainparams.GetConsensus().IsDemurrageActive(next_height, next_block_mtp) &&
+            !demurrage_attestations.empty()) {
+            return false;
+        }
+        for (const Consensus::DemurrageAttestation& attestation : demurrage_attestations) {
+            if (spent_outpoints.count(attestation.target_outpoint)) return false;
+            attestation_targets.insert(attestation.target_outpoint);
+        }
+        if (!Consensus::CheckDemurrageAttestations(tx, package_view, chainparams.GetConsensus(), next_height,
+                                                   next_block_mtp, attested_keys,
+                                                   attestation_count, demurrage_reject_reason)) {
+            LogPrint(BCLog::MEMPOOL, "Skipping transaction %s from block template: %s\n",
+                     tx.GetHash().ToString(), demurrage_reject_reason);
+            return false;
+        }
+        TxValidationState tx_state;
+        CAmount next_block_fee{0};
+        if (!Consensus::CheckTxInputs(tx, tx_state, package_view, next_height, nTime,
+                                      next_block_mtp, next_block_fee)) {
+            LogPrint(BCLog::MEMPOOL, "Skipping transaction %s from block template after next-block input recheck: %s\n",
+                     tx.GetHash().ToString(), tx_state.ToString());
+            return false;
+        }
+        std::string quantum_reject_reason;
+        const unsigned int next_block_flags = GetNextBlockPolicyScriptFlags(
+            tip, m_chainstate.m_chainman);
+        if (!CheckQuantumQuasarTransaction(tx, package_view, next_block_flags,
+                                           next_height, chainparams.GetConsensus(),
+                                           next_block_mtp, quantum_reject_reason)) {
+            LogPrint(BCLog::MEMPOOL, "Skipping transaction %s from block template after Quantum Quasar contextual recheck: %s\n",
+                     tx.GetHash().ToString(), quantum_reject_reason);
+            return false;
+        }
+        PrecomputedTransactionData txdata;
+        if (!CheckInputScripts(tx, tx_state, package_view,
+                               next_block_flags,
+                               /*cacheSigStore=*/true,
+                               /*cacheFullScriptStore=*/true, txdata)) {
+            LogPrint(BCLog::MEMPOOL, "Skipping transaction %s from block template after next-block script recheck: %s\n",
+                     tx.GetHash().ToString(), tx_state.ToString());
+            return false;
+        }
+        package_fees.emplace(tx.GetHash(), next_block_fee);
+        // peercoin: only v1 serializes a transaction timestamp. Applying this
+        // policy to a hidden v2 field makes local and relayed objects differ.
+        if (tx.nVersion < 2 &&
+            (tx.nTime > GetAdjustedTimeSeconds() || (nTime && tx.nTime > nTime))) {
             return false;
         }
     }
+    m_next_block_fees.insert(package_fees.begin(), package_fees.end());
     return true;
 }
 
 void BlockAssembler::AddToBlock(CTxMemPool::txiter iter)
 {
+    const CTransaction& tx = iter->GetTx();
+    const auto fee_it = m_next_block_fees.find(tx.GetHash());
+    // Every entry reaches AddToBlock only after TestPackageTransactions has
+    // recomputed its fee in the exact next-block demurrage context.
+    assert(fee_it != m_next_block_fees.end());
+    const CAmount next_block_fee = fee_it->second;
     pblocktemplate->block.vtx.emplace_back(iter->GetSharedTx());
-    pblocktemplate->vTxFees.push_back(iter->GetFee());
+    pblocktemplate->vTxFees.push_back(next_block_fee);
     pblocktemplate->vTxSigOpsCost.push_back(iter->GetSigOpCost());
     nBlockWeight += iter->GetTxWeight();
     ++nBlockTx;
     nBlockSigOpsCost += iter->GetSigOpCost();
-    nFees += iter->GetFee();
+    nFees += next_block_fee;
     inBlock.insert(iter);
+    for (const Consensus::DemurrageAttestation& attestation : Consensus::ExtractDemurrageAttestations(tx)) {
+        m_demurrage_attestation_keys.insert(attestation.pubkey_hash);
+        m_demurrage_attestation_targets.insert(attestation.target_outpoint);
+        ++m_demurrage_attestation_count;
+    }
 
     bool fPrintPriority = gArgs.GetBoolArg("-printpriority", DEFAULT_PRINTPRIORITY);
     if (fPrintPriority) {
@@ -673,24 +862,25 @@ void BlockAssembler::addPackageTxs(const CTxMemPool& mempool, int& nPackagesSele
         std::vector<CTxMemPool::txiter> sortedEntries;
         SortForBlock(ancestors, sortedEntries);
 
-        bool package_has_shadow_proof = false;
-        bool package_has_duplicate_shadow_proofs = false;
+        uint32_t package_shadow_proofs{0};
         for (CTxMemPool::txiter entry : sortedEntries) {
             if (!IsShadowProofTx(entry->GetTx())) continue;
-            if (package_has_shadow_proof || m_shadow_proof_selected) {
-                package_has_duplicate_shadow_proofs = true;
-                break;
-            }
-            package_has_shadow_proof = true;
+            ++package_shadow_proofs;
         }
-        if (package_has_shadow_proof && !m_building_pos_template) {
+        if (package_shadow_proofs > 0 && !m_building_pos_template) {
             if (fUsingModified) {
                 mapModifiedTx.get<ancestor_score>().erase(modit);
             }
             failedTx.insert(iter);
             continue;
         }
-        if (package_has_duplicate_shadow_proofs) {
+        const uint32_t shadow_proof_limit =
+            chainparams.GetConsensus().IsShadowCompetingClaimsActive(nHeight)
+                ? MAX_SHADOW_POW_EVALS_PER_BLOCK
+                : 1;
+        if (m_shadow_proof_selected > shadow_proof_limit ||
+            package_shadow_proofs > shadow_proof_limit -
+                                      m_shadow_proof_selected) {
             if (fUsingModified) {
                 mapModifiedTx.get<ancestor_score>().erase(modit);
             }
@@ -703,7 +893,7 @@ void BlockAssembler::addPackageTxs(const CTxMemPool& mempool, int& nPackagesSele
             // Erase from the modified set, if present
             mapModifiedTx.erase(sortedEntries[i]);
         }
-        if (package_has_shadow_proof) m_shadow_proof_selected = true;
+        m_shadow_proof_selected += package_shadow_proofs;
 
         ++nPackagesSelected;
 
@@ -739,7 +929,10 @@ static bool ProcessBlockFound(const CBlock* pblock, ChainstateManager& chainman)
     {
         LOCK(cs_main);
         BlockValidationState state;
-        if (!CheckProofOfStake(&chainman.BlockIndex()[pblock->hashPrevBlock], *pblock->vtx[1], pblock->nBits, state, chainman.ActiveChainstate().CoinsTip(), pblock->vtx[1]->nTime ? pblock->vtx[1]->nTime : pblock->nTime))
+        const uint32_t stake_time = pblock->vtx[1]->nVersion < 2 && pblock->vtx[1]->nTime
+            ? pblock->vtx[1]->nTime
+            : pblock->nTime;
+        if (!CheckProofOfStake(&chainman.BlockIndex()[pblock->hashPrevBlock], *pblock->vtx[1], pblock->nBits, state, chainman.ActiveChainstate().CoinsTip(), stake_time, chainman))
             return error("ProcessBlockFound(): proof-of-stake checking failed");
         
         if (pblock->hashPrevBlock != chainman.ActiveChain().Tip()->GetBlockHash())
@@ -866,19 +1059,26 @@ void PoSMiner(CWallet *pwallet)
 
     CTxDestination dest;
 
-    // Compute timeout for pos as sqrt(numUTXO)
-    unsigned int pos_timio;
+    // The old timeout path held cs_wallet and then acquired cs_main while
+    // scanning stakeable coins. Keep scheduling independent of wallet size:
+    // -staketimio is the complete retry interval. Never inflate it from wallet
+    // history: a long-lived wallet must not silently turn a configured
+    // sub-second retry into a multi-second or multi-minute pause.
+    const unsigned int pos_timio = static_cast<unsigned int>(
+        std::max<int64_t>(1, gArgs.GetIntArg("-staketimio", DEFAULT_STAKETIMIO)));
     {
-        LOCK2(pwallet->cs_wallet, cs_main);
         CBlockIndex* tip = pwallet->chain().getTip();
         const bool final_quantum_lockout = tip && Params().GetConsensus().IsQuantumFinalLockout(tip->GetMedianTimePast(), tip->nHeight + 1);
         if (!final_quantum_lockout) {
             const std::string label = "Staking Legacy Address";
-            pwallet->ForEachAddrBookEntry([&](const CTxDestination& _dest, const std::string& _label, bool _is_change, const std::optional<wallet::AddressPurpose>& _purpose) {
-                if (_is_change) return;
-                if (_label == label)
-                    dest = _dest;
-            });
+            {
+                LOCK(pwallet->cs_wallet);
+                pwallet->ForEachAddrBookEntry([&](const CTxDestination& _dest, const std::string& _label, bool _is_change, const std::optional<wallet::AddressPurpose>& _purpose) {
+                    if (_is_change) return;
+                    if (_label == label)
+                        dest = _dest;
+                });
+            }
 
             if (std::get_if<CNoDestination>(&dest)) {
                 // create mintkey address
@@ -889,18 +1089,16 @@ void PoSMiner(CWallet *pwallet)
             }
         }
 
-        std::vector<std::pair<const CWalletTx*, unsigned int> > vCoins;
-        CCoinControl coincontrol;
-        AvailableCoinsForStaking(*pwallet, vCoins, &coincontrol);
-        pos_timio = gArgs.GetIntArg("-staketimio", DEFAULT_STAKETIMIO) + 30 * sqrt(vCoins.size());
-        pwallet->WalletLogPrintf("Set proof-of-stake timeout: %ums for %u UTXOs\n", pos_timio, vCoins.size());
+        pwallet->WalletLogPrintf("Set proof-of-stake timeout: %ums; %u live wallet outputs indexed for staking\n",
+                                 pos_timio, pwallet->GetLiveUnspentStakeOutputCount());
     }
 
+    unsigned int assembly_failures{0};
     try {
         while (true)
         {
             while (pwallet->IsLocked() || !pwallet->m_enabled_staking || fReindex || pwallet->chain().chainman().m_blockman.m_importing) {
-                pwallet->m_last_coin_stake_search_interval = 0;
+                WITH_LOCK(pwallet->cs_wallet, pwallet->m_last_coin_stake_search_interval = 0);
                 if (!SleepStaker(pwallet, 5000))
                     return;
             }
@@ -914,14 +1112,14 @@ void PoSMiner(CWallet *pwallet)
                 (Params().IsTestChain() && gArgs.GetBoolArg("-solostaking", node::DEFAULT_SOLO_STAKING));
             if (!solo_staking) {
                 while (pwallet->chain().getNodeCount(ConnectionDirection::Both) == 0 || pwallet->chain().isInitialBlockDownload()) {
-                    pwallet->m_last_coin_stake_search_interval = 0;
+                    WITH_LOCK(pwallet->cs_wallet, pwallet->m_last_coin_stake_search_interval = 0);
                     if (!SleepStaker(pwallet, 10000))
                         return;
                 }
             }
 
             while (!solo_staking && GuessVerificationProgress(Params().TxData(), pwallet->chain().getTip()) < 0.996) {
-                pwallet->m_last_coin_stake_search_interval = 0;
+                WITH_LOCK(pwallet->cs_wallet, pwallet->m_last_coin_stake_search_interval = 0);
                 pwallet->WalletLogPrintf("Staker thread sleeps while sync at %f\n", GuessVerificationProgress(Params().TxData(), pwallet->chain().getTip()));
                 if (!SleepStaker(pwallet, 10000))
                     return;
@@ -933,22 +1131,24 @@ void PoSMiner(CWallet *pwallet)
             //
             // Create new block
             //
-            CBlockIndex* pindexPrev = pwallet->chain().getTip();
             bool fPoSCancel{false};
             int64_t pFees{0};
             CBlock *pblock;
             std::unique_ptr<CBlockTemplate> pblocktemplate;
 
+            try {
+                // BlockAssembler owns its chainstate locking and CreateCoinStake
+                // acquires cs_main before trying cs_wallet. Do not wrap it in a
+                // wallet-first lock pair.
+                pblocktemplate = BlockAssembler{pwallet->chain().chainman().ActiveChainstate(), &pwallet->chain().mempool()}.CreateNewBlock(GetScriptForDestination(dest), pwallet, &fPoSCancel, &pFees, dest);
+            }
+            catch (const std::runtime_error &e)
             {
-                LOCK2(pwallet->cs_wallet, cs_main);
-                try {
-                    pblocktemplate = BlockAssembler{pwallet->chain().chainman().ActiveChainstate(), &pwallet->chain().mempool()}.CreateNewBlock(GetScriptForDestination(dest), pwallet, &fPoSCancel, &pFees, dest);
-                }
-                catch (const std::runtime_error &e)
-                {
-                    pwallet->WalletLogPrintf("PoSMiner runtime error: %s\n", e.what());
-                    continue;
-                }
+                pwallet->WalletLogPrintf("PoSMiner runtime error: %s\n", e.what());
+                assembly_failures = std::min(assembly_failures + 1, 6U);
+                const uint64_t backoff_ms = std::min<uint64_t>(250ULL << (assembly_failures - 1), 5000ULL);
+                if (!SleepStaker(pwallet, backoff_ms)) return;
+                continue;
             }
 
             if (!pblocktemplate.get())
@@ -960,25 +1160,58 @@ void PoSMiner(CWallet *pwallet)
                     continue;
                 }
                 pwallet->WalletLogPrintf("Error in PoSMiner: Keypool ran out, please call keypoolrefill before restarting the mining thread\n");
+                pwallet->m_enabled_staking = false;
                 if (!SleepStaker(pwallet, 10000))
                    return;
 
                 return;
             }
             pblock = &pblocktemplate->block;
-            IncrementExtraNonce(pblock, pindexPrev, nExtraNonce);
+
+            const CBlockIndex* pindexPrev{nullptr};
+            int64_t prev_mtp{0};
+            int next_height{0};
+            bool stale_template{false};
+            {
+                LOCK(cs_main);
+                pindexPrev = pwallet->chain().chainman().m_blockman.LookupBlockIndex(pblock->hashPrevBlock);
+                const CBlockIndex* active_tip = pwallet->chain().chainman().ActiveChain().Tip();
+                if (!pindexPrev || !active_tip || active_tip != pindexPrev) {
+                    stale_template = true;
+                } else {
+                    prev_mtp = pindexPrev->GetMedianTimePast();
+                    next_height = pindexPrev->nHeight + 1;
+                    // IncrementExtraNonce keeps process-global previous-tip
+                    // state. Serialize it with the same chain lock used by all
+                    // template builders so concurrent wallet stakers cannot
+                    // race that static state after the old outer lock removal.
+                    IncrementExtraNonce(pblock, pindexPrev, nExtraNonce);
+                }
+            }
+            if (stale_template) {
+                if (!SleepStaker(pwallet, pos_timio)) return;
+                continue;
+            }
 
             // peercoin: if proof-of-stake block found then process block
             if (pblock->IsProofOfStake())
             {
+                bool signed_block{false};
                 {
-                    LOCK2(pwallet->cs_wallet, cs_main);
-                    if (!SignBlock(*pblock, *pwallet, Params().GetConsensus(), pindexPrev->GetMedianTimePast(), pindexPrev->nHeight + 1))
-                    {
-                        pwallet->WalletLogPrintf("PoSMiner: failed to sign PoS block\n");
-                        continue;
-                    }
+                    // Block signing uses wallet keys only. The phase context was
+                    // snapshotted above under cs_main; never hold the wallet lock
+                    // while entering chainstate here.
+                    LOCK(pwallet->cs_wallet);
+                    signed_block = SignBlock(*pblock, *pwallet, Params().GetConsensus(), prev_mtp, next_height);
                 }
+                if (!signed_block) {
+                    pwallet->WalletLogPrintf("PoSMiner: failed to sign PoS block\n");
+                    assembly_failures = std::min(assembly_failures + 1, 6U);
+                    const uint64_t backoff_ms = std::min<uint64_t>(250ULL << (assembly_failures - 1), 5000ULL);
+                    if (!SleepStaker(pwallet, backoff_ms)) return;
+                    continue;
+                }
+                assembly_failures = 0;
                 pwallet->WalletLogPrintf("PoSMiner: proof-of-stake block found %s\n", pblock->GetHash().ToString());
                 ProcessBlockFound(pblock, pwallet->chain().chainman());
                 // Rest for ~16 seconds after successful block to preserve close quick
@@ -1003,16 +1236,21 @@ void PoSMiner(CWallet *pwallet)
 void static ThreadStakeMiner(CWallet *pwallet)
 {
     pwallet->WalletLogPrintf("ThreadStakeMiner started\n");
-    while (true) {
+    unsigned int restart_failures{0};
+    while (!pwallet->IsStakeClosing()) {
         try {
             PoSMiner(pwallet);
-            break;
         }
         catch (std::exception& e) {
             PrintExceptionContinue(&e, "ThreadStakeMiner()");
         } catch (...) {
             PrintExceptionContinue(nullptr, "ThreadStakeMiner()");
         }
+        if (pwallet->IsStakeClosing()) break;
+        restart_failures = std::min(restart_failures + 1, 6U);
+        const uint64_t backoff_ms = std::min<uint64_t>(1000ULL << (restart_failures - 1), 30000ULL);
+        pwallet->WalletLogPrintf("ThreadStakeMiner restarting after unexpected exit in %ums\n", backoff_ms);
+        if (!SleepStaker(pwallet, backoff_ms)) break;
     }
     pwallet->WalletLogPrintf("ThreadStakeMiner stopped\n");
 }
@@ -1020,16 +1258,20 @@ void static ThreadStakeMiner(CWallet *pwallet)
 // qtum
 void StakeCoins(bool fStake, CWallet *pwallet, std::unique_ptr<std::vector<std::thread>>& threadStakeMinerGroup)
 {
-    // If threadStakeMinerGroup is initialized join all threads and clear the vector
-    if (threadStakeMinerGroup) {
-        for (std::thread& thread : *threadStakeMinerGroup)
-            if (thread.joinable()) thread.join();
-        threadStakeMinerGroup->clear();
-    }
-
     if (fStake) {
+        // Start is idempotent. Joining a live worker here would wait forever
+        // because only the stop path publishes m_stop_staking_thread.
+        if (threadStakeMinerGroup && !threadStakeMinerGroup->empty()) return;
         threadStakeMinerGroup = std::make_unique<std::vector<std::thread>>();
         threadStakeMinerGroup->emplace_back(std::thread(&ThreadStakeMiner, pwallet));
+        return;
+    }
+
+    if (threadStakeMinerGroup) {
+        for (std::thread& thread : *threadStakeMinerGroup) {
+            if (thread.joinable()) thread.join();
+        }
+        threadStakeMinerGroup->clear();
     }
 }
 #endif

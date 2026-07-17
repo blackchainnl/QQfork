@@ -1,3 +1,4 @@
+// Copyright (c) 2016-present The Bitcoin Core developers
 // Copyright (c) 2016-present Blackcoin Core Developers
 // Copyright (c) 2016-present Blackcoin More Developers
 // Copyright (c) 2016-present Quantum Quasar Developers
@@ -18,6 +19,7 @@ std::string RemovalReasonToString(const MemPoolRemovalReason& r) noexcept
         case MemPoolRemovalReason::BLOCK: return "block";
         case MemPoolRemovalReason::CONFLICT: return "conflict";
         case MemPoolRemovalReason::REPLACED: return "replaced";
+        case MemPoolRemovalReason::SHADOW_STALE: return "shadow-stale";
     }
     assert(false);
 }

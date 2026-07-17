@@ -1,3 +1,4 @@
+// Copyright (c) 2021-2022 The Bitcoin Core developers
 // Copyright (c) 2021-2022 Blackcoin Core Developers
 // Copyright (c) 2021-2022 Blackcoin More Developers
 // Copyright (c) 2021-2022 Quantum Quasar Developers
@@ -23,7 +24,7 @@ std::unique_ptr<CWallet> CreateSyncedWallet(interfaces::Chain& chain, CChain& cc
 {
     auto wallet = std::make_unique<CWallet>(&chain, "", CreateMockableWalletDatabase());
     {
-        LOCK2(wallet->cs_wallet, ::cs_main);
+        LOCK2(::cs_main, wallet->cs_wallet);
         wallet->SetLastBlockProcessed(cchain.Height(), cchain.Tip()->GetBlockHash());
     }
     wallet->LoadWallet();
@@ -125,12 +126,13 @@ DatabaseCursor::Status MockableCursor::Next(DataStream& key, DataStream& value)
 
 bool MockableBatch::ReadKey(DataStream&& key, DataStream& value)
 {
-    if (!m_pass) {
+    if (!m_database.m_pass) {
         return false;
     }
     SerializeData key_data{key.begin(), key.end()};
-    const auto& it = m_records.find(key_data);
-    if (it == m_records.end()) {
+    const auto& records = Records();
+    const auto& it = records.find(key_data);
+    if (it == records.end()) {
         return false;
     }
     value.clear();
@@ -140,12 +142,13 @@ bool MockableBatch::ReadKey(DataStream&& key, DataStream& value)
 
 bool MockableBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrite)
 {
-    if (!m_pass) {
+    if (ShouldFailWrite()) {
         return false;
     }
     SerializeData key_data{key.begin(), key.end()};
     SerializeData value_data{value.begin(), value.end()};
-    auto [it, inserted] = m_records.emplace(key_data, value_data);
+    auto& records = Records();
+    auto [it, inserted] = records.emplace(key_data, value_data);
     if (!inserted && overwrite) { // Overwrite if requested
         it->second = value_data;
         inserted = true;
@@ -155,38 +158,90 @@ bool MockableBatch::WriteKey(DataStream&& key, DataStream&& value, bool overwrit
 
 bool MockableBatch::EraseKey(DataStream&& key)
 {
-    if (!m_pass) {
+    if (ShouldFailWrite()) {
         return false;
     }
     SerializeData key_data{key.begin(), key.end()};
-    m_records.erase(key_data);
+    Records().erase(key_data);
     return true;
 }
 
 bool MockableBatch::HasKey(DataStream&& key)
 {
-    if (!m_pass) {
+    if (!m_database.m_pass) {
         return false;
     }
     SerializeData key_data{key.begin(), key.end()};
-    return m_records.count(key_data) > 0;
+    return Records().count(key_data) > 0;
 }
 
 bool MockableBatch::ErasePrefix(Span<const std::byte> prefix)
 {
-    if (!m_pass) {
+    if (ShouldFailWrite()) {
         return false;
     }
-    auto it = m_records.begin();
-    while (it != m_records.end()) {
+    auto& records = Records();
+    auto it = records.begin();
+    while (it != records.end()) {
         auto& key = it->first;
         if (key.size() < prefix.size() || std::search(key.begin(), key.end(), prefix.begin(), prefix.end()) != key.begin()) {
             it++;
             continue;
         }
-        it = m_records.erase(it);
+        it = records.erase(it);
     }
     return true;
+}
+
+MockableData& MockableBatch::Records()
+{
+    return m_transaction_records ? *m_transaction_records : m_database.m_records;
+}
+
+const MockableData& MockableBatch::Records() const
+{
+    return m_transaction_records ? *m_transaction_records : m_database.m_records;
+}
+
+bool MockableBatch::ShouldFailWrite()
+{
+    if (!m_database.m_pass) return true;
+    const size_t write_index = m_database.m_write_calls++;
+    return m_database.m_fail_write_at && write_index == *m_database.m_fail_write_at;
+}
+
+std::unique_ptr<DatabaseCursor> MockableBatch::GetNewCursor()
+{
+    return std::make_unique<MockableCursor>(Records(), m_database.m_pass);
+}
+
+std::unique_ptr<DatabaseCursor> MockableBatch::GetNewPrefixCursor(Span<const std::byte> prefix)
+{
+    return std::make_unique<MockableCursor>(Records(), m_database.m_pass, prefix);
+}
+
+bool MockableBatch::TxnBegin(bool durable)
+{
+    if (!m_database.m_pass || m_database.m_fail_begin || m_transaction_records) return false;
+    m_database.m_write_calls = 0;
+    m_database.m_last_txn_durable = durable;
+    m_transaction_records = m_database.m_records;
+    return true;
+}
+
+bool MockableBatch::TxnCommit()
+{
+    if (!m_database.m_pass || !m_transaction_records || m_database.m_fail_commit) return false;
+    m_database.m_records = std::move(*m_transaction_records);
+    m_transaction_records.reset();
+    return true;
+}
+
+bool MockableBatch::TxnAbort()
+{
+    if (!m_transaction_records) return false;
+    m_transaction_records.reset();
+    return m_database.m_pass;
 }
 
 std::unique_ptr<WalletDatabase> CreateMockableWalletDatabase(MockableData records)

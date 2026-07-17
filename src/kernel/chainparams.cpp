@@ -86,13 +86,23 @@ static CBlock CreateGenesisBlock(uint32_t nTime, uint32_t nNonce, uint32_t nBits
 class CMainParams : public CChainParams {
 public:
     CMainParams() {
+        // Test-chain construction can compress the process-local shadow
+        // schedule. Re-selecting mainnet must always restore immutable
+        // production reward heights before any consensus consumer runs.
+        SetShadowTestSchedule(MAINNET_SHADOW_WHITELIST_HEIGHT,
+                              MAINNET_SHADOW_REWARD_START_HEIGHT,
+                              MAINNET_SHADOW_GOLD_RUSH_BLOCKS);
+        SetShadowTestHalvingInterval(MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS);
         m_chain_type = ChainType::MAIN;
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nMaxReorganizationDepth = 500;
         consensus.CSVHeight = 4908715;
-        consensus.SegwitHeight = std::numeric_limits<int>::max(); // std::numeric_limits<int>::max()
-        consensus.MinBIP9WarningHeight = std::numeric_limits<int>::max(); // segwit activation height + miner confirmation window
+        // Preserve the designated legacy chain's buried SegWit activation.
+        // The versionbits entry below remains for configuration/RPC
+        // compatibility but is ignored when this height override is set.
+        consensus.SegwitHeight = 5805000;
+        consensus.MinBIP9WarningHeight = 5820000;
         consensus.powLimit = uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         consensus.posLimit = uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         consensus.posLimitV2 = uint256S("000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -111,12 +121,16 @@ public:
 
         // Deployment of SegWit (BIP141, BIP143, and BIP147)
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].bit = 1;
-        consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nStartTime = 1750377600; // Friday, June 20, 2025 12:00:00 AM
+        consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].min_activation_height = 0; // No activation delay
 
         // Deployment of Taproot (BIPs 340-342)
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit = 2;
+        // Keep the default legacy/mainnet deployment schedule. The separate
+        // 28.x development branch's July 2026 start is not active on the
+        // designated legacy release line and must not become an incidental
+        // Gold Rush consensus change.
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0; // No activation delay
@@ -128,8 +142,9 @@ public:
         consensus.vDeployments[Consensus::DEPLOYMENT_QUANTUM_QUASAR].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_QUANTUM_QUASAR].min_activation_height = 0;
 
-        // Post-quantum migration readiness signalling. The final lockout deadline is the
-        // deterministic 24-month deadline, not the versionbits state.
+        // Post-quantum migration readiness signalling. The mainnet lifecycle
+        // heights below, not versionbits state or nominal time anchors, decide
+        // Final Lockout.
         consensus.vDeployments[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].bit = 4;
         consensus.vDeployments[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].nStartTime = 1713938400;
         consensus.vDeployments[Consensus::DEPLOYMENT_QUANTUM_MIGRATION].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
@@ -139,17 +154,31 @@ public:
         consensus.nProtocolV2Time = 1407053625;
         consensus.nProtocolV3Time = 1444028400;
         consensus.nProtocolV3_1Time = 1713938400;
-        consensus.nProtocolV4Time = Consensus::QUANTUM_QUASAR_MAINNET_V4_TIME; // Future date for mainnet
+        consensus.nProtocolV4Time = Consensus::QUANTUM_QUASAR_MAINNET_V4_TIME; // Nominal forecast anchor; mainnet phases are height-authoritative.
         consensus.nGoldRushEndTime = consensus.nProtocolV4Time + Consensus::QUANTUM_QUASAR_GOLD_RUSH_SECONDS;
         consensus.nQuantumMigrationDeadlineTime = consensus.nGoldRushEndTime + Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS;
+        consensus.nQuantumLifecycleStartHeight = MAINNET_SHADOW_REWARD_START_HEIGHT;
+        consensus.nGoldRushEndHeight = MAINNET_SHADOW_REWARD_END_HEIGHT;
+        consensus.nQuantumMigrationEndHeight = MAINNET_QUANTUM_MIGRATION_END_HEIGHT;
         consensus.nQuantumSighashChainId = 0x424c4b00; // "BLK\0": mainnet ML-DSA replay domain
-        consensus.nDemurrageMinActivationHeight = SHADOW_REWARD_END_HEIGHT + 1;
+        // The first Final-Lockout block also starts demurrage with zero
+        // inactivity. This is automatic, height-exact, and non-retroactive.
+        consensus.nDemurrageActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
+        consensus.nDemurrageMinActivationHeight = consensus.nDemurrageActivationHeight;
+        consensus.nStakeTierActivationHeight = consensus.nGoldRushEndHeight + 1;
+        consensus.nStakeRewardSplitActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
+        consensus.nShadowCompetingClaimsActivationHeight =
+            MAINNET_SHADOW_COMPETING_CLAIMS_ACTIVATION_HEIGHT;
+        // QQP4 is intentionally not activated by this alpha/beta release.
+        // The new v30.1.1 QQP3 boundary above is the only scheduled mainnet
+        // competing-claim transition until a separately announced hard fork.
+        consensus.nShadowQQP4ActivationHeight = std::numeric_limits<int>::max();
         consensus.nLastPOWBlock = 10000;
         consensus.nStakeTimestampMask = 0xf; // 15
         consensus.nCoinbaseMaturity = 500;
 
-        consensus.nMinimumChainWork = uint256S("0x000000000000000000000000000000000000000000000517dc2f2562502bd3fa"); // block 5930000
-        consensus.defaultAssumeValid = uint256S("0xc40cf9cffb440f09a38e26d0a4f3c3514587641900f2cb90204186ff882533e5"); // block 5930000
+        consensus.nMinimumChainWork = uint256S("0x000000000000000000000000000000000000000000000517e2d8a11f8c35a13e"); // block 5930110
+        consensus.defaultAssumeValid = uint256S("0x544cc4c650dc758ce20626101533f0476f3f987add3aae0d68e791e01bad013f"); // block 5930110
 
         /**
          * The message start string is designed to be unlikely to occur in normal data.
@@ -201,19 +230,14 @@ public:
                 { 872456, uint256S("0xe4fd321ced1de06213d2e246b150b4bfd8c4aa0989965dce88f2a58668c64860")}, // hardfork
                 {4232630, uint256S("0xae0c2a9bd13746e2887ca57bf1046b3c787a5ed1068fd1633a3575f08ee291fc")}, // Devfund
                 {4908715, uint256S("0x6f8e37e21aa2fba3f8e2d6825cb825ca290e9367ed08b8c30943bc16efcba119")}, // hardfork
-                {5930000, uint256S("0xc40cf9cffb440f09a38e26d0a4f3c3514587641900f2cb90204186ff882533e5")}, // A4 header anchor
+                {5805000, uint256S("0xd46da886008c871fa10f6a793b9c62df949a915cecf01e34b3d6467e59e37459")}, // SegWit activated
+                {5930110, uint256S("0x544cc4c650dc758ce20626101533f0476f3f987add3aae0d68e791e01bad013f")}, // OP_RETURN staking
             }
         };
 
-        m_assumeutxo_data = {
-            {
-                // Data from local upgraded full node RPC: dumptxoutset assumeutxo-mainnet-5932227.dat
-                .height = 5932227,
-                .hash_serialized = AssumeutxoHash{uint256S("0xddffdbd89f611c4ec55e7dfdc67ba4e4fc9ce152ca0fd862b21593da087592c6")},
-                .nChainTx = 17224254,
-                .blockhash = uint256S("0xc6cabaa990056e97b2c8a7c71dfba586cb0147aeeacfa5e07ef105fd61aeaf60")
-            },
-        };
+        // Disabled until the snapshot commitment authenticates every
+        // consensus-relevant Coin field, including nTime and fCoinStake.
+        m_assumeutxo_data = {};
 
         chainTxData = ChainTxData{
             // Data from local upgraded full node RPC: getchaintxstats 40500 c40cf9cffb440f09a38e26d0a4f3c3514587641900f2cb90204186ff882533e5
@@ -233,13 +257,17 @@ public:
 class CTestNetParams : public CChainParams {
 public:
     explicit CTestNetParams(const TestNetOptions& opts) {
+        SetShadowTestSchedule(MAINNET_SHADOW_WHITELIST_HEIGHT,
+                              MAINNET_SHADOW_REWARD_START_HEIGHT,
+                              MAINNET_SHADOW_GOLD_RUSH_BLOCKS);
+        SetShadowTestHalvingInterval(MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS);
         m_chain_type = ChainType::TESTNET;
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nMaxReorganizationDepth = 500;
         consensus.CSVHeight = 1320664;
-        consensus.SegwitHeight = std::numeric_limits<int>::max(); // std::numeric_limits<int>::max()
-        consensus.MinBIP9WarningHeight = std::numeric_limits<int>::max(); // segwit activation height + miner confirmation window
+        consensus.SegwitHeight = 2070000;
+        consensus.MinBIP9WarningHeight = 2085000;
         consensus.powLimit = uint256S("0000ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         consensus.posLimit = uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         consensus.posLimitV2 = uint256S("000000000000ffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -258,13 +286,13 @@ public:
 
         // Deployment of SegWit (BIP141, BIP143, and BIP147)
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].bit = 1;
-        consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nStartTime = 1727100000; // Monday, September 23, 2024 2:00:00 PM
+        consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].min_activation_height = 0; // No activation delay
 
         // Deployment of Taproot (BIPs 340-342)
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit = 2;
-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = 1780300000; // June 1, 2026
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0; // No activation delay
 
@@ -287,6 +315,12 @@ public:
         consensus.nProtocolV4Time = 0; // Instantly active on testnet
         consensus.nGoldRushEndTime = Consensus::QUANTUM_QUASAR_MAINNET_V4_TIME + Consensus::QUANTUM_QUASAR_GOLD_RUSH_SECONDS;
         consensus.nQuantumMigrationDeadlineTime = consensus.nGoldRushEndTime + Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS;
+        consensus.nQuantumLifecycleStartHeight = 0;
+        consensus.nGoldRushEndHeight = MAINNET_SHADOW_REWARD_END_HEIGHT;
+        consensus.nQuantumMigrationEndHeight = consensus.nGoldRushEndHeight +
+            (Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS + consensus.nTargetSpacing - 1) / consensus.nTargetSpacing;
+        consensus.nStakeTierActivationHeight = consensus.nGoldRushEndHeight + 1;
+        consensus.nStakeRewardSplitActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
         consensus.nQuantumSighashChainId = 0x424c4b01; // "BLK\1": testnet ML-DSA replay domain
         if (opts.quantum_v4_time) consensus.nProtocolV4Time = *opts.quantum_v4_time;
         if (opts.quantum_gold_rush_end_time) consensus.nGoldRushEndTime = *opts.quantum_gold_rush_end_time;
@@ -305,7 +339,26 @@ public:
         if (opts.shadow_halving_interval_blocks) {
             SetShadowTestHalvingInterval(*opts.shadow_halving_interval_blocks);
         }
-        consensus.nDemurrageMinActivationHeight = SHADOW_REWARD_END_HEIGHT + 1;
+        if (!opts.quantum_gold_rush_end_height && !opts.quantum_migration_end_height &&
+            !opts.quantum_gold_rush_end_time && !opts.quantum_migration_deadline_time &&
+            (opts.shadow_whitelist_height || opts.shadow_gold_rush_start_height || opts.shadow_gold_rush_blocks)) {
+            consensus.nGoldRushEndHeight = SHADOW_REWARD_END_HEIGHT;
+            consensus.nQuantumMigrationEndHeight = consensus.nGoldRushEndHeight +
+                (Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS + consensus.nTargetSpacing - 1) / consensus.nTargetSpacing;
+        }
+        consensus.nStakeTierActivationHeight = consensus.nGoldRushEndHeight > 0
+            ? consensus.nGoldRushEndHeight + 1
+            : std::numeric_limits<int>::max();
+        consensus.nStakeRewardSplitActivationHeight = consensus.nQuantumMigrationEndHeight > 0
+            ? consensus.nQuantumMigrationEndHeight + 1
+            : std::numeric_limits<int>::max();
+        consensus.nShadowCompetingClaimsActivationHeight = SHADOW_REWARD_START_HEIGHT;
+        if (consensus.UsesHeightLifecycle() && consensus.IsQuantumLifecycleScheduleOrdered()) {
+            consensus.nDemurrageActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
+            consensus.nDemurrageMinActivationHeight = consensus.nDemurrageActivationHeight;
+        } else {
+            consensus.nDemurrageMinActivationHeight = SHADOW_REWARD_END_HEIGHT + 1;
+        }
         if (opts.segwit_activation_height) consensus.SegwitHeight = *opts.segwit_activation_height;
         for (const auto& [deployment_pos, version_bits_params] : opts.version_bits_parameters) {
             consensus.vDeployments[deployment_pos].nStartTime = version_bits_params.start_time;
@@ -316,8 +369,8 @@ public:
         consensus.nStakeTimestampMask = 0xf;
         consensus.nCoinbaseMaturity = 10;
 
-        consensus.nMinimumChainWork = uint256S("0x00000000000000000000000000000000000000000000008caf69d9a41416d590"); // block 2856326
-        consensus.defaultAssumeValid = uint256S("0xf9fb773326a5207dc9cb86b6521141dfff199c5fce086665a6ef84df32c904af"); // block 2856326
+        consensus.nMinimumChainWork = uint256S("0x00000000000000000000000000000000000000000000008da52e1d2219de5a78"); // block 2865000
+        consensus.defaultAssumeValid = uint256S("0xdb325f728786683ce330b11ba7bc0a9627fb94ba5a460ec76a09b54720f17486"); // block 2865000
 
         pchMessageStart[0] = 0xcd;
         pchMessageStart[1] = 0xf2;
@@ -363,19 +416,13 @@ public:
                 {1320664, uint256S("0x64fa6a5414c6797629d34ef150c46486a5e1d49d2bceb87d6da14a501f838afd")}, // hardfork
                 {1415393, uint256S("0x5d5c42500cc6057533e249ba9eeb9b5e998aff30468c904bc267ec9bccbc8b39")}, // start devfund
                 {2070000, uint256S("0xf8e2c3919353487f73cd957f29654dc00a3b0c99a9fbf38a3514cdead626f0ec")}, // segwit activated
-                {2856326, uint256S("0xf9fb773326a5207dc9cb86b6521141dfff199c5fce086665a6ef84df32c904af")}, // A4 peer-observed header anchor
+                {2865000, uint256S("0xdb325f728786683ce330b11ba7bc0a9627fb94ba5a460ec76a09b54720f17486")}, // Taproot activated
             }
         };
 
-        m_assumeutxo_data = {
-            {
-                // Data from local upgraded full node RPC: dumptxoutset assumeutxo-testnet-2856723.dat
-                .height = 2856723,
-                .hash_serialized = AssumeutxoHash{uint256S("0xf1d3f47080a243efa3ffef63a8e0274ab24ad08d188b2dad861f064fdbca4bbb")},
-                .nChainTx = 5733999,
-                .blockhash = uint256S("0x3ed5a1f7d32acfdb3506459cb8ab61d5941315609b0b8b3addef13cf0058c67d")
-            },
-        };
+        // Production snapshots are disabled until their commitments cover
+        // every consensus-relevant Coin field.
+        m_assumeutxo_data = {};
 
         chainTxData = ChainTxData{
             // Data from local upgraded full node RPC: getchaintxstats 40500 f9fb773326a5207dc9cb86b6521141dfff199c5fce086665a6ef84df32c904af
@@ -396,6 +443,10 @@ class SigNetParams : public CChainParams {
 public:
     explicit SigNetParams(const SigNetOptions& options)
     {
+        SetShadowTestSchedule(MAINNET_SHADOW_WHITELIST_HEIGHT,
+                              MAINNET_SHADOW_REWARD_START_HEIGHT,
+                              MAINNET_SHADOW_GOLD_RUSH_BLOCKS);
+        SetShadowTestHalvingInterval(MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS);
         std::vector<uint8_t> bin;
         vSeeds.clear();
 
@@ -463,7 +514,7 @@ public:
 
         // Deployment of SegWit (BIP141, BIP143, and BIP147)
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].bit = 1;
-        consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].min_activation_height = 0; // No activation delay
 
@@ -490,8 +541,16 @@ public:
         consensus.nProtocolV4Time = 0; // Instantly active on signet
         consensus.nGoldRushEndTime = Consensus::QUANTUM_QUASAR_MAINNET_V4_TIME + Consensus::QUANTUM_QUASAR_GOLD_RUSH_SECONDS;
         consensus.nQuantumMigrationDeadlineTime = consensus.nGoldRushEndTime + Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS;
+        consensus.nQuantumLifecycleStartHeight = 0;
+        consensus.nGoldRushEndHeight = MAINNET_SHADOW_REWARD_END_HEIGHT;
+        consensus.nQuantumMigrationEndHeight = consensus.nGoldRushEndHeight +
+            (Consensus::QUANTUM_QUASAR_MIGRATION_SECONDS + consensus.nTargetSpacing - 1) / consensus.nTargetSpacing;
+        consensus.nStakeTierActivationHeight = consensus.nGoldRushEndHeight + 1;
+        consensus.nStakeRewardSplitActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
+        consensus.nShadowCompetingClaimsActivationHeight = MAINNET_SHADOW_REWARD_START_HEIGHT;
+        consensus.nDemurrageActivationHeight = consensus.nQuantumMigrationEndHeight + 1;
         consensus.nQuantumSighashChainId = 0x424c4b02; // "BLK\2": signet ML-DSA replay domain
-        consensus.nDemurrageMinActivationHeight = SHADOW_REWARD_END_HEIGHT + 1;
+        consensus.nDemurrageMinActivationHeight = consensus.nDemurrageActivationHeight;
         consensus.nLastPOWBlock = 0x7fffffff;
         consensus.nStakeTimestampMask = 0xf;
         consensus.nCoinbaseMaturity = 10;
@@ -537,12 +596,16 @@ class CRegTestParams : public CChainParams
 public:
     explicit CRegTestParams(const RegTestOptions& opts)
     {
+        SetShadowTestSchedule(MAINNET_SHADOW_WHITELIST_HEIGHT,
+                              MAINNET_SHADOW_REWARD_START_HEIGHT,
+                              MAINNET_SHADOW_GOLD_RUSH_BLOCKS);
+        SetShadowTestHalvingInterval(MAINNET_SHADOW_HALVING_INTERVAL_BLOCKS);
         m_chain_type = ChainType::REGTEST;
         consensus.signet_blocks = false;
         consensus.signet_challenge.clear();
         consensus.nMaxReorganizationDepth = 50;
         consensus.CSVHeight = 1;
-        consensus.SegwitHeight = 1;
+        consensus.SegwitHeight = 0;
         consensus.MinBIP9WarningHeight = 0;
         consensus.powLimit = uint256S("7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
         consensus.posLimit = uint256S("00000fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
@@ -562,14 +625,14 @@ public:
 
         // Deployment of SegWit (BIP141, BIP143, and BIP147)
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].bit = 1;
-        consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_SEGWIT].min_activation_height = 0; // No activation delay
         if (opts.segwit_activation_height) consensus.SegwitHeight = *opts.segwit_activation_height;
 
         // Deployment of Taproot (BIPs 340-342)
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].bit = 2;
-        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = Consensus::BIP9Deployment::NEVER_ACTIVE;
+        consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nStartTime = Consensus::BIP9Deployment::ALWAYS_ACTIVE;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].nTimeout = Consensus::BIP9Deployment::NO_TIMEOUT;
         consensus.vDeployments[Consensus::DEPLOYMENT_TAPROOT].min_activation_height = 0; // No activation delay
 
@@ -608,13 +671,56 @@ public:
         if (opts.quantum_v4_time) consensus.nProtocolV4Time = *opts.quantum_v4_time;
         if (opts.quantum_gold_rush_end_time) consensus.nGoldRushEndTime = *opts.quantum_gold_rush_end_time;
         if (opts.quantum_migration_deadline_time) consensus.nQuantumMigrationDeadlineTime = *opts.quantum_migration_deadline_time;
-        if (opts.quantum_gold_rush_end_height) consensus.nGoldRushEndHeight = *opts.quantum_gold_rush_end_height;
-        if (opts.quantum_migration_end_height) consensus.nQuantumMigrationEndHeight = *opts.quantum_migration_end_height;
+        if (opts.quantum_gold_rush_end_height && opts.quantum_migration_end_height) {
+            // Test-chain height schedules retain the historical behavior in
+            // which Protocol V4 is active from genesis; only their compressed
+            // Gold Rush/Migration end heights are overridden.
+            consensus.nQuantumLifecycleStartHeight = 0;
+            consensus.nGoldRushEndHeight = *opts.quantum_gold_rush_end_height;
+            consensus.nQuantumMigrationEndHeight = *opts.quantum_migration_end_height;
+        }
         if (opts.quantum_stake_tiers_activation_height) consensus.nStakeTierActivationHeight = *opts.quantum_stake_tiers_activation_height;
         if (opts.quantum_stake_reward_split_activation_height) consensus.nStakeRewardSplitActivationHeight = *opts.quantum_stake_reward_split_activation_height;
         if (opts.quantum_demurrage_activation_height) consensus.nDemurrageActivationHeight = *opts.quantum_demurrage_activation_height;
         if (opts.quantum_demurrage_blocks_per_month) consensus.nDemurrageBlocksPerMonth = *opts.quantum_demurrage_blocks_per_month;
-        consensus.nDemurrageMinActivationHeight = SHADOW_REWARD_END_HEIGHT + 1;
+        consensus.nShadowCompetingClaimsActivationHeight =
+            opts.shadow_competing_claims_activation_height.value_or(SHADOW_REWARD_START_HEIGHT);
+        if (consensus.nShadowCompetingClaimsActivationHeight < SHADOW_REWARD_START_HEIGHT ||
+            consensus.nShadowCompetingClaimsActivationHeight > SHADOW_REWARD_END_HEIGHT) {
+            throw std::runtime_error(strprintf(
+                "-shadowcompetingclaimsheight (%d) must be inside the Gold Rush reward window [%d, %d].",
+                consensus.nShadowCompetingClaimsActivationHeight,
+                SHADOW_REWARD_START_HEIGHT,
+                SHADOW_REWARD_END_HEIGHT));
+        }
+        consensus.nShadowQQP4ActivationHeight =
+            opts.shadow_qqp4_activation_height.value_or(
+                std::numeric_limits<int>::max());
+        if (opts.shadow_qqp4_activation_height &&
+            (consensus.nShadowQQP4ActivationHeight <
+                 consensus.nShadowCompetingClaimsActivationHeight ||
+             consensus.nShadowQQP4ActivationHeight < SHADOW_REWARD_START_HEIGHT ||
+             consensus.nShadowQQP4ActivationHeight > SHADOW_REWARD_END_HEIGHT)) {
+            throw std::runtime_error(strprintf(
+                "-shadowqqp4height (%d) must be inside the Gold Rush reward window [%d, %d] and not precede -shadowcompetingclaimsheight (%d).",
+                consensus.nShadowQQP4ActivationHeight,
+                SHADOW_REWARD_START_HEIGHT,
+                SHADOW_REWARD_END_HEIGHT,
+                consensus.nShadowCompetingClaimsActivationHeight));
+        }
+        if (consensus.UsesHeightLifecycle() && consensus.IsQuantumLifecycleScheduleOrdered()) {
+            const int automatic_demurrage_height = consensus.nQuantumMigrationEndHeight + 1;
+            if (opts.quantum_demurrage_activation_height &&
+                *opts.quantum_demurrage_activation_height != automatic_demurrage_height) {
+                throw std::runtime_error(strprintf(
+                    "-qqdemurrageheight (%d) must equal the first Final-Lockout height (%d) for a height-authoritative lifecycle.",
+                    *opts.quantum_demurrage_activation_height, automatic_demurrage_height));
+            }
+            consensus.nDemurrageActivationHeight = automatic_demurrage_height;
+            consensus.nDemurrageMinActivationHeight = automatic_demurrage_height;
+        } else {
+            consensus.nDemurrageMinActivationHeight = SHADOW_REWARD_END_HEIGHT + 1;
+        }
         consensus.nLastPOWBlock = 0x7fffffff;
         consensus.nStakeTimestampMask = 0xf;
         consensus.nCoinbaseMaturity = 10;

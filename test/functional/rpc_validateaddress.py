@@ -192,7 +192,6 @@ class ValidateAddressMainTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.chain = ""  # main
         self.num_nodes = 1
-        self.extra_args = [["-prune=899"]] * self.num_nodes
 
     def check_valid(self, addr, spk):
         info = self.nodes[0].validateaddress(addr)

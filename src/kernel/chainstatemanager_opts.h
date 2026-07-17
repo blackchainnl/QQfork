@@ -46,6 +46,10 @@ struct ChainstateManagerOpts {
     DBOptions block_tree_db{};
     DBOptions coins_db{};
     CoinsViewOptions coins_view{};
+    //! Called while the rebuilt Coin commitment is still protected by
+    //! cs_main, immediately after COMMIT_READY is durable. Production uses
+    //! this to request shutdown before another block can stale the commitment.
+    std::function<void()> chainstate_rebuild_commit_callback{};
     Notifications& notifications;
 };
 

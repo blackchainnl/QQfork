@@ -12,7 +12,6 @@
 #include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
-#include <qt/bitcoinamountfield.h>
 #include <qt/bitcoinunits.h>
 #include <qt/bitcoinamountfield.h>
 #include <qt/clientmodel.h>
@@ -28,18 +27,25 @@
 #include <qt/stakingminingpage.h>
 #include <qt/transactiontablemodel.h>
 #include <qt/transactionview.h>
+#include <qt/utilitydialog.h>
 #include <qt/walletview.h>
 #include <qt/walletmodel.h>
 #include <script/solver.h>
 #include <test/util/setup_common.h>
 #include <util/strencodings.h>
 #include <validation.h>
+#include <validationinterface.h>
 #include <wallet/test/util.h>
+#include <wallet/spend.h>
 #include <wallet/wallet.h>
+
+#include <clientversion.h>
 
 #include <algorithm>
 #include <chrono>
+#include <future>
 #include <memory>
+#include <thread>
 
 #include <QAbstractButton>
 #include <QAction>
@@ -60,6 +66,9 @@
 #include <QTextEdit>
 #include <QListView>
 #include <QDialogButtonBox>
+#include <QElapsedTimer>
+#include <QEventLoop>
+#include <QSignalSpy>
 
 using wallet::AddWallet;
 using wallet::CWallet;
@@ -84,6 +93,20 @@ void ConfirmSend(QString* text = nullptr, QMessageBox::StandardButton confirm_ty
                 QAbstractButton* button = dialog->button(confirm_type);
                 button->setEnabled(true);
                 button->click();
+            }
+        }
+    });
+}
+
+//! Press a standard button in a modal message box.
+void ConfirmMessageBox(QMessageBox::StandardButton confirm_type)
+{
+    QTimer::singleShot(0, [confirm_type]() {
+        for (QWidget* widget : QApplication::topLevelWidgets()) {
+            if (auto* dialog = qobject_cast<QMessageBox*>(widget)) {
+                if (QAbstractButton* button = dialog->button(confirm_type)) {
+                    button->click();
+                }
             }
         }
     });
@@ -154,7 +177,7 @@ void CompareBalance(WalletModel& walletModel, CAmount expected_balance, QLabel* 
 {
     BitcoinUnit unit = walletModel.getOptionsModel()->getDisplayUnit();
     QString balanceComparison = BitcoinUnits::formatWithUnit(unit, expected_balance, false, BitcoinUnits::SeparatorStyle::ALWAYS);
-    QCOMPARE(balance_label_to_check->text().trimmed(), balanceComparison);
+    QTRY_COMPARE_WITH_TIMEOUT(balance_label_to_check->text().trimmed(), balanceComparison, 5000);
 }
 
 // Verify the 'useAvailableBalance' functionality. With and without manually selected coins.
@@ -207,6 +230,7 @@ std::shared_ptr<CWallet> SetupLegacyWatchOnlyWallet(interfaces::Node& node, Test
 {
     std::shared_ptr<CWallet> wallet = std::make_shared<CWallet>(node.context()->chain.get(), "", CreateMockableWalletDatabase());
     wallet->LoadWallet();
+    const uint256 tip_hash = WITH_LOCK(node.context()->chainman->GetMutex(), return node.context()->chainman->ActiveChain().Tip()->GetBlockHash());
     {
         LOCK(wallet->cs_wallet);
         wallet->SetWalletFlag(WALLET_FLAG_DISABLE_PRIVATE_KEYS);
@@ -215,7 +239,7 @@ std::shared_ptr<CWallet> SetupLegacyWatchOnlyWallet(interfaces::Node& node, Test
         CPubKey pubKey = test.coinbaseKey.GetPubKey();
         bool import_keys = wallet->ImportPubKeys({pubKey.GetID()}, {{pubKey.GetID(), pubKey}} , /*key_origins=*/{}, /*add_keypool=*/false, /*internal=*/false, /*timestamp=*/1);
         assert(import_keys);
-        wallet->SetLastBlockProcessed(105, WITH_LOCK(node.context()->chainman->GetMutex(), return node.context()->chainman->ActiveChain().Tip()->GetBlockHash()));
+        wallet->SetLastBlockProcessed(105, tip_hash);
     }
     SyncUpWallet(wallet, node);
     return wallet;
@@ -225,20 +249,23 @@ std::shared_ptr<CWallet> SetupDescriptorsWallet(interfaces::Node& node, TestChai
 {
     std::shared_ptr<CWallet> wallet = std::make_shared<CWallet>(node.context()->chain.get(), "", CreateMockableWalletDatabase());
     wallet->LoadWallet();
-    LOCK(wallet->cs_wallet);
-    wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
-    wallet->SetupDescriptorScriptPubKeyMans();
+    const uint256 tip_hash = WITH_LOCK(node.context()->chainman->GetMutex(), return node.context()->chainman->ActiveChain().Tip()->GetBlockHash());
+    {
+        LOCK(wallet->cs_wallet);
+        wallet->SetWalletFlag(WALLET_FLAG_DESCRIPTORS);
+        wallet->SetupDescriptorScriptPubKeyMans();
 
-    // Add the coinbase key
-    FlatSigningProvider provider;
-    std::string error;
-    std::unique_ptr<Descriptor> desc = Parse("combo(" + EncodeSecret(test.coinbaseKey) + ")", provider, error, /* require_checksum=*/ false);
-    assert(desc);
-    WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
-    if (!wallet->AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
-    CTxDestination dest = GetDestinationForKey(test.coinbaseKey.GetPubKey(), wallet->m_default_address_type);
-    wallet->SetAddressBook(dest, "", wallet::AddressPurpose::RECEIVE);
-    wallet->SetLastBlockProcessed(105, WITH_LOCK(node.context()->chainman->GetMutex(), return node.context()->chainman->ActiveChain().Tip()->GetBlockHash()));
+        // Add the coinbase key
+        FlatSigningProvider provider;
+        std::string error;
+        std::unique_ptr<Descriptor> desc = Parse("combo(" + EncodeSecret(test.coinbaseKey) + ")", provider, error, /* require_checksum=*/ false);
+        assert(desc);
+        WalletDescriptor w_desc(std::move(desc), 0, 0, 1, 1);
+        if (!wallet->AddWalletDescriptor(w_desc, provider, "", false)) assert(false);
+        CTxDestination dest = GetDestinationForKey(test.coinbaseKey.GetPubKey(), wallet->m_default_address_type);
+        wallet->SetAddressBook(dest, "", wallet::AddressPurpose::RECEIVE);
+        wallet->SetLastBlockProcessed(105, tip_hash);
+    }
     SyncUpWallet(wallet, node);
     wallet->SetBroadcastTransactions(true);
     return wallet;
@@ -269,20 +296,44 @@ public:
     }
 };
 
-void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
+void TestStakingMiningPageControls(MiniGUI& mini_gui, const std::shared_ptr<CWallet>& core_wallet, const PlatformStyle* platformStyle)
 {
     WalletModel& walletModel = *mini_gui.walletModel;
     struct PowMiningCleanup {
         WalletModel& wallet_model;
+        std::shared_ptr<CWallet> wallet;
+        std::vector<COutPoint> locked_coins;
         ~PowMiningCleanup()
         {
             std::string ignored_error;
             wallet_model.wallet().setPowMining(false, 1, 10, ignored_error);
+            LOCK(wallet->cs_wallet);
+            for (const COutPoint& outpoint : locked_coins) wallet->UnlockCoin(outpoint);
         }
-    } cleanup{walletModel};
+    } cleanup{walletModel, core_wallet};
 
     std::string error;
     QVERIFY(walletModel.wallet().setPowMining(false, 1, 10, error));
+    core_wallet->StopStake();
+    const auto staking_thread_count = [&] {
+        LOCK(core_wallet->m_staking_thread_mutex);
+        return core_wallet->threadStakeMinerGroup
+            ? core_wallet->threadStakeMinerGroup->size()
+            : size_t{0};
+    };
+    QCOMPARE(staking_thread_count(), size_t{0});
+
+    walletModel.wallet().setEnabledStaking(true);
+    QTRY_COMPARE_WITH_TIMEOUT(staking_thread_count(), size_t{1}, 5000);
+    QVERIFY(walletModel.wallet().getEnabledStaking());
+
+    walletModel.wallet().setEnabledStaking(false);
+    QVERIFY(!walletModel.wallet().getEnabledStaking());
+    QCOMPARE(staking_thread_count(), size_t{1});
+
+    walletModel.wallet().setEnabledStaking(true);
+    QVERIFY(walletModel.wallet().getEnabledStaking());
+    QCOMPARE(staking_thread_count(), size_t{1});
     walletModel.wallet().setEnabledStaking(false);
     walletModel.wallet().setDonationPercentage(0);
 
@@ -295,6 +346,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     StakingMiningPage page(platformStyle);
     page.setClientModel(mini_gui.clientModel.get());
     page.setWalletModel(&walletModel);
+    page.show();
+    qApp->processEvents();
 
     QCheckBox* staking_enable = page.findChild<QCheckBox*>("stakingEnable");
     QCheckBox* unlock_staking_only = page.findChild<QCheckBox*>("unlockStakingOnly");
@@ -310,6 +363,16 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QPushButton* pow_copy = page.findChild<QPushButton*>("powCopy");
     QLabel* pow_status = page.findChild<QLabel*>("powStatus");
     QLabel* pow_warning = page.findChild<QLabel*>("powWarning");
+    QLabel* pow_dashboard = page.findChild<QLabel*>("stakingMiningDashboardPow");
+    QCheckBox* automation_autostart_staking = page.findChild<QCheckBox*>("automationAutostartStaking");
+    QCheckBox* automation_autostart_pow = page.findChild<QCheckBox*>("automationAutostartPow");
+    QCheckBox* automation_qqsignal = page.findChild<QCheckBox*>("automationQqSignal");
+    QCheckBox* automation_demurrage = page.findChild<QCheckBox*>("automationDemurrageAttest");
+    QCheckBox* automation_redelegate = page.findChild<QCheckBox*>("automationRedelegate");
+    QCheckBox* automation_new_keys = page.findChild<QCheckBox*>("automationAllowNewKeys");
+    QLabel* automation_status = page.findChild<QLabel*>("automationStatus");
+    QPushButton* refresh_details = page.findChild<QPushButton*>("stakingMiningRefresh");
+    QLabel* refresh_hint = page.findChild<QLabel*>("stakingMiningRefreshHint");
     QLabel* migration_phase = page.findChild<QLabel*>("migrationPhase");
     QLabel* migration_deadline = page.findChild<QLabel*>("migrationDeadline");
     QLabel* migration_legacy_amount = page.findChild<QLabel*>("migrationLegacyAmount");
@@ -323,6 +386,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QPushButton* quantum_new = page.findChild<QPushButton*>("newQuantumAddress");
     QPushButton* quantum_copy = page.findChild<QPushButton*>("quantumCopy");
     QPushButton* quantum_pubkey_copy = page.findChild<QPushButton*>("quantumPubkeyCopy");
+    QPushButton* migration_legacy_sweep = page.findChild<QPushButton*>("migrationLegacySweep");
+    QPushButton* migration_goldrush_sweep = page.findChild<QPushButton*>("migrationGoldrushSweep");
     QComboBox* selfstake_lock_period = page.findChild<QComboBox*>("selfStakeLockPeriod");
     QComboBox* selfstake_selector = page.findChild<QComboBox*>("selfStakeAddressSelector");
     QLineEdit* selfstake_address = page.findChild<QLineEdit*>("selfStakeAddress");
@@ -373,6 +438,23 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(pow_copy);
     QVERIFY(pow_status);
     QVERIFY(pow_warning);
+    QVERIFY(pow_dashboard);
+    QVERIFY(automation_autostart_staking);
+    QVERIFY(automation_autostart_pow);
+    QVERIFY(automation_qqsignal);
+    QVERIFY(automation_demurrage);
+    QVERIFY(automation_redelegate);
+    QVERIFY(automation_new_keys);
+    QVERIFY(automation_status);
+    QVERIFY(automation_status->text().contains("optional automation", Qt::CaseInsensitive));
+    QVERIFY(!automation_autostart_staking->isChecked());
+    QVERIFY(!automation_autostart_pow->isChecked());
+    QVERIFY(!automation_qqsignal->isChecked());
+    QVERIFY(!automation_demurrage->isChecked());
+    QVERIFY(!automation_redelegate->isChecked());
+    QVERIFY(!automation_new_keys->isChecked());
+    QVERIFY(refresh_details);
+    QVERIFY(refresh_hint);
     QVERIFY(migration_phase);
     QVERIFY(migration_deadline);
     QVERIFY(migration_legacy_amount);
@@ -386,6 +468,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(quantum_new);
     QVERIFY(quantum_copy);
     QVERIFY(quantum_pubkey_copy);
+    QVERIFY(migration_legacy_sweep);
+    QVERIFY(migration_goldrush_sweep);
     QVERIFY(selfstake_lock_period);
     QVERIFY(selfstake_selector);
     QVERIFY(selfstake_address);
@@ -422,7 +506,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(coldstake_withdraw);
     QVERIFY(coldstake_status);
 
-    QVERIFY(QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection));
+    refresh_details->click();
+    QTRY_VERIFY_WITH_TIMEOUT(refresh_hint->text().contains(QString("Detail panels updated")), 10000);
     QCOMPARE(staking_enable->isChecked(), false);
     QCOMPARE(unlock_staking_only->isChecked(), false);
     QVERIFY(!unlock_staking_only->isEnabled());
@@ -444,6 +529,11 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(coldstake_quantum_available->text().contains(QString("BLK")));
     QVERIFY(!quantum_copy->isEnabled());
     QVERIFY(!quantum_pubkey_copy->isEnabled());
+    // The default regtest schedule remains in Gold Rush. Key/address creation
+    // is available, but every action that would fund a quantum output must
+    // stay disabled until Migration opens.
+    QVERIFY(!migration_legacy_sweep->isEnabled());
+    QVERIFY(!migration_goldrush_sweep->isEnabled());
     QVERIFY(selfstake_new->isEnabled());
     QVERIFY(!selfstake_selector->isEnabled());
     QVERIFY(!selfstake_copy->isEnabled());
@@ -469,8 +559,14 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(!coldstake_fund->isEnabled());
     QVERIFY(!coldstake_withdraw->isEnabled());
 
+    ConfirmMessageBox(QMessageBox::No);
     quantum_new->click();
     qApp->processEvents();
+    QCOMPARE(quantum_address_count->text(), QString("0"));
+
+    ConfirmMessageBox(QMessageBox::Yes);
+    quantum_new->click();
+    QTRY_COMPARE_WITH_TIMEOUT(quantum_address_count->text(), QString("1"), 10000);
     const CTxDestination gui_quantum_dest = DecodeDestination(quantum_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_quantum_dest));
     QVERIFY(IsQuantumMigrationDestination(gui_quantum_dest));
@@ -486,8 +582,9 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QCOMPARE(QApplication::clipboard()->text(), quantum_pubkey->text());
 
     selfstake_lock_period->setCurrentIndex(5);
+    ConfirmMessageBox(QMessageBox::Yes);
     selfstake_new->click();
-    qApp->processEvents();
+    QTRY_VERIFY_WITH_TIMEOUT(selfstake_selector->findData(selfstake_address->text()) >= 0, 10000);
     const CTxDestination gui_selfstake_dest = DecodeDestination(selfstake_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_selfstake_dest));
     QVERIFY(IsQuantumMigrationDestination(gui_selfstake_dest));
@@ -495,16 +592,17 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(selfstake_selector->isEnabled());
     QVERIFY(selfstake_selector->findData(selfstake_address->text()) >= 0);
     QVERIFY(!selfstake_output_selector->isEnabled());
-    QVERIFY(selfstake_fund_amount->isEnabled());
-    QVERIFY(selfstake_fund->isEnabled());
+    QVERIFY(!selfstake_fund_amount->isEnabled());
+    QVERIFY(!selfstake_fund->isEnabled());
     QVERIFY(!selfstake_withdraw->isEnabled());
     QVERIFY(selfstake_status->text().contains(QString("9450")));
 
     selfstake_copy->click();
     QCOMPARE(QApplication::clipboard()->text(), selfstake_address->text());
 
+    ConfirmMessageBox(QMessageBox::Yes);
     coldstake_operator_new->click();
-    qApp->processEvents();
+    QTRY_VERIFY_WITH_TIMEOUT(coldstake_operator_address_selector->findData(coldstake_operator_address->text()) >= 0, 10000);
     const CTxDestination gui_operator_dest = DecodeDestination(coldstake_operator_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_operator_dest));
     QVERIFY(IsQuantumMigrationDestination(gui_operator_dest));
@@ -515,6 +613,8 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(!coldstake_operator_address_selector->currentText().contains(QString("40500")));
     QVERIFY(coldstake_operator_copy->isEnabled());
     QVERIFY(coldstake_operator_use->isEnabled());
+    QVERIFY(!coldstake_operator_bond_amount->isEnabled());
+    QVERIFY(!coldstake_operator_fund->isEnabled());
     QVERIFY(coldstake_operator_status->text().contains(QString("30-day")));
 
     coldstake_operator_copy->click();
@@ -525,8 +625,9 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
 
     coldstake_lock_period->setCurrentIndex(5);
     QVERIFY(coldstake_new->isEnabled());
+    ConfirmMessageBox(QMessageBox::Yes);
     coldstake_new->click();
-    qApp->processEvents();
+    QTRY_COMPARE_WITH_TIMEOUT(quantum_coldstake_count->text(), QString("1"), 10000);
 
     const CTxDestination gui_coldstake_dest = DecodeDestination(coldstake_address->text().toStdString());
     QVERIFY(IsValidDestination(gui_coldstake_dest));
@@ -536,7 +637,7 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     QVERIFY(coldstake_delegation_selector->isEnabled());
     QVERIFY(coldstake_delegation_selector->findData(coldstake_address->text()) >= 0);
     QVERIFY(coldstake_copy->isEnabled());
-    QVERIFY(coldstake_fund_amount->isEnabled());
+    QVERIFY(!coldstake_fund_amount->isEnabled());
     QVERIFY(!coldstake_fund->isEnabled());
     QVERIFY(!coldstake_withdraw->isEnabled());
     QVERIFY(coldstake_status->text().contains(QString("Cold-stake address created")));
@@ -575,8 +676,10 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     const int requested_threads = std::min(2, pow_cores->maximum());
     pow_cores->setValue(requested_threads);
     pow_percent->setValue(25);
+    ConfirmMessageBox(QMessageBox::Yes);
     pow_enable->click();
     qApp->processEvents();
+    QVERIFY(pow_status->text().contains(QString("enabled")));
 
     interfaces::WalletPowMiningInfo info;
     for (int i = 0; i < 50; ++i) {
@@ -593,16 +696,48 @@ void TestStakingMiningPageControls(MiniGUI& mini_gui, const PlatformStyle* platf
     const CTxDestination payout_dest = DecodeDestination(info.payout_address);
     QVERIFY(IsValidDestination(payout_dest));
     QVERIFY(IsQuantumMigrationDestination(payout_dest));
-    QCOMPARE(pow_payout->text(), QString::fromStdString(info.payout_address));
+    const QString expected_payout = QString::fromStdString(info.payout_address);
+    // Full-detail wallet walks run on WalletWorker. The Qt event thread only
+    // queues the refresh and applies one immutable result.
+    refresh_details->click();
+    QTRY_COMPARE_WITH_TIMEOUT(pow_payout->text(), expected_payout, 10000);
     QVERIFY(pow_copy->isEnabled());
 
     pow_copy->click();
     QCOMPARE(QApplication::clipboard()->text(), pow_payout->text());
-    QVERIFY(pow_warning->text().contains(QString("fresh quantum address")));
+    QVERIFY(pow_warning->text().contains(QString("Back up this wallet")));
+    QVERIFY(pow_warning->text().contains(QString("locked until Gold Rush ends")));
 
     pow_enable->click();
     qApp->processEvents();
     QVERIFY(!walletModel.wallet().getPowMiningInfo().enabled);
+    QCOMPARE(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED);
+    QCOMPARE(pow_status->text(), QString("Gold Rush PoW mining is off."));
+
+    {
+        LOCK2(::cs_main, core_wallet->cs_wallet);
+        for (const wallet::COutput& output : wallet::AvailableCoins(*core_wallet).All()) {
+            QVERIFY(core_wallet->LockCoin(output.outpoint));
+            cleanup.locked_coins.push_back(output.outpoint);
+        }
+    }
+    QVERIFY(!cleanup.locked_coins.empty());
+
+    ConfirmMessageBox(QMessageBox::Yes);
+    pow_enable->click();
+    QTRY_VERIFY_WITH_TIMEOUT(
+        walletModel.wallet().getPowMiningInfo().state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO,
+        10000);
+    QCOMPARE(walletModel.wallet().getPowMiningInfo().hashrate, 0.0);
+
+    refresh_details->click();
+    QTRY_VERIFY_WITH_TIMEOUT(pow_status->text().contains(QString("legacy BLK UTXO")), 10000);
+    QTRY_VERIFY_WITH_TIMEOUT(pow_dashboard->text().contains(QString("waiting for a spendable legacy fee UTXO")), 10000);
+    QVERIFY(!pow_dashboard->text().contains(QString("running at 0")));
+
+    pow_enable->click();
+    qApp->processEvents();
+    QCOMPARE(walletModel.wallet().getPowMiningInfo().state, interfaces::WalletPowMiningState::DISABLED);
 }
 
 void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet, const PlatformStyle* platformStyle)
@@ -616,6 +751,8 @@ void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, co
     StakingMiningPage page(platformStyle);
     page.setClientModel(mini_gui.clientModel.get());
     page.setWalletModel(wallet_model);
+    page.show();
+    qApp->processEvents();
 
     QCheckBox* staking_enable = page.findChild<QCheckBox*>("stakingEnable");
     QLabel* staking_status = page.findChild<QLabel*>("stakingStatus");
@@ -649,6 +786,189 @@ void TestStakingMiningPageSurvivesWalletModelDeletion(interfaces::Node& node, co
     QVERIFY(pow_status->text().contains(QString("Load a wallet")));
 }
 
+void TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(interfaces::Node& node, const PlatformStyle* platformStyle)
+{
+    auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-staking-heartbeat", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+
+    MiniGUI mini_gui(node, platformStyle);
+    mini_gui.initModelForWallet(node, wallet, platformStyle);
+    WalletModel& wallet_model = *mini_gui.walletModel;
+
+    // The cache is initialized before the first view heartbeat, then refreshed
+    // by every encrypt, unlock, and lock notification.
+    QCOMPARE(wallet_model.getCachedEncryptionStatus(), WalletModel::Unencrypted);
+    QVERIFY(wallet->EncryptWallet("qt-heartbeat-passphrase"));
+    QTRY_COMPARE_WITH_TIMEOUT(wallet_model.getCachedEncryptionStatus(), WalletModel::Locked, 1000);
+    QVERIFY(wallet->Unlock("qt-heartbeat-passphrase"));
+    QTRY_COMPARE_WITH_TIMEOUT(wallet_model.getCachedEncryptionStatus(), WalletModel::Unlocked, 1000);
+
+    // Cached state is display-only. Before the queued lock notification is
+    // delivered, the backend must still reject a sensitive operation by
+    // consulting the live wallet lock.
+    QVERIFY(wallet->Lock());
+    QCOMPARE(wallet_model.getCachedEncryptionStatus(), WalletModel::Unlocked);
+    std::string mining_error;
+    QVERIFY(!wallet_model.wallet().setPowMining(true, 1, 1, mining_error));
+    QVERIFY(mining_error.find("unlocked wallet") != std::string::npos);
+    QTRY_COMPARE_WITH_TIMEOUT(wallet_model.getCachedEncryptionStatus(), WalletModel::Locked, 1000);
+
+    StakingMiningPage page(platformStyle);
+    page.setClientModel(mini_gui.clientModel.get());
+    page.setWalletModel(&wallet_model);
+    page.show();
+    qApp->processEvents();
+
+    std::promise<void> mutex_held;
+    std::future<void> mutex_held_future = mutex_held.get_future();
+    std::thread holder([&] {
+        LOCK(wallet->cs_wallet);
+        mutex_held.set_value();
+        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+    });
+    mutex_held_future.wait();
+
+    QElapsedTimer status_timer;
+    status_timer.start();
+    wallet_model.updateStatus();
+    const qint64 status_elapsed_ms = status_timer.elapsed();
+
+    QElapsedTimer heartbeat_timer;
+    heartbeat_timer.start();
+    const bool invoked = QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection);
+    const qint64 heartbeat_elapsed_ms = heartbeat_timer.elapsed();
+    holder.join();
+
+    QVERIFY(invoked);
+    QVERIFY2(status_elapsed_ms < 100,
+             qPrintable(QStringLiteral("Wallet status callback waited %1 ms for cs_wallet").arg(status_elapsed_ms)));
+    QVERIFY2(heartbeat_elapsed_ms < 100,
+             qPrintable(QStringLiteral("Staking page heartbeat waited %1 ms for cs_wallet").arg(heartbeat_elapsed_ms)));
+}
+
+void TestStakingMiningAsyncRefreshLifecycle(interfaces::Node& node, const PlatformStyle* platformStyle)
+{
+    auto wallet = std::make_shared<CWallet>(node.context()->chain.get(), "qt-staking-async-refresh", CreateMockableWalletDatabase());
+    QCOMPARE(wallet->LoadWallet(), wallet::DBErrors::LOAD_OK);
+
+    MiniGUI mini_gui(node, platformStyle);
+    mini_gui.initModelForWallet(node, wallet, platformStyle);
+    WalletModel& wallet_model = *mini_gui.walletModel;
+
+    auto page = std::make_unique<StakingMiningPage>(platformStyle);
+    page->setClientModel(mini_gui.clientModel.get());
+    page->setWalletModel(&wallet_model);
+    page->show();
+    qApp->processEvents();
+
+    QPushButton* refresh = page->findChild<QPushButton*>("stakingMiningRefresh");
+    QLabel* refresh_hint = page->findChild<QLabel*>("stakingMiningRefreshHint");
+    QLabel* staking_status = page->findChild<QLabel*>("stakingStatus");
+    QVERIFY(refresh);
+    QVERIFY(refresh_hint);
+    QVERIFY(staking_status);
+
+    QSignalSpy ready_spy(&wallet_model, &WalletModel::stakingMiningSnapshotReady);
+
+    // A result built for any other tip must be marked stale before wallet
+    // detail calls run, and must remain an immutable, inspectable result.
+    WalletModel::StakingMiningSnapshotRequest stale_request;
+    stale_request.request_id = 1000000;
+    stale_request.generation = 1000000;
+    stale_request.expected_tip = std::string(64, 'f');
+    wallet_model.requestStakingMiningSnapshot(stale_request);
+    QTRY_COMPARE_WITH_TIMEOUT(ready_spy.count(), 1, 5000);
+    const std::shared_ptr<const WalletModel::StakingMiningSnapshot> stale_snapshot =
+        wallet_model.takeStakingMiningSnapshot(stale_request.request_id);
+    QVERIFY(stale_snapshot);
+    QVERIFY(stale_snapshot->stale_tip);
+    ready_spy.clear();
+
+    std::promise<void> first_lock_held;
+    std::promise<void> release_first_lock;
+    std::shared_future<void> first_release = release_first_lock.get_future().share();
+    std::thread first_holder([&] {
+        LOCK(wallet->cs_wallet);
+        first_lock_held.set_value();
+        first_release.wait();
+    });
+    first_lock_held.get_future().wait();
+
+    QElapsedTimer click_timer;
+    click_timer.start();
+    refresh->click();
+    const qint64 click_elapsed_ms = click_timer.elapsed();
+
+    // Give WalletWorker time to reach a wallet read while keeping the GUI
+    // event queue free. A queued heartbeat must still run immediately.
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    bool heartbeat_seen{false};
+    QTimer::singleShot(0, page.get(), [&] { heartbeat_seen = true; });
+    QElapsedTimer heartbeat_timer;
+    heartbeat_timer.start();
+    qApp->processEvents(QEventLoop::AllEvents, 50);
+    const qint64 heartbeat_elapsed_ms = heartbeat_timer.elapsed();
+
+    // Repeated refreshes while the worker is occupied must not create a queue
+    // of full wallet scans. They collapse to one pending latest request.
+    for (int i = 0; i < 20; ++i) refresh->click();
+    const bool queued_hint_seen = refresh_hint->text().contains(QString("queued"));
+
+    QElapsedTimer switch_timer;
+    switch_timer.start();
+    page->setWalletModel(nullptr);
+    const qint64 switch_elapsed_ms = switch_timer.elapsed();
+    release_first_lock.set_value();
+    first_holder.join();
+
+    QTRY_COMPARE_WITH_TIMEOUT(ready_spy.count(), 1, 5000);
+    const uint64_t first_request_id = ready_spy.at(0).at(0).toULongLong();
+    const std::shared_ptr<const WalletModel::StakingMiningSnapshot> cancelled =
+        wallet_model.takeStakingMiningSnapshot(first_request_id);
+    QVERIFY(cancelled);
+    QVERIFY(cancelled->cancelled);
+    QVERIFY(queued_hint_seen);
+    QCOMPARE(staking_status->text(), QString("No wallet loaded"));
+
+    // Reattach and prove that destroying the page also performs bounded,
+    // cooperative cancellation without waiting for the worker-held request.
+    page->setWalletModel(&wallet_model);
+    qApp->processEvents();
+    refresh = page->findChild<QPushButton*>("stakingMiningRefresh");
+    QVERIFY(refresh);
+
+    std::promise<void> second_lock_held;
+    std::promise<void> release_second_lock;
+    std::shared_future<void> second_release = release_second_lock.get_future().share();
+    std::thread second_holder([&] {
+        LOCK(wallet->cs_wallet);
+        second_lock_held.set_value();
+        second_release.wait();
+    });
+    second_lock_held.get_future().wait();
+    refresh->click();
+    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+
+    QElapsedTimer destroy_timer;
+    destroy_timer.start();
+    page.reset();
+    const qint64 destroy_elapsed_ms = destroy_timer.elapsed();
+    release_second_lock.set_value();
+    second_holder.join();
+
+    QTRY_COMPARE_WITH_TIMEOUT(ready_spy.count(), 2, 5000);
+
+    QVERIFY2(click_elapsed_ms < 100,
+             qPrintable(QStringLiteral("Full-detail click blocked the GUI for %1 ms").arg(click_elapsed_ms)));
+    QVERIFY(heartbeat_seen);
+    QVERIFY2(heartbeat_elapsed_ms < 100,
+             qPrintable(QStringLiteral("GUI heartbeat was delayed %1 ms during full refresh").arg(heartbeat_elapsed_ms)));
+    QVERIFY2(switch_elapsed_ms < 100,
+             qPrintable(QStringLiteral("Wallet switch waited %1 ms for full refresh").arg(switch_elapsed_ms)));
+    QVERIFY2(destroy_elapsed_ms < 100,
+             qPrintable(QStringLiteral("Page destruction waited %1 ms for full refresh").arg(destroy_elapsed_ms)));
+}
+
 void TestWalletPagesScale(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
 {
     TransactionView& transaction_view = mini_gui.transactionView;
@@ -672,8 +992,11 @@ void TestWalletPagesScale(MiniGUI& mini_gui, const PlatformStyle* platformStyle)
     QVERIFY(wallet_view.findChild<QTableView*>(QStringLiteral("transactionView")));
     QVERIFY(wallet_view.minimumSizeHint().width() <= 640);
 
+    QElapsedTimer staking_page_timer;
+    staking_page_timer.start();
     wallet_view.gotoStakingMiningPage();
     qApp->processEvents();
+    QVERIFY2(staking_page_timer.elapsed() < 5000, "Staking/Mining page switch exceeded 5 seconds");
     auto* staking_scroll = wallet_view.findChild<QScrollArea*>(QStringLiteral("stakingMiningScrollPage"));
     QVERIFY(staking_scroll);
     QCOMPARE(wallet_view.currentWidget(), staking_scroll);
@@ -697,14 +1020,26 @@ void TestGUI(interfaces::Node& node, const std::shared_ptr<CWallet>& wallet)
 {
     // Create widgets for sending coins and listing transactions.
     std::unique_ptr<const PlatformStyle> platformStyle(PlatformStyle::instantiate("other"));
+    HelpMessageDialog about_dialog(/*parent=*/nullptr, /*about=*/true);
+    QLabel* about_message = about_dialog.findChild<QLabel*>("aboutMessage");
+    QVERIFY(about_message);
+    const QString expected_source_identity = QString::fromStdString(FormatSourceIdentity());
+    QVERIFY(about_message->text().contains(GUIUtil::HtmlEscape(expected_source_identity)));
+    QVERIFY(expected_source_identity.startsWith(QStringLiteral("Source commit: ")));
+    if (IsSourceTreeDirty() || FormatSourceCommit().empty()) {
+        QVERIFY(about_message->text().contains(QStringLiteral("color:#b00020")));
+    }
+
     MiniGUI mini_gui(node, platformStyle.get());
     mini_gui.initModelForWallet(node, wallet, platformStyle.get());
     WalletModel& walletModel = *mini_gui.walletModel;
     SendCoinsDialog& sendCoinsDialog = mini_gui.sendCoinsDialog;
 
-    TestStakingMiningPageControls(mini_gui, platformStyle.get());
+    TestStakingMiningPageControls(mini_gui, wallet, platformStyle.get());
     TestWalletPagesScale(mini_gui, platformStyle.get());
     TestStakingMiningPageSurvivesWalletModelDeletion(node, wallet, platformStyle.get());
+    TestStakingMiningHeartbeatDoesNotWaitForWalletMutex(node, platformStyle.get());
+    TestStakingMiningAsyncRefreshLifecycle(node, platformStyle.get());
 
     // Update walletModel cached balance which will trigger an update for the 'labelBalance' QLabel.
     walletModel.pollBalanceChanged();
@@ -934,6 +1269,166 @@ void TestGUI(interfaces::Node& node)
     TestGUIWatchOnly(node, test);
 }
 
+void TestQuantumFundingControlsFollowReorg(interfaces::Node& node)
+{
+    const std::vector<const char*> phase_args{
+        "-regtest",
+        "-shadowwhitelistheight=20",
+        "-shadowgoldrushstartheight=30",
+        "-shadowgoldrushendheight=106",
+        "-qqgoldrushendheight=106",
+        "-qqmigrationendheight=109",
+        "-qqstaketierheight=108",
+    };
+    TestChain100Setup test{ChainType::REGTEST, phase_args};
+    for (int i = 0; i < 5; ++i) {
+        test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+    }
+
+    auto wallet_loader = interfaces::MakeWalletLoader(*test.m_node.chain, *Assert(test.m_node.args));
+    test.m_node.wallet_loader = wallet_loader.get();
+    node.setContext(&test.m_node);
+
+    std::unique_ptr<const PlatformStyle> platform_style(PlatformStyle::instantiate("other"));
+    const std::shared_ptr<CWallet>& wallet = SetupDescriptorsWallet(node, test);
+    MiniGUI mini_gui(node, platform_style.get());
+    mini_gui.initModelForWallet(node, wallet, platform_style.get());
+
+    interfaces::Wallet& wallet_interface = mini_gui.walletModel->wallet();
+    auto selfstake_result = wallet_interface.createQuantumStakeAddress("reorg-selfstake", 9450);
+    QVERIFY(selfstake_result);
+    auto operator_result = wallet_interface.createQuantumStakeAddress("coldstake-operator", 40500);
+    QVERIFY(operator_result);
+    auto staker_result = wallet_interface.createQuantumAddress("reorg-coldstake-staker");
+    QVERIFY(staker_result);
+    auto liquid_coldstake_result = wallet_interface.createQuantumColdStakeAddress(
+        staker_result->public_key, "reorg-liquid-coldstake", 0);
+    QVERIFY(liquid_coldstake_result);
+    auto tiered_coldstake_result = wallet_interface.createQuantumColdStakeAddress(
+        staker_result->public_key, "reorg-tiered-coldstake", 9450);
+    QVERIFY(tiered_coldstake_result);
+
+    StakingMiningPage page(platform_style.get());
+    page.setClientModel(mini_gui.clientModel.get());
+    page.setWalletModel(mini_gui.walletModel.get());
+    page.show();
+    qApp->processEvents();
+
+    QPushButton* migration_legacy_sweep = page.findChild<QPushButton*>("migrationLegacySweep");
+    QPushButton* migration_goldrush_sweep = page.findChild<QPushButton*>("migrationGoldrushSweep");
+    QLineEdit* selfstake_address = page.findChild<QLineEdit*>("selfStakeAddress");
+    BitcoinAmountField* selfstake_fund_amount = page.findChild<BitcoinAmountField*>("selfStakeFundAmount");
+    QPushButton* selfstake_fund = page.findChild<QPushButton*>("selfStakeFund");
+    QLineEdit* operator_address = page.findChild<QLineEdit*>("coldstakeOperatorAddress");
+    BitcoinAmountField* operator_bond_amount = page.findChild<BitcoinAmountField*>("coldstakeOperatorBondAmount");
+    QPushButton* operator_fund = page.findChild<QPushButton*>("coldstakeOperatorFund");
+    QLineEdit* coldstake_address = page.findChild<QLineEdit*>("coldstakeAddress");
+    BitcoinAmountField* coldstake_fund_amount = page.findChild<BitcoinAmountField*>("coldstakeFundAmount");
+    QVERIFY(migration_legacy_sweep);
+    QVERIFY(migration_goldrush_sweep);
+    QVERIFY(selfstake_address);
+    QVERIFY(selfstake_fund_amount);
+    QVERIFY(selfstake_fund);
+    QVERIFY(operator_address);
+    QVERIFY(operator_bond_amount);
+    QVERIFY(operator_fund);
+    QVERIFY(coldstake_address);
+    QVERIFY(coldstake_fund_amount);
+
+    selfstake_address->setText(QString::fromStdString(selfstake_result->address));
+    operator_address->setText(QString::fromStdString(operator_result->address));
+    coldstake_address->setText(QString::fromStdString(tiered_coldstake_result->address));
+
+    const auto height = [&] {
+        return WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Height());
+    };
+    const auto update_controls = [&] {
+        QVERIFY(QMetaObject::invokeMethod(&page, "updateStatus", Qt::DirectConnection));
+        qApp->processEvents();
+    };
+    const auto expect_controls = [&](int expected_height, bool quantum_active, bool legacy_active, bool tiers_active) {
+        QCOMPARE(height(), expected_height);
+        const interfaces::WalletQuantumFundingStatus status = wallet_interface.getQuantumFundingStatus();
+        QVERIFY(status.available);
+        QCOMPARE(status.quantum_outputs_active, quantum_active);
+        QCOMPARE(status.legacy_migration_active, legacy_active);
+        QCOMPARE(status.stake_tiers_active, tiers_active);
+
+        coldstake_address->setText(QString::fromStdString(tiered_coldstake_result->address));
+        update_controls();
+        QCOMPARE(migration_legacy_sweep->isEnabled(), legacy_active);
+        QCOMPARE(migration_goldrush_sweep->isEnabled(), quantum_active);
+        QCOMPARE(selfstake_fund_amount->isEnabled(), tiers_active);
+        QCOMPARE(selfstake_fund->isEnabled(), tiers_active);
+        QCOMPARE(operator_bond_amount->isEnabled(), tiers_active);
+        QCOMPARE(operator_fund->isEnabled(), tiers_active);
+        QCOMPARE(coldstake_fund_amount->isEnabled(), tiers_active);
+
+        // Liquid cold-stake funding follows ordinary quantum-output support;
+        // only tiered cold-stake addresses require stake-tier activation.
+        coldstake_address->setText(QString::fromStdString(liquid_coldstake_result->address));
+        update_controls();
+        QCOMPARE(coldstake_fund_amount->isEnabled(), quantum_active);
+        coldstake_address->setText(QString::fromStdString(tiered_coldstake_result->address));
+    };
+    const auto mine_block = [&] {
+        test.CreateAndProcessBlock({}, GetScriptForRawPubKey(test.coinbaseKey.GetPubKey()));
+        SyncWithValidationInterfaceQueue();
+    };
+    const auto invalidate_tip = [&] {
+        CBlockIndex* tip = WITH_LOCK(test.m_node.chainman->GetMutex(), return test.m_node.chainman->ActiveChain().Tip());
+        QVERIFY(tip);
+        BlockValidationState state;
+        QVERIFY(test.m_node.chainman->ActiveChainstate().InvalidateBlock(state, tip));
+        SyncWithValidationInterfaceQueue();
+    };
+
+    // Tip 105 creates candidate 106, the final Gold Rush block. Both the UI
+    // and the backend reject migration without allocating an unused address.
+    expect_controls(105, /*quantum_active=*/false, /*legacy_active=*/false, /*tiers_active=*/false);
+    const size_t goldrush_address_count = wallet_interface.listQuantumAddresses().size();
+    QVERIFY(!wallet_interface.migrateLegacyToQuantum(/*allow_new_quantum_key=*/true));
+    QCOMPARE(wallet_interface.listQuantumAddresses().size(), goldrush_address_count);
+
+    // Candidate 107 is Migration but precedes the tier activation at 108.
+    mine_block();
+    expect_controls(106, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/false);
+
+    // Candidate 108 is the first block that permits tiered funding.
+    mine_block();
+    expect_controls(107, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/true);
+
+    mine_block();
+    mine_block();
+    // Candidate 110 is Final: ordinary quantum and tiered funding remain
+    // available, but legacy migration closes. Failure must not reserve a key.
+    expect_controls(109, /*quantum_active=*/true, /*legacy_active=*/false, /*tiers_active=*/true);
+    const size_t final_address_count = wallet_interface.listQuantumAddresses().size();
+    QVERIFY(!wallet_interface.migrateLegacyToQuantum(/*allow_new_quantum_key=*/true));
+    QCOMPARE(wallet_interface.listQuantumAddresses().size(), final_address_count);
+
+    // Reorg backward across Final, tier activation, and Gold Rush. Every
+    // lightweight refresh must derive permissions from the new active tip.
+    invalidate_tip();
+    expect_controls(108, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/true);
+    invalidate_tip();
+    expect_controls(107, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/true);
+    invalidate_tip();
+    expect_controls(106, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/false);
+    invalidate_tip();
+    expect_controls(105, /*quantum_active=*/false, /*legacy_active=*/false, /*tiers_active=*/false);
+
+    // Mine an alternate branch forward through the same exact boundaries.
+    test.coinbaseKey.MakeNewKey(true);
+    mine_block();
+    expect_controls(106, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/false);
+    mine_block();
+    expect_controls(107, /*quantum_active=*/true, /*legacy_active=*/true, /*tiers_active=*/true);
+    mine_block();
+    mine_block();
+    expect_controls(109, /*quantum_active=*/true, /*legacy_active=*/false, /*tiers_active=*/true);
+}
+
 } // namespace
 
 void WalletTests::walletTests()
@@ -950,4 +1445,5 @@ void WalletTests::walletTests()
     }
 #endif
     TestGUI(m_node);
+    TestQuantumFundingControlsFollowReorg(m_node);
 }

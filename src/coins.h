@@ -48,11 +48,11 @@ public:
     uint32_t nHeight : 31;
 
     //! time of the transaction
-    unsigned int nTime;
+    uint32_t nTime;
 
     //! construct a Coin from a CTxOut and height/coinbase information.
-    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn, int nTimeIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn), nHeight(nHeightIn), nTime(nTimeIn) {}
-    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn, int nTimeIn) : out(outIn), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn), nHeight(nHeightIn), nTime(nTimeIn) {}
+    Coin(CTxOut&& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn, uint32_t nTimeIn) : out(std::move(outIn)), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn), nHeight(nHeightIn), nTime(nTimeIn) {}
+    Coin(const CTxOut& outIn, int nHeightIn, bool fCoinBaseIn, bool fCoinStakeIn, uint32_t nTimeIn) : out(outIn), fCoinBase(fCoinBaseIn), fCoinStake(fCoinStakeIn), nHeight(nHeightIn), nTime(nTimeIn) {}
 
     void Clear() {
         out.SetNull();
@@ -177,6 +177,15 @@ public:
 
     virtual bool GetKey(COutPoint &key) const = 0;
     virtual bool GetValue(Coin &coin) const = 0;
+
+    /** Retrieve one exact coin from this cursor's immutable snapshot.
+     *
+     * This operation may reposition the underlying iterator. Callers that
+     * also need an ordered scan must use a dedicated cursor for point
+     * lookups. The returned view is nevertheless the same snapshot captured
+     * when this cursor was created, rather than a later live database read.
+     */
+    virtual bool GetValueAt(const COutPoint& key, Coin& coin) = 0;
 
     virtual bool Valid() const = 0;
     virtual void Next() = 0;
@@ -384,7 +393,13 @@ private:
 //! an overwrite.
 // TODO: pass in a boolean to limit these possible overwrites to known
 // (pre-BIP34) cases.
-void AddCoins(CCoinsViewCache& cache, const CTransaction& tx, int nHeight, bool check = false, int nBlockTime = 0);
+/** Return the canonical UTXO timestamp for a transaction in a block.
+ * Version-2 transactions do not serialize nTime, so their UTXOs carry the
+ * containing block time. Keep the input wide enough for the full uint32_t
+ * header range; callers must supply a valid block-header timestamp. */
+uint32_t GetCoinTime(const CTransaction& tx, int64_t nBlockTime = 0);
+
+void AddCoins(CCoinsViewCache& cache, const CTransaction& tx, int nHeight, bool check = false, int64_t nBlockTime = 0);
 
 //! Utility function to find any unspent output with a given txid.
 //! This function can be quite expensive because in the event of a transaction

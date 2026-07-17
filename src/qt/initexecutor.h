@@ -9,12 +9,15 @@
 
 #include <exception>
 
+#include <QMetaType>
 #include <QObject>
 #include <QThread>
 
 QT_BEGIN_NAMESPACE
 class QString;
 QT_END_NAMESPACE
+
+Q_DECLARE_METATYPE(interfaces::AppInitResult)
 
 /** Class encapsulating Blackcoin - Blackcoin startup and shutdown.
  * Allows running startup and shutdown in a different thread from the UI thread.
@@ -31,7 +34,7 @@ public Q_SLOTS:
     void shutdown();
 
 Q_SIGNALS:
-    void initializeResult(bool success, interfaces::BlockAndHeaderTipInfo tip_info);
+    void initializeResult(interfaces::AppInitResult result, interfaces::BlockAndHeaderTipInfo tip_info);
     void shutdownResult();
     void runawayException(const QString& message);
 

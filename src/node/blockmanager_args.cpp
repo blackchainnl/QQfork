@@ -1,3 +1,4 @@
+// Copyright (c) 2023 The Bitcoin Core developers
 // Copyright (c) 2023 Blackcoin Core Developers
 // Copyright (c) 2023 Blackcoin More Developers
 // Copyright (c) 2023 Quantum Quasar Developers
@@ -9,6 +10,7 @@
 #include <common/args.h>
 #include <node/blockstorage.h>
 #include <tinyformat.h>
+#include <util/chaintype.h>
 #include <util/result.h>
 #include <util/translation.h>
 #include <validation.h>
@@ -22,6 +24,13 @@ util::Result<void> ApplyArgsManOptions(const ArgsManager& args, BlockManager::Op
     int64_t nPruneArg{args.GetIntArg("-prune", opts.prune_target)};
     if (nPruneArg < 0) {
         return util::Error{_("Prune cannot be configured with a negative value.")};
+    }
+    if (opts.chainparams.GetChainType() != ChainType::REGTEST && nPruneArg != 0) {
+        return util::Error{_("Block pruning is disabled on production networks in v30.1.1 because the Blackcoin proof-of-stake retention and recovery gate has not passed. Remove -prune or set prune=0, then use a full -reindex if historical block files are missing.")};
+    }
+    if (opts.chainparams.GetChainType() != ChainType::REGTEST &&
+        args.GetBoolArg("-fastprune", false)) {
+        return util::Error{_("Fast pruning is a regtest-only option in v30.1.1.")};
     }
     uint64_t nPruneTarget{uint64_t(nPruneArg) * 1024 * 1024};
     if (nPruneArg == 1) { // manual pruning: -prune=1

@@ -31,6 +31,7 @@ class BaseSignatureCreator {
 public:
     virtual ~BaseSignatureCreator() {}
     virtual const BaseSignatureChecker& Checker() const =0;
+    virtual unsigned int GetScriptVerifyFlags() const =0;
 
     /** Create a singular (non-script) signature. */
     virtual bool CreateSig(const SigningProvider& provider, std::vector<unsigned char>& vchSig, const CKeyID& keyid, const CScript& scriptCode, SigVersion sigversion) const =0;
@@ -46,11 +47,13 @@ class MutableTransactionSignatureCreator : public BaseSignatureCreator
     CAmount amount;
     const MutableTransactionSignatureChecker checker;
     const PrecomputedTransactionData* m_txdata;
+    unsigned int m_script_verify_flags;
 
 public:
     MutableTransactionSignatureCreator(const CMutableTransaction& tx LIFETIMEBOUND, unsigned int input_idx, const CAmount& amount, int hash_type);
-    MutableTransactionSignatureCreator(const CMutableTransaction& tx LIFETIMEBOUND, unsigned int input_idx, const CAmount& amount, const PrecomputedTransactionData* txdata, int hash_type);
+    MutableTransactionSignatureCreator(const CMutableTransaction& tx LIFETIMEBOUND, unsigned int input_idx, const CAmount& amount, const PrecomputedTransactionData* txdata, int hash_type, unsigned int script_verify_flags = 0);
     const BaseSignatureChecker& Checker() const override { return checker; }
+    unsigned int GetScriptVerifyFlags() const override { return m_script_verify_flags; }
     bool CreateSig(const SigningProvider& provider, std::vector<unsigned char>& vchSig, const CKeyID& keyid, const CScript& scriptCode, SigVersion sigversion) const override;
     bool CreateSchnorrSig(const SigningProvider& provider, std::vector<unsigned char>& sig, const XOnlyPubKey& pubkey, const uint256* leaf_hash, const uint256* merkle_root, SigVersion sigversion) const override;
 };
@@ -121,13 +124,19 @@ bool VerifySignature(const Coin& coin, uint256 txFromHash, const CTransaction& t
 bool VerifySignature(const CScript& fromPubKey, uint256 txFromHash, const CTransaction& txTo, unsigned int nIn, unsigned int flags);    
 
 /** Extract signature data from a transaction input, and insert it. */
-SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nIn, const CTxOut& txout);
+SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nIn, const CTxOut& txout,
+                                  const PrecomputedTransactionData* txdata = nullptr,
+                                  unsigned int extra_verify_flags = 0);
 void UpdateInput(CTxIn& input, const SignatureData& data);
 
 /** Check whether a scriptPubKey is known to be segwit. */
 bool IsSegWitOutput(const SigningProvider& provider, const CScript& script);
 
 /** Sign the CMutableTransaction */
-bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* provider, const std::map<COutPoint, Coin>& coins, int sighash, std::map<int, bilingual_str>& input_errors);
+bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* provider,
+                     const std::map<COutPoint, Coin>& coins, int sighash,
+                     std::map<int, bilingual_str>& input_errors,
+                     uint32_t quantum_chain_id = 0,
+                     unsigned int extra_verify_flags = 0);
 
 #endif // BITCOIN_SCRIPT_SIGN_H

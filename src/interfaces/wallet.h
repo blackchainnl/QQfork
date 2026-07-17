@@ -10,6 +10,7 @@
 #include <addresstype.h>
 #include <consensus/amount.h>
 #include <interfaces/chain.h>
+#include <interfaces/pow_mining.h>
 #include <pubkey.h>
 #include <script/script.h>
 #include <support/allocators/secure.h>
@@ -65,6 +66,7 @@ struct WalletUTXOOptimizationTx;
 struct WalletQuantumStakeOutputInfo;
 struct WalletQuantumPoolInfo;
 struct WalletQuantumPoolOperatorInfo;
+struct WalletQuantumFundingStatus;
 struct WalletMigrationStatus;
 struct WalletRGBAssignmentInfo;
 struct WalletRGBAssetInfo;
@@ -75,6 +77,14 @@ struct WalletQuantumActionTx;
 
 using WalletOrderForm = std::vector<std::pair<std::string, std::string>>;
 using WalletValueMap = std::map<std::string, std::string>;
+
+/** Nonblocking wallet encryption snapshot for timer-driven user interfaces. */
+struct WalletEncryptionStatus
+{
+    bool encrypted{false};
+    bool locked{false};
+    bool private_keys_disabled{false};
+};
 
 //! Interface for accessing a wallet.
 class Wallet
@@ -99,6 +109,9 @@ public:
 
     //! Return whether wallet is locked.
     virtual bool isLocked() = 0;
+
+    //! Try to read encryption state without waiting for the wallet mutex.
+    virtual bool tryGetEncryptionStatus(WalletEncryptionStatus& status) = 0;
 
     //! Change wallet passphrase.
     virtual bool changeWalletPassphrase(const SecureString& old_wallet_passphrase,
@@ -214,6 +227,8 @@ public:
 
     //! Finalize and extract PSBT with wallet/chain-aware script verification flags.
     virtual bool finalizePSBT(PartiallySignedTransaction& psbtx, CMutableTransaction& mtx) = 0;
+    //! Return next-block script flags and Quantum Quasar chain id for PSBT analysis.
+    virtual std::pair<unsigned int, uint32_t> getPSBTAnalysisContext() const = 0;
 
     //! Get balances.
     virtual WalletBalances getBalances() = 0;
@@ -307,8 +322,12 @@ public:
     //! @param enabled  start/stop in-process PoW mining
     //! @param threads  worker threads / CPU cores (>=1)
     //! @param cpu_percent  per-core CPU duty-cycle target, 1..100
+    //! @param allow_new_payout_key  explicit one-call consent to create a missing non-HD payout key
+    //! @param created_payout_key  optional result indicating that a new payout key was created
     //! Returns false (and fills `error`) if PoW mining cannot be configured (e.g. wallet locked).
-    virtual bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error) = 0;
+    virtual bool setPowMining(bool enabled, int threads, int cpu_percent, std::string& error,
+                              bool allow_new_payout_key = false,
+                              bool* created_payout_key = nullptr) = 0;
 
     //! Read the built-in Gold Rush PoW miner status (config, hashrate, epoch, payout).
     virtual WalletPowMiningInfo getPowMiningInfo() = 0;
@@ -332,10 +351,10 @@ public:
     virtual WalletQuantumOperatorBondInfo getQuantumOperatorBondInfo(const std::string& operator_address) = 0;
 
     //! Fund this wallet's 30-day operator bond address from spendable wallet funds.
-    virtual util::Result<WalletQuantumOperatorBondTx> fundQuantumOperatorBond(const std::string& operator_address, CAmount amount) = 0;
+    virtual util::Result<WalletQuantumOperatorBondTx> fundQuantumOperatorBond(const std::string& operator_address, CAmount amount, bool allow_new_quantum_key) = 0;
 
     //! Stop operating: start unbonding if bonded, or complete withdrawal if already mature.
-    virtual util::Result<WalletQuantumOperatorBondTx> withdrawQuantumOperatorBond(const std::string& operator_address) = 0;
+    virtual util::Result<WalletQuantumOperatorBondTx> withdrawQuantumOperatorBond(const std::string& operator_address, bool allow_new_quantum_key) = 0;
 
     //! Return wallet-owned tiered self-staking address status.
     virtual WalletQuantumOperatorBondInfo getQuantumStakeAddressBondInfo(const std::string& stake_address) = 0;
@@ -344,13 +363,13 @@ public:
     virtual std::vector<WalletQuantumStakeOutputInfo> listQuantumStakeOutputs(const std::string& stake_address) = 0;
 
     //! Fund this wallet's tiered self-staking address from spendable wallet funds.
-    virtual util::Result<WalletQuantumOperatorBondTx> fundQuantumStakeAddress(const std::string& stake_address, CAmount amount) = 0;
+    virtual util::Result<WalletQuantumOperatorBondTx> fundQuantumStakeAddress(const std::string& stake_address, CAmount amount, bool allow_new_quantum_key) = 0;
 
     //! Stop self-staking: start unbonding if bonded, or complete withdrawal if already mature.
-    virtual util::Result<WalletQuantumOperatorBondTx> withdrawQuantumStakeAddress(const std::string& stake_address) = 0;
+    virtual util::Result<WalletQuantumOperatorBondTx> withdrawQuantumStakeAddress(const std::string& stake_address, bool allow_new_quantum_key) = 0;
 
     //! Stop or withdraw one selected self-staking UTXO.
-    virtual util::Result<WalletQuantumOperatorBondTx> withdrawQuantumStakeOutput(const std::string& stake_address, const COutPoint& outpoint) = 0;
+    virtual util::Result<WalletQuantumOperatorBondTx> withdrawQuantumStakeOutput(const std::string& stake_address, const COutPoint& outpoint, bool allow_new_quantum_key) = 0;
 
     //! Create a Quantum Cold-Stake deposit address using a hex ML-DSA staking public key.
     virtual util::Result<WalletQuantumColdStakeInfo> createQuantumColdStakeAddress(const std::string& staking_pubkey_hex, const std::string& label, uint16_t unbonding_blocks) = 0;
@@ -359,14 +378,14 @@ public:
     virtual WalletQuantumColdStakeBalanceInfo getQuantumColdStakeBalanceInfo(const std::string& coldstake_address) = 0;
 
     //! Fund this wallet's Quantum Cold-Stake delegation address from spendable quantum funds.
-    virtual util::Result<WalletQuantumOperatorBondTx> fundQuantumColdStakeAddress(const std::string& coldstake_address, CAmount amount) = 0;
+    virtual util::Result<WalletQuantumOperatorBondTx> fundQuantumColdStakeAddress(const std::string& coldstake_address, CAmount amount, bool allow_new_quantum_key) = 0;
 
     //! Withdraw this wallet's Quantum Cold-Stake delegation funds to a fresh quantum address.
-    virtual util::Result<WalletQuantumOperatorBondTx> withdrawQuantumColdStakeAddress(const std::string& coldstake_address) = 0;
+    virtual util::Result<WalletQuantumOperatorBondTx> withdrawQuantumColdStakeAddress(const std::string& coldstake_address, bool allow_new_quantum_key) = 0;
 
     //! Plan (dry_run=true) or create and broadcast (dry_run=false) an owner-branch
     //! Quantum Cold-Stake redelegation moving delegated funds to a new staking public key.
-    virtual util::Result<WalletQuantumRedelegationInfo> redelegateQuantumColdStake(const std::string& source_coldstake_address, const std::string& target_staking_pubkey_hex, bool dry_run, const std::string& label) = 0;
+    virtual util::Result<WalletQuantumRedelegationInfo> redelegateQuantumColdStake(const std::string& source_coldstake_address, const std::string& target_staking_pubkey_hex, bool dry_run, const std::string& label, bool allow_new_quantum_key) = 0;
 
     //! Rebuild spendable coins into equal-value UTXOs paying dest to maximize PoS
     //! yield under continuous minting. Resets accumulated coinage. Commits and
@@ -376,11 +395,15 @@ public:
     //! Read wallet migration progress and deadline state.
     virtual WalletMigrationStatus getMigrationStatus() = 0;
 
-    //! Sweep spendable legacy coins into a wallet-backed quantum address.
-    virtual util::Result<WalletQuantumActionTx> migrateLegacyToQuantum() = 0;
+    //! Return phase-specific next-block quantum funding permissions. This
+    //! lightweight GUI guard fails closed if chain state is unavailable.
+    virtual WalletQuantumFundingStatus getQuantumFundingStatus() = 0;
 
-    //! Move wallet-owned Gold Rush reward outputs to a fresh quantum address once quantum reward spends are active.
-    virtual util::Result<WalletQuantumActionTx> migrateGoldRushRewards() = 0;
+    //! Sweep spendable legacy coins into a wallet-backed quantum address.
+    virtual util::Result<WalletQuantumActionTx> migrateLegacyToQuantum(bool allow_new_quantum_key) = 0;
+
+    //! Optionally consolidate matured wallet-owned Gold Rush reward outputs to a fresh quantum address.
+    virtual util::Result<WalletQuantumActionTx> migrateGoldRushRewards(bool allow_new_quantum_key) = 0;
 
     //! List wallet-owned RGB assets and assignments.
     virtual std::vector<WalletRGBAssetInfo> listRGBAssets(bool include_spent = false) = 0;
@@ -395,7 +418,7 @@ public:
     virtual util::Result<WalletQuantumActionTx> sendDemurrageAttestation(const std::string& address) = 0;
 
     //! Sweep all currently decaying direct quantum outputs to a fresh wallet-backed quantum address.
-    virtual util::Result<WalletQuantumActionTx> sweepDemurrageDecay() = 0;
+    virtual util::Result<WalletQuantumActionTx> sweepDemurrageDecay(bool allow_new_quantum_key) = 0;
 
     //! Return whether is a legacy wallet
     virtual bool isLegacy() = 0;
@@ -493,6 +516,13 @@ struct WalletBalances
     CAmount balance = 0;
     CAmount legacy_balance = 0;
     CAmount quantum_balance = 0;
+    CAmount synthetic_immature_balance = 0;
+    CAmount synthetic_mature_locked_balance = 0;
+    CAmount direct_quantum_phase_locked_balance = 0;
+    CAmount quantum_contract_restricted_balance = 0;
+    CAmount final_locked_legacy_balance = 0;
+    CAmount demurrage_locked_balance = 0;
+    CAmount demurrage_burned_balance = 0;
     CAmount unconfirmed_balance = 0;
     CAmount immature_balance = 0;
     CAmount stake = 0;
@@ -505,6 +535,13 @@ struct WalletBalances
     bool balanceChanged(const WalletBalances& prev) const
     {
         return balance != prev.balance || legacy_balance != prev.legacy_balance || quantum_balance != prev.quantum_balance ||
+               synthetic_immature_balance != prev.synthetic_immature_balance ||
+               synthetic_mature_locked_balance != prev.synthetic_mature_locked_balance ||
+               direct_quantum_phase_locked_balance != prev.direct_quantum_phase_locked_balance ||
+               quantum_contract_restricted_balance != prev.quantum_contract_restricted_balance ||
+               final_locked_legacy_balance != prev.final_locked_legacy_balance ||
+               demurrage_locked_balance != prev.demurrage_locked_balance ||
+               demurrage_burned_balance != prev.demurrage_burned_balance ||
                unconfirmed_balance != prev.unconfirmed_balance ||
                immature_balance != prev.immature_balance || stake != prev.stake || watch_only_balance != prev.watch_only_balance ||
                unconfirmed_watch_only_balance != prev.unconfirmed_watch_only_balance ||
@@ -570,9 +607,11 @@ struct WalletMigrationResult
 struct WalletPowMiningInfo
 {
     bool enabled{false};            //!< whether in-process PoW mining is currently requested
+    WalletPowMiningState state{WalletPowMiningState::DISABLED}; //!< bounded worker readiness/waiting state
     int threads{0};                 //!< worker threads (CPU cores) configured
     int cpu_percent{0};             //!< per-core CPU duty-cycle target, 1..100
     double hashrate{0.0};           //!< Argon2id tries per second (aggregate)
+    int current_height{-1};         //!< active-chain tip used for Gold Rush state, or -1 if unavailable
     bool epoch_active{false};       //!< whether the Gold Rush reward window is currently open
     int blocks_remaining{0};        //!< blocks left in the Gold Rush window (0 if inactive)
     std::string payout_address;     //!< auto-created quantum (ML-DSA) payout address (empty until created)
@@ -589,7 +628,7 @@ struct WalletPowMiningInfo
     int shadow_reward_start_height{0};//!< Gold Rush reward start height
     int shadow_reward_end_height{0};  //!< Gold Rush reward end height
     bool wallet_goldrush_status_available{true}; //!< false when wallet status could not be read without blocking
-    int wallet_whitelisted_scripts{0}; //!< wallet-owned spendable scripts in the deterministic whitelist
+    int wallet_whitelisted_scripts{0}; //!< bounded wallet-known scripts in the deterministic whitelist
     bool wallet_recent_solve_qualified{false}; //!< wallet has a whitelisted script with a recent solver marker
     bool wallet_active_signal{false}; //!< wallet has an active QQSIGNAL entry
     int wallet_blocks_until_solver_expiry{0}; //!< max recent-solver expiry across wallet-owned whitelisted scripts
@@ -604,6 +643,8 @@ struct WalletQuantumAddressInfo
     std::string public_key;
     int64_t creation_time{0};
     bool encrypted{false};
+    bool durably_stored{false};
+    bool backup_verified{false};
     bool tiered{false};
     uint16_t unbonding_blocks{0};
     uint32_t unlock_height{0};
@@ -739,6 +780,15 @@ struct WalletUTXOOptimizationTx
     CAmount fee{0};
 };
 
+//! Nonblocking next-block quantum funding permissions for user interfaces.
+struct WalletQuantumFundingStatus
+{
+    bool available{false};
+    bool quantum_outputs_active{false};
+    bool legacy_migration_active{false};
+    bool stake_tiers_active{false};
+};
+
 //! Wallet migration progress and deadline state.
 struct WalletMigrationStatus
 {
@@ -746,8 +796,11 @@ struct WalletMigrationStatus
     std::string phase{"unknown"};
     int64_t median_time{0};
     int64_t deadline_mtp{0};
+    int deadline_height{0};
     bool deadline_scheduled{false};
+    bool height_boundaries_authoritative{false};
     int64_t seconds_until_deadline{0};
+    int64_t blocks_until_deadline{0};
     int64_t blocks_until_deadline_est{0};
     bool deadline_passed{false};
     unsigned int eligible_legacy_inputs{0};

@@ -109,13 +109,11 @@ class RejectLowDifficultyHeadersTest(BitcoinTestFramework):
         self.generate(self.nodes[0], NODE2_BLOCKS_REQUIRED-self.nodes[0].getblockcount(), sync_fun=self.no_op)
 
         self.log.info("Verify that node2 and node3 will sync the chain when it gets long enough")
-        # Under the parallel functional-suite runner, the low-work header phase
-        # can leave a node disconnected before this final block-sync assertion.
-        # Reconnect only missing peers so sync_blocks() tests chain convergence
-        # rather than a transient P2P connection precondition.
+        # The low-work phase intentionally disconnects peers. Re-establish each
+        # tested connection after the chain reaches the configured threshold.
         for node_index in (1, 2, 3):
-            if not self.nodes[node_index].getpeerinfo():
-                self.connect_nodes(0, node_index)
+            self.disconnect_nodes(0, node_index)
+            self.connect_nodes(0, node_index)
         self.sync_blocks()
 
     def test_peerinfo_includes_headers_presync_height(self):

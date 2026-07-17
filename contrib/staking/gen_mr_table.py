@@ -145,8 +145,8 @@ def emit_header(path: str) -> None:
     lines.append("// Regenerate/verify: python3 contrib/staking/gen_mr_table.py --check <thisfile>")
     lines.append("// Staking-weight table (fixed-point, no floats).")
     lines.append("// Frozen rule: " + man["_frozen_rule"])
-    lines.append("#ifndef BLACKCOIN_TEST_DATA_STAKING_MR_TABLE_H")
-    lines.append("#define BLACKCOIN_TEST_DATA_STAKING_MR_TABLE_H")
+    lines.append("#ifndef BITCOIN_TEST_DATA_STAKING_MR_TABLE_H")
+    lines.append("#define BITCOIN_TEST_DATA_STAKING_MR_TABLE_H")
     lines.append("#include <array>")
     lines.append("#include <cstdint>")
     lines.append("namespace blackcoin_staking_canonical {")
@@ -177,22 +177,22 @@ def emit_header(path: str) -> None:
         lines.append("    " + chunk + ",")
     lines.append("}};")
     lines.append("}  // namespace blackcoin_staking_canonical")
-    lines.append("#endif")
-    with open(path, "w") as f:
+    lines.append("#endif // BITCOIN_TEST_DATA_STAKING_MR_TABLE_H")
+    with open(path, "w", encoding="utf8") as f:
         f.write("\n".join(lines) + "\n")
 
 
 def emit_json(path: str) -> None:
     man = build_manifest()
     man["full_table"] = full_table()
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf8") as f:
         json.dump(man, f, indent=2)
         f.write("\n")
 
 
 def check(path: str) -> int:
     man = build_manifest()
-    with open(path) as f:
+    with open(path, encoding="utf8") as f:
         blob = f.read()
     ok = True
     # table hash must appear verbatim in either header or json

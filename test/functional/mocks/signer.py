@@ -10,6 +10,14 @@ import sys
 import argparse
 import json
 
+FUNCTIONAL_DIR = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+sys.path.insert(0, FUNCTIONAL_DIR)
+
+from test_framework.descriptors import (  # noqa: E402
+    descsum_create,
+    xkey_to_main_prefix,
+)
+
 def perform_pre_checks():
     mock_result_path = os.path.join(os.getcwd(), "mock_result")
     if os.path.isfile(mock_result_path):
@@ -23,21 +31,24 @@ def enumerate(args):
     sys.stdout.write(json.dumps([{"fingerprint": "00000001", "type": "trezor", "model": "trezor_t"}]))
 
 def getdescriptors(args):
-    xpub = "tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B"
+    xpub = xkey_to_main_prefix("tpubD6NzVbkrYhZ4WaWSyoBvQwbpLkojyoTZPRsgXELWz3Popb3qkjcJyJUGLnL4qHHoQvao8ESaAstxYSnhyswJ76uZPStJRJCTKvosUCJZL5B")
+
+    def descriptor(purpose, internal, wrapper):
+        key = "[00000001/" + purpose + "'/1'/" + args.account + "']" + xpub + "/" + str(internal) + "/*"
+        return descsum_create(wrapper.format(key=key))
 
     sys.stdout.write(json.dumps({
         "receive": [
-            "pkh([00000001/44'/1'/" + args.account + "']" + xpub + "/0/*)#vt6w3l3j",
-            "sh(wpkh([00000001/49'/1'/" + args.account + "']" + xpub + "/0/*))#r0grqw5x",
-            "wpkh([00000001/84'/1'/" + args.account + "']" + xpub + "/0/*)#x30uthjs",
-            "tr([00000001/86'/1'/" + args.account + "']" + xpub + "/0/*)#sng9rd4t"
+            descriptor("44", 0, "pkh({key})"),
+            descriptor("49", 0, "sh(wpkh({key}))"),
+            descriptor("84", 0, "wpkh({key})"),
+            descriptor("86", 0, "tr({key})"),
         ],
         "internal": [
-            "pkh([00000001/44'/1'/" + args.account + "']" + xpub + "/1/*)#all0v2p2",
-            "sh(wpkh([00000001/49'/1'/" + args.account + "']" + xpub + "/1/*))#kwx4c3pe",
-            "wpkh([00000001/84'/1'/" + args.account + "']" + xpub + "/1/*)#h92akzzg",
-            "tr([00000001/86'/1'/" + args.account + "']" + xpub + "/1/*)#p8dy7c9n"
-
+            descriptor("44", 1, "pkh({key})"),
+            descriptor("49", 1, "sh(wpkh({key}))"),
+            descriptor("84", 1, "wpkh({key})"),
+            descriptor("86", 1, "tr({key})"),
         ]
     }))
 
@@ -55,7 +66,7 @@ def displayaddress(args):
     if args.desc not in expected_desc:
         return sys.stdout.write(json.dumps({"error": "Unexpected descriptor", "desc": args.desc}))
 
-    return sys.stdout.write(json.dumps({"address": "bcrt1qm90ugl4d48jv8n6e5t9ln6t9zlpm5th68x4f8g"}))
+    return sys.stdout.write(json.dumps({"address": "blrt1qm90ugl4d48jv8n6e5t9ln6t9zlpm5th6r4pa3x"}))
 
 def signtx(args):
     if args.fingerprint != "00000001":

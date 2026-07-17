@@ -2,20 +2,25 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Check Gold Rush shadow-ledger payouts against coinstatsindex.
+"""Check Gold Rush payouts against coinstatsindex and the explorer index.
 
 Gold Rush reward credits are synthetic quantum UTXOs created by upgraded nodes
 after connecting otherwise legacy-compatible PoS blocks. This test verifies that
 two upgraded nodes converge on the same UTXO commitment and that a node running
-coinstatsindex reports the same state as its live chainstate across apply/undo.
+coinstatsindex plus shadowindex reports the same state across apply, spend,
+restart, rebuild, and reorg. The block-page loop is a reference explorer
+ingestion flow: enumerate active-chain anchors, follow next_offset, and
+reconcile every observed credit against getshadowsupply.
 """
 
 from decimal import Decimal
+from threading import Thread
 import time
 
+from test_framework.authproxy import JSONRPCException
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error, get_rpc_proxy
 
 
 GOLD_RUSH_END_TIME = 2_000_000_000
@@ -32,16 +37,22 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         self.num_nodes = 2
         self.setup_clean_chain = True
         common_args = [
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushstartheight=20",
             "-shadowgoldrushblocks=10",
+            # This is an explicit QQP4/index vector.  Keep the Q3 and Q4
+            # schedules independently declared rather than inheriting a
+            # production default.
+            "-shadowcompetingclaimsheight=20",
+            "-shadowqqp4height=20",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
         ]
         self.extra_args = [
             common_args,
-            common_args + ["-coinstatsindex"],
+            common_args + ["-coinstatsindex", "-shadowindex=1"],
         ]
 
     def skip_test_if_missing_module(self):
@@ -94,7 +105,13 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
                 assert "proof-of-stake" in block["flags"]
                 txids = [tx["txid"] for tx in block["tx"]]
                 assert claim_txid in txids[2:], "QQSPROOF claim must be a fee-paying transaction"
+                # Node 0 validates the in-memory block object produced by its
+                # wallet. Node 1 validates the network-serialized copy, where
+                # version-2 transaction nTime is absent. Both must derive the
+                # stake input time from the source block and accept the exact
+                # same PoS block.
                 self.sync_blocks()
+                assert_equal(self.nodes[1].getbestblockhash(), block_hash)
                 return block_hash
             except AssertionError as e:
                 last_error = e
@@ -107,8 +124,12 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         index_node = self.nodes[1]
 
         def synced_to_tip():
-            info = index_node.getindexinfo()["coinstatsindex"]
-            return info["synced"] and info.get("best_block_height", index_node.getblockcount()) == index_node.getblockcount()
+            indexes = index_node.getindexinfo()
+            return all(
+                indexes[name]["synced"]
+                and indexes[name].get("best_block_height", index_node.getblockcount()) == index_node.getblockcount()
+                for name in ("coinstatsindex", "shadowindex")
+            )
 
         self.wait_until(synced_to_tip, timeout=60)
 
@@ -130,6 +151,111 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
     def _amount(self, value):
         return Decimal(str(value))
 
+    def _lifecycle_supply(self, node=None):
+        node = node or self.nodes[1]
+        supply = node.getcirculatingsupply()
+        assert_equal(supply["schema"], "blackcoin.supply.lifecycle.v2")
+        assert_equal(
+            self._amount(supply["circulating_amount"])
+            + self._amount(supply["noncirculating_amount"]),
+            self._amount(supply["nominal_amount"]),
+        )
+        assert_equal(
+            sum(
+                (self._amount(item["nominal_amount"]) for item in supply["categories"].values()),
+                ZERO_AMOUNT,
+            ),
+            self._amount(supply["nominal_amount"]),
+        )
+        assert_equal(
+            self._amount(supply["merkle_included_nominal_amount"])
+            + self._amount(supply["synthetic_non_merkle_nominal_amount"]),
+            self._amount(supply["nominal_amount"]),
+        )
+        shadow = supply["shadow"]
+        assert_equal(shadow["synthetic"], True)
+        assert_equal(shadow["merkle_included"], False)
+        assert_equal(
+            self._amount(shadow["claimed_amount"])
+            + self._amount(shadow["outstanding_amount"]),
+            self._amount(shadow["scheduled_through_height_amount"]),
+        )
+        assert_equal(
+            self._amount(shadow["pow_outstanding_amount"])
+            + self._amount(shadow["pos_outstanding_amount"]),
+            self._amount(shadow["outstanding_amount"]),
+        )
+        operational = supply["operational_resource"]
+        assert_equal(operational["explicit_override"], False)
+        assert_equal(operational["consensus_behavior_changed"], False)
+        assert_equal(
+            operational["marker_records_scanned"],
+            operational["utxo_records_scanned"],
+        )
+        assert operational["marker_records_scanned"] > 0
+        assert operational["active_coin_batch_payload_bytes_scanned"] > 0
+        assert operational["authenticated_shadow_records_scanned"] > 0
+        assert (
+            operational[
+                "authenticated_shadow_batch_payload_bytes_scanned"
+            ] > 0
+        )
+        assert (
+            operational["authenticated_shadow_records_scanned"]
+            <= operational["utxo_records_scanned"]
+        )
+        assert (
+            operational[
+                "authenticated_shadow_batch_payload_bytes_scanned"
+            ]
+            <= operational["active_coin_batch_payload_bytes_scanned"]
+        )
+        assert (
+            operational["provenance_point_seeks"]
+            + operational["demurrage_point_seeks"]
+            <= operational["maximum_point_seeks"]
+        )
+
+        # GUI warnings, blackcoind RPC, and blackcoin-cli all read this same
+        # source. Regtest is intentionally outside the mainnet-only model, but
+        # single-flight progress and completion still remain observable.
+        resource = node.getshadowresourceinfo()
+        assert_equal(resource["model_class"], "scoped_operational")
+        assert_equal(resource["universal_consensus_bound"], False)
+        assert_equal(resource["applicable"], False)
+        assert_equal(resource["supply_scan"]["active"], False)
+        assert_equal(resource["supply_scan"]["scan_id"], operational["scan_id"])
+        assert_equal(resource["supply_scan"]["last_outcome"], "complete")
+        assert_equal(resource["supply_scan"]["abort_requested"], False)
+        assert_equal(node.abortcirculatingsupplyscan(), False)
+        return supply
+
+    def _ingest_shadow_reward_window(self):
+        """Reference explorer loop with bounded pages and supply reconciliation."""
+        node = self.nodes[1]
+        observed = []
+        last_reward_height = min(node.getblockcount(), 29)
+        for height in range(20, last_reward_height + 1):
+            offset = 0
+            while True:
+                page = node.getshadowblock(height, offset, 2)
+                assert_equal(page["schema"], "blackcoin.shadow.block.v3")
+                assert_equal(page["synthetic"], True)
+                assert_equal(page["merkle_included"], False)
+                observed.extend(page["payouts"])
+                if page["next_offset"] is None:
+                    break
+                offset = page["next_offset"]
+
+        supply = node.getshadowsupply()
+        assert_equal(supply["schema"], "blackcoin.shadow.supply.v1")
+        assert_equal(len(observed), supply["issued_count"])
+        assert_equal(
+            sum((self._amount(item["nominal_amount"]) for item in observed), ZERO_AMOUNT),
+            self._amount(supply["issued_nominal_amount"]),
+        )
+        return observed, supply
+
     def _assert_cross_node_live_stats_match(self):
         assert_equal(self._live_stats(self.nodes[0]), self._live_stats(self.nodes[1]))
 
@@ -138,6 +264,16 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
 
     def _get_quantum_utxos(self, wallet, address):
         return wallet.listunspent(0, 9999999, [address], True, {"include_immature_coinbase": True})
+
+    def _witness_inventory(self, view="utxos"):
+        inventory = self.nodes[1].getquantumwitnessinventory(view, 0, 100, 1_000_000)
+        assert_equal(inventory["schema"], "blackcoin.quantum.witness_inventory.v1")
+        assert_equal(inventory["coverage"]["snapshot_current_utxos_exact"], True)
+        assert_equal(inventory["coverage"]["history_snapshot_tip_covered"], True)
+        assert_equal(inventory["coverage"]["history_scan_complete"], True)
+        assert_equal(inventory["coverage"]["history_aggregates_exact"], True)
+        assert_equal(inventory["coverage"]["history_reconciles_current_utxos"], True)
+        return inventory
 
     def _wait_for_quantum_utxo(self, wallet, address):
         self.wait_until(lambda: len(self._get_quantum_utxos(wallet, address)) == 1, timeout=30)
@@ -165,8 +301,87 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
             [{"public_key": key["public_key"], "private_key": key["private_key"]}],
         )
 
+    def _assert_shadow_snapshot_aba_retry(self, rpc_name, rpc_args, claim_block_hash, parent_hash):
+        """Force an equal-tip ABA reorg after snapshot capture and require retry."""
+        node = self.nodes[1]
+        barrier = f"Shadow RPC snapshot race barrier reached: rpc={rpc_name}"
+        log_offset = node.debug_log_size(encoding="utf-8")
+        outcome = []
+
+        def call_rpc():
+            rpc = get_rpc_proxy(node.url, 100, timeout=15, coveragedir=node.coverage_dir)
+            try:
+                outcome.append(("result", getattr(rpc, rpc_name)(*rpc_args)))
+            except JSONRPCException as error:
+                outcome.append(("error", error.error))
+            except Exception as error:
+                outcome.append(("exception", str(error)))
+
+        caller = Thread(target=call_rpc, name=f"{rpc_name}-aba-race", daemon=True)
+        caller.start()
+
+        def barrier_reached():
+            with open(node.debug_log_path, encoding="utf-8", errors="replace") as debug_log:
+                debug_log.seek(log_offset)
+                return barrier in debug_log.read()
+
+        self.wait_until(barrier_reached, timeout=10)
+        node.invalidateblock(claim_block_hash)
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(node.getbestblockhash(), parent_hash)
+        node.reconsiderblock(claim_block_hash)
+        node.syncwithvalidationinterfacequeue()
+        assert_equal(node.getbestblockhash(), claim_block_hash)
+
+        caller.join(timeout=15)
+        assert not caller.is_alive(), f"{rpc_name} did not leave the forced snapshot race"
+        assert_equal(len(outcome), 1)
+        assert_equal(outcome[0][0], "error")
+        assert_equal(outcome[0][1]["code"], -1)
+        assert "changed" in outcome[0][1]["message"].lower()
+        assert "retry" in outcome[0][1]["message"].lower()
+
+    def _assert_explorer_help_schemas(self):
+        expected_fields = {
+            "getshadowblock": (
+                "schema", "pow_claim_accounting", "canonical_rank",
+                "accounting_commitment", "payouts", "lifecycle", "spend",
+            ),
+            "getshadowtransaction": (
+                "schema", "base_anchor", "pow_claim_source", "demurrage",
+                "spend", "units",
+            ),
+            "getshadowaddress": (
+                "schema", "scriptPubKey", "next_cursor", "records",
+                "base_anchor", "demurrage",
+            ),
+            "getshadowscript": (
+                "schema", "address", "next_cursor", "synthetic",
+                "records", "demurrage",
+            ),
+            "getshadowoutpoint": (
+                "schema", "lookup_index", "base_anchor", "lifecycle",
+                "spend", "units",
+            ),
+            "getquantumwitnessinventory": (
+                "schema", "utxo_snapshot", "current_utxos", "history",
+                "coverage", "bridge_handling",
+                "history_reconciles_current_utxos", "records",
+            ),
+            "getshadowsupply": (
+                "schema", "schedule", "pool", "lifecycle", "burn", "legacy",
+                "decay_paid_as_fee", "units",
+            ),
+        }
+        for command, fields in expected_fields.items():
+            command_help = self.nodes[1].help(command)
+            assert "Fields are defined by the top-level schema discriminator" not in command_help
+            for field in fields:
+                assert f'"{field}"' in command_help, (command, field)
+
     def run_test(self):
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
+        self._assert_explorer_help_schemas()
 
         self.log.info("Preparing a wallet with mature staking and QQSPROOF funding coins")
         for node in self.nodes:
@@ -195,6 +410,12 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         payout_address = wallet.getnewquantumaddress()["address"]
         claim = wallet.sendshadowpowclaim(claim_address, payout_address, 500000)
         assert claim["txid"] in self.nodes[0].getrawmempool()
+        raw_claim = self.nodes[0].getrawtransaction(claim["txid"], True)
+        assert_equal(len(raw_claim["vin"]), 1)
+        expected_claim_outpoint = {
+            "txid": raw_claim["vin"][0]["txid"],
+            "vout": raw_claim["vin"][0]["vout"],
+        }
         claim_block_hash = self._mine_pos_block_with_claim(wallet, claim["txid"])
         claim_block_height = self.nodes[0].getblockcount()
         self._wait_index_synced()
@@ -216,12 +437,153 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         assert_equal(self._amount(claim_indexed_full["block_info"]["unspendable"]), ZERO_AMOUNT)
         assert_equal(self._amount(claim_indexed_full["block_info"]["unspendables"]["unclaimed_rewards"]), ZERO_AMOUNT)
         assert_equal(claim_indexed_full["total_unspendable_amount"], parent_indexed_full["total_unspendable_amount"])
+        claim_lifecycle = self._lifecycle_supply()
+        # The bounded point-lookup implementation must be byte-for-byte
+        # equivalent on two independent immutable chainstate snapshots; it may
+        # not depend on a process-local payout-marker map.
+        assert_equal(self._lifecycle_supply(self.nodes[0]), claim_lifecycle)
+        assert_equal(claim_lifecycle["shadow"]["issued_count"], 1)
+        assert_equal(claim_lifecycle["shadow"]["unspent_count"], 1)
+        assert_equal(claim_lifecycle["goldrush_synthetic_immature_txouts"], 1)
+        assert_equal(claim_lifecycle["goldrush_locked_payout_txouts"], 0)
+        assert_equal(
+            self._amount(claim_lifecycle["goldrush_synthetic_immature_amount"]),
+            self._amount(payout_utxo["amount"]),
+        )
+        assert_equal(
+            claim_lifecycle["categories"]["gold_rush_synthetic_immature"]["count"],
+            1,
+        )
+
+        self.log.info("Enumerating explorer pages and reconciling indexed shadow supply")
+        claim_shadow = self.nodes[1].getshadowblock(claim_block_hash, 0, 1, 0, 1)
+        assert_equal(claim_shadow["total_payouts"], 1)
+        assert_equal(claim_shadow["count"], 1)
+        assert_equal(claim_shadow["payouts"][0]["synthetic_txid"], payout_utxo["txid"])
+        assert_equal(claim_shadow["payouts"][0]["synthetic"], True)
+        assert_equal(claim_shadow["payouts"][0]["merkle_included"], False)
+        claim_accounting = claim_shadow["pow_claim_accounting"]
+        assert_equal(claim_accounting["active"], True)
+        assert_equal(claim_accounting["total_records"], 1)
+        assert_equal(claim_accounting["observed_count"], 1)
+        assert_equal(claim_accounting["evaluated_count"], 1)
+        assert_equal(claim_accounting["winner_count"], 1)
+        assert_equal(claim_accounting["reimbursed_loser_count"], 0)
+        assert_equal(claim_accounting["rejected_count"], 0)
+        assert_equal(claim_accounting["next_offset"], None)
+        assert_equal(claim_accounting["records"][0]["txid"], claim["txid"])
+        assert_equal(claim_accounting["records"][0]["disposition"], "winner")
+        assert_equal(claim_accounting["records"][0]["synthetic_txid"], payout_utxo["txid"])
+        assert_equal(claim_accounting["records"][0]["proof_version"], 4)
+        assert_equal(claim_accounting["records"][0]["input_bound"], True)
+        assert_equal(claim_accounting["records"][0]["claim_outpoint"], expected_claim_outpoint)
+        assert_equal(
+            self._amount(claim_accounting["credited_total"]),
+            self._amount(claim_shadow["pow_payout_total"]),
+        )
+        payout_record = self.nodes[1].getshadowtransaction(payout_utxo["txid"])
+        assert_equal(payout_record["schema"], "blackcoin.shadow.transaction.v1")
+        assert_equal(payout_record["status"], "immature")
+        assert_equal(payout_record["lifecycle_category"], "gold_rush_synthetic_immature")
+        assert_equal(payout_record["lifecycle"]["consensus_spendable_next_block"], False)
+        assert_equal(payout_record["lifecycle"]["ordinary_spendable_next_block"], False)
+        assert_equal(payout_record["base_anchor"]["blockhash"], claim_block_hash)
+        assert_equal(payout_record["pow_claim_source"]["txid"], claim["txid"])
+        assert_equal(payout_record["pow_claim_source"]["disposition"], "winner")
+        assert_equal(payout_record["pow_claim_source"]["proof_version"], 4)
+        assert_equal(payout_record["pow_claim_source"]["input_bound"], True)
+        assert_equal(payout_record["pow_claim_source"]["claim_outpoint"], expected_claim_outpoint)
+        address_history = self.nodes[1].getshadowaddress(payout_address)
+        assert_equal(address_history["schema"], "blackcoin.shadow.address.v1")
+        assert_equal(address_history["address"], payout_address)
+        assert_equal(address_history["count"], 1)
+        assert_equal(address_history["records"][0]["synthetic_txid"], payout_utxo["txid"])
+        payout_script = address_history["scriptPubKey"]
+        script_history = self.nodes[1].getshadowscript(payout_script)
+        assert_equal(script_history["schema"], "blackcoin.shadow.script.v1")
+        assert_equal(script_history["scriptPubKey"], payout_script)
+        assert_equal(script_history["address"], payout_address)
+        assert_equal(script_history["synthetic"], True)
+        assert_equal(script_history["merkle_included"], False)
+        assert_equal(script_history["count"], 1)
+        assert_equal(script_history["records"][0]["synthetic_txid"], payout_utxo["txid"])
+        payout_outpoint = self.nodes[1].getshadowoutpoint(payout_utxo["txid"], payout_utxo["vout"])
+        assert_equal(payout_outpoint["schema"], "blackcoin.shadow.outpoint.v1")
+        assert_equal(payout_outpoint["lookup_index"], "synthetic_transaction")
+        assert_equal(payout_outpoint["status"], "immature")
+        assert_equal(payout_outpoint["synthetic"], True)
+        assert_equal(payout_outpoint["merkle_included"], False)
+        assert_raises_rpc_error(
+            -5, "not found", self.nodes[1].getshadowoutpoint, payout_utxo["txid"], payout_utxo["vout"] + 1
+        )
+        observed, shadow_supply = self._ingest_shadow_reward_window()
+        assert_equal([item["synthetic_txid"] for item in observed], [payout_utxo["txid"]])
+        assert_equal(shadow_supply["unspent_count"], 1)
+        assert_equal(self._amount(shadow_supply["unspent_nominal_amount"]), self._amount(payout_utxo["amount"]))
+        assert_equal(shadow_supply["lifecycle_schema"], "blackcoin.shadow.supply.lifecycle.v1")
+        assert_equal(shadow_supply["accounting_scope"], "synthetic_gold_rush_payouts_only")
+        assert_equal(shadow_supply["synthetic"], True)
+        assert_equal(shadow_supply["merkle_included"], False)
+        assert_equal(shadow_supply["lifecycle"]["classification_exact"], True)
+        assert_equal(shadow_supply["lifecycle"]["locked_count"], 1)
+        assert_equal(shadow_supply["lifecycle"]["spendable_count"], 0)
+        assert_equal(shadow_supply["lifecycle"]["expired_payout_count"], 0)
+        assert_equal(shadow_supply["legacy"]["included"], False)
+        assert_equal(shadow_supply["legacy"]["spendable_amount"], None)
+        assert_equal(
+            self._amount(shadow_supply["schedule"]["accrued_amount"]),
+            self._amount(shadow_supply["issued_nominal_amount"])
+            + self._amount(shadow_supply["pool"]["amount"]),
+        )
+        assert_equal(
+            self._amount(shadow_supply["pool"]["amount"]),
+            self._amount(shadow_supply["pool"]["pow_amount"])
+            + self._amount(shadow_supply["pool"]["pos_amount"]),
+        )
+        payout_inventory = self._witness_inventory()
+        assert_equal(payout_inventory["current_utxos"]["total"]["count"], 0)
+        assert_equal(payout_inventory["current_utxos"]["excluded_synthetic_shadow"]["count"], 1)
+        assert_equal(payout_inventory["history"]["created"]["count"], 0)
+
+        self.log.info("Rejecting equal-tip ABA reorgs across shadow supply, script, outpoint, and witness-history snapshots")
+        race_args = self.extra_args[1] + [
+            "-shadowrpcsnapshotdelaymillis=1500",
+            f"-mocktime={self.mock_time}",
+        ]
+        self.restart_node(1, extra_args=race_args)
+        self.connect_nodes(0, 1)
+        self.sync_blocks()
+        self._wait_index_synced()
+        for rpc_name, rpc_args in (
+            ("getshadowsupply", []),
+            ("getshadowscript", [payout_script]),
+            ("getshadowoutpoint", [payout_utxo["txid"], payout_utxo["vout"]]),
+            ("getquantumwitnessinventory", ["history", 0, 100, 100_000]),
+        ):
+            self._assert_shadow_snapshot_aba_retry(
+                rpc_name, rpc_args, claim_block_hash, parent_hash
+            )
+
+        self.restart_node(
+            1,
+            extra_args=self.extra_args[1] + [f"-mocktime={self.mock_time}"],
+        )
+        self.connect_nodes(0, 1)
+        self.sync_blocks()
+        self._wait_index_synced()
+        assert_equal(self.nodes[1].getbestblockhash(), claim_block_hash)
 
         self.log.info("Invalidating the claim block on the index node rewinds indexed shadow payouts")
         self.nodes[1].invalidateblock(claim_block_hash)
         self.wait_until(lambda: self.nodes[1].getbestblockhash() == parent_hash, timeout=30)
         self._wait_index_synced()
         assert self.nodes[1].gettxout(payout_utxo["txid"], payout_utxo["vout"], False) is None
+        assert_raises_rpc_error(-5, "not in the active chain", self.nodes[1].getshadowblock, claim_block_hash)
+        assert_raises_rpc_error(-5, "not found", self.nodes[1].getshadowtransaction, payout_utxo["txid"])
+        assert_raises_rpc_error(
+            -5, "not found", self.nodes[1].getshadowoutpoint, payout_utxo["txid"], payout_utxo["vout"]
+        )
+        assert_equal(self.nodes[1].getshadowscript(payout_script)["count"], 0)
         assert_equal(self._live_stats(self.nodes[1]), parent_stats)
         self._assert_index_matches_live()
 
@@ -230,6 +592,8 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         self.wait_until(lambda: self.nodes[1].getbestblockhash() == claim_block_hash, timeout=30)
         self._wait_index_synced()
         assert self.nodes[1].gettxout(payout_utxo["txid"], payout_utxo["vout"], False) is not None
+        assert_equal(self.nodes[1].getshadowtransaction(payout_utxo["txid"])["status"], "immature")
+        assert_equal(self.nodes[1].getshadowscript(payout_script)["count"], 1)
         assert_equal(self._live_stats(self.nodes[1]), claim_stats)
         self._assert_index_matches_live()
         self._assert_cross_node_live_stats_match()
@@ -239,12 +603,34 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         self._sync_mocktime_to_tip()
         matured_utxo = self._wait_for_quantum_utxo(wallet, payout_address)
         assert matured_utxo["confirmations"] > COINBASE_MATURITY
+        mature_locked_supply = self._lifecycle_supply()
+        assert_equal(mature_locked_supply["goldrush_synthetic_immature_txouts"], 0)
+        assert_equal(mature_locked_supply["goldrush_locked_payout_txouts"], 1)
+        assert_equal(
+            self._amount(mature_locked_supply["goldrush_locked_payout_amount"]),
+            self._amount(matured_utxo["amount"]),
+        )
+        assert_equal(
+            mature_locked_supply["categories"]["gold_rush_synthetic_mature_locked"]["count"],
+            1,
+        )
 
         self._advance_to_migration_window()
         migration_parent_hash = self.nodes[0].getbestblockhash()
         migration_parent_height = self.nodes[0].getblockcount()
         migration_parent_stats = self._live_stats(self.nodes[1])
         migration_parent_indexed_full = self._indexed_full_stats_at(self.nodes[1], migration_parent_hash)
+        migration_supply = self._lifecycle_supply()
+        assert_equal(migration_supply["goldrush_locked_payout_txouts"], 0)
+        assert_equal(migration_supply["shadow"]["unspent_count"], 1)
+        assert_equal(
+            self._amount(migration_supply["synthetic_non_merkle_nominal_amount"]),
+            self._amount(matured_utxo["amount"]),
+        )
+        assert_equal(
+            migration_supply["categories"]["migration_spendable_direct_quantum"]["count"],
+            1,
+        )
         next_quantum = wallet.getnewquantumaddress()["address"]
         signed = self._build_quantum_spend(wallet, matured_utxo, next_quantum)
         assert_equal(signed["complete"], True)
@@ -267,12 +653,75 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         assert_equal(self._amount(spend_indexed_full["block_info"]["unspendable"]), ZERO_AMOUNT)
         assert_equal(self._amount(spend_indexed_full["block_info"]["unspendables"]["unclaimed_rewards"]), ZERO_AMOUNT)
         assert_equal(spend_indexed_full["total_unspendable_amount"], migration_parent_indexed_full["total_unspendable_amount"])
+        spent_record = self.nodes[1].getshadowtransaction(payout_utxo["txid"])
+        assert_equal(spent_record["status"], "spent")
+        assert_equal(spent_record["spend"]["txid"], spend_txid)
+        assert_equal(spent_record["spend"]["blockhash"], spend_block_hash)
+        spent_outpoint = self.nodes[1].getshadowoutpoint(payout_utxo["txid"], payout_utxo["vout"])
+        assert_equal(spent_outpoint["lookup_index"], "spent_outpoint")
+        assert_equal(spent_outpoint["status"], "spent")
+        assert_equal(spent_outpoint["spend"]["txid"], spend_txid)
+        spent_script_history = self.nodes[1].getshadowscript(payout_script)
+        assert_equal(spent_script_history["count"], 1)
+        assert_equal(spent_script_history["records"][0]["status"], "spent")
+        spent_supply = self.nodes[1].getshadowsupply()
+        assert_equal(spent_supply["spent_count"], 1)
+        assert_equal(spent_supply["unspent_count"], 0)
+        assert_equal(self._amount(spent_supply["spent_nominal_amount"]), self._amount(payout_utxo["amount"]))
+        assert_equal(spent_supply["lifecycle"]["classification_exact"], True)
+        assert_equal(spent_supply["lifecycle"]["locked_count"], 0)
+        assert_equal(spent_supply["lifecycle"]["spendable_count"], 0)
+        assert_equal(
+            self._amount(spent_supply["burn"]["realized_amount"]),
+            self._amount(spent_supply["spent_burned_amount"]),
+        )
+        spent_lifecycle = self._lifecycle_supply()
+        assert_equal(spent_lifecycle["shadow"]["spent_count"], 1)
+        assert_equal(spent_lifecycle["shadow"]["unspent_count"], 0)
+        assert_equal(self._amount(spent_lifecycle["synthetic_non_merkle_nominal_amount"]), ZERO_AMOUNT)
+        assert_equal(
+            spent_lifecycle["categories"]["migration_spendable_direct_quantum"]["count"],
+            1,
+        )
+        witness_inventory = self._witness_inventory()
+        assert_equal(witness_inventory["current_utxos"]["total"]["count"], 1)
+        assert_equal(witness_inventory["current_utxos"]["by_version"]["v16"]["count"], 1)
+        assert_equal(witness_inventory["current_utxos"]["by_origin_group"]["migration_or_later"]["count"], 1)
+        assert_equal(witness_inventory["current_utxos"]["by_bridge_handling"]["recognized_direct_quantum"]["count"], 1)
+        assert_equal(witness_inventory["current_utxos"]["excluded_synthetic_shadow"]["count"], 0)
+        assert_equal(witness_inventory["history"]["created"]["count"], 1)
+        assert_equal(witness_inventory["history"]["spent"]["count"], 0)
+        assert_equal(witness_inventory["history"]["unspent"]["count"], 1)
+        assert_equal(witness_inventory["records"][0]["txid"], spend_txid)
+        history_inventory = self._witness_inventory("history")
+        assert_equal(history_inventory["records"][0]["txid"], spend_txid)
+        assert_equal(history_inventory["records"][0]["spent"], False)
 
         self.log.info("Invalidating the spend block restores the synthetic payout in indexed chainstate")
         self.nodes[1].invalidateblock(spend_block_hash)
         self.wait_until(lambda: self.nodes[1].getbestblockhash() == migration_parent_hash, timeout=30)
         self._wait_index_synced()
         assert self.nodes[1].gettxout(matured_utxo["txid"], matured_utxo["vout"], False) is not None
+        assert_equal(self.nodes[1].getshadowtransaction(payout_utxo["txid"])["status"], "unspent")
+        rewound_outpoint = self.nodes[1].getshadowoutpoint(payout_utxo["txid"], payout_utxo["vout"])
+        assert_equal(rewound_outpoint["lookup_index"], "synthetic_transaction")
+        assert_equal(rewound_outpoint["status"], "unspent")
+        assert_equal(self.nodes[1].getshadowscript(payout_script)["records"][0]["status"], "unspent")
+        rewound_supply = self.nodes[1].getshadowsupply()
+        assert_equal(rewound_supply["lifecycle"]["classification_exact"], True)
+        assert_equal(rewound_supply["lifecycle"]["locked_count"], 0)
+        assert_equal(rewound_supply["lifecycle"]["spendable_count"], 1)
+        rewound_lifecycle = self._lifecycle_supply()
+        assert_equal(rewound_lifecycle["shadow"]["spent_count"], 0)
+        assert_equal(rewound_lifecycle["shadow"]["unspent_count"], 1)
+        assert_equal(
+            self._amount(rewound_lifecycle["synthetic_non_merkle_nominal_amount"]),
+            self._amount(matured_utxo["amount"]),
+        )
+        rewound_inventory = self._witness_inventory()
+        assert_equal(rewound_inventory["current_utxos"]["total"]["count"], 0)
+        assert_equal(rewound_inventory["current_utxos"]["excluded_synthetic_shadow"]["count"], 1)
+        assert_equal(rewound_inventory["history"]["created"]["count"], 0)
         assert_equal(self._live_stats(self.nodes[1]), migration_parent_stats)
         self._assert_index_matches_live()
 
@@ -281,24 +730,70 @@ class GoldRushCoinStatsIndexTest(BitcoinTestFramework):
         self.wait_until(lambda: self.nodes[1].getbestblockhash() == spend_block_hash, timeout=30)
         self._wait_index_synced()
         assert self.nodes[1].gettxout(matured_utxo["txid"], matured_utxo["vout"], False) is None
+        assert_equal(self._witness_inventory()["history"]["created"]["count"], 1)
         assert_equal(self._live_stats(self.nodes[1]), spend_stats)
         self._assert_index_matches_live()
         self._assert_cross_node_live_stats_match()
 
         self.log.info("Restarting and rebuilding coinstatsindex preserves synthetic payout spend state")
         final_stats = self._live_stats(self.nodes[1])
-        for restart_args in (
-            self.extra_args[1],
-            self.extra_args[1] + ["-reindex"],
-            self.extra_args[1] + ["-reindex-chainstate"],
+        for restart_args, expected_shadow_log in (
+            (self.extra_args[1], None),
+            (self.extra_args[1] + ["-reindex"], None),
+            (self.extra_args[1] + ["-reindex-chainstate"], None),
+            (
+                self.extra_args[1] + ["-shadowindexmockobsoleteschema=1"],
+                "ShadowIndex: rebuilding incompatible schema version",
+            ),
         ):
-            self.restart_node(1, extra_args=restart_args + [f"-mocktime={self.mock_time}"])
+            restart_args = restart_args + [f"-mocktime={self.mock_time}"]
+            if "-reindex-chainstate" in restart_args:
+                self.stop_node(1)
+                self.run_chainstate_rebuild_first_pass(self.nodes[1], restart_args)
+                self.restart_after_chainstate_rebuild(
+                    1,
+                    extra_args=self.extra_args[1] + [f"-mocktime={self.mock_time}"],
+                )
+            elif expected_shadow_log:
+                with self.nodes[1].assert_debug_log([expected_shadow_log], timeout=60):
+                    self.restart_node(1, extra_args=restart_args)
+            else:
+                self.restart_node(1, extra_args=restart_args)
             self.nodes[1].setmocktime(self.mock_time)
             self.connect_nodes(0, 1)
             self.sync_blocks()
             self._wait_index_synced()
             assert_equal(self.nodes[1].getbestblockhash(), spend_block_hash)
             assert self.nodes[1].gettxout(matured_utxo["txid"], matured_utxo["vout"], False) is None
+            rebuilt_record = self.nodes[1].getshadowtransaction(payout_utxo["txid"])
+            assert_equal(rebuilt_record["status"], "spent")
+            assert_equal(rebuilt_record["spend"]["txid"], spend_txid)
+            rebuilt_outpoint = self.nodes[1].getshadowoutpoint(payout_utxo["txid"], payout_utxo["vout"])
+            assert_equal(rebuilt_outpoint["lookup_index"], "spent_outpoint")
+            assert_equal(rebuilt_outpoint["status"], "spent")
+            rebuilt_script = self.nodes[1].getshadowscript(payout_script)
+            assert_equal(rebuilt_script["count"], 1)
+            assert_equal(rebuilt_script["records"][0]["status"], "spent")
+            rebuilt_claim = self.nodes[1].getshadowblock(claim_block_hash, 0, 1, 0, 1)["pow_claim_accounting"]
+            assert_equal(rebuilt_claim["records"][0]["txid"], claim["txid"])
+            assert_equal(rebuilt_claim["records"][0]["disposition"], "winner")
+            assert_equal(rebuilt_claim["records"][0]["synthetic_txid"], payout_utxo["txid"])
+            assert_equal(rebuilt_claim["records"][0]["proof_version"], 4)
+            assert_equal(rebuilt_claim["records"][0]["input_bound"], True)
+            assert_equal(rebuilt_claim["records"][0]["claim_outpoint"], expected_claim_outpoint)
+            rebuilt_supply = self.nodes[1].getshadowsupply()
+            assert_equal(rebuilt_supply["spent_count"], 1)
+            assert_equal(rebuilt_supply["unspent_count"], 0)
+            assert_equal(rebuilt_supply["lifecycle"]["classification_exact"], True)
+            assert_equal(rebuilt_supply["lifecycle"]["locked_count"], 0)
+            assert_equal(rebuilt_supply["lifecycle"]["spendable_count"], 0)
+            rebuilt_lifecycle = self._lifecycle_supply()
+            assert_equal(rebuilt_lifecycle["shadow"]["spent_count"], 1)
+            assert_equal(rebuilt_lifecycle["shadow"]["unspent_count"], 0)
+            assert_equal(self._amount(rebuilt_lifecycle["synthetic_non_merkle_nominal_amount"]), ZERO_AMOUNT)
+            rebuilt_inventory = self._witness_inventory()
+            assert_equal(rebuilt_inventory["current_utxos"]["total"]["count"], 1)
+            assert_equal(rebuilt_inventory["history"]["created"]["count"], 1)
             assert_equal(self._live_stats(self.nodes[1]), final_stats)
             self._assert_index_matches_live()
             assert_equal(self._indexed_stats_at(self.nodes[1], migration_parent_hash), migration_parent_stats)

@@ -38,6 +38,7 @@
 #include <random.h>
 #include <reverse_iterator.h>
 #include <scheduler.h>
+#include <shadow.h>
 #include <streams.h>
 #include <sync.h>
 #include <timedata.h>
@@ -522,7 +523,7 @@ public:
         return false;
     }
 
-    bool updateState(BlockValidationState& state, bool ret)
+    bool updateState(NodeId peer_id, BlockValidationState& state, bool ret)
     {
         // No headers
         size_t size = points.size();
@@ -539,15 +540,16 @@ public:
         // Compute the average value per height
         double nAvgValue = (double)nHeaders / size;
 
-        // Ban the node if try to spam
+        // Flag the peer for the normal discouragement/disconnection path.
         bool banNode = (nAvgValue >= 1.5 * maxAvg && size >= maxAvg) ||
                        (nAvgValue >= maxAvg && nHeaders >= maxSize) ||
                        (nHeaders >= maxSize * 4.1);
         if(banNode)
         {
-            // Clear the points and ban the node
             points.clear();
-            return state.Invalid(BlockValidationResult::BLOCK_HEADER_SPAM, "header-spam", "ban node for sending spam");
+            return state.Invalid(BlockValidationResult::BLOCK_HEADER_SPAM, "header-spam",
+                strprintf("peer %d discouraged/disconnected for header spam (avg=%.2f/%u, headers=%u, max=%u, size=%u)",
+                          peer_id, nAvgValue, maxAvg, nHeaders, maxSize, size));
         }
 
         return ret;
@@ -1242,6 +1244,21 @@ static bool CanServeWitnesses(const Peer& peer)
     return peer.m_their_services & NODE_WITNESS;
 }
 
+static bool WitnessConsensusActiveAt(const CBlockIndex& index, const ChainstateManager& chainman)
+{
+    const int64_t mtp = index.pprev ? index.pprev->GetMedianTimePast() : index.GetBlockTime();
+    return DeploymentActiveAt(index, chainman, Consensus::DEPLOYMENT_SEGWIT) ||
+           IsQuantumWitnessSpendActive(chainman.GetConsensus(), mtp, index.nHeight);
+}
+
+static bool WitnessConsensusActiveAfter(const CBlockIndex* pindex_prev, const ChainstateManager& chainman)
+{
+    const int next_height = pindex_prev ? pindex_prev->nHeight + 1 : 0;
+    const int64_t mtp = pindex_prev ? pindex_prev->GetMedianTimePast() : 0;
+    return DeploymentActiveAfter(pindex_prev, chainman, Consensus::DEPLOYMENT_SEGWIT) ||
+           IsQuantumWitnessSpendActive(chainman.GetConsensus(), mtp, next_height);
+}
+
 CNodeHeaders& PeerManagerImpl::ServiceHeaders(const CService& address) EXCLUSIVE_LOCKS_REQUIRED(cs_main) {
     unsigned short port =
             gArgs.GetBoolArg("-headerspamfilterignoreport", DEFAULT_HEADER_SPAM_FILTER_IGNORE_PORT) ? 0 : address.GetPort();
@@ -1572,7 +1589,7 @@ void PeerManagerImpl::FindNextBlocks(std::vector<const CBlockIndex*>& vBlocks, c
                 // We consider the chain that this peer is on invalid.
                 return;
             }
-            if (!CanServeWitnesses(peer) && DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_SEGWIT)) {
+            if (!CanServeWitnesses(peer) && WitnessConsensusActiveAt(*pindex, m_chainman)) {
                 // We wouldn't download this block or its descendants from this peer.
                 return;
             }
@@ -1637,10 +1654,10 @@ bool PeerManagerImpl::ProcessNetBlockHeaders(CNode& pfrom, const std::vector<CBl
         if (!m_chainman.IsInitialBlockDownload() || (gArgs.GetBoolArg("-headerspamfilterduringibd", DEFAULT_HEADER_SPAM_FILTER_DURING_IBD) && m_chainman.IsInitialBlockDownload()))
         {
             LOCK(cs_main);
-            CNodeHeaders& headers = ServiceHeaders(pfrom.GetAddrLocal());
+            CNodeHeaders& headers = ServiceHeaders(pfrom.addr);
             const CBlockIndex *pindexLast = ppindex == nullptr ? nullptr : *ppindex;
             headers.addHeaders(pindexFirst, pindexLast);
-            return headers.updateState(state, ret);
+            return headers.updateState(pfrom.GetId(), state, ret);
         }       
     }
     return ret;
@@ -2005,10 +2022,17 @@ bool PeerManagerImpl::MaybePunishNodeForBlock(NodeId nodeid, const BlockValidati
             break;
         }
     case BlockValidationResult::BLOCK_INVALID_HEADER:
-    case BlockValidationResult::BLOCK_CHECKPOINT:
     case BlockValidationResult::BLOCK_INVALID_PREV:
     case BlockValidationResult::BLOCK_HEADER_SPAM:
         if (peer) Misbehaving(*peer, 100, message);
+        return true;
+    case BlockValidationResult::BLOCK_CHECKPOINT:
+        // A peer can disagree with a locally configured or release-specific
+        // checkpoint while still sending an otherwise well-formed header.
+        // Reject the conflicting history, but accumulate only the deployed
+        // rolling-checkpoint penalty instead of immediately discouraging the
+        // peer as if it had sent intrinsically invalid consensus data.
+        if (peer) Misbehaving(*peer, 1, message);
         return true;
     // Conflicting (but not necessarily invalid) data or different policy:
     case BlockValidationResult::BLOCK_MISSING_PREV:
@@ -2225,7 +2249,7 @@ void PeerManagerImpl::NewPoWValidBlock(const CBlockIndex *pindex, const std::sha
         return;
     m_highest_fast_announce = pindex->nHeight;
 
-    if (!DeploymentActiveAt(*pindex, m_chainman, Consensus::DEPLOYMENT_SEGWIT)) return;
+    if (!WitnessConsensusActiveAt(*pindex, m_chainman)) return;
 
     uint256 hashBlock(pblock->GetHash());
     const std::shared_future<CSerializedNetMsg> lazy_ser{
@@ -2738,11 +2762,11 @@ arith_uint256 PeerManagerImpl::GetAntiDoSWorkThreshold()
 {
     arith_uint256 near_chaintip_work = 0;
     LOCK(cs_main);
-    if (m_chainman.ActiveChain().Tip() != nullptr) {
-        const CBlockIndex *tip = m_chainman.ActiveChain().Tip();
-        // Use a 144 block buffer, so that we'll accept headers that fork from
-        // near our tip.
-        near_chaintip_work = tip->nChainWork - std::min<arith_uint256>(144*GetBlockProof(*tip), tip->nChainWork);
+    const CBlockIndex* tip = m_chainman.ActiveChain().Tip();
+    if (tip != nullptr) {
+        // Match the deployed legacy rolling-checkpoint anti-DoS floor.
+        const CBlockIndex* checkpoint = m_chainman.m_blockman.AutoSelectSyncCheckpoint(tip);
+        near_chaintip_work = checkpoint->nChainWork;
     }
     return std::max(near_chaintip_work, m_chainman.MinimumChainWork());
 }
@@ -2976,7 +3000,7 @@ void PeerManagerImpl::HeadersDirectFetchBlocks(CNode& pfrom, const Peer& peer, c
         while (pindexWalk && !m_chainman.ActiveChain().Contains(pindexWalk) && vToFetch.size() <= MAX_BLOCKS_IN_TRANSIT_PER_PEER) {
             if (!(pindexWalk->nStatus & BLOCK_HAVE_DATA) &&
                     !IsBlockRequested(pindexWalk->GetBlockHash()) &&
-                    (!DeploymentActiveAt(*pindexWalk, m_chainman, Consensus::DEPLOYMENT_SEGWIT) || CanServeWitnesses(peer))) {
+                    (!WitnessConsensusActiveAt(*pindexWalk, m_chainman) || CanServeWitnesses(peer))) {
                 // We don't have this block, and it's not yet in flight.
                 vToFetch.push_back(pindexWalk);
             }
@@ -4925,7 +4949,7 @@ void PeerManagerImpl::ProcessMessage(CNode& pfrom, const std::string& msg_type, 
 
         // Check for possible mutation if it connects to something we know so we can check for DEPLOYMENT_SEGWIT being active
         if (prev_block && IsBlockMutated(/*block=*/*pblock,
-                           /*check_witness_root=*/DeploymentActiveAfter(prev_block, m_chainman, Consensus::DEPLOYMENT_SEGWIT))) {
+                           /*check_witness_root=*/WitnessConsensusActiveAfter(prev_block, m_chainman))) {
             LogPrint(BCLog::NET, "Received mutated block from peer=%d\n", peer->m_id);
             Misbehaving(*peer, 100, "mutated block");
             WITH_LOCK(cs_main, RemoveBlockRequest(pblock->GetHash(), peer->m_id));

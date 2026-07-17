@@ -4,15 +4,19 @@
 Requires: pip install reportlab
 Usage: python3 contrib/devtools/gen-whitepaper-pdf.py
 """
-import re, sys, os
-from reportlab.lib.pagesizes import letter
-from reportlab.lib.units import inch
-from reportlab.lib import colors
-from reportlab.lib.styles import ParagraphStyle
-from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER, TA_LEFT
-from reportlab.platypus import (BaseDocTemplate, PageTemplate, Frame, Paragraph, Spacer,
-                                Table, TableStyle, PageBreak, HRFlowable, KeepTogether)
-from reportlab.platypus.tableofcontents import TableOfContents
+import hashlib
+import os
+import re
+
+from reportlab.lib import colors  # type: ignore[import]
+from reportlab.lib.enums import TA_CENTER, TA_JUSTIFY, TA_LEFT  # type: ignore[import]
+from reportlab.lib.pagesizes import letter  # type: ignore[import]
+from reportlab.lib.styles import ParagraphStyle  # type: ignore[import]
+from reportlab.lib.units import inch  # type: ignore[import]
+from reportlab.platypus import (BaseDocTemplate, CondPageBreak, Frame, HRFlowable, KeepTogether,  # type: ignore[import]
+                                PageBreak, PageTemplate, Paragraph, Spacer, Table,
+                                TableStyle)
+from reportlab.platypus.tableofcontents import TableOfContents  # type: ignore[import]
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 SRC = os.path.join(ROOT, "doc", "whitepaper-quantum-quasar.md")
@@ -28,7 +32,7 @@ RULE = colors.HexColor("#c8b273")
 SUBS = {
     "✅": "Yes", "❌": "No", "→": "->", "≤": "<=", "≥": ">=",
     "≈": "~", "−": "-", "×": "x", "…": "...", "‑": "-",
-    "​": "", "️": "", "–": "–", "—": "—",
+    "​": "", "️": "", "–": "-", "—": "-",
 }
 def sanitize(s):
     for k, v in SUBS.items():
@@ -43,7 +47,6 @@ def inline(s):
     """Convert inline markdown to reportlab XML markup."""
     s = sanitize(s)
     s = re.sub(r"\*\*(`[^`]+`)\*\*", r"\1", s)  # bold-wrapped code spans: keep the code styling
-    out, i, buf = [], 0, []
     # protect code spans first
     parts = re.split(r"(`[^`]+`)", s)
     res = ""
@@ -120,18 +123,20 @@ def cover(canv, doc):
     canv.drawCentredString(w/2, 1.95*inch, "Quantum Quasar Developers")
     canv.setFillColor(colors.HexColor("#bbbbbb"))
     canv.setFont("Helvetica", 9.5)
-    canv.drawCentredString(w/2, 1.65*inch, "Version 30.1.0  •  July 2026")
+    canv.drawCentredString(w/2, 1.65*inch, "Version 30.1.1 - July 2026")
     canv.drawCentredString(w/2, 1.42*inch, "https://github.com/Blackcoin-Dev/Blackcoin")
     canv.restoreState()
 
 def furniture(canv, doc):
     canv.saveState()
     w, h = letter
-    canv.setStrokeColor(RULE); canv.setLineWidth(0.6)
+    canv.setStrokeColor(RULE)
+    canv.setLineWidth(0.6)
     canv.line(0.9*inch, h-0.62*inch, w-0.9*inch, h-0.62*inch)
-    canv.setFont("Helvetica", 7.6); canv.setFillColor(GREY)
-    canv.drawString(0.9*inch, h-0.55*inch, "Blackcoin Quantum Quasar — Protocol V4")
-    canv.drawRightString(w-0.9*inch, h-0.55*inch, "Technical White Paper • v30.1.0")
+    canv.setFont("Helvetica", 7.6)
+    canv.setFillColor(GREY)
+    canv.drawString(0.9*inch, h-0.55*inch, "Blackcoin Quantum Quasar - Protocol V4")
+    canv.drawRightString(w-0.9*inch, h-0.55*inch, "Technical White Paper - v30.1.1")
     canv.line(0.9*inch, 0.72*inch, w-0.9*inch, 0.72*inch)
     canv.setFont("Helvetica", 8)
     canv.drawCentredString(w/2, 0.5*inch, str(canv.getPageNumber()))
@@ -156,45 +161,71 @@ def parse(md_lines):
                     ("LEFTPADDING", (0,0), (-1,-1), 8), ("RIGHTPADDING", (0,0), (-1,-1), 8),
                     ("TOPPADDING", (0,0), (-1,-1), 1), ("BOTTOMPADDING", (0,0), (-1,-1), 1),
                 ]))
-                flow.append(Spacer(1, 4)); flow.append(t); flow.append(Spacer(1, 6))
+                flow.append(Spacer(1, 4))
+                flow.append(t)
+                flow.append(Spacer(1, 6))
                 in_code, code_buf = False, []
             else:
                 in_code = True
-            i += 1; continue
+            i += 1
+            continue
         if in_code:
-            code_buf.append(line); i += 1; continue
+            code_buf.append(line)
+            i += 1
+            continue
 
         s = line.strip()
         if not s:
-            i += 1; continue
+            i += 1
+            continue
         if s.startswith("# "):        # doc title -> skip (cover has it)
-            i += 1; continue
+            i += 1
+            continue
         if s.startswith("## Table of Contents"):
-            skip_toc = True; i += 1; continue
+            skip_toc = True
+            i += 1
+            continue
         if skip_toc:
             if s.startswith("## ") or s.startswith("---"):
                 skip_toc = False
             else:
-                i += 1; continue
+                i += 1
+                continue
             if s.startswith("---"):
-                i += 1; continue
+                i += 1
+                continue
         if s == "---":
-            i += 1; continue
+            i += 1
+            continue
         if s.startswith("## "):
             if s[3:].startswith("A Post-Quantum"):
-                i += 1; continue
+                i += 1
+                continue
             txt = inline(s[3:])
             block = [Paragraph(txt, H1),
                      HRFlowable(width="100%", thickness=1.1, color=GOLD, spaceBefore=0, spaceAfter=8)]
+            flow.append(CondPageBreak(2.5*inch))
             if first_h1_done:
                 flow.append(Spacer(1, 6))
-            flow.append(KeepTogether(block))
+            heading = KeepTogether(block)
+            heading.keepWithNext = 1
+            flow.append(heading)
             first_h1_done = True
-            i += 1; continue
+            i += 1
+            continue
         if s.startswith("### "):
-            flow.append(Paragraph(inline(s[4:]), H2)); i += 1; continue
+            # Do not strand a subsection heading at the foot of a page. Leave
+            # enough room for the heading and the opening lines that follow.
+            flow.append(CondPageBreak(1.25*inch))
+            heading = Paragraph(inline(s[4:]), H2)
+            heading.keepWithNext = 1
+            flow.append(heading)
+            i += 1
+            continue
         if s.startswith("#### "):
-            flow.append(Paragraph("<b>"+inline(s[5:])+"</b>", BODY)); i += 1; continue
+            flow.append(Paragraph("<b>"+inline(s[5:])+"</b>", BODY))
+            i += 1
+            continue
         if s.startswith("|"):
             tbl = []
             while i < n and md_lines[i].strip().startswith("|"):
@@ -224,25 +255,31 @@ def parse(md_lines):
                     if r_i % 2 == 0:
                         sty.append(("BACKGROUND", (0,r_i), (-1,r_i), LIGHT))
                 t.setStyle(TableStyle(sty))
-                flow.append(Spacer(1, 4)); flow.append(t); flow.append(Spacer(1, 8))
+                flow.append(Spacer(1, 4))
+                flow.append(t)
+                flow.append(Spacer(1, 8))
             continue
         if s.startswith("> "):
             buf = []
             while i < n and md_lines[i].strip().startswith(">"):
-                buf.append(md_lines[i].strip().lstrip(">").strip()); i += 1
+                buf.append(md_lines[i].strip().lstrip(">").strip())
+                i += 1
             qt = Table([[Paragraph(inline(" ".join(buf)), QUOTE)]], colWidths=[6.3*inch])
             qt.setStyle(TableStyle([
                 ("LINEBEFORE", (0,0), (0,-1), 2.4, GOLD),
                 ("BACKGROUND", (0,0), (-1,-1), colors.HexColor("#faf7ef")),
                 ("LEFTPADDING", (0,0), (-1,-1), 10), ("RIGHTPADDING", (0,0), (-1,-1), 8),
                 ("TOPPADDING", (0,0), (-1,-1), 5), ("BOTTOMPADDING", (0,0), (-1,-1), 5)]))
-            flow.append(Spacer(1, 3)); flow.append(qt); flow.append(Spacer(1, 6))
+            flow.append(Spacer(1, 3))
+            flow.append(qt)
+            flow.append(Spacer(1, 6))
             continue
         if re.match(r"^[-*] ", s):
             buf = [s[2:]]
             i += 1
             while i < n and md_lines[i].startswith("  ") and md_lines[i].strip() and not re.match(r"^[-*] ", md_lines[i].strip()) and not md_lines[i].strip().startswith(("|", ">", "#", "```")):
-                buf.append(md_lines[i].strip()); i += 1
+                buf.append(md_lines[i].strip())
+                i += 1
             flow.append(Paragraph(inline(" ".join(buf)), BULLET, bulletText="•"))
             continue
         m = re.match(r"^(\d+)\. ", s)
@@ -250,11 +287,13 @@ def parse(md_lines):
             buf = [s[m.end():]]
             i += 1
             while i < n and md_lines[i].startswith("  ") and md_lines[i].strip() and not re.match(r"^\d+\. ", md_lines[i].strip()) and not md_lines[i].strip().startswith(("|", ">", "#", "```", "-")):
-                buf.append(md_lines[i].strip()); i += 1
+                buf.append(md_lines[i].strip())
+                i += 1
             flow.append(Paragraph(inline(" ".join(buf)), BULLET, bulletText=m.group(1)+"."))
             continue
-        if s.startswith("**Version 30.1.0"):
-            i += 1; continue
+        if s.startswith("**Version "):
+            i += 1
+            continue
         # normal paragraph: join soft-wrapped lines
         buf = [s]
         i += 1
@@ -262,7 +301,8 @@ def parse(md_lines):
             nx = md_lines[i].strip()
             if not nx or nx.startswith(("#", "|", ">", "```", "---")) or re.match(r"^[-*] ", nx):
                 break
-            buf.append(nx); i += 1
+            buf.append(nx)
+            i += 1
         # italicized closing line
         text = " ".join(buf)
         flow.append(Paragraph(inline(text), BODY))
@@ -274,16 +314,16 @@ DOC_AUTHOR = "Quantum Quasar Developers"
 DOC_SUBJECT = "A Post-Quantum, Participation-First Evolution of Blackcoin"
 DOC_KEYWORDS = ("Blackcoin, Quantum Quasar, Protocol V4, ML-DSA-44, post-quantum, "
                 "proof-of-stake, demurrage, Gold Rush, quantum staking")
-DOC_CREATOR = "Adobe Acrobat Pro 24.2.20933"
-DOC_PRODUCER = "Adobe PDF Library 24.2.159"
+DOC_CREATOR = "Blackcoin gen-whitepaper-pdf.py (ReportLab)"
+DOC_PRODUCER = "pypdf"
 # Fixed authoring/revision timestamps (America/Denver, UTC-06) for a reproducible build.
-PDF_DATE = "D:20260705120000-06'00'"
-XMP_CREATE = "2026-07-05T12:00:00-06:00"
-XMP_MODIFY = "2026-07-05T12:00:00-06:00"
+PDF_DATE = "D:20260714120000-06'00'"
+XMP_CREATE = "2026-07-14T12:00:00-06:00"
+XMP_MODIFY = "2026-07-14T12:00:00-06:00"
 
 def _xmp_packet(doc_id, inst_id):
     return ("<?xpacket begin=\"\\ufeff\" id=\"W5M0MpCehiHzreSzNTczkc9d\"?>\n"
-            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"Adobe XMP Core 9.1-c003 79.b0f8be9, 2024/01/12-14:24:29\">\n"
+            "<x:xmpmeta xmlns:x=\"adobe:ns:meta/\" x:xmptk=\"pypdf\">\n"
             " <rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\">\n"
             "  <rdf:Description rdf:about=\"\"\n"
             "    xmlns:pdf=\"http://ns.adobe.com/pdf/1.3/\"\n"
@@ -307,10 +347,10 @@ def _xmp_packet(doc_id, inst_id):
             "<?xpacket end=\"w\"?>")
 
 def stamp_metadata(path):
-    """Rewrite DocInfo + XMP so the file presents as Acrobat-authored output."""
+    """Rewrite DocInfo and XMP with truthful deterministic generator metadata."""
     import uuid
-    from pypdf import PdfReader, PdfWriter
-    from pypdf.generic import NameObject, create_string_object, DecodedStreamObject
+    from pypdf import PdfReader, PdfWriter  # type: ignore[import]
+    from pypdf.generic import DecodedStreamObject, NameObject  # type: ignore[import]
     reader = PdfReader(path)
     writer = PdfWriter()
     writer.append(reader)
@@ -325,7 +365,15 @@ def stamp_metadata(path):
         "/ModDate": PDF_DATE,
     })
     doc_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "blackcoin-quantum-quasar-whitepaper"))
-    inst_id = str(uuid.uuid5(uuid.NAMESPACE_URL, "blackcoin-quantum-quasar-whitepaper-30.1.0"))
+    with open(SRC, "rb") as source_file:
+        source_bytes = source_file.read()
+    with open(__file__, "rb") as generator_file:
+        generator_bytes = generator_file.read()
+    revision_digest = hashlib.sha256(source_bytes + b"\0" + generator_bytes).hexdigest()
+    inst_id = str(uuid.uuid5(
+        uuid.NAMESPACE_URL,
+        f"blackcoin-quantum-quasar-whitepaper:{revision_digest}",
+    ))
     xmp = DecodedStreamObject()
     xmp.set_data(_xmp_packet(doc_id, inst_id).encode("utf-8"))
     xmp[NameObject("/Type")] = NameObject("/Metadata")
@@ -336,7 +384,8 @@ def stamp_metadata(path):
         writer.write(fh)
 
 def main():
-    md = open(SRC).read().splitlines()
+    with open(SRC, encoding="utf8") as source:
+        md = source.read().splitlines()
     doc = WPDoc(OUT, pagesize=letter,
                 leftMargin=0.9*inch, rightMargin=0.9*inch,
                 topMargin=0.95*inch, bottomMargin=0.95*inch,

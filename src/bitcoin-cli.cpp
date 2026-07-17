@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 // Copyright (c) 2009-2022 Blackcoin Core Developers
 // Copyright (c) 2009-2022 Blackcoin More Developers
 // Copyright (c) 2009-2022 Blackcoin Developers
@@ -148,6 +149,7 @@ static int AppInitRPC(int argc, char* argv[])
     }
     if (argc < 2 || HelpRequested(gArgs) || gArgs.IsArgSet("-version")) {
         std::string strUsage = PACKAGE_NAME " RPC client version " + FormatFullVersion() + "\n";
+        strUsage += FormatSourceIdentity() + "\n";
 
         if (gArgs.IsArgSet("-version")) {
             strUsage += FormatParagraph(LicenseInfo());

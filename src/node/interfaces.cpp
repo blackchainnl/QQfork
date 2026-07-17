@@ -31,6 +31,7 @@
 #include <node/context.h>
 #include <node/interface_ui.h>
 #include <node/mini_miner.h>
+#include <node/shadow_resource_monitor.h>
 #include <node/transaction.h>
 #include <policy/feerate.h>
 #include <policy/fees.h>
@@ -99,6 +100,33 @@ public:
     void initParameterInteraction() override { InitParameterInteraction(args()); }
     bilingual_str getWarnings() override { return GetWarnings(true); }
     int getExitStatus() override { return Assert(m_context)->exit_status.load(); }
+    ChainstateRebuildStatus getChainstateRebuildStatus() override
+    {
+        return Assert(m_context)->chainstate_rebuild_status.load();
+    }
+    ShadowResourceStatus getShadowResourceStatus() override
+    {
+        return node::GetShadowResourceStatus(chainman());
+    }
+    ShadowSupplyScanProgress getShadowSupplyScanProgress() override
+    {
+        return node::GetShadowSupplyScanProgress();
+    }
+    bool abortCirculatingSupplyScan() override
+    {
+        return node::RequestShadowSupplyScanAbort();
+    }
+    UniValue runCirculatingSupplyScan(
+        bool allow_unqualified_resource_scan) override
+    {
+        // Keep the consensus-sensitive accounting implementation single-source
+        // while exposing a typed model operation to Qt. The GUI never builds a
+        // command string and the one-call authorization value is passed only in
+        // this ephemeral request.
+        UniValue params{UniValue::VARR};
+        params.push_back(allow_unqualified_resource_scan);
+        return executeRpc("getcirculatingsupply", params, {});
+    }
     uint32_t getLogCategories() override { return LogInstance().GetCategoryMask(); }
     bool baseInitialize() override
     {
@@ -113,12 +141,19 @@ public:
 
         return true;
     }
-    bool appInitMain(interfaces::BlockAndHeaderTipInfo* tip_info) override
+    interfaces::AppInitResult appInitMain(interfaces::BlockAndHeaderTipInfo* tip_info) override
     {
-        if (AppInitMain(*m_context, tip_info)) return true;
+        const interfaces::AppInitResult result = AppInitMain(*m_context, tip_info);
+        if (result != interfaces::AppInitResult::FAILURE) return result;
+        if (m_context->chainstate_rebuild_status.load() !=
+            ChainstateRebuildStatus::NONE) {
+            // The GUI assistant deliberately stops before wallets load or at
+            // COMMIT_READY. These are safe upgrade handoffs, not crashes.
+            return result;
+        }
         // Error during initialization, set exit status before continue
         m_context->exit_status.store(EXIT_FAILURE);
-        return false;
+        return result;
     }
     void appShutdown() override
     {
@@ -810,9 +845,19 @@ public:
     void requestMempoolTransactions(Notifications& notifications) override
     {
         if (!m_node.mempool) return;
-        LOCK2(::cs_main, m_node.mempool->cs);
-        for (const CTxMemPoolEntry& entry : m_node.mempool->entryAll()) {
-            notifications.transactionAddedToMempool(entry.GetSharedTx());
+        std::vector<CTransactionRef> transactions;
+        {
+            LOCK2(::cs_main, m_node.mempool->cs);
+            transactions.reserve(m_node.mempool->size());
+            for (const CTxMemPoolEntry& entry : m_node.mempool->entryAll()) {
+                transactions.push_back(entry.GetSharedTx());
+            }
+        }
+        // Wallet notification code takes cs_wallet and may query current
+        // mempool state. Never invoke it while holding cs_main or mempool.cs;
+        // callbacks already tolerate entries disappearing after a snapshot.
+        for (const CTransactionRef& tx : transactions) {
+            notifications.transactionAddedToMempool(tx);
         }
     }
     bool isTaprootActive() const override
@@ -842,17 +887,6 @@ public:
     {
         if (node::CanStake()) {
             StartStake(wallet);
-        }
-        // Headless auto-start of the built-in Gold Rush PoW miner (-powmining). Logs and continues
-        // if it cannot start yet (e.g. the wallet is locked); the user can start it later via the
-        // setpowmining RPC or the GUI once conditions allow.
-        if (gArgs.GetBoolArg("-powmining", false)) {
-            bilingual_str pow_error;
-            const int pow_threads = (int)gArgs.GetIntArg("-powminingthreads", 1);
-            const int pow_cpu = (int)gArgs.GetIntArg("-powminingcpu", 1);
-            if (!wallet.SetPowMining(true, pow_threads, pow_cpu, pow_error)) {
-                wallet.WalletLogPrintf("Gold Rush PoW mining not auto-started: %s\n", pow_error.original);
-            }
         }
     }
     void stopStake(wallet::CWallet& wallet) override

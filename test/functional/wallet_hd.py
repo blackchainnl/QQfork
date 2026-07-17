@@ -141,6 +141,10 @@ class WalletHDTest(BitcoinTestFramework):
             self.nodes[1].wallets_path / self.default_wallet_name / self.wallet_data_filename
         )
         self.start_node(1, extra_args=self.extra_args[1])
+        # The backup predates the addresses under test and this node starts
+        # with -keypool=0. Restore the deterministic lookahead before syncing
+        # so startup scanning can discover those derived destinations.
+        self.nodes[1].keypoolrefill(NUM_HD_ADDS)
         self.connect_nodes(0, 1)
         self.sync_all()
         # Wallet automatically scans blocks older than key on startup
@@ -155,6 +159,12 @@ class WalletHDTest(BitcoinTestFramework):
 
         # send a tx and make sure its using the internal chain for the changeoutput
         txid = self.nodes[1].sendtoaddress(self.nodes[0].getnewaddress(), 1)
+        # This test covers wallet derivation, not fee-filtered P2P relay. Submit
+        # the fixture directly because a peer may advertise a randomized fee
+        # filter just above the wallet's default feerate.
+        if txid not in self.nodes[0].getrawmempool():
+            self.nodes[0].sendrawtransaction(self.nodes[1].gettransaction(txid)['hex'])
+        self.sync_mempools()
         outs = self.nodes[1].gettransaction(txid=txid, verbose=True)['decoded']['vout']
         keypath = ""
         for out in outs:

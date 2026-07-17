@@ -11,14 +11,19 @@ synthetic quantum UTXOs from later PoS blocks without per-block signaling.
 """
 
 from decimal import Decimal
+from threading import Event, Thread
 import time
+from urllib.parse import quote
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, get_rpc_proxy
 
 
-GOLD_RUSH_END_TIME = 2_000_000_000
+SHADOW_WHITELIST_HEIGHT = 1
+SHADOW_GOLD_RUSH_BLOCKS = 500
+GOLD_RUSH_END_HEIGHT = SHADOW_WHITELIST_HEIGHT + SHADOW_GOLD_RUSH_BLOCKS
+MIGRATION_END_HEIGHT = GOLD_RUSH_END_HEIGHT + 10
 QUANTUM_SPEND_FEE = Decimal("0.01")
 WALLET_NAME = "goldrush_pos_signal"
 QQSIGNAL_HEX = "51515349474e414c"
@@ -33,11 +38,14 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.extra_args = [[
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
-            "-shadowwhitelistheight=1",
-            "-shadowgoldrushblocks=500",
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
+            "-qqautoshadowsignal=1",
+            f"-shadowwhitelistheight={SHADOW_WHITELIST_HEIGHT}",
+            f"-shadowgoldrushblocks={SHADOW_GOLD_RUSH_BLOCKS}",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
         ]]
 
     def skip_test_if_missing_module(self):
@@ -112,11 +120,13 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
 
     def _advance_to_quantum_spends_active(self):
         node = self.nodes[0]
-        self._set_mocktime(GOLD_RUSH_END_TIME + 16)
         for _ in range(700):
             self.generatetoaddress(node, 1, node.get_deterministic_priv_key().address, sync_fun=self.no_op)
             self._bump_mocktime(16)
-            if node.getquantumquasarinfo()["quantum_spend_enforcement_active"]:
+            info = node.getquantumquasarinfo()
+            assert_equal(info["height_boundaries_authoritative"], True)
+            if info["quantum_spend_enforcement_active"]:
+                assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
                 return
         raise AssertionError("timed out waiting for quantum spend activation")
 
@@ -139,16 +149,42 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
             for vout in tx["vout"]:
                 assert vout["scriptPubKey"].get("address") != address
 
+    def _start_staking_health_poller(self):
+        """Continuously exercise the historical getstakinginfo/PoSMiner ABBA path."""
+        node = self.nodes[0]
+        stop = Event()
+        errors = []
+        samples = []
+
+        def poll():
+            wallet_url = f"{node.url}/wallet/{quote(WALLET_NAME, safe='')}"
+            rpc = get_rpc_proxy(wallet_url, 90, timeout=3, coveragedir=node.coverage_dir)
+            while not stop.is_set():
+                try:
+                    info = rpc.getstakinginfo()
+                    samples.append((info["blocks"], info["search-interval"]))
+                except Exception as e:
+                    errors.append(str(e))
+                    return
+                time.sleep(0.005)
+
+        thread = Thread(target=poll, name="staking-health-poller", daemon=True)
+        thread.start()
+        self.wait_until(lambda: len(samples) >= 3 or errors, timeout=5)
+        assert_equal(errors, [])
+        return stop, thread, errors, samples
+
     def _advance_to_migration_window(self):
         node = self.nodes[0]
-        self._set_mocktime(GOLD_RUSH_END_TIME + 16)
         generated = 0
         while node.getquantumquasarinfo()["phase"] != "migration":
             self.generatetoaddress(node, 1, node.get_deterministic_priv_key().address, sync_fun=self.no_op)
             self._bump_mocktime(16)
             generated += 1
-            assert generated < COINBASE_MATURITY, "migration phase should activate before the synthetic payout matures"
+            assert generated <= GOLD_RUSH_END_HEIGHT, "migration phase should activate at the configured height"
         assert_equal(node.getquantumquasarinfo()["phase"], "migration")
+        assert_equal(node.getquantumquasarinfo()["height_boundaries_authoritative"], True)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
 
     def _build_quantum_spend(self, wallet, utxo, destination):
         node = self.nodes[0]
@@ -204,11 +240,17 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
 
         self.log.info("Mining a later PoS block that includes both auto QQSIGNAL and pending QQSPROOF")
         locked_non_whitelist_for_combo = self._lock_non_whitelist_script_utxos(wallet, whitelist_script)
+        poll_stop, poll_thread, poll_errors, poll_samples = self._start_staking_health_poller()
         try:
             payout_block_hash = self._mine_pos_block(wallet)
         finally:
+            poll_stop.set()
+            poll_thread.join(timeout=5)
             if locked_non_whitelist_for_combo:
                 wallet.lockunspent(True, locked_non_whitelist_for_combo)
+        assert not poll_thread.is_alive(), "getstakinginfo remained blocked after the PoS/QQSIGNAL attempt"
+        assert_equal(poll_errors, [])
+        assert len(poll_samples) >= 3
         payout_block = node.getblock(payout_block_hash, 2)
         payout_height = payout_block["height"]
         signal_txids = [
@@ -247,18 +289,42 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
         assert combined_info["pos_count"] >= 1
         assert combined_info["pow_count"] >= 1
 
-        self.log.info("Disconnecting and reconnecting the combined payout block removes and restores both synthetic coins")
-        node.invalidateblock(payout_block_hash)
-        self._assert_no_quantum_utxo(wallet, payout_address)
-        self._assert_no_quantum_utxo(wallet, pow_payout_address)
-        assert node.gettxout(payout_utxo["txid"], payout_utxo["vout"], False) is None
-        assert node.gettxout(pow_payout_utxo["txid"], pow_payout_utxo["vout"], False) is None
-        node.reconsiderblock(payout_block_hash)
-        self.wait_until(lambda: node.getbestblockhash() == payout_block_hash)
-        payout_utxo = self._wait_for_quantum_utxo(wallet, payout_address)
-        pow_payout_utxo = self._wait_for_quantum_utxo(wallet, pow_payout_address)
-        assert_equal(payout_utxo["confirmations"], 1)
-        assert_equal(pow_payout_utxo["confirmations"], 1)
+        self.log.info("Repeatedly disconnecting and reconnecting the combined payout block while polling wallet RPC")
+
+        def latest_signal_solve_height():
+            entries = [
+                entry for entry in wallet.getgoldrushinfo()["wallet_scripts"]
+                if entry["address"] == signal_address
+            ]
+            assert_equal(len(entries), 1)
+            return entries[0]["last_solve_height"]
+
+        assert_equal(latest_signal_solve_height(), payout_height)
+        reorg_poll_stop, reorg_poll_thread, reorg_poll_errors, reorg_poll_samples = self._start_staking_health_poller()
+        try:
+            for reorg_round in range(3):
+                self.log.info(f"Reorg round {reorg_round + 1}: disconnect restores the preceding indexed solve")
+                node.invalidateblock(payout_block_hash)
+                self._assert_no_quantum_utxo(wallet, payout_address)
+                self._assert_no_quantum_utxo(wallet, pow_payout_address)
+                assert node.gettxout(payout_utxo["txid"], payout_utxo["vout"], False) is None
+                assert node.gettxout(pow_payout_utxo["txid"], pow_payout_utxo["vout"], False) is None
+                assert_equal(latest_signal_solve_height(), solve_height)
+
+                self.log.info(f"Reorg round {reorg_round + 1}: reconnect restores the newer indexed solve")
+                node.reconsiderblock(payout_block_hash)
+                self.wait_until(lambda: node.getbestblockhash() == payout_block_hash)
+                payout_utxo = self._wait_for_quantum_utxo(wallet, payout_address)
+                pow_payout_utxo = self._wait_for_quantum_utxo(wallet, pow_payout_address)
+                assert_equal(payout_utxo["confirmations"], 1)
+                assert_equal(pow_payout_utxo["confirmations"], 1)
+                assert_equal(latest_signal_solve_height(), payout_height)
+        finally:
+            reorg_poll_stop.set()
+            reorg_poll_thread.join(timeout=5)
+        assert not reorg_poll_thread.is_alive(), "getstakinginfo remained blocked during repeated reorgs"
+        assert_equal(reorg_poll_errors, [])
+        assert len(reorg_poll_samples) >= 3
 
         self.log.info("Mining a follow-up PoS block with no QQSIGNAL still pays the active 14-day look-back signaler")
         locked_non_whitelist = self._lock_non_whitelist_script_utxos(wallet, whitelist_script)
@@ -307,11 +373,13 @@ class GoldRushPosSignalTest(BitcoinTestFramework):
 
         self.log.info("Disconnecting and reconnecting the spend block restores and consumes the QQSIGNAL payout")
         node.invalidateblock(spend_block_hash)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         restored = node.gettxout(matured_utxo["txid"], matured_utxo["vout"], False)
         assert restored is not None
         assert_equal(Decimal(str(restored["value"])), Decimal(str(matured_utxo["amount"])))
         node.reconsiderblock(spend_block_hash)
         self.wait_until(lambda: node.getbestblockhash() == spend_block_hash)
+        assert_equal(node.getgoldrushstate()["replay_state"]["valid_for_tip"], True)
         assert node.gettxout(matured_utxo["txid"], matured_utxo["vout"], False) is None
         migrated_utxo = self._wait_for_quantum_utxo(wallet, next_quantum)
 

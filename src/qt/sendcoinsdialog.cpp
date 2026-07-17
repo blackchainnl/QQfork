@@ -34,6 +34,7 @@
 #include <chrono>
 #include <fstream>
 #include <memory>
+#include <set>
 
 #include <QComboBox>
 #include <QFontMetrics>
@@ -100,7 +101,7 @@ SendCoinsDialog::SendCoinsDialog(const PlatformStyle *_platformStyle, QWidget *p
     m_spend_source_combo->setMinimumContentsLength(22);
     m_spend_source_balance_label = new QLabel(this);
     m_spend_source_balance_label->setTextInteractionFlags(Qt::TextSelectableByMouse | Qt::TextSelectableByKeyboard);
-    m_spend_source_warning_label = new QLabel(tr("Quantum sends require quantum addresses; unmoved Gold Rush rewards are excluded."), this);
+    m_spend_source_warning_label = new QLabel(tr("Quantum sends require quantum addresses; Gold Rush rewards remain excluded until Gold Rush ends and normal maturity is satisfied."), this);
     m_spend_source_warning_label->setStyleSheet(QStringLiteral("QLabel{color:#aa0000;}"));
     spend_source_layout->addWidget(spend_source_label);
     spend_source_layout->addWidget(m_spend_source_combo);
@@ -239,7 +240,29 @@ bool SendCoinsDialog::PrepareSendText(QString& question_string, QString& informa
         fNewRecipientAllowed = true;
         return false;
     }
+    std::set<std::string> quantum_addresses_before;
+    if (coin_control.m_allow_new_quantum_key) {
+        for (const interfaces::WalletQuantumAddressInfo& info : model->wallet().listQuantumAddresses()) {
+            quantum_addresses_before.insert(info.address);
+        }
+    }
     prepareStatus = model->prepareTransaction(*m_current_transaction, coin_control);
+
+    if (coin_control.m_allow_new_quantum_key) {
+        QStringList created_addresses;
+        for (const interfaces::WalletQuantumAddressInfo& info : model->wallet().listQuantumAddresses()) {
+            if (!quantum_addresses_before.count(info.address)) {
+                created_addresses.push_back(QString::fromStdString(info.address));
+            }
+        }
+        if (!created_addresses.empty()) {
+            Q_EMIT message(
+                tr("Back up wallet now"),
+                tr("Transaction preparation created durable non-HD ML-DSA quantum change key(s): %1. The key remains in this wallet even if preparation or the later broadcast fails. Back up the wallet now; an older backup and the wallet seed cannot recover it.")
+                    .arg(created_addresses.join(", ")),
+                CClientUIInterface::MSG_WARNING);
+        }
+    }
 
     // process prepareStatus and on error generate message shown to user
     processSendCoinsReturn(prepareStatus,
@@ -796,30 +819,30 @@ bool SendCoinsDialog::ensureSpendSourceChange(CCoinControl& coin_control)
     }
 
     if (IsValidDestination(coin_control.destChange)) {
-        if (IsQuantumMigrationDestinationValue(coin_control.destChange)) {
+        if (IsQuantumMigrationDestinationValue(coin_control.destChange) &&
+            model->wallet().isSpendable(coin_control.destChange)) {
             return true;
         }
         Q_EMIT message(tr("Send Coins"),
-                       tr("Quantum wallet funds require a direct quantum change address. Clear the custom change address or enter a direct quantum wallet address. Cold-stake contract addresses cannot be used as ordinary change."),
+                       tr("Quantum wallet funds require an existing wallet-owned direct quantum change address. Clear the custom change address or enter a direct quantum address whose ML-DSA private key is stored in this wallet. Foreign, watch-only, and cold-stake contract addresses are not accepted as implicit change authorization."),
                        CClientUIInterface::MSG_ERROR);
         return false;
     }
 
-    auto quantum_change = model->wallet().createQuantumAddress("quantum-change");
-    if (!quantum_change) {
+    const auto consent = QMessageBox::question(
+        this,
+        tr("Authorize quantum change key"),
+        tr("If this quantum-funded transaction needs positive change, preparation will create at most one new non-HD ML-DSA change key. No key is created for an exact no-change transaction. Once written, a key remains in this wallet even if you later cancel the payment or preparation/broadcast fails. It is not recoverable from the wallet seed, so an older backup cannot recover funds sent to it. The wallet will report the created address; back up immediately whenever it does.\n\nAuthorize one key if positive change is required?"),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No);
+    if (consent != QMessageBox::Yes) {
         Q_EMIT message(tr("Send Coins"),
-                       tr("Unable to create a wallet-backed quantum change address: %1").arg(QString::fromStdString(util::ErrorString(quantum_change).original)),
-                       CClientUIInterface::MSG_ERROR);
+                       tr("No quantum change key was created. To continue without creating one, choose an existing wallet-owned direct quantum address as the custom change address."),
+                       CClientUIInterface::MSG_WARNING);
         return false;
     }
-    const CTxDestination change_dest = DecodeDestination(quantum_change->address);
-    if (!IsQuantumMigrationDestinationValue(change_dest)) {
-        Q_EMIT message(tr("Send Coins"),
-                       tr("Unable to create a valid direct quantum change address."),
-                       CClientUIInterface::MSG_ERROR);
-        return false;
-    }
-    coin_control.destChange = change_dest;
+
+    coin_control.m_allow_new_quantum_key = true;
     return true;
 }
 

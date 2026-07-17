@@ -83,6 +83,14 @@ public:
         return true;
     }
 
+    bool GetValueAt(const COutPoint& key, Coin& coin) override
+    {
+        const auto it = m_map.find(key);
+        if (it == m_map.end() || it->second.IsSpent()) return false;
+        coin = it->second;
+        return true;
+    }
+
     bool Valid() const override { return m_it != m_map.end(); }
     void Next() override { ++m_it; }
 };

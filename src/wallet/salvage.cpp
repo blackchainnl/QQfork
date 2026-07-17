@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2009-2021 The Bitcoin Core developers
 // Copyright (c) 2009-2021 Blackcoin Core Developers
 // Copyright (c) 2009-2021 Blackcoin More Developers
 // Copyright (c) 2009-2021 Quantum Quasar Developers
@@ -43,7 +44,7 @@ public:
 
     std::unique_ptr<DatabaseCursor> GetNewCursor() override { return std::make_unique<DummyCursor>(); }
     std::unique_ptr<DatabaseCursor> GetNewPrefixCursor(Span<const std::byte> prefix) override { return GetNewCursor(); }
-    bool TxnBegin() override { return true; }
+    bool TxnBegin(bool durable = false) override { return true; }
     bool TxnCommit() override { return true; }
     bool TxnAbort() override { return true; }
 };

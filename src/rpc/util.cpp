@@ -329,11 +329,9 @@ public:
         obj.pushKV("isquantummigration", IsQuantumMigrationDestination(dest));
         obj.pushKV("isquantumcoldstake", IsQuantumColdStakeDestination(dest));
         if (IsQuantumMigrationDestination(dest)) {
-            obj.pushKV("fundable_now", true);
-            obj.pushKV("migration_note", "Blackcoin ML-DSA address. Spendability depends on wallet key ownership and the scheduled migration activation phase.");
+            obj.pushKV("migration_note", "Blackcoin ML-DSA address. Funding and spending depend on the scheduled migration phase; query getquantumquasarinfo for current capabilities.");
         } else if (IsQuantumColdStakeDestination(dest)) {
-            obj.pushKV("fundable_now", true);
-            obj.pushKV("migration_note", "Blackcoin cold-staking address. Spendability requires an ML-DSA owner or staker key plus the companion public-key hash in the witness template.");
+            obj.pushKV("migration_note", "Blackcoin cold-staking address. Funding depends on the scheduled migration phase; spending also requires an ML-DSA owner or staker key plus the companion public-key hash in the witness template.");
         }
         return obj;
     }

@@ -104,6 +104,19 @@ HD wallets introduced deterministic key derivation. With HD wallets, users no lo
 
 This means that a single backup is enough to recover the coins at any time. It is still recommended to make regular backups (once a week) or after a significant number of new transactions to maintain the metadata, such as labels. Metadata cannot be retrieved from a blockchain rescan, so if the backup is too old, the metadata will be lost forever.
 
+Blackcoin v30 quantum keys are an important exception. ML-DSA keys are not
+derived from the HD seed. Back up the wallet after creating every quantum
+migration, staking, operator, or cold-stake address and before relying on funds
+or rewards sent to it. A wallet backup made before a quantum key was generated
+cannot recover that key, even if the seed phrase is available.
+
+In v30.1.1, `backupwallet` and the GUI's **Backup Wallet** action reopen the
+produced backup and perform an independent ML-DSA signing check for every
+current wallet-backed quantum key. An encrypted wallet must be normally
+unlocked for that verification. A successful verification proves that the
+backup contained the current key inventory when it was created; it cannot
+verify that an external backup file remains present or secure afterward.
+
 Wallets created before version 0.13 are not HD and must be backed up every 100 keys used since the previous backup, or even more often to maintain the metadata.
 
 ### 1.6 Restoring the Wallet From a Backup

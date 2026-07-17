@@ -7,9 +7,10 @@
 #ifndef BITCOIN_RPC_RAWTRANSACTION_UTIL_H
 #define BITCOIN_RPC_RAWTRANSACTION_UTIL_H
 
+#include <cstdint>
 #include <map>
-#include <string>
 #include <optional>
+#include <string>
 
 struct bilingual_str;
 class FillableSigningProvider;
@@ -28,7 +29,10 @@ class SigningProvider;
  * @param  hashType      The signature hash type
  * @param result         JSON object where signed transaction results accumulate
  */
-void SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, const std::map<COutPoint, Coin>& coins, const UniValue& hashType, UniValue& result);
+void SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore,
+                     const std::map<COutPoint, Coin>& coins, const UniValue& hashType,
+                     UniValue& result, uint32_t quantum_chain_id = 0,
+                     unsigned int extra_verify_flags = 0);
 void SignTransactionResultToJSON(CMutableTransaction& mtx, bool complete, const std::map<COutPoint, Coin>& coins, const std::map<int, bilingual_str>& input_errors, UniValue& result);
 
 /**

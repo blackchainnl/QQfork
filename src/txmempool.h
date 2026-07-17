@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 // Copyright (c) 2009-2022 Blackcoin Core Developers
 // Copyright (c) 2009-2022 Blackcoin More Developers
 // Copyright (c) 2009-2022 Quantum Quasar Developers
@@ -410,6 +411,9 @@ private:
      * Track locally submitted transactions to periodically retry initial broadcast.
      */
     std::set<uint256> m_unbroadcast_txids GUARDED_BY(cs);
+    std::map<uint256, size_t> m_demurrage_attestation_key_counts GUARDED_BY(cs);
+    std::map<COutPoint, size_t> m_demurrage_attestation_target_counts GUARDED_BY(cs);
+    size_t m_demurrage_attestation_count GUARDED_BY(cs){0};
 
 
     /**
@@ -461,7 +465,8 @@ public:
      * all inputs are in the mapNextTx array). If sanity-checking is turned off,
      * check does nothing.
      */
-    void check(const CCoinsViewCache& active_coins_tip, int64_t spendheight, int64_t spendtime = 0) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
+    void check(const CCoinsViewCache& active_coins_tip, int64_t spendheight,
+               int64_t spendtime = 0, int64_t demurragetime = 0) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
 
     // addUnchecked must updated state for all ancestors of a given transaction,
     // to track size/count of descendant transactions.  First version of
@@ -472,6 +477,8 @@ public:
     // lack of CValidationInterface::TransactionAddedToMempool callbacks).
     void addUnchecked(const CTxMemPoolEntry& entry, bool validFeeEstimate = true) EXCLUSIVE_LOCKS_REQUIRED(cs, cs_main);
     void addUnchecked(const CTxMemPoolEntry& entry, setEntries& setAncestors, bool validFeeEstimate = true) EXCLUSIVE_LOCKS_REQUIRED(cs, cs_main);
+    void GetDemurrageAttestationState(std::set<uint256>& attested_keys, size_t& attestation_count) const EXCLUSIVE_LOCKS_REQUIRED(cs);
+    bool HasDemurrageAttestationTarget(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs);
 
     void removeRecursive(const CTransaction& tx, MemPoolRemovalReason reason) EXCLUSIVE_LOCKS_REQUIRED(cs);
     /** After reorg, filter the entries that would no longer be valid in the next block, and update

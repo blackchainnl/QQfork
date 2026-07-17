@@ -18,7 +18,7 @@
 static CFeeRate g_dust{DUST_RELAY_TX_FEE};
 static bool g_bare_multi{DEFAULT_PERMIT_BAREMULTISIG};
 
-BOOST_FIXTURE_TEST_SUITE(v2_transaction_tests, BasicTestingSetup)
+BOOST_FIXTURE_TEST_SUITE(blk_v2_transaction_tests, BasicTestingSetup)
 
 BOOST_AUTO_TEST_CASE(IsStandard_test)
 {

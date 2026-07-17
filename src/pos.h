@@ -6,8 +6,8 @@
 // Stake cache by Qtum
 // Copyright (c) 2016-2018 The Qtum developers
 
-#ifndef BLACKCOIN_POS_H
-#define BLACKCOIN_POS_H
+#ifndef BITCOIN_POS_H
+#define BITCOIN_POS_H
 
 #include <chain.h>
 #include <primitives/transaction.h>
@@ -49,7 +49,9 @@ bool CheckKernel(CBlockIndex* pindexPrev, unsigned int nBits, uint32_t nTime, co
 bool CheckKernel(CBlockIndex* pindexPrev, unsigned int nBits, uint32_t nTime, const COutPoint& prevout, CCoinsViewCache& view, const std::map<COutPoint, CStakeCache>& cache);
 bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, uint32_t blockFromTime, CAmount prevoutValue, const COutPoint& prevout, const CScript& scriptPubKey, unsigned int nTimeTx, bool fPrintProofOfStake = false);
 bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, uint32_t blockFromTime, CAmount prevoutValue, const COutPoint& prevout, const CScript& scriptPubKey, unsigned int nTimeTx, const StakeWeightContext& weight_context, bool fPrintProofOfStake);
-bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned int nBits, BlockValidationState& state, CCoinsViewCache& view, unsigned int nTimeTx);
+bool CheckProofOfStake(CBlockIndex* pindexPrev, const CTransaction& tx, unsigned int nBits,
+                       BlockValidationState& state, CCoinsViewCache& view,
+                       unsigned int nTimeTx, const ChainstateManager& chainman);
 void CacheKernel(std::map<COutPoint, CStakeCache>& cache, const COutPoint& prevout, CBlockIndex* pindexPrev, CCoinsViewCache& view);
 CAmount GetKernelStakeValue(const Coin& coin, const CCoinsViewCache& view, const Consensus::Params& consensus, int spend_height, int64_t spend_time);
 
@@ -57,4 +59,4 @@ StakeWeightContext GetStakeWeightContext(const CScript& scriptPubKey, const CTxI
 uint16_t StakeWeightMultiplierPpm10k(int remaining_unbonding_blocks);
 arith_uint256 EffectiveStakeWeight(CAmount nValueIn, uint16_t m_ppm10k, uint16_t pool_ppm10k);
 bool KernelProductLE(const arith_uint256& bnTarget, const arith_uint256& bnWeight, const uint256& hashProofOfStake);
-#endif // BLACKCOIN_POS_H
+#endif // BITCOIN_POS_H

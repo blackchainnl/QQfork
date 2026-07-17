@@ -9,14 +9,71 @@
 
 #include <consensus/amount.h>
 #include <policy/fees.h> // for FeeCalculation
+#include <shadow.h>
 #include <util/result.h>
 #include <wallet/coinselection.h>
 #include <wallet/transaction.h>
 #include <wallet/wallet.h>
 
+#include <array>
 #include <optional>
 
 namespace wallet {
+struct Balance;
+struct WalletLifecycleAmounts {
+    static constexpr size_t CATEGORY_COUNT{static_cast<size_t>(ValueLifecycleCategory::COUNT)};
+    std::array<uint64_t, CATEGORY_COUNT> outputs{};
+    std::array<CAmount, CATEGORY_COUNT> nominal{};
+    std::array<CAmount, CATEGORY_COUNT> effective{};
+    std::array<CAmount, CATEGORY_COUNT> burned{};
+    CAmount ordinary_available{0};
+    CAmount spendable_legacy{0};
+    CAmount spendable_quantum{0};
+};
+
+struct WalletLifecycleSummary {
+    int evaluation_height{0};
+    int64_t evaluation_mtp{0};
+    WalletLifecycleAmounts mine;
+    WalletLifecycleAmounts watchonly;
+};
+
+/** Whether the wallet transaction view and active UTXO view describe the
+ * same chain tip. Lifecycle accounting must not combine the wallet state from
+ * one tip with coins from another. */
+bool WalletLifecycleViewIsSynchronized(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+/** Classify one wallet output against the candidate next block using the
+ * active-chain coin and authenticated Gold Rush provenance. */
+bool GetWalletOutputLifecycle(const CWallet& wallet, const COutPoint& outpoint,
+                              const CTxOut& txout,
+                              ValueLifecycleClassification& classification,
+                              std::string& error)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+/** Return the ordinary-spendable wallet balance and a mutually exclusive
+ * lifecycle inventory. Locked synthetic, contract, Final, and fully decayed
+ * outputs never enter the trusted available balance. */
+bool GetLifecycleAdjustedBalance(const CWallet& wallet, int min_depth,
+                                 bool avoid_reuse, Balance& balance,
+                                 WalletLifecycleSummary& summary,
+                                 std::string& error)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+
+/** Whether this wallet can satisfy a legacy input with a scriptSig-committed
+ * ECDSA/ForkID signature, giving the transaction a txid that cannot be shared
+ * with the legacy fork. Native and wrapped witness-only scripts return false. */
+bool IsWalletTxidCommittedMigrationAnchor(const CWallet& wallet, const CScript& script_pub_key);
+bool IsWalletProtectedLineageInput(const CWallet& wallet, const COutPoint& outpoint,
+                                   const Coin& coin, const Consensus::Params& consensus,
+                                   int64_t spend_time, int spend_height);
+/** True only for an authenticated synthetic payout that is consensus-mature
+ * in the candidate next block, even when its coinbase-shaped wallet
+ * transaction reports one display block remaining. */
+bool IsNextBlockMatureGoldRushPayout(const CWallet& wallet, const COutPoint& outpoint,
+                                     int spend_height, int64_t spend_time);
+
 /** Get the marginal bytes if spending the specified output from this transaction.
  * Use CoinControl to determine whether to expect signature grinding when calculating the size of the input spend. */
 int CalculateMaximumSignedInputSize(const CTxOut& txout, const CWallet* pwallet, const CCoinControl* coin_control);
@@ -80,8 +137,8 @@ struct CoinFilterParams {
     bool include_immature_coinbase{false};
     // By default, skip locked UTXOs
     bool skip_locked{true};
-    // Ordinary wallet funding must not consume unmoved Gold Rush rewards. Status
-    // and guided migration views opt in so users can still see and move them.
+    // Ordinary wallet funding must not consume Gold Rush rewards while v16
+    // spends are locked. The phase-aware filter stops excluding them at G+1.
     bool include_generated_quantum_inputs{false};
     // Bonded and still-unbonding tiered quantum outputs require the guided
     // unbond/withdraw paths. Ordinary sends and staking skip them by default.
@@ -97,13 +154,13 @@ struct CoinFilterParams {
 CoinsResult AvailableCoins(const CWallet& wallet,
                            const CCoinControl* coinControl = nullptr,
                            std::optional<CFeeRate> feerate = std::nullopt,
-                           const CoinFilterParams& params = {}) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+                           const CoinFilterParams& params = {}) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /**
  * Wrapper function for AvailableCoins which skips the `feerate` and `CoinFilterParams::only_spendable` parameters. Use this function
  * to list all available coins (e.g. listunspent RPC) while not intending to fund a transaction.
  */
-CoinsResult AvailableCoinsListUnspent(const CWallet& wallet, const CCoinControl* coinControl = nullptr, CoinFilterParams params = {}) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+CoinsResult AvailableCoinsListUnspent(const CWallet& wallet, const CCoinControl* coinControl = nullptr, CoinFilterParams params = {}) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /**
  * Find non-change parent output.
@@ -113,7 +170,8 @@ const CTxOut& FindNonChangeParentOutput(const CWallet& wallet, const COutPoint& 
 /**
  * Return list of available coins and locked coins grouped by non-change output address.
  */
-std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+std::map<CTxDestination, std::vector<COutput>> ListCoins(const CWallet& wallet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 struct SelectionFilter {
     CoinEligibilityFilter filter;
@@ -188,7 +246,7 @@ struct PreSelectedInputs
  * Coins could be internal (from the wallet) or external.
 */
 util::Result<PreSelectedInputs> FetchSelectedInputs(const CWallet& wallet, const CCoinControl& coin_control,
-                                                    const CoinSelectionParams& coin_selection_params) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+                                                    const CoinSelectionParams& coin_selection_params) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 
 /**
  * Select a set of coins such that nTargetValue is met; never select unconfirmed coins if they are not ours
@@ -218,9 +276,16 @@ struct CreatedTransactionResult
     CTransactionRef tx;
     CAmount fee;
     int change_pos;
+    //! Non-HD ML-DSA key durably created while preparing this transaction,
+    //! even when coin selection ultimately did not materialize change.
+    std::optional<CTxDestination> created_quantum_change;
 
-    CreatedTransactionResult(CTransactionRef _tx, CAmount _fee, int _change_pos)
-        : tx(_tx), fee(_fee), change_pos(_change_pos) {}
+    CreatedTransactionResult(
+        CTransactionRef _tx,
+        CAmount _fee,
+        int _change_pos,
+        std::optional<CTxDestination> _created_quantum_change = std::nullopt)
+        : tx(_tx), fee(_fee), change_pos(_change_pos), created_quantum_change(std::move(_created_quantum_change)) {}
 };
 
 /**
@@ -243,7 +308,16 @@ util::Result<CreatedTransactionResult> CreateUTXOOptimizationTransaction(CWallet
  * Insert additional inputs into the transaction by
  * calling CreateTransaction();
  */
-bool FundTransaction(CWallet& wallet, CMutableTransaction& tx, CAmount& nFeeRet, int& nChangePosInOut, bilingual_str& error, bool lockUnspents, const std::set<int>& setSubtractFeeFromOutputs, CCoinControl);
+bool FundTransaction(
+    CWallet& wallet,
+    CMutableTransaction& tx,
+    CAmount& nFeeRet,
+    int& nChangePosInOut,
+    bilingual_str& error,
+    bool lockUnspents,
+    const std::set<int>& setSubtractFeeFromOutputs,
+    CCoinControl,
+    std::optional<CTxDestination>* created_quantum_change = nullptr);
 } // namespace wallet
 
 #endif // BITCOIN_WALLET_SPEND_H

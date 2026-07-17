@@ -1,3 +1,4 @@
+dnl Copyright (c) 2013-2016 The Bitcoin Core developers
 dnl Copyright (c) 2013-2016 Blackcoin Core Developers
 dnl Copyright (c) 2013-2016 Blackcoin More Developers
 dnl Copyright (c) 2013-2016 Blackcoin Developers

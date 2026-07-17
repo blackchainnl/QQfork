@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2018-2022 The Bitcoin Core developers
 # Copyright (c) 2018-2022 Blackcoin Core Developers
 # Copyright (c) 2018-2022 Blackcoin More Developers
 # Copyright (c) 2018-2022 Blackcoin Developers
@@ -206,9 +207,11 @@ class TransactionTimeRescanTest(BitcoinTestFramework):
 
             encrypted_wallet.walletpassphrase("passphrase", 99999)
             encrypted_wallet.sethdseed(seed=hd_seed)
+            expected_stop_height = minernode.getblockcount()
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as thread:
-                with minernode.assert_debug_log(expected_msgs=["Rescan started from block 0f9188f13cb7b2c71f2a335e3a4fc328bf5beb436012afca590b1a11466e2206... (slow variant inspecting all blocks)"], timeout=5):
+                genesis_hash = minernode.getblockhash(0)
+                with minernode.assert_debug_log(expected_msgs=[f"Rescan started from block {genesis_hash}... (slow variant inspecting all blocks)"], timeout=5):
                     rescanning = thread.submit(encrypted_wallet.rescanblockchain)
 
                 # set the passphrase timeout to 1 to test that the wallet remains unlocked during the rescan
@@ -224,7 +227,7 @@ class TransactionTimeRescanTest(BitcoinTestFramework):
                 except JSONRPCException as e:
                     assert e.error["code"] == -4 and "Error: the wallet is currently being used to rescan the blockchain for related transactions. Please call `abortrescan` before changing the passphrase." in e.error["message"]
 
-                assert_equal(rescanning.result(), {"start_height": 0, "stop_height": 803})
+                assert_equal(rescanning.result(), {"start_height": 0, "stop_height": expected_stop_height})
 
             assert_equal(encrypted_wallet.getbalance(), temp_wallet.getbalance())
 

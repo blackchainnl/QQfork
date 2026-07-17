@@ -211,6 +211,7 @@ class WalletLabelsTest(BitcoinTestFramework):
         if self.options.descriptors:
             # This is a descriptor wallet test because of segwit v1+ addresses
             self.log.info('Check watchonly labels')
+            legacy_mining_address = node.getnewaddress(address_type='legacy')
             node.createwallet(wallet_name='watch_only', disable_private_keys=True)
             wallet_watch_only = node.get_wallet_rpc('watch_only')
             BECH32_VALID = {
@@ -225,7 +226,11 @@ class WalletLabelsTest(BitcoinTestFramework):
             for l in BECH32_VALID:
                 ad = BECH32_VALID[l]
                 wallet_watch_only.importaddress(label=l, rescan=False, address=ad)
-                self.generatetoaddress(node, 1, ad)
+                # The labels under test include future-witness addresses,
+                # which are not valid coinbase destinations during Gold Rush.
+                # Advance the chain using a legacy payout without crediting the
+                # watch-only label.
+                self.generatetoaddress(node, 1, legacy_mining_address)
                 assert_equal(wallet_watch_only.getaddressesbylabel(label=l), {ad: {'purpose': 'receive'}})
                 assert_equal(wallet_watch_only.getreceivedbylabel(label=l), 0)
             for l in BECH32_INVALID:

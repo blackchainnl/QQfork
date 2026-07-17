@@ -16,12 +16,23 @@ from test_framework.util import (
 )
 
 
+GOLD_RUSH_END_HEIGHT = COINBASE_MATURITY + 1
+MIGRATION_END_HEIGHT = GOLD_RUSH_END_HEIGHT + 100
+
+
 class WalletQuantumCoinSelectionTest(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser)
 
     def set_test_params(self):
         self.num_nodes = 1
+        self.setup_clean_chain = True
+        self.extra_args = [[
+            "-shadowwhitelistheight=1",
+            f"-shadowgoldrushblocks={GOLD_RUSH_END_HEIGHT - 1}",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
+        ]]
 
     def skip_test_if_missing_module(self):
         self.skip_if_no_wallet()
@@ -43,6 +54,7 @@ class WalletQuantumCoinSelectionTest(BitcoinTestFramework):
 
         self.log.info("Mine mature legacy funds")
         self.generatetoaddress(node, COINBASE_MATURITY + 1, mining_address, sync_fun=self.no_op)
+        assert_equal(node.getquantumquasarinfo()["phase"], "migration")
 
         self.log.info("Funding a quantum address from legacy coins remains supported")
         quantum_address = node.getnewquantumaddress("quantum-target")["address"]

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2022-present The Bitcoin Core developers
 # Copyright (c) 2022 Blackcoin Core Developers
 # Copyright (c) 2022 Blackcoin More Developers
 # Copyright (c) 2022 Blackcoin Developers
@@ -30,8 +31,8 @@ MEMPOOL_TRACEPOINTS_PROGRAM = """
 // The longest rejection reason is 118 chars and is generated in case of SCRIPT_ERR_EVAL_FALSE by
 // strprintf("mandatory-script-verify-flag-failed (%s)", ScriptErrorString(check.GetScriptError()))
 #define MAX_REJECT_REASON_LENGTH        118
-// The longest string returned by RemovalReasonToString() is 'sizelimit'
-#define MAX_REMOVAL_REASON_LENGTH       9
+// The longest string returned by RemovalReasonToString() is 'shadow-stale'
+#define MAX_REMOVAL_REASON_LENGTH       12
 #define HASH_LENGTH                     32
 
 struct added_event

@@ -19,10 +19,12 @@ else
 fi
 
 export CONTAINER_NAME=ci_native_asan
-export PACKAGES="systemtap-sdt-dev clang-17 llvm-17 libclang-rt-17-dev python3-zmq qtbase5-dev qttools5-dev-tools libevent-dev libboost-dev libdb5.3++-dev libminiupnpc-dev libnatpmp-dev libzmq3-dev libqrencode-dev libsqlite3-dev ${BPFCC_PACKAGE}"
-export NO_DEPENDS=1
+export PACKAGES="cmake systemtap-sdt-dev clang-17 llvm-17 libclang-rt-17-dev python3-zmq qtbase5-dev qttools5-dev-tools libevent-dev libboost-dev libdb5.3++-dev libminiupnpc-dev libnatpmp-dev libzmq3-dev libqrencode-dev libsqlite3-dev ${BPFCC_PACKAGE}"
+# Quantum Quasar consensus requires the exact pinned liboqs build.  A host
+# liboqs is deliberately rejected, so sanitizer jobs must use depends too.
+export DEP_OPTS="CC=clang-17 CXX=clang++-17"
 export GOAL="install"
-export BITCOIN_CONFIG="--enable-c++20 --enable-usdt --enable-zmq --with-incompatible-bdb --with-gui=qt5 \
+export BITCOIN_CONFIG="--enable-usdt --enable-zmq --with-incompatible-bdb --with-gui=qt5 \
 CPPFLAGS='-DARENA_DEBUG -DDEBUG_LOCKORDER' \
 --with-sanitizers=address,float-divide-by-zero,integer,undefined \
 CC='clang-17 -ftrivial-auto-var-init=pattern' CXX='clang++-17 -ftrivial-auto-var-init=pattern'"

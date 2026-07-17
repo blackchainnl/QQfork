@@ -1,3 +1,4 @@
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 // Copyright (c) 2009-2022 Blackcoin Core Developers
 // Copyright (c) 2009-2022 Blackcoin More Developers
 // Copyright (c) 2009-2022 Quantum Quasar Developers
@@ -1217,7 +1218,9 @@ enum class PSBTRole {
 std::string PSBTRoleName(PSBTRole role);
 
 /** Compute a PrecomputedTransactionData object from a psbt. */
-PrecomputedTransactionData PrecomputePSBTData(const PartiallySignedTransaction& psbt);
+PrecomputedTransactionData PrecomputePSBTData(const PartiallySignedTransaction& psbt,
+                                              uint32_t quantum_chain_id = 0,
+                                              bool sighash_forkid_active = false);
 
 /** Checks whether a PSBTInput is already signed by checking for non-null finalized fields. */
 bool PSBTInputSigned(const PSBTInput& input);
@@ -1250,7 +1253,9 @@ void UpdatePSBTOutput(const SigningProvider& provider, PartiallySignedTransactio
  * @param[in,out] psbtx PartiallySignedTransaction to finalize
  * return True if the PSBT is now complete, false otherwise
  */
-bool FinalizePSBT(PartiallySignedTransaction& psbtx, unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS);
+bool FinalizePSBT(PartiallySignedTransaction& psbtx,
+                  unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS,
+                  uint32_t quantum_chain_id = 0);
 
 /**
  * Finalizes a PSBT if possible, and extracts it to a CMutableTransaction if it could be finalized.
@@ -1259,7 +1264,9 @@ bool FinalizePSBT(PartiallySignedTransaction& psbtx, unsigned int verify_flags =
  * @param[out] result CMutableTransaction representing the complete transaction, if successful
  * @return True if we successfully extracted the transaction, false otherwise
  */
-bool FinalizeAndExtractPSBT(PartiallySignedTransaction& psbtx, CMutableTransaction& result, unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS);
+bool FinalizeAndExtractPSBT(PartiallySignedTransaction& psbtx, CMutableTransaction& result,
+                            unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS,
+                            uint32_t quantum_chain_id = 0);
 
 /**
  * Combines PSBTs with the same underlying transaction, resulting in a single PSBT with all partial signatures from each input.

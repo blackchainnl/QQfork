@@ -35,6 +35,7 @@ class OptionsModel;
 class PlatformStyle;
 class RPCConsole;
 class SendCoinsRecipient;
+class ShadowResourceDialog;
 class UnitDisplayStatusBarControl;
 class WalletController;
 class WalletFrame;
@@ -160,6 +161,7 @@ private:
     QAction *lockWalletAction = nullptr;
     QAction* aboutQtAction = nullptr;
     QAction* openRPCConsoleAction = nullptr;
+    QAction* openShadowResourceAction = nullptr;
     QAction* openAction = nullptr;
     QAction* showHelpMessageAction = nullptr;
     QAction* m_create_wallet_action{nullptr};
@@ -181,6 +183,7 @@ private:
     const std::unique_ptr<QMenu> trayIconMenu;
     Notificator* notificator = nullptr;
     RPCConsole* rpcConsole = nullptr;
+    ShadowResourceDialog* shadowResourceDialog = nullptr;
     HelpMessageDialog* helpMessageDialog = nullptr;
     ModalOverlay* modalOverlay = nullptr;
 
@@ -323,6 +326,8 @@ public Q_SLOTS:
     void showDebugWindow();
     /** Show debug window and set focus to the console */
     void showDebugWindowActivateConsole();
+    /** Show scoped operational resource status and supply-scan controls. */
+    void showShadowResourceDialog();
     /** Show help message dialog */
     void showHelpMessageClicked();
 

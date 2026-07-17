@@ -30,8 +30,11 @@
 #endif
 
 #include <cstdint>
+#include <cstdlib>
 #include <fstream>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
@@ -1540,6 +1543,29 @@ static CMutableTransaction TxFromHex(const std::string& str)
     return tx;
 }
 
+static int32_t ScriptAssetTransactionVersion(std::string_view tx_hex)
+{
+    if (tx_hex.size() < 8) {
+        throw std::runtime_error("Script asset transaction is shorter than its int32 version");
+    }
+    if ((tx_hex.size() % 2) != 0 || !IsHex(tx_hex)) {
+        throw std::runtime_error("Script asset transaction is not strict even-length hex");
+    }
+
+    uint32_t raw_version{0};
+    for (size_t byte = 0; byte < sizeof(raw_version); ++byte) {
+        const auto high = static_cast<uint32_t>(HexDigit(tx_hex[2 * byte]));
+        const auto low = static_cast<uint32_t>(HexDigit(tx_hex[2 * byte + 1]));
+        raw_version |= ((high << 4) | low) << (8 * byte);
+    }
+
+    int64_t signed_version{raw_version};
+    if ((raw_version & 0x80000000U) != 0) {
+        signed_version -= 0x100000000LL;
+    }
+    return static_cast<int32_t>(signed_version);
+}
+
 static std::vector<CTxOut> TxOutsFromJSON(const UniValue& univalue)
 {
     assert(univalue.isArray());
@@ -1848,28 +1874,84 @@ BOOST_AUTO_TEST_CASE(script_assets_test)
     // See src/test/fuzz/script_assets_test_minimizer.cpp for information on how to generate
     // the script_assets_test.json file used by this test.
 
+    static constexpr size_t PINNED_TOTAL{2244};
+    static constexpr size_t PINNED_INCOMPATIBLE{1161};
+    static constexpr size_t PINNED_COMPATIBLE{1083};
+
+    const char* required = std::getenv("REQUIRE_SCRIPT_ASSETS_TEST");
+    BOOST_REQUIRE_MESSAGE(required == nullptr || std::string_view{required} == "1",
+                          "REQUIRE_SCRIPT_ASSETS_TEST must be unset or exactly 1");
     const char* dir = std::getenv("DIR_UNIT_TEST_DATA");
-    BOOST_WARN_MESSAGE(dir != nullptr, "Variable DIR_UNIT_TEST_DATA unset, skipping script_assets_test");
-    if (dir == nullptr) return;
+    if (dir == nullptr) {
+        BOOST_REQUIRE_MESSAGE(required == nullptr,
+                              "DIR_UNIT_TEST_DATA is required by the script-assets release gate");
+        BOOST_TEST_MESSAGE("DIR_UNIT_TEST_DATA unset; external script-assets gate was not requested");
+        return;
+    }
+    BOOST_REQUIRE_MESSAGE(dir[0] != '\0', "DIR_UNIT_TEST_DATA must not be empty");
     auto path = fs::path(dir) / "script_assets_test.json";
     bool exists = fs::exists(path);
-    BOOST_WARN_MESSAGE(exists, "File $DIR_UNIT_TEST_DATA/script_assets_test.json not found, skipping script_assets_test");
-    if (!exists) return;
+    BOOST_REQUIRE_MESSAGE(exists, "File $DIR_UNIT_TEST_DATA/script_assets_test.json not found");
     std::ifstream file{path};
-    BOOST_CHECK(file.is_open());
+    BOOST_REQUIRE(file.is_open());
     file.seekg(0, std::ios::end);
-    size_t length = file.tellg();
+    const std::streampos end = file.tellg();
+    BOOST_REQUIRE_MESSAGE(end >= 0, "Unable to determine script-assets corpus size");
+    const size_t length = static_cast<size_t>(end);
     file.seekg(0, std::ios::beg);
     std::string data(length, '\0');
     file.read(data.data(), data.size());
+    BOOST_REQUIRE_MESSAGE(file.good() || file.eof(), "Unable to read script-assets corpus");
+    BOOST_REQUIRE_EQUAL(static_cast<size_t>(file.gcount()), length);
     UniValue tests = read_json(data);
-    BOOST_CHECK(tests.isArray());
-    BOOST_CHECK(tests.size() > 0);
+    BOOST_REQUIRE(tests.isArray());
+    BOOST_REQUIRE_EQUAL(tests.size(), PINNED_TOTAL);
 
+    std::vector<size_t> compatible;
+    compatible.reserve(PINNED_COMPATIBLE);
+    size_t incompatible{0};
     for (size_t i = 0; i < tests.size(); i++) {
-        AssetTest(tests[i]);
+        BOOST_REQUIRE_MESSAGE(tests[i].isObject(), "Script asset vector " << i << " is not an object");
+        BOOST_REQUIRE_MESSAGE(tests[i].exists("tx") && tests[i]["tx"].isStr(),
+                              "Script asset vector " << i << " has no transaction hex string");
+        const int32_t version = ScriptAssetTransactionVersion(tests[i]["tx"].get_str());
+        if (version < 2) {
+            // The pinned upstream vectors use Bitcoin's version-1 serialization,
+            // which omits Blackcoin's nTime field. They are intentionally not
+            // deserialized as Blackcoin transactions.
+            ++incompatible;
+        } else {
+            compatible.push_back(i);
+        }
     }
+
+    BOOST_REQUIRE_EQUAL(incompatible, PINNED_INCOMPATIBLE);
+    BOOST_REQUIRE_EQUAL(compatible.size(), PINNED_COMPATIBLE);
+    size_t executed{0};
+    for (const size_t index : compatible) {
+        BOOST_TEST_CONTEXT("script asset vector " << index) {
+            AssetTest(tests[index]);
+        }
+        ++executed;
+    }
+    BOOST_REQUIRE_EQUAL(executed, PINNED_COMPATIBLE);
+    BOOST_TEST_MESSAGE("script-assets corpus: total=" << tests.size()
+                       << " incompatible-version-lt-2=" << incompatible
+                       << " blackcoin-compatible=" << compatible.size()
+                       << " executed=" << executed);
     file.close();
+}
+
+BOOST_AUTO_TEST_CASE(script_asset_transaction_version_test)
+{
+    BOOST_CHECK_EQUAL(ScriptAssetTransactionVersion("01000000"), 1);
+    BOOST_CHECK_EQUAL(ScriptAssetTransactionVersion("02000000"), 2);
+    BOOST_CHECK_EQUAL(ScriptAssetTransactionVersion("ffffff7f"), 2147483647);
+    BOOST_CHECK_EQUAL(ScriptAssetTransactionVersion("00000080"), -2147483647 - 1);
+    BOOST_CHECK_EQUAL(ScriptAssetTransactionVersion("ffffffff"), -1);
+    BOOST_CHECK_THROW(ScriptAssetTransactionVersion(""), std::runtime_error);
+    BOOST_CHECK_THROW(ScriptAssetTransactionVersion("0200000"), std::runtime_error);
+    BOOST_CHECK_THROW(ScriptAssetTransactionVersion("0200000z"), std::runtime_error);
 }
 
 BOOST_AUTO_TEST_CASE(bip341_keypath_test_vectors)

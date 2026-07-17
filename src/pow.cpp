@@ -77,7 +77,15 @@ unsigned int CalculateNextTargetRequired(const CBlockIndex* pindexLast, int64_t 
     arith_uint256 bnNew;
     bnNew.SetCompact(pindexLast->nBits);
     int64_t nInterval = params.nTargetTimespan / nTargetSpacing;
-    bnNew *= ((nInterval - 1) * nTargetSpacing + nActualSpacing + nActualSpacing);
+    // The uint32 multiplier and its low-32-bit reduction are historical
+    // consensus behavior. Make that reduction explicit and use a wide
+    // intermediate so extended fuzz-only timestamp inputs cannot overflow
+    // signed arithmetic or trigger an implicit signed-to-unsigned conversion.
+    const uint32_t nActualSpacingMod = static_cast<uint32_t>(nActualSpacing);
+    const uint64_t nAdjustmentWide =
+        static_cast<uint64_t>((nInterval - 1) * nTargetSpacing) +
+        uint64_t{2} * nActualSpacingMod;
+    bnNew *= static_cast<uint32_t>(nAdjustmentWide);
     bnNew /= ((nInterval + 1) * nTargetSpacing);
 
     if (bnNew <= 0 || bnNew > bnTargetLimit)

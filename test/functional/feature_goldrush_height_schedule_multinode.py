@@ -51,6 +51,7 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
         # tens of seconds, so keep RPCs comfortably inside the socket timeout.
         self.rpc_timeout = 600
         common = [
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
             "-solostaking=1",
@@ -79,9 +80,14 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
         self.started = [0]
 
     # --- mocktime helpers -------------------------------------------------
-    def _set_mocktime(self, timestamp):
+    def _set_mocktime(self, timestamp, *, producer=None):
         self.mock_time = timestamp
-        for i in self.started:
+        update_order = list(self.started)
+        if producer is not None:
+            assert producer.index in update_order, "staking producer must be a started node"
+            update_order.remove(producer.index)
+            update_order.append(producer.index)
+        for i in update_order:
             self.nodes[i].setmocktime(timestamp)
 
     def _bump_mocktime(self, seconds=16):
@@ -118,7 +124,11 @@ class GoldRushHeightScheduleMultiNodeTest(BitcoinTestFramework):
             self._set_mocktime(kernel_time - 16)
             wallet.staking(True)
             try:
-                self._set_mocktime(kernel_time)
+                # ProtocolV2 allows only 15 seconds of future drift while PoS
+                # timestamps advance in 16-second slots. Update every peer
+                # before the armed producer so it cannot broadcast the next
+                # slot while a peer still has the previous slot's mocktime.
+                self._set_mocktime(kernel_time, producer=node)
                 # 60s: a whitelisted staker also grinds Argon2id auto shadow-signals
                 # inside the staking loop, which can push block production past 30s.
                 self.wait_until(lambda: node.getblockcount() > start_height, timeout=60)

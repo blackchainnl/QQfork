@@ -8,7 +8,7 @@ import time
 
 from test_framework.blocktools import COINBASE_MATURITY
 from test_framework.test_framework import BitcoinTestFramework
-from test_framework.util import assert_equal
+from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
 GOLD_RUSH_END_TIME = 2_000_000_000
@@ -25,6 +25,8 @@ class GoldRushReorgTest(BitcoinTestFramework):
             "-txindex=1",
             "-staketimio=50",
             "-shadowwhitelistheight=1",
+            "-shadowcompetingclaimsheight=2",
+            "-shadowqqp4height=2",
             "-shadowgoldrushblocks=500",
             f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
         ]
@@ -97,6 +99,39 @@ class GoldRushReorgTest(BitcoinTestFramework):
         self.wait_until(lambda: len(self._get_quantum_utxos(wallet, address)) == 1, timeout=30)
         return self._get_quantum_utxos(wallet, address)[0]
 
+    @staticmethod
+    def _is_abandoned(wallet, txid):
+        return any(detail.get("abandoned", False) for detail in wallet.gettransaction(txid)["details"])
+
+    def _claim_input(self, node, txid):
+        decoded = node.decoderawtransaction(node.getrawtransaction(txid))
+        assert_equal(len(decoded["vin"]), 1)
+        return {"txid": decoded["vin"][0]["txid"], "vout": decoded["vin"][0]["vout"]}
+
+    def _assert_live_reserved_claim(self, node, wallet, txid, address, claim_input):
+        """A reorged QQP4 may remain valid for a later block, never reusable."""
+        self.wait_until(lambda: txid in node.getrawmempool(), timeout=20)
+        record = wallet.gettransaction(txid)
+        assert_equal(self._is_abandoned(wallet, txid), False)
+        # Reorg/block callbacks may retain a pending reservation marker while
+        # the scheduler revalidates the claim. It is not a terminal cleanup
+        # condition while this exact transaction is still in the mempool.
+        assert record.get("qq_shadow_pow_quarantine") in (None, "1")
+        assert not any(
+            entry.get("qq_shadow_pow_cleanup_for") == txid
+            for entry in wallet.listtransactions("*", 1000, 0, True)
+        )
+        assert_raises_rpc_error(
+            -5,
+            "Transaction not eligible for abandonment",
+            wallet.abandontransaction,
+            txid,
+        )
+        assert all(
+            {"txid": utxo["txid"], "vout": utxo["vout"]} != claim_input
+            for utxo in wallet.listunspent(1, 9999999, [address])
+        )
+
     def run_test(self):
         self._set_mocktime((int(time.time()) & ~0xf) + 16)
         for node in self.nodes:
@@ -126,6 +161,7 @@ class GoldRushReorgTest(BitcoinTestFramework):
         payout_address = wallet.getnewquantumaddress()["address"]
         self.disconnect_nodes(0, 1)
         claim = wallet.sendshadowpowclaim(claim_address, payout_address, 500000)
+        claim_input = self._claim_input(self.nodes[0], claim["txid"])
         assert claim["txid"] in self.nodes[0].getrawmempool()
         assert claim["txid"] not in self.nodes[1].getrawmempool()
 
@@ -151,8 +187,28 @@ class GoldRushReorgTest(BitcoinTestFramework):
         assert_equal(self.nodes[0].getbestblockhash(), competing_blocks[-1])
         assert self.nodes[0].gettxout(payout_utxo["txid"], payout_utxo["vout"], False) is None
         assert_equal(self._get_quantum_utxos(wallet, payout_address), [])
-        assert claim["txid"] not in self.nodes[0].getrawmempool()
-        assert claim["txid"] not in self.nodes[1].getrawmempool()
+        self._assert_live_reserved_claim(
+            self.nodes[0], wallet, claim["txid"], claim_address, claim_input
+        )
+
+        self.log.info("The still-valid reorged claim resolves only through later winning-chain inclusion")
+        resolved_block = self._mine_pos_block(
+            self.nodes[0], wallet, expected_txid=claim["txid"]
+        )
+        self.wait_until(
+            lambda: wallet.gettransaction(claim["txid"])["confirmations"] > 0,
+            timeout=20,
+        )
+        resolved_utxo = self._wait_for_quantum_utxo(wallet, payout_address)
+        assert self.nodes[0].gettxout(
+            resolved_utxo["txid"], resolved_utxo["vout"], False
+        ) is not None
+        self.sync_blocks(timeout=60)
+        assert_equal(self.nodes[0].getbestblockhash(), resolved_block)
+        assert_equal(self.nodes[1].getbestblockhash(), resolved_block)
+        assert self.nodes[1].gettxout(
+            resolved_utxo["txid"], resolved_utxo["vout"], False
+        ) is not None
 
 
 if __name__ == "__main__":

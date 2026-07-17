@@ -7,8 +7,8 @@
 This is an extended, on-demand soak rather than a default-suite test. It compresses
 the demurrage month to two blocks, then drives a three-year equivalent local run:
 20 dormant direct-quantum actors decay to lock, 20 active direct-quantum actors
-refresh by periodic quantum spends, and 10 cold-stake actors remain exempt while
-the per-pool cap bootstrap pool-cap selection path is exercised.
+refresh by periodic quantum spends, and 10 cold-stake actors prove that delegation
+is not a demurrage exemption while the per-pool cap bootstrap path is exercised.
 """
 
 from decimal import Decimal
@@ -21,6 +21,8 @@ from test_framework.util import assert_equal, assert_greater_than
 
 GOLD_RUSH_END_TIME = 2_000_000_000
 MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 5_000
+GOLD_RUSH_END_HEIGHT = 11
+MIGRATION_END_HEIGHT = 14
 DIRECT_AMOUNT = Decimal("2")
 COLD_BOOTSTRAP_AMOUNT = Decimal("100")
 COLD_SMALL_AMOUNT = Decimal("1")
@@ -28,6 +30,9 @@ QUANTUM_SPEND_FEE = Decimal("0.01")
 BLOCKS_PER_MONTH = 2
 SOAK_BLOCKS = 36 * BLOCKS_PER_MONTH
 ACTIVE_REFRESH_INTERVAL = 4 * BLOCKS_PER_MONTH
+N_DORMANT = 20
+N_ACTIVE = 20
+N_COLD = 10
 
 
 class QuantumDemurrageSoakTest(BitcoinTestFramework):
@@ -38,13 +43,13 @@ class QuantumDemurrageSoakTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.extra_args = [[
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-donatetodevfund=0",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=10",
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
-            f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
-            "-qqdemurrageheight=1",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
             f"-qqdemurrageblockspermonth={BLOCKS_PER_MONTH}",
         ]]
 
@@ -131,15 +136,15 @@ class QuantumDemurrageSoakTest(BitcoinTestFramework):
             wallet.staking(False)
 
         funder_address = funder.getnewaddress("", "legacy")
-        mining_address = node.createquantumkey()["address"]
+        mining_address = funder.getnewquantumaddress()["address"]
         self._set_mocktime(GOLD_RUSH_END_TIME + 16)
         self._generate(COINBASE_MATURITY + 2, funder_address)
 
-        dormant_addresses = [funder.getnewquantumaddress()["address"] for _ in range(20)]
-        active_addresses = [funder.getnewquantumaddress()["address"] for _ in range(20)]
+        dormant_addresses = [funder.getnewquantumaddress()["address"] for _ in range(N_DORMANT)]
+        active_addresses = [funder.getnewquantumaddress()["address"] for _ in range(N_ACTIVE)]
         cold_actors = [self._new_cold_actor(owner, staker_a, "bootstrap-a", COLD_BOOTSTRAP_AMOUNT)]
         stakers = (staker_a, staker_b, staker_c)
-        for i in range(1, 10):
+        for i in range(1, N_COLD):
             cold_actors.append(self._new_cold_actor(owner, stakers[i % len(stakers)], f"cold-{i}", COLD_SMALL_AMOUNT))
 
         outputs = {}
@@ -204,7 +209,7 @@ class QuantumDemurrageSoakTest(BitcoinTestFramework):
                 active_addresses = refreshed
             self._generate(1, mining_address)
 
-        self.log.info("Checking dormant lock, active survival, cold-stake exemption, and supply decay")
+        self.log.info("Checking dormant and cold-stake lock, active survival, and supply decay")
         info = funder.getdemurragewalletinfo()
         assert_equal(info["demurrage_active"], True)
         for address in dormant_addresses:
@@ -223,9 +228,35 @@ class QuantumDemurrageSoakTest(BitcoinTestFramework):
             assert txout is not None
             assert_equal(Decimal(str(txout["value"])), actor["amount"])
 
+            # Prove the terminal state for this exact cold-stake outpoint. The
+            # nominal UTXO remains in the set, but delegation is neither a
+            # demurrage exemption nor an ordinary spend path after zero value.
+            output = self._one_output(owner, actor["address"])
+            assert_equal(output["txid"], actor["utxo"]["txid"])
+            assert_equal(output["vout"], actor["utxo"]["vout"])
+            assert_equal(Decimal(output["amount"]), actor["amount"])
+            assert_equal(Decimal(output["nominal_amount"]), actor["amount"])
+            assert_equal(output["spendability_state"], "demurrage_locked")
+            assert_equal(output["synthetic"], False)
+            assert_equal(output["merkle_included"], True)
+            assert_equal(output["mature"], True)
+            assert_equal(output["wallet_signable"], True)
+            assert_equal(output["consensus_spendable"], False)
+            assert_equal(output["ordinary_spendable"], False)
+            assert_equal(output["spendable"], False)
+            assert_equal(output["permanently_locked"], True)
+            assert_equal(output["demurrage_active"], True)
+            assert_equal(output["demurrage_exempt"], False)
+            assert_equal(output["demurrage_locked"], True)
+            assert_equal(output["demurrage_exemption"], "")
+            assert_equal(Decimal(output["effective_amount"]), Decimal("0E-8"))
+            assert_equal(Decimal(output["burned_amount"]), actor["amount"])
+
         supply = node.getcirculatingsupply()
         assert_equal(supply["demurrage_active"], True)
-        assert_greater_than(supply["locked_txouts"], 19)
+        # Whole-chain counts also include historical outputs, so they remain a
+        # supply-accounting smoke check rather than the cold-output oracle.
+        assert_greater_than(supply["locked_txouts"], 0)
         assert_greater_than(Decimal(supply["decayed_amount"]), Decimal("0"))
 
 

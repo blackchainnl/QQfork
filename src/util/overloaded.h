@@ -1,3 +1,4 @@
+// Copyright (c) 2021-present The Bitcoin Core developers
 // Copyright (c) 2021 Blackcoin Core Developers
 // Copyright (c) 2021 Blackcoin More Developers
 // Copyright (c) 2021 Quantum Quasar Developers

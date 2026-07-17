@@ -1,0 +1,427 @@
+# Shadow-ledger explorer interface
+
+Blackcoin Core v30.1.1 provides an explorer-facing index for the synthetic
+Quantum Quasar ledger. Enable it with:
+
+```text
+shadowindex=1
+prune=0
+rpcserialversion=1
+```
+
+`-shadowindex` is optional and disabled by default. The legacy
+`getgoldrushblock` RPC remains available for compatibility, but new
+integrations should use the versioned `getshadow*` schemas. The same index
+retains base-chain witness-version inventory history for
+`getquantumwitnessinventory`. If the index is disabled or still synchronizing,
+the new RPCs return an explicit error rather than silently returning partial
+history.
+
+Mainnet lifecycle boundaries are height-authoritative. Gold Rush is height
+5,950,000 through 6,192,999; the QQP3 emission-neutral competing-claim rule
+begins at height 5,993,200; Migration is height 6,193,000 through 6,921,999;
+and Final Lockout plus automatic demurrage begin at height 6,922,000. Witness-v15 EUTXO
+funding and spending remain frozen because v15 lacks quantum ownership
+authorization. Demurrage decay realized by a valid spend is permanently burned
+and is never paid to a miner, staker, treasury, shadow pool, or claim
+participant.
+
+Explorer processes that fetch raw blocks or transactions must set
+`rpcserialversion=1`. Blackcoin's legacy-compatible default is `0`, which
+omits witness data from raw RPC serialization even though the witness
+commitment remains in the block. Copying a witness-bearing block returned by
+`getblock(hash, 0)` under the default and then submitting those stripped bytes
+will therefore fail with `bad-witness-merkle-match`. This RPC setting does not
+change P2P block relay or consensus; it ensures raw RPC responses contain the
+complete witness data an explorer needs.
+
+Initial index construction reads historical block files. v30.1.1 does not
+support production-network pruning and rejects a nonzero `-prune` value on
+mainnet, testnet, and signet. Explorer operators must use `-prune=0`.
+`-reindex` wipes and deterministically rebuilds the index.
+
+v30.1.1 uses shadowindex schema 11. Schema 5 invalidated prerelease data built
+with the superseded height-5,950,000 claim boundary, schema 6 added proof-mode
+classification, schema 7 added ordered spend anchors used by the bounded event
+transport, schema 8 replaced unbounded per-note claim rows with top-64 detail
+and fixed aggregates, schema 9 added origin/inclusion provenance and
+late-claim dispositions, schema 10 adds proof-version and optional
+exact-fee-input-binding fields for a separately activated QQP4 rule, and schema
+11 adds carrier-independent logical-proof IDs plus duplicate and
+already-accounted outcomes. Any recognized older
+shadowindex schema is discarded and rebuilt automatically. Coinstatsindex
+schema 3 likewise invalidates its
+prerelease schema-2 synthetic-payout statistics. These auxiliary-index rebuilds
+do not require a full block or chainstate reindex when all active-chain block
+files remain available. An operator whose older datadir lacks required history
+must disable the affected index or restore the history with `prune=0` and a
+full `-reindex`.
+
+## Data model
+
+A Gold Rush credit is a deterministic upgraded-ledger transaction anchored to
+an active-chain base block. It is not a transaction in the base block's
+transaction array and is not committed by that block's transaction Merkle
+root. Every response states:
+
+- `synthetic: true`
+- `merkle_included: false`
+- `base_anchor.height`, `base_anchor.blockhash`, `base_anchor.time`, and
+  `base_anchor.claim_index`
+
+The synthetic transaction ID and output index identify the actual quantum UTXO
+in upgraded chainstate. The index stores active-chain lookup keys by base block,
+synthetic transaction ID/outpoint, destination script, and spent outpoint. A
+spend record includes its base block, transaction ID, transaction position, and
+input position. Disconnecting a block atomically restores the prior spend and
+attestation state; disconnecting the origin block removes the synthetic record.
+
+The index stores detailed rows only for the at most 64 canonically selected
+`QQSPROOF` logical proofs classified by the same engine used by chainstate.
+Each row identifies its source transaction/output, logical-proof ID, canonical
+rank, decoded payout destination, actual base fee when known, credited amount,
+exact disposition, and linked synthetic payout (if one exists). Every other
+note is represented by fixed disposition counts and `accounting_commitment`, which binds the exact
+ordered note stream, accounting context, aggregates, and retained rows to the
+indexed base-block anchor. The index does not reimplement winner selection or
+fee arithmetic and never writes more than 64 claim-detail records for a block.
+Fee-paying `QQSPROOF` is a PoW-only channel. A payload carrying mode byte `1`
+(`pos`) or an unknown mode remains ordinary base-block data but cannot consume,
+clear, count, or retarget either shadow pool. `QQSIGNAL` plus a qualified
+coinstake is the only PoS credit path.
+
+Amounts are JSON numbers denominated in BLK with eight decimal places. Internal
+accounting remains integer atomic units.
+
+Every `getshadow*` response is bound to one active-tip and shadowindex
+generation. The RPC captures the active hash, height, and monotonic live-index
+revision before reading, then verifies the same values after assembling the
+result. This rejects same-height and equal-total ABA reorganizations that would
+otherwise look consistent. A concurrent connect, disconnect, or index rewind
+returns an explicit `retry the request` error. Negative transaction/outpoint
+lookups perform the same final check before returning “not found,” so a reorg
+cannot create a silent false negative.
+
+## RPCs
+
+### `getshadowblock hash_or_height ( offset count claim_offset claim_count )`
+
+Returns schema `blackcoin.shadow.block.v3`. Version 3 replaces v2's unbounded
+per-note detail semantics with the fixed aggregate and top-64 detail contract
+below. `count` is limited to 1,000 and
+`claim_count` is limited to 64, the same bound as the persisted detail set.
+`offset`/`next_offset` page synthetic payouts;
+`claim_offset`/`pow_claim_accounting.next_offset` independently page claim
+records.
+Continue with `next_offset` until it is `null`. Only active-chain blocks are
+accepted, so an explorer detects a reorganization when a previously stored
+anchor hash is rejected or no longer matches `getblockhash(height)`.
+
+`pow_claim_accounting` reports `observed_count`, `evaluated_count`, winner,
+current-loser reimbursement, late reimbursement, total rejection counts, and a fixed breakdown for invalid
+location, malformed transaction, invalid proof, wrong/unknown mode, input
+mismatch, invalid base fee, origin mismatch, origin expiry, duplicate logical
+proof, already-accounted proof, and evaluation-limit outcomes. It also reports
+exact winner, reimbursement, and combined credited totals plus the non-null
+`accounting_commitment`. `total_records` is the pageable detail count and is
+always equal to `evaluated_count` and at most 64; aggregate-only structural and
+over-budget outcomes do not have invented detail rows. Stable detailed
+dispositions are `invalid_proof`, `input_mismatch`, `invalid_base_fee`,
+`origin_mismatch`, `origin_expired`, `already_accounted`, `winner`,
+`reimbursed_loser`, and `reimbursed_late`. Every row exposes
+`logical_proof_id`, `proof_version`, `origin_bound`,
+`origin_height`, `origin_previous_block_hash`, `inclusion_height`,
+`origin_age`, `input_bound`, and `claim_outpoint`. The last is null for QQP3
+and becomes an object containing the exact base-chain `txid` and `vout` only
+after separately activated QQP4 binding is in force.
+A positive winner or reimbursement carries the exact synthetic transaction ID.
+Zero-fee valid reimbursements remain visible with zero credit and no synthetic
+output.
+
+`observed_pow_claim_txids` is retained as a compatibility sample in base-block
+order and is capped at 64 entries. It is not a complete inventory when
+`observed_count` exceeds the array length. Consumers must use the aggregate
+counts and commitment rather than treating the sample as exhaustive.
+
+On mainnet this QQP3 canonical per-claim classification begins at height 5,993,200.
+Earlier Gold Rush blocks intentionally reproduce the v30.1.0 first-valid-claim
+allocation and therefore do not expose a retroactively invented canonical
+winner or loser reimbursement. Their authenticated PoW synthetic payouts are
+still indexed, counted in supply, and returned by payout queries, but
+`pow_claim_accounting.active` is false, its records and totals are zero, and
+each payout's `pow_claim_source` is null. At and after height 5,993,200, every
+credited PoW payout must map to one canonical source record and the exact
+credited total; missing or inconsistent provenance stops the auxiliary index
+instead of publishing a partial result.
+
+QQP3 commits the intended height and parent hash. It may be included at that
+height or up to 64 blocks later while the origin remains on the active branch.
+Late claims receive only their capped actual fee. A late-only block therefore
+reports reimbursement payouts but no winner and does not consume the remaining
+PoW jackpot. QQP4 additionally commits the exact single legacy fee input, but
+its activation is separate and disabled on mainnet in v30.1.1.
+No readiness or version-bit state activates QQP4. A future QQP4 schedule must
+publish its height and the tested treatment of already-eligible QQP3 late
+claims; explorers must not infer that a QQP4 boundary is the 5,993,200 QQP3
+boundary.
+
+Minimal and non-minimal outer `OP_RETURN` pushes of the same canonically
+decoded proof share one `logical_proof_id`, one rank, one Argon2 evaluation,
+and at most one credit. The representative source maximizes the eligible
+reimbursement capped at 0.01 BLK, then uses txid/vout as a deterministic tie.
+Additional same-block carriers are aggregate-only
+`duplicate_logical_proof_count` outcomes. A proof already credited on the
+active branch remains visible as one zero-credit `already_accounted` row if a
+base block carries it again; mempool policy rejects it earlier. Authenticated
+per-height buckets cover the exact 64-block late window and are included in the
+replay-state commitment. After Gold Rush, startup continues authenticating the
+final 64 reward buckets without expecting buckets in Migration or Final. The
+finite reward epoch retains its bucket history so an ordinary deep disconnect
+can undo each authenticated marker before the alternate branch is replayed.
+
+Index construction authenticates the historical pool context while holding the
+chain/view lock, then releases that lock before the shared Argon2 evaluator is
+called. Missing undo/provenance is an index error, never a new base-block
+invalidity.
+
+### `getshadowtransaction synthetic_txid`
+
+Returns schema `blackcoin.shadow.transaction.v1`. It reports current lifecycle
+status, ordinary coinbase maturity, the Gold Rush phase lock, earliest spend
+height, destination script/address, nominal and effective value, and exact
+spend provenance. On mainnet, height-authoritative lifecycle boundaries make
+`earliest_spend_height` exact. On a time-only test schedule it is a height lower
+bound and `earliest_spend_height_exact` is false because MedianTimePast may
+delay the phase transition.
+
+Gold Rush payouts remain locked for the entire reward window. Once the Gold
+Rush is over and ordinary maturity is satisfied, the original quantum output
+is directly spendable. It does not expire at Final Lockout and does not require
+a remigration transaction.
+
+### `getshadowaddress address ( after_height after_txid count )`
+
+Returns schema `blackcoin.shadow.address.v1`. The page is ordered by origin
+height and synthetic transaction ID. `after_height` and `after_txid` form one
+exclusive cursor and must be supplied together. Continue with the
+`next_cursor.height` and `next_cursor.txid` values until `next_cursor` is
+`null`. Spent payouts remain in address history with exact base-chain spend
+provenance.
+
+### `getshadowscript scriptPubKey ( after_height after_txid count )`
+
+Returns schema `blackcoin.shadow.script.v1` for one exact hexadecimal output
+script. It uses the same stable ordering, exclusive cursor, and retained spend
+provenance as `getshadowaddress`, but performs no address or descriptor
+normalization. This is the authoritative history query for scripts that do not
+have a standard address encoding. The page and every nested payout state
+explicitly that the record is synthetic and is not included in a base-block
+Merkle tree.
+
+### `getshadowoutpoint synthetic_txid vout`
+
+Returns schema `blackcoin.shadow.outpoint.v1`. An unspent payout is resolved by
+the synthetic-transaction index. Once spent, the same original outpoint is
+resolved by the persisted spent-outpoint index and retains the exact spending
+block, transaction, transaction position, and input position. The
+`lookup_index` field reports which index served the result. Disconnecting the
+spend atomically changes the lookup back to `synthetic_transaction`; a restart
+or index rebuild restores the same result for the active chain. Top-level
+`height` and `bestblock` bind the lookup to the exact snapshot that served it.
+
+### `getshadowsupply ( include_effective max_records )`
+
+Returns schema `blackcoin.shadow.supply.v1`. Issued, spent, and unspent nominal
+totals are constant-time cumulative index values. The additive lifecycle
+contract is versioned separately as
+`blackcoin.shadow.supply.lifecycle.v1`, so existing v1 fields retain their
+names and meanings.
+
+The `schedule` bucket distinguishes the configured height schedule, the amount
+scheduled through the indexed height, value actually accrued into upgraded
+state, and the remaining unaccrued schedule. The `pool` bucket reports exact
+PoW and PoS amounts that accrued but were not issued. It separately identifies
+the amount claimable in the next block and any pool value left unissued after
+the reward-height window. That expired pool value is not a synthetic payout.
+
+The `lifecycle` bucket divides every current unspent synthetic payout into
+locked or spendable count, nominal amount, and current effective amount. During
+Gold Rush the phase lock makes this classification constant-time. After every
+payout is mature and before demurrage, the spendable classification is also
+constant-time. Maturity boundaries and demurrage require a per-payout scan.
+That scan is optional and hard capped by `max_records` (maximum 10,000,000).
+When the cap is reached, `classification_exact` is false and lifecycle values
+are `null`; a scanned prefix is never labeled as a total.
+
+Before demurrage activates, the unspent effective total remains identical to
+the unspent nominal total even if a caller declines a lifecycle scan. After
+activation, an exact current effective total requires evaluating live
+attestation state for each unspent payout. If that scan is disabled or capped,
+`effective_amount_exact` is false and effective and decayed unspent totals are
+`null`.
+
+Demurrage decay is destroyed by consensus. It is not paid as a transaction fee
+and is not redistributed. `spent_burned_amount` is the cumulative realized
+burn. For unspent outputs, `unspent_projected_burn_amount` is the exact amount
+that would be burned at the reported next-block valuation point when
+`effective_amount_exact` is true. The `burn` bucket presents the same realized
+amount with the projected unspent and combined totals.
+
+Gold Rush payout outputs do not expire, so the lifecycle payout-expiry count
+and amount are always zero. `getshadowsupply` is intentionally scoped to
+synthetic Gold Rush payouts. Its `legacy` bucket therefore returns null legacy
+spendable/locked amounts and names `getcirculatingsupply` as the authoritative
+whole-UTXO-set source instead of silently mixing two accounting scopes.
+
+### `getquantumwitnessinventory ( view offset count max_history_records )`
+
+Returns schema `blackcoin.quantum.witness_inventory.v1`. The RPC scans an
+immutable, flushed UTXO snapshot and enumerates every current active-chain,
+value-bearing native witness output with witness version greater than 1. It
+classifies exact `v14`, `v15`, `v16`, or `unknown` version buckets; exact
+pre-Migration versus Migration-or-later origin; the detailed origin phase; and
+recognized direct-quantum, EUTXO, quantum-cold-stake, or unknown bridge
+handling. Authenticated synthetic Gold Rush payouts are reported separately
+and are not misclassified as base-chain witness creations.
+
+Every response also includes `utxo_snapshot`, a MuHash3072 commitment and UTXO
+count computed from the same immutable cursor used for the witness inventory.
+It uses the same authenticated zero-value protocol-marker exclusion as
+`gettxoutsetinfo "muhash"`. Cursor read errors and active-tip movement during
+the call are fatal. `coverage.snapshot_tip_still_active` and
+`coverage.snapshot_utxo_commitment_exact` are therefore true only on a
+completed, unchanged-tip result. Callers paging the inventory must still
+require the height, block hash, MuHash, UTXO count, aggregates, and total record
+count to remain identical across every page.
+
+`recognized_eutxo` identifies only the exact reserved v15 script shape. It does
+not mean the output is enabled or spendable. v30.1.1 provides no supported v15
+funding or spending workflow, and consensus rejects v15 outputs and spends from
+Migration onward because that commitment has no quantum ownership authorization.
+
+The default `utxos` view works without `-shadowindex`. With a synchronized
+index, the response also reconciles current UTXOs against all base-block
+witness-version >1 creations since genesis, including creations that were
+later spent. Use `view="history"` to page those retained records and their exact
+spend provenance. The index tip must contain the immutable UTXO snapshot tip,
+and its live revision must remain unchanged for the entire history scan;
+otherwise the RPC asks the caller to retry instead of mixing branches or
+labeling a partial branch view as exact.
+
+`max_history_records` is a hard scan cap (maximum 10,000,000). When the cap is
+reached, `history_scan_complete` and `history_aggregates_exact` are false,
+historical aggregate totals and `total_records` are `null`, and the RPC never
+labels the scanned prefix as complete history. Inventory buckets include both
+an exact decimal-BLK JSON number and an `amount_atomic` decimal string, so
+cumulative historical flow remains exact even when it exceeds the live money
+supply.
+
+The release acceptance procedure is defined in
+`doc/quantum-witness-inventory-acceptance.md`. The bundled
+`contrib/devtools/quantum_witness_inventory_audit.py` tool paginates every
+current record, independently reconciles `gettxoutsetinfo "muhash"`, rejects a
+moving tip or incomplete page set, and produces either an explicit zero review
+result or snapshot-bound per-outpoint dispositions.
+
+## Reference ingestion and event contract
+
+`feature_goldrush_coinstatsindex.py` is the executable reference ingestion
+test. It:
+
+1. records the active tip hash;
+2. walks the configured reward-height range;
+3. consumes every payout and claim-accounting page through their independent
+   `next_offset` fields;
+4. stores each synthetic transaction by ID and base anchor;
+5. reconciles the enumerated count and nominal amount with `getshadowsupply`;
+6. verifies spend metadata;
+7. disconnects and reconnects origin and spend blocks; and
+8. repeats the checks after restart, incompatible-schema rebuild, `-reindex`,
+   and `-reindex-chainstate`; and
+9. forces an equal-tip ABA reorg while supply, script, and outpoint RPCs are in
+   progress and requires an explicit retry instead of a mixed-branch result.
+
+`feature_shadowindex_claim_boundary.py` must configure its QQP3 and QQP4
+activation heights independently on regtest. It proves that a paid historical
+v30.1.0-style claim survives restart, disconnect/reconnect, and `-reindex` with
+explicit null source provenance; QQP3 canonical provenance and any future QQP4
+exact-input provenance must then be exercised as separate transitions.
+
+`interface_zmq_shadow.py` is the executable event-ingestion test. Enable the
+transport with:
+
+```text
+shadowindex=1
+prune=0
+zmqpubshadow=tcp://127.0.0.1:28334
+```
+
+The multipart topic is `shadow`. Its body is deterministic UTF-8 JSON with schema
+`blackcoin.shadow.event.v1`; the final frame is the notifier's little-endian
+uint32 sequence. One event is emitted only after the index has atomically
+applied or rewound the block. `shadow.block.connected` and
+`shadow.block.disconnected` use the same block, credit, spend, provenance, and
+exact-atomic-amount payload except for `event`, so disconnect is an exact
+inverse. Historical preactivation PoW credits carry the same explicit null
+`pow_claim_source` as their RPC record; post-activation PoW credits carry the
+canonical source object. Credits are ordered by claim index. Spends are ordered
+by transaction index and input index. Reorganizations publish former-branch
+disconnects from tip to ancestor, followed by replacement-branch connects from
+ancestor to tip.
+
+The transport does not replay history during startup, initial index build,
+restart, or reindex. A reference consumer therefore:
+
+1. subscribes to `shadow` and records the per-topic sequence;
+2. bootstraps active block pages and cumulative supply through RPC;
+3. applies only a connected event whose parent equals its stored tip;
+4. applies disconnect events as exact inverse deltas;
+5. keys idempotency by block hash plus synthetic transaction/outpoint; and
+6. replays RPC pages from the last common ancestor after any sequence gap,
+   reconnect, restart, parent mismatch, or periodic supply mismatch.
+
+The in-memory ZMQ sequence restarts with the notifier. A publish failure removes
+only that failed notifier. An over-limit or inconsistent delta is logged and
+omitted. None of those failures rolls back the index, rejects the base block,
+or changes consensus validity, so RPC reconciliation is mandatory rather than
+an optional error-recovery enhancement.
+
+Base-block BIP158 compact filters and ordinary Electrum transaction histories
+cannot discover synthetic payout transaction IDs because those virtual
+transactions are not members of the base block or its transaction Merkle tree.
+A negative compact-filter match is therefore not evidence that a quantum
+address received no Gold Rush credit. The v1 `shadow` topic closes that
+discovery false negative without pretending that a synthetic credit has a base
+transaction Merkle proof. Electrum servers and light-client backends must ingest
+the topic, persist its separate synthetic history, and reconcile it with
+`getshadowblock`, `getshadowaddress`, or `getshadowscript`. Base compact filters
+remain unchanged and authoritative only for transactions actually serialized
+in the base block.
+
+## Resource and failure boundaries
+
+- Block payout and claim-accounting pages are independently capped at 1,000.
+- Effective-supply scans are caller-controlled and hard capped.
+- Live event construction reads persisted delta anchors and point records; it
+  never scans chainstate or the historical index. One event is capped at 4,096
+  combined credits/spends and a 16 MiB JSON body. A valid block above that
+  transport bound remains indexed and queryable by RPC.
+- Synthetic payout records begin at the configured Gold Rush reward start
+  height; earlier blocks return an empty shadow page. Quantum witness history
+  begins at genesis.
+- Corrupt or missing index entries produce RPC/index errors. They are never
+  converted into base-chain consensus invalidity. Primary records must match
+  their database key, active-chain anchor, deterministic payout shape, value
+  range, proof mode, and spend-value conservation before an RPC or event may
+  expose them.
+- A persisted BaseIndex locator inside the reward window is never accepted
+  without the matching custom shadow tip. This rare interrupted-rewind seam
+  fails closed and requires `-reindex` instead of advertising incomplete data
+  as synchronized.
+- Claim classification is all-or-nothing. Allocation, Argon2, or authenticated
+  undo/provenance failure returns an index error with no partial page. The
+  shared evaluator runs before an atomic index batch is built or written, and
+  the index locator is not advanced; restart retries the identical block.
+- The index contains active-chain history only. Orphan-branch records are
+  removed during rewind and can be reconstructed if that branch later becomes
+  active again.

@@ -89,7 +89,7 @@ class BIP65Test(BitcoinTestFramework):
 
     def test_cltv_info(self, *, is_active):
         # Blackcoin: assume that CLTV is always active
-        pass
+        assert is_active
 
     def run_test(self):
         peer = self.nodes[0].add_p2p_connection(P2PInterface())

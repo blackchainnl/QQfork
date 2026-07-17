@@ -24,15 +24,17 @@ typedef std::vector<unsigned char> valtype;
 
 MutableTransactionSignatureCreator::MutableTransactionSignatureCreator(const CMutableTransaction& tx, unsigned int input_idx, const CAmount& amount, int hash_type)
     : m_txto{tx}, nIn{input_idx}, nHashType{hash_type}, amount{amount}, checker{&m_txto, nIn, amount, MissingDataBehavior::FAIL},
-      m_txdata(nullptr)
+      m_txdata(nullptr), m_script_verify_flags{STANDARD_SCRIPT_VERIFY_FLAGS}
 {
 }
 
-MutableTransactionSignatureCreator::MutableTransactionSignatureCreator(const CMutableTransaction& tx, unsigned int input_idx, const CAmount& amount, const PrecomputedTransactionData* txdata, int hash_type)
+MutableTransactionSignatureCreator::MutableTransactionSignatureCreator(const CMutableTransaction& tx, unsigned int input_idx, const CAmount& amount, const PrecomputedTransactionData* txdata, int hash_type, unsigned int script_verify_flags)
     : m_txto{tx}, nIn{input_idx}, nHashType{hash_type}, amount{amount},
       checker{txdata ? MutableTransactionSignatureChecker{&m_txto, nIn, amount, *txdata, MissingDataBehavior::FAIL} :
                        MutableTransactionSignatureChecker{&m_txto, nIn, amount, MissingDataBehavior::FAIL}},
-      m_txdata(txdata)
+      m_txdata(txdata),
+      m_script_verify_flags{(script_verify_flags ? script_verify_flags : STANDARD_SCRIPT_VERIFY_FLAGS) |
+          (txdata && txdata->m_sighash_forkid_active ? SCRIPT_ENABLE_SIGHASH_FORKID : 0)}
 {
 }
 
@@ -53,6 +55,16 @@ bool MutableTransactionSignatureCreator::CreateSig(const SigningProvider& provid
 
     // BASE/WITNESS_V0 signatures don't support explicit SIGHASH_DEFAULT, use SIGHASH_ALL instead.
     const int hashtype = nHashType == SIGHASH_DEFAULT ? SIGHASH_ALL : nHashType;
+
+    if ((hashtype & SIGHASH_FORKID) &&
+        (!m_txdata || !m_txdata->m_sighash_forkid_active ||
+         m_txdata->m_quantum_sighash_chain_id == 0)) {
+        return false;
+    }
+    if ((hashtype & SIGHASH_FORKID) && (hashtype & 0x1f) == SIGHASH_SINGLE &&
+        nIn >= m_txto.vout.size()) {
+        return false;
+    }
 
     uint256 hash = SignatureHash(scriptCode, m_txto, nIn, hashtype, amount, sigversion, m_txdata);
     if (!key.Sign(hash, vchSig))
@@ -572,7 +584,8 @@ bool ProduceSignature(const SigningProvider& provider, const BaseSignatureCreato
     sigdata.scriptSig = PushAll(result);
 
     // Test solution
-    sigdata.complete = solved && VerifyScript(sigdata.scriptSig, fromPubKey, &sigdata.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, creator.Checker());
+    sigdata.complete = solved && VerifyScript(sigdata.scriptSig, fromPubKey, &sigdata.scriptWitness,
+                                              creator.GetScriptVerifyFlags(), creator.Checker());
     return sigdata.complete;
 }
 
@@ -610,7 +623,9 @@ struct Stacks
 }
 
 // Extracts signatures and scripts from incomplete scriptSigs. Please do not extend this, use PSBT instead
-SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nIn, const CTxOut& txout)
+SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nIn, const CTxOut& txout,
+                                  const PrecomputedTransactionData* txdata,
+                                  unsigned int extra_verify_flags)
 {
     SignatureData data;
     assert(tx.vin.size() > nIn);
@@ -619,9 +634,12 @@ SignatureData DataFromTransaction(const CMutableTransaction& tx, unsigned int nI
     Stacks stack(data);
 
     // Get signatures
-    MutableTransactionSignatureChecker tx_checker(&tx, nIn, txout.nValue, MissingDataBehavior::FAIL);
+    MutableTransactionSignatureChecker tx_checker = txdata
+        ? MutableTransactionSignatureChecker(&tx, nIn, txout.nValue, *txdata, MissingDataBehavior::FAIL)
+        : MutableTransactionSignatureChecker(&tx, nIn, txout.nValue, MissingDataBehavior::FAIL);
     SignatureExtractorChecker extractor_checker(data, tx_checker);
-    if (VerifyScript(data.scriptSig, txout.scriptPubKey, &data.scriptWitness, STANDARD_SCRIPT_VERIFY_FLAGS, extractor_checker)) {
+    const unsigned int verify_flags = extra_verify_flags ? extra_verify_flags : STANDARD_SCRIPT_VERIFY_FLAGS;
+    if (VerifyScript(data.scriptSig, txout.scriptPubKey, &data.scriptWitness, verify_flags, extractor_checker)) {
         data.complete = true;
         return data;
     }
@@ -743,6 +761,8 @@ bool VerifySignature(const Coin& coin, const uint256 txFromHash, const CTransact
     PrecomputedTransactionData txdata;
     txdata.Init(txTo, std::vector<CTxOut>{spent_outputs->begin(), spent_outputs->end()});
     txdata.m_quantum_sighash_chain_id = quantum_chain_id;
+    txdata.m_sighash_forkid_active = flags & SCRIPT_ENABLE_SIGHASH_FORKID;
+    if (txdata.m_sighash_forkid_active && quantum_chain_id == 0) return false;
     TransactionSignatureChecker checker(&txTo, nIn, txout.nValue, txdata, MissingDataBehavior::FAIL);
 
     return VerifyScript(txin.scriptSig, txout.scriptPubKey, &txin.scriptWitness, flags, checker);
@@ -783,6 +803,7 @@ private:
 public:
     DummySignatureCreator(char r_len, char s_len) : m_r_len(r_len), m_s_len(s_len) {}
     const BaseSignatureChecker& Checker() const override { return DUMMY_CHECKER; }
+    unsigned int GetScriptVerifyFlags() const override { return STANDARD_SCRIPT_VERIFY_FLAGS; }
     bool CreateSig(const SigningProvider& provider, std::vector<unsigned char>& vchSig, const CKeyID& keyid, const CScript& scriptCode, SigVersion sigversion) const override
     {
         // Create a dummy signature that is a valid DER-encoding
@@ -829,7 +850,11 @@ bool IsSegWitOutput(const SigningProvider& provider, const CScript& script)
     return false;
 }
 
-bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, const std::map<COutPoint, Coin>& coins, int nHashType, std::map<int, bilingual_str>& input_errors)
+bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore,
+                     const std::map<COutPoint, Coin>& coins, int nHashType,
+                     std::map<int, bilingual_str>& input_errors,
+                     uint32_t quantum_chain_id,
+                     unsigned int extra_verify_flags)
 {
     bool fHashSingle = ((nHashType & ~(SIGHASH_ANYONECANPAY | SIGHASH_FORKID)) == SIGHASH_SINGLE);
 	
@@ -856,6 +881,16 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
     if (spent_outputs.size() == mtx.vin.size()) {
         txdata.Init(txConst, std::move(spent_outputs), true);
     }
+    txdata.m_sighash_forkid_active = nHashType & SIGHASH_FORKID;
+    txdata.m_quantum_sighash_chain_id = quantum_chain_id;
+    if (txdata.m_sighash_forkid_active && quantum_chain_id == 0) {
+        for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
+            input_errors[i] = Untranslated("Active SIGHASH_FORKID signing requires a nonzero Quantum Quasar chain id");
+        }
+        return false;
+    }
+    const unsigned int contextual_verify_flags = (extra_verify_flags ? extra_verify_flags : STANDARD_SCRIPT_VERIFY_FLAGS) |
+        (txdata.m_sighash_forkid_active ? SCRIPT_ENABLE_SIGHASH_FORKID : 0);
 
     // Sign what we can:
     for (unsigned int i = 0; i < mtx.vin.size(); ++i) {
@@ -868,10 +903,13 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
         const CScript& prevPubKey = coin->second.out.scriptPubKey;
         const CAmount& amount = coin->second.out.nValue;
 
-        SignatureData sigdata = DataFromTransaction(mtx, i, coin->second.out);
+        SignatureData sigdata = DataFromTransaction(mtx, i, coin->second.out, &txdata,
+                                                    contextual_verify_flags);
         // Only sign SIGHASH_SINGLE if there's a corresponding output:
         if (!fHashSingle || (i < mtx.vout.size())) {
-            ProduceSignature(*keystore, MutableTransactionSignatureCreator(mtx, i, amount, &txdata, nHashType), prevPubKey, sigdata);
+            ProduceSignature(*keystore, MutableTransactionSignatureCreator(
+                mtx, i, amount, &txdata, nHashType, contextual_verify_flags),
+                prevPubKey, sigdata);
         }
 
         UpdateInput(txin, sigdata);
@@ -882,10 +920,7 @@ bool SignTransaction(CMutableTransaction& mtx, const SigningProvider* keystore, 
             continue;
         }
 
-        unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS;
-        if (nHashType & SIGHASH_FORKID) {
-            verify_flags |= SCRIPT_ENABLE_SIGHASH_FORKID;
-        }
+        const unsigned int verify_flags = contextual_verify_flags;
 
         ScriptError serror = SCRIPT_ERR_OK;
         if (!VerifyScript(txin.scriptSig, prevPubKey, &txin.scriptWitness, verify_flags, TransactionSignatureChecker(&txConst, i, amount, txdata, MissingDataBehavior::FAIL), &serror)) {

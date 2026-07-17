@@ -41,12 +41,14 @@ std::vector<fs::path> ListDatabases(const fs::path& wallet_dir)
                 (IsBDBFile(BDBDataFile(it->path())) || IsSQLiteFile(SQLiteDataFile(it->path())))) {
                 // Found a directory which contains wallet.dat btree file, add it as a wallet.
                 paths.emplace_back(path);
-            } else if (it.depth() == 0 && it->symlink_status().type() == fs::file_type::regular && IsBDBFile(it->path())) {
+            } else if (it.depth() == 0 && it->symlink_status().type() == fs::file_type::regular) {
                 if (it->path().filename() == "wallet.dat") {
-                    // Found top-level wallet.dat btree file, add top level directory ""
-                    // as a wallet.
-                    paths.emplace_back();
-                } else {
+                    // The unnamed wallet can be a legacy btree file or a migrated
+                    // SQLite file directly in the wallet directory.
+                    if (IsBDBFile(it->path()) || IsSQLiteFile(it->path())) {
+                        paths.emplace_back();
+                    }
+                } else if (IsBDBFile(it->path())) {
                     // Found top-level btree file not called wallet.dat. Current blackcoin
                     // software will never create these files but will allow them to be
                     // opened in a shared database environment for backwards compatibility.

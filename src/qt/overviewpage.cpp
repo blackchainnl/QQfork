@@ -23,6 +23,7 @@
 #include <QLabel>
 #include <QPainter>
 #include <QStatusTipEvent>
+#include <QStyle>
 
 #include <algorithm>
 #include <map>
@@ -62,12 +63,18 @@ public:
         QString address = index.data(Qt::DisplayRole).toString();
         qint64 amount = index.data(TransactionTableModel::AmountRole).toLongLong();
         bool confirmed = index.data(TransactionTableModel::ConfirmedRole).toBool();
+        const bool selected = option.state & QStyle::State_Selected;
+        const QPalette& content_palette = !selected && option.widget && option.widget->parentWidget()
+            ? option.widget->parentWidget()->palette()
+            : option.palette;
+        const QColor background = content_palette.color(selected ? QPalette::Highlight : QPalette::Window);
+        const QColor palette_foreground = content_palette.color(selected ? QPalette::HighlightedText : QPalette::WindowText);
         QVariant value = index.data(Qt::ForegroundRole);
-        QColor foreground = option.palette.color(QPalette::Text);
+        QColor foreground = palette_foreground;
         if(value.canConvert<QBrush>())
         {
             QBrush brush = qvariant_cast<QBrush>(value);
-            foreground = brush.color();
+            foreground = GUIUtil::ReadableColor(brush.color(), background, palette_foreground);
         }
 
         if (index.data(TransactionTableModel::WatchonlyRole).toBool()) {
@@ -84,15 +91,15 @@ public:
 
         if(amount < 0)
         {
-            foreground = COLOR_NEGATIVE;
+            foreground = GUIUtil::ReadableColor(COLOR_NEGATIVE, background, palette_foreground);
         }
         else if(!confirmed)
         {
-            foreground = COLOR_UNCONFIRMED;
+            foreground = GUIUtil::ReadableColor(COLOR_UNCONFIRMED, background, palette_foreground);
         }
         else
         {
-            foreground = option.palette.color(QPalette::Text);
+            foreground = palette_foreground;
         }
         painter->setPen(foreground);
         QString amountText = BitcoinUnits::formatWithUnit(unit, amount, true, BitcoinUnits::SeparatorStyle::ALWAYS);
@@ -104,7 +111,7 @@ public:
         QRect amount_bounding_rect;
         painter->drawText(amountRect, Qt::AlignRight | Qt::AlignVCenter, amountText, &amount_bounding_rect);
 
-        painter->setPen(option.palette.color(QPalette::Text));
+        painter->setPen(palette_foreground);
         QRect date_bounding_rect;
         painter->drawText(amountRect, Qt::AlignLeft | Qt::AlignVCenter, GUIUtil::dateTimeStr(date), &date_bounding_rect);
 
@@ -148,20 +155,31 @@ OverviewPage::OverviewPage(const PlatformStyle *platformStyle, QWidget *parent) 
     ui->setupUi(this);
 
     m_label_legacy_balance_text = new QLabel(tr("Legacy spendable:"), this);
+    m_label_legacy_balance_text->setObjectName(QStringLiteral("overviewLegacyBalanceText"));
     m_label_legacy_balance = new QLabel(QStringLiteral("0.00000000 BLK"), this);
-    m_label_quantum_balance_text = new QLabel(tr("Quantum-controlled:"), this);
+    m_label_legacy_balance->setObjectName(QStringLiteral("overviewLegacyBalance"));
+    m_label_quantum_balance_text = new QLabel(tr("Quantum spendable:"), this);
+    m_label_quantum_balance_text->setObjectName(QStringLiteral("overviewQuantumBalanceText"));
     m_label_quantum_balance = new QLabel(QStringLiteral("0.00000000 BLK"), this);
-    for (QLabel* label : {m_label_legacy_balance, m_label_quantum_balance}) {
+    m_label_quantum_balance->setObjectName(QStringLiteral("overviewQuantumBalance"));
+    m_label_lifecycle_locked_text = new QLabel(tr("Lifecycle locked/restricted:"), this);
+    m_label_lifecycle_locked_text->setObjectName(QStringLiteral("overviewLifecycleLockedText"));
+    m_label_lifecycle_locked = new QLabel(QStringLiteral("0.00000000 BLK"), this);
+    m_label_lifecycle_locked->setObjectName(QStringLiteral("overviewLifecycleLocked"));
+    for (QLabel* label : {m_label_legacy_balance, m_label_quantum_balance, m_label_lifecycle_locked}) {
         label->setCursor(Qt::IBeamCursor);
         label->setAlignment(Qt::AlignRight | Qt::AlignTrailing | Qt::AlignVCenter);
         label->setTextInteractionFlags(Qt::LinksAccessibleByMouse | Qt::TextSelectableByKeyboard | Qt::TextSelectableByMouse);
     }
     m_label_legacy_balance->setToolTip(tr("Spendable balance held in legacy Blackcoin outputs."));
-    m_label_quantum_balance->setToolTip(tr("Wallet-controlled quantum-resistant Blackcoin outputs. Some outputs may need confirmation, a Gold Rush move, unbonding, or demurrage attestation before ordinary spending."));
+    m_label_quantum_balance->setToolTip(tr("Demurrage-adjusted direct quantum value available to ordinary sends in the next block."));
+    m_label_lifecycle_locked->setToolTip(tr("Mature Gold Rush phase locks, direct-quantum phase locks, staking contracts, Final-locked legacy value, and fully decayed outputs. Immature generated value is shown separately."));
     ui->gridLayout->addWidget(m_label_legacy_balance_text, 8, 0);
     ui->gridLayout->addWidget(m_label_legacy_balance, 8, 1);
     ui->gridLayout->addWidget(m_label_quantum_balance_text, 9, 0);
     ui->gridLayout->addWidget(m_label_quantum_balance, 9, 1);
+    ui->gridLayout->addWidget(m_label_lifecycle_locked_text, 10, 0);
+    ui->gridLayout->addWidget(m_label_lifecycle_locked, 10, 1);
 
     // use a SingleColorIcon for the "out of sync warning" icon
     QIcon icon = m_platform_style->SingleColorIcon(QStringLiteral(":/icons/warning"));
@@ -240,9 +258,14 @@ void OverviewPage::setBalance(const interfaces::WalletBalances& balances)
         ui->labelStake->setText(BitcoinUnits::formatWithPrivacy(unit, balances.stake, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
         ui->labelTotal->setText(BitcoinUnits::formatWithPrivacy(unit, balances.balance + balances.unconfirmed_balance + balances.immature_balance + balances.stake, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
     }
-    if (m_label_legacy_balance && m_label_quantum_balance) {
+    if (m_label_legacy_balance && m_label_quantum_balance && m_label_lifecycle_locked) {
         m_label_legacy_balance->setText(BitcoinUnits::formatWithPrivacy(unit, balances.legacy_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
         m_label_quantum_balance->setText(BitcoinUnits::formatWithPrivacy(unit, balances.quantum_balance, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
+        const CAmount locked = balances.synthetic_mature_locked_balance +
+            balances.direct_quantum_phase_locked_balance +
+            balances.quantum_contract_restricted_balance +
+            balances.final_locked_legacy_balance + balances.demurrage_locked_balance;
+        m_label_lifecycle_locked->setText(BitcoinUnits::formatWithPrivacy(unit, locked, BitcoinUnits::SeparatorStyle::ALWAYS, m_privacy));
     }
     ui->labelDonations->setText((m_privacy ? QString::fromStdString("#") : (QString::number(donation_percentage) + "%")) + " of stake rewards");
     // only show immature (newly mined) balance if it's non-zero, so as not to complicate things

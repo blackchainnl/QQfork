@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2018-2022 The Bitcoin Core developers
 # Copyright (c) 2018-2022 Blackcoin Core Developers
 # Copyright (c) 2018-2022 Blackcoin More Developers
 # Copyright (c) 2018-2022 Blackcoin Developers
@@ -129,6 +130,23 @@ class HelpRpcTest(BitcoinTestFramework):
 
     def wallet_help(self):
         assert 'getnewaddress ( "label" "address_type" )' in self.nodes[0].help('getnewaddress')
+        stake_funding_help = self.nodes[0].help('fundquantumstakeaddress')
+        assert 'from direct quantum wallet coins' in stake_funding_help
+        assert 'from legacy wallet coins' not in stake_funding_help
+        assert 'allow_new_quantum_key' in stake_funding_help
+        assert 'non-HD ML-DSA' in stake_funding_help
+        assert 'allow_new_quantum_key' in self.nodes[0].help('migratetoquantum')
+        assert 'allow_new_quantum_key' in self.nodes[0].help('sweepdemurragedecay')
+        for command in ('sendtoaddress', 'sendmany', 'burn'):
+            command_help = self.nodes[0].help(command)
+            assert 'change_address' in command_help
+            assert 'never creates a non-HD change key' in command_help
+        optimize_help = self.nodes[0].help('optimizeutxoset')
+        assert 'required address for every output and for change' in optimize_help
+        assert 'does not create a hidden quantum change key' in optimize_help
+        rgb_transfer_help = self.nodes[0].help('creatergbtransfer')
+        assert 'existing wallet-owned direct quantum address' in rgb_transfer_help
+        assert 'never creates a non-HD quantum change key' in rgb_transfer_help
         self.restart_node(0, extra_args=['-nowallet=1'])
         assert 'getnewaddress ( "label" "address_type" )' in self.nodes[0].help('getnewaddress')
 

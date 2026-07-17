@@ -10,14 +10,17 @@
 #include <interfaces/node.h>
 #include <qt/bitcoin.h>
 #include <qt/test/apptests.h>
+#include <qt/test/chainstaterebuildassistanttests.h>
 #include <qt/test/optiontests.h>
 #include <qt/test/rpcnestedtests.h>
+#include <qt/test/shadowresourcedialogtests.h>
 #include <qt/test/uritests.h>
 #include <test/util/setup_common.h>
 #include <util/chaintype.h>
 
 #ifdef ENABLE_WALLET
 #include <qt/test/addressbooktests.h>
+#include <qt/test/themetests.h>
 #include <qt/test/wallettests.h>
 #endif // ENABLE_WALLET
 
@@ -92,6 +95,9 @@ int main(int argc, char* argv[])
     AppTests app_tests(app);
     num_test_failures += QTest::qExec(&app_tests);
 
+    ChainstateRebuildAssistantTests chainstate_rebuild_assistant_tests;
+    num_test_failures += QTest::qExec(&chainstate_rebuild_assistant_tests);
+
     OptionTests options_tests(app.node());
     num_test_failures += QTest::qExec(&options_tests);
 
@@ -101,12 +107,18 @@ int main(int argc, char* argv[])
     RPCNestedTests test3(app.node());
     num_test_failures += QTest::qExec(&test3);
 
+    ShadowResourceDialogTests shadow_resource_dialog_tests;
+    num_test_failures += QTest::qExec(&shadow_resource_dialog_tests);
+
 #ifdef ENABLE_WALLET
     WalletTests test5(app.node());
     num_test_failures += QTest::qExec(&test5);
 
     AddressBookTests test6(app.node());
     num_test_failures += QTest::qExec(&test6);
+
+    ThemeTests theme_tests;
+    num_test_failures += QTest::qExec(&theme_tests);
 #endif
 
     if (num_test_failures) {

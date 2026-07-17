@@ -173,16 +173,12 @@ FUZZ_TARGET(coins_view, .init = initialize_coins_view)
     }
 
     {
-        bool expected_code_path = false;
-        try {
-            (void)coins_view_cache.Cursor();
-        } catch (const std::logic_error&) {
-            expected_code_path = true;
-        }
-        assert(expected_code_path);
+        const uint256 best_block = coins_view_cache.GetBestBlock();
+        std::unique_ptr<CCoinsViewCursor> cursor = coins_view_cache.Cursor();
+        assert(cursor);
+        assert(cursor->GetBestBlock() == best_block);
         (void)coins_view_cache.DynamicMemoryUsage();
         (void)coins_view_cache.EstimateSize();
-        (void)coins_view_cache.GetBestBlock();
         (void)coins_view_cache.GetCacheSize();
         (void)coins_view_cache.GetHeadBlocks();
         (void)coins_view_cache.HaveInputs(CTransaction{random_mutable_transaction});

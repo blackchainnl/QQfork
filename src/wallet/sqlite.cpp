@@ -606,14 +606,26 @@ std::unique_ptr<DatabaseCursor> SQLiteBatch::GetNewPrefixCursor(Span<const std::
     return cursor;
 }
 
-bool SQLiteBatch::TxnBegin()
+bool SQLiteBatch::TxnBegin(bool durable)
 {
     if (!m_database.m_db || sqlite3_get_autocommit(m_database.m_db) == 0) return false;
+    if (durable && m_database.m_use_unsafe_sync) {
+        const int sync_res = sqlite3_exec(m_database.m_db, "PRAGMA synchronous=FULL", nullptr, nullptr, nullptr);
+        if (sync_res != SQLITE_OK) {
+            LogPrintf("SQLiteBatch: Failed to enable durable synchronous mode\n");
+            return false;
+        }
+    }
     int res = sqlite3_exec(m_database.m_db, "BEGIN TRANSACTION", nullptr, nullptr, nullptr);
     if (res != SQLITE_OK) {
         LogPrintf("SQLiteBatch: Failed to begin the transaction\n");
+        if (durable && m_database.m_use_unsafe_sync) {
+            sqlite3_exec(m_database.m_db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr);
+        }
+        return false;
     }
-    return res == SQLITE_OK;
+    m_durable_txn = durable;
+    return true;
 }
 
 bool SQLiteBatch::TxnCommit()
@@ -622,8 +634,21 @@ bool SQLiteBatch::TxnCommit()
     int res = sqlite3_exec(m_database.m_db, "COMMIT TRANSACTION", nullptr, nullptr, nullptr);
     if (res != SQLITE_OK) {
         LogPrintf("SQLiteBatch: Failed to commit the transaction\n");
+        // A failed COMMIT can leave the connection inside the transaction.
+        // Explicitly roll it back so partial non-HD key state cannot leak into
+        // a later batch and synchronous mode can be restored safely.
+        if (sqlite3_exec(m_database.m_db, "ROLLBACK TRANSACTION", nullptr, nullptr, nullptr) != SQLITE_OK) {
+            LogPrintf("SQLiteBatch: Failed to roll back after commit failure\n");
+        }
     }
-    return res == SQLITE_OK;
+    const bool committed = res == SQLITE_OK;
+    if (m_durable_txn && m_database.m_use_unsafe_sync) {
+        if (sqlite3_exec(m_database.m_db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr) != SQLITE_OK) {
+            LogPrintf("SQLiteBatch: Failed to restore unsafe synchronous mode after durable transaction\n");
+        }
+    }
+    m_durable_txn = false;
+    return committed;
 }
 
 bool SQLiteBatch::TxnAbort()
@@ -633,7 +658,14 @@ bool SQLiteBatch::TxnAbort()
     if (res != SQLITE_OK) {
         LogPrintf("SQLiteBatch: Failed to abort the transaction\n");
     }
-    return res == SQLITE_OK;
+    const bool aborted = res == SQLITE_OK;
+    if (m_durable_txn && m_database.m_use_unsafe_sync) {
+        if (sqlite3_exec(m_database.m_db, "PRAGMA synchronous=OFF", nullptr, nullptr, nullptr) != SQLITE_OK) {
+            LogPrintf("SQLiteBatch: Failed to restore unsafe synchronous mode after abort\n");
+        }
+    }
+    m_durable_txn = false;
+    return aborted;
 }
 
 std::unique_ptr<SQLiteDatabase> MakeSQLiteDatabase(const fs::path& path, const DatabaseOptions& options, DatabaseStatus& status, bilingual_str& error)

@@ -1,3 +1,4 @@
+// Copyright (c) 2012-2022 The Bitcoin Core developers
 // Copyright (c) 2012-2022 Blackcoin Core Developers
 // Copyright (c) 2012-2022 Blackcoin More Developers
 // Copyright (c) 2012-2022 Quantum Quasar Developers
@@ -5,11 +6,17 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <dbwrapper.h>
+#include <crc32c/crc32c.h>
+#include <crc32c_arm64.h>
+#include <crc32c_arm64_check.h>
+#include <crc32c_internal.h>
 #include <test/util/random.h>
 #include <test/util/setup_common.h>
 #include <uint256.h>
 #include <util/string.h>
 
+#include <array>
+#include <cstdint>
 #include <memory>
 
 #include <boost/test/unit_test.hpp>
@@ -25,6 +32,37 @@ static bool is_null_key(const std::vector<unsigned char>& key) {
 }
 
 BOOST_FIXTURE_TEST_SUITE(dbwrapper_tests, BasicTestingSetup)
+
+BOOST_AUTO_TEST_CASE(crc32c_accepts_unaligned_arm64_input)
+{
+    alignas(uint64_t) const std::array<uint8_t, 10> input{
+        0, '1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    const uint8_t* const unaligned = input.data() + 1;
+
+    BOOST_REQUIRE_NE(
+        reinterpret_cast<std::uintptr_t>(unaligned) % alignof(uint64_t), 0U);
+    BOOST_CHECK_EQUAL(crc32c::Crc32c(unaligned, 9), 0xe3069283U);
+#if HAVE_ARM64_CRC32C
+    BOOST_REQUIRE_MESSAGE(crc32c::CanUseArm64Crc32(),
+                          "native ARM64 CRC32/PMULL instructions are unavailable");
+    BOOST_CHECK_EQUAL(crc32c::ExtendArm64(0, unaligned, 9), 0xe3069283U);
+
+    alignas(uint64_t) std::array<uint8_t, 1088> hardware_input{};
+    for (size_t index = 0; index < hardware_input.size(); ++index) {
+        hardware_input[index] = static_cast<uint8_t>((index * 131 + 17) & 0xff);
+    }
+    constexpr std::array<size_t, 7> lengths{2, 4, 6, 8, 14, 1032, 1046};
+    for (size_t offset = 1; offset <= 7; ++offset) {
+        for (const size_t length : lengths) {
+            const uint8_t* const data = hardware_input.data() + offset;
+            BOOST_TEST_CONTEXT("offset=" << offset << ", length=" << length) {
+                BOOST_CHECK_EQUAL(crc32c::ExtendArm64(0, data, length),
+                                  crc32c::ExtendPortable(0, data, length));
+            }
+        }
+    }
+#endif
+}
 
 BOOST_AUTO_TEST_CASE(dbwrapper)
 {

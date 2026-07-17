@@ -53,7 +53,7 @@ class WalletPoSMultiwalletStakingTest(BitcoinTestFramework):
     def _find_next_kernel_time(self, wallet):
         inputs = self._staking_inputs(wallet)
         assert inputs, "funded wallet must have mature staking inputs"
-        for _ in range(300):
+        for _ in range(3000):
             self._bump_mocktime(16)
             kernel = wallet.checkkernel(inputs)
             if kernel["found"]:

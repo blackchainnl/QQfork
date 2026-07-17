@@ -14,7 +14,9 @@
 #include <qt/walletmodel.h>
 
 #include <addresstype.h>
+#include <common/args.h>
 #include <crypto/sha256.h>
+#include <interfaces/node.h>
 #include <interfaces/wallet.h>
 #include <key_io.h>
 #include <primitives/transaction.h>
@@ -22,10 +24,13 @@
 #include <util/strencodings.h>
 #include <wallet/wallet.h>
 
+#include <univalue.h>
+
 #include <algorithm>
 #include <array>
 #include <limits>
 #include <optional>
+#include <set>
 #include <thread>
 
 #include <QApplication>
@@ -43,7 +48,9 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMessageBox>
+#include <QPalette>
 #include <QPushButton>
+#include <QScopedValueRollback>
 #include <QSettings>
 #include <QScrollArea>
 #include <QSize>
@@ -157,7 +164,7 @@ QString outputSelectorLabel(const interfaces::WalletQuantumStakeOutputInfo& outp
     QString text = QObject::tr("%1  |  %2  |  %3")
         .arg(state.isEmpty() ? QObject::tr("Unknown") : state)
         .arg(formatBLK(output.amount))
-        .arg(shortenHex(output.txid + ":" + std::to_string(output.vout)));
+        .arg(shortenHex(outputSelectorKey(output.txid, output.vout).toStdString()));
     if (output.unlock_height > 0) {
         text += QObject::tr("  |  unlock %1").arg(output.unlock_height);
     }
@@ -181,15 +188,23 @@ std::optional<COutPoint> outpointFromSelectorData(const QVariant& data)
     return COutPoint(uint256S(parts[0].toStdString()), vout);
 }
 
-bool stakingAddressTier(const QString& address, QuantumStakeTierProgram& tier)
+bool quantumAddressTier(const QString& address, QuantumStakeTierProgram& tier)
 {
     const CTxDestination dest = DecodeDestination(address.toStdString());
     const auto* witness = std::get_if<WitnessUnknown>(&dest);
     if (!witness) return false;
-    if (!DecodeQuantumStakeTierProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram(), tier) || !tier.tiered || tier.cold_stake) {
-        return false;
-    }
-    return true;
+    return DecodeQuantumStakeTierProgram(witness->GetWitnessVersion(), witness->GetWitnessProgram(), tier);
+}
+
+bool stakingAddressTier(const QString& address, QuantumStakeTierProgram& tier)
+{
+    return quantumAddressTier(address, tier) && tier.tiered && !tier.cold_stake;
+}
+
+bool isTieredQuantumAddress(const QString& address)
+{
+    QuantumStakeTierProgram tier;
+    return quantumAddressTier(address, tier) && tier.tiered;
 }
 
 uint16_t stakingAddressLockBlocks(const QString& address)
@@ -299,6 +314,24 @@ StakingMiningPage::StakingMiningPage(const PlatformStyle* platformStyle, QWidget
     connect(m_coldstake_withdraw, &QPushButton::clicked, this, &StakingMiningPage::onWithdrawColdStakeAddress);
     connect(m_coldstake_redelegate, &QPushButton::clicked, this, &StakingMiningPage::onRedelegateColdStake);
     connect(m_optimize_button, &QPushButton::clicked, this, &StakingMiningPage::onOptimizeUTXOSet);
+    connect(m_autostart_staking, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_autostart_staking, "autostartstaking", enabled);
+    });
+    connect(m_autostart_pow, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_autostart_pow, "powmining", enabled);
+    });
+    connect(m_auto_qqsignal, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_auto_qqsignal, "qqautoshadowsignal", enabled);
+    });
+    connect(m_auto_demurrage_attest, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_auto_demurrage_attest, "qqautodemurrageattest", enabled);
+    });
+    connect(m_auto_redelegate, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_auto_redelegate, "qqautoredelegate", enabled);
+    });
+    connect(m_allow_auto_key_creation, &QCheckBox::clicked, this, [this](bool enabled) {
+        onAutomationToggled(m_allow_auto_key_creation, "qqallowautokeycreation", enabled);
+    });
     connect(m_refresh_button, &QPushButton::clicked, this, [this]() {
         m_force_full_refresh = true;
         updateStatus();
@@ -311,7 +344,12 @@ StakingMiningPage::StakingMiningPage(const PlatformStyle* platformStyle, QWidget
     });
 }
 
-StakingMiningPage::~StakingMiningPage() = default;
+StakingMiningPage::~StakingMiningPage()
+{
+    if (m_wallet_model && m_detail_refresh_in_flight) {
+        m_wallet_model->cancelStakingMiningSnapshot(m_detail_request_in_flight);
+    }
+}
 
 QSize StakingMiningPage::minimumSizeHint() const
 {
@@ -343,16 +381,14 @@ void StakingMiningPage::setupUi()
     auto configureInfoPanel = [](QLabel* label) {
         label->setWordWrap(true);
         label->setTextFormat(Qt::RichText);
-        label->setStyleSheet(QStringLiteral("QLabel { background: #f5f7fb; border: 1px solid #d8dee9; border-radius: 6px; padding: 8px; }"));
+        GUIUtil::ConfigureThemedLabelPanel(label, QPalette::AlternateBase, QPalette::Text, 8);
     };
     auto configureStatusCard = [](QLabel* label) {
         label->setWordWrap(true);
         label->setTextFormat(Qt::RichText);
         label->setMinimumHeight(74);
         label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-        label->setStyleSheet(QStringLiteral(
-            "QLabel { background: #ffffff; border: 1px solid #cfd8e3; border-radius: 6px; padding: 10px; }"
-            "QLabel[attention=\"true\"] { background: #fff7e6; border-color: #d8a441; }"));
+        GUIUtil::ConfigureThemedLabelPanel(label, QPalette::Base, QPalette::Text, 10);
     };
     auto makeHelpButton = [this](const QString& text, const QString& title, const QString& html, QWidget* parent) {
         auto* button = new QPushButton(text, parent);
@@ -386,7 +422,7 @@ void StakingMiningPage::setupUi()
     m_dashboard_action->setObjectName(QStringLiteral("stakingMiningDashboardAction"));
     m_dashboard_action->setWordWrap(true);
     m_dashboard_action->setTextFormat(Qt::RichText);
-    m_dashboard_action->setStyleSheet(QStringLiteral("QLabel { background: #eef6ff; border: 1px solid #b8d7f5; border-radius: 6px; padding: 10px; }"));
+    GUIUtil::ConfigureThemedLabelPanel(m_dashboard_action, QPalette::Highlight, QPalette::HighlightedText, 10);
     m_dashboard_wallet = new QLabel(tr("Wallet status will appear here."), dashboardBox);
     m_dashboard_wallet->setObjectName(QStringLiteral("stakingMiningDashboardWallet"));
     configureStatusCard(m_dashboard_wallet);
@@ -403,12 +439,13 @@ void StakingMiningPage::setupUi()
         tr("System"),
         tr("Staking & Mining system guide"),
         tr("<h3>What this page controls</h3>"
-           "<p>This page brings together the new V30 staking, Gold Rush, quantum migration, cold-staking, RGB, and EUTXO controls. The dashboard shows the current state first. The tabs below contain actions.</p>"
+           "<p>This page brings together the new V30 staking, Gold Rush, quantum migration, cold-staking, RGB, and EUTXO inspection surfaces. The dashboard shows the current state first. The tabs below contain actions.</p>"
+           "<p>Mainnet uses exact height boundaries: Gold Rush 5,950,000-6,192,999; the emission-neutral competing-claim rule from 5,993,200; Migration 6,193,000-6,921,999; and Final Lockout plus automatic demurrage from 6,922,000. Nominal time forecasts and readiness signalling do not move these boundaries.</p>"
            "<h3>The safe order</h3>"
            "<ol>"
            "<li><b>Keep legacy staking online</b> while Gold Rush runs. Legacy staking secures the base chain and can also produce PoS Gold Rush eligibility.</li>"
            "<li><b>Use normal wallet unlock for quantum actions.</b> Legacy staking-only unlock is intentionally limited and will not create Gold Rush signal or quantum transactions.</li>"
-           "<li><b>Move Gold Rush rewards once.</b> Newly mined Gold Rush quantum rewards must move to a fresh wallet-backed quantum address before being used for sends, staking, node bonds, or delegation.</li>"
+           "<li><b>Wait for Gold Rush rewards to unlock.</b> Newly mined Gold Rush quantum rewards remain locked until Gold Rush ends. After maturity and that boundary, the original outputs are ordinary direct quantum funds; no preliminary move is required.</li>"
            "<li><b>Choose a staking mode.</b> Stake locally if you want this machine to secure the network with your coins, run a node if you want to stake delegated cold deposits, or delegate to a verified node if you want owner keys offline.</li>"
            "</ol>"
            "<h3>Where transactions appear</h3>"
@@ -419,14 +456,14 @@ void StakingMiningPage::setupUi()
         tr("Wallet safety checklist"),
         tr("<h3>Before using new V30 features</h3>"
            "<ul>"
-           "<li>Back up the wallet after creating any new quantum address, node key, or delegation address.</li>"
+           "<li>Quantum keys are non-HD and are not derived from the wallet seed. Back up the wallet after creating any new quantum address, node key, or delegation address; an older backup cannot recover a later key.</li>"
            "<li>Use <b>Unlock wallet for LEGACY staking only</b> only when you want ordinary legacy staking and no spending or quantum operations.</li>"
            "<li>Use <b>Unlock wallet for Quantum and Legacy Staking</b> when you want Gold Rush PoS signals, PoW claim transactions, migration, cold-staking setup, or quantum spends.</li>"
-           "<li>Do not delegate or stake unmoved Gold Rush reward outputs directly. The wallet will move them to a fresh quantum address first when possible.</li>"
+           "<li>Gold Rush reward outputs cannot be spent during Gold Rush. After Gold Rush and maturity, they can be sent, staked, bonded, or delegated directly; consolidation is optional.</li>"
            "<li>Node bonds use a fixed 30-day unbonding period. Delegated funds remain owner-controlled by the delegator wallet.</li>"
            "</ul>"
            "<h3>What the dashboard is telling you</h3>"
-           "<p>The recommended action panel is conservative. It calls out the next action most likely to prevent confusion or blocked transactions, such as moving Gold Rush rewards, unlocking normally for signals, or choosing a cold-staking path.</p>"),
+           "<p>The recommended action panel is conservative. It calls out the next action most likely to prevent confusion or blocked transactions, such as waiting for Gold Rush rewards to unlock, unlocking normally for signals, or choosing a cold-staking path.</p>"),
         dashboardBox);
     dashboard->addWidget(m_dashboard_action, 0, 0, 1, 2);
     dashboard->addLayout(makeGuideRow({systemHelp, safetyHelp}), 1, 0, 1, 2);
@@ -470,10 +507,9 @@ void StakingMiningPage::setupUi()
     // ---- Staking section ----
     auto* stakingBox = new QGroupBox(tr("Staking"), this);
     auto* sgrid = new QGridLayout(stakingBox);
-    m_staking_enable = new QCheckBox(tr("Enable staking (Proof-of-Stake + Gold Rush)"), stakingBox);
+    m_staking_enable = new QCheckBox(tr("Enable legacy Proof-of-Stake"), stakingBox);
     m_staking_enable->setObjectName(QStringLiteral("stakingEnable"));
-    m_staking_enable->setToolTip(tr("Starts legacy PoS staking. If this wallet is whitelisted, Gold Rush "
-                                    "signalling and payouts are added to your coinstakes automatically during the epoch."));
+    m_staking_enable->setToolTip(tr("Starts legacy PoS staking for this loaded wallet. Gold Rush QQSIGNAL submission is a separate optional automation choice below and remains off unless you enable it."));
     m_unlock_staking_only = new QCheckBox(tr("Unlock wallet for LEGACY staking only"), stakingBox);
     m_unlock_staking_only->setObjectName(QStringLiteral("unlockStakingOnly"));
     m_unlock_staking_only->setToolTip(tr("Unlocks an encrypted wallet only for legacy staking. Spending, Gold Rush signals, "
@@ -485,7 +521,6 @@ void StakingMiningPage::setupUi()
     m_quantum_legacy_unlock_note = new QLabel(tr("Gold Rush whitelist status will appear after the wallet is loaded."), stakingBox);
     m_quantum_legacy_unlock_note->setObjectName(QStringLiteral("quantumLegacyUnlockNote"));
     m_quantum_legacy_unlock_note->setWordWrap(true);
-    m_quantum_legacy_unlock_note->setStyleSheet(QStringLiteral("QLabel { color: #6b5d00; }"));
     m_staking_status = new QLabel(tr("Staking is off"), stakingBox);
     m_staking_status->setObjectName(QStringLiteral("stakingStatus"));
     m_stake_weight = new QLabel(QStringLiteral("-"), stakingBox);
@@ -507,12 +542,12 @@ void StakingMiningPage::setupUi()
            "<ul>"
            "<li>The wallet must have at least 10,000 BLK aggregate balance at the whitelist snapshot height.</li>"
            "<li>The wallet must solve a PoS block during the rolling activity window.</li>"
-           "<li>The wallet must be normally unlocked so it can publish a QQSIGNAL transaction. Staking-only unlock is not enough for this part.</li>"
+           "<li>The wallet must be normally unlocked and you must explicitly enable automatic QQSIGNAL submission below (or submit it through RPC). Staking-only unlock is not enough for this part.</li>"
            "</ul>"
            "<h3>How payouts work</h3>"
            "<p>Qualified active signalers share the PoS Gold Rush pool. The wallet displays these reward credits as <b>PoS - Quantum Stake</b> and shows the quantum payout address in the transaction list.</p>"
            "<h3>Example</h3>"
-           "<p>If your wallet was whitelisted and solves a PoS block, keep staking enabled and unlock with <b>Quantum and Legacy Staking</b>. The wallet publishes the signal and remains in the active signaler set until the activity window expires.</p>"),
+           "<p>If your wallet was whitelisted and solves a PoS block, keep staking enabled, unlock with <b>Quantum and Legacy Staking</b>, and explicitly enable automatic QQSIGNAL if you want the wallet to publish fee-paying signals. The runtime staking switch alone never grants that consent.</p>"),
         stakingBox);
     auto* unlockHelp = makeHelpButton(
         tr("Unlock"),
@@ -576,6 +611,37 @@ void StakingMiningPage::setupUi()
     sgrid->addWidget(m_optimize_status, 14, 0, 1, 3);
     miningLayout->addWidget(stakingBox);
 
+    // ---- Explicit optional automation ----
+    auto* automationBox = new QGroupBox(tr("Optional automation (explicit opt-in)"), this);
+    auto* automationLayout = new QVBoxLayout(automationBox);
+    auto* automationIntro = new QLabel(tr(
+        "These settings persist across restarts. Each is off by default. Runtime staking and mining controls above remain available without enabling automatic restart behavior."), automationBox);
+    automationIntro->setWordWrap(true);
+    m_autostart_staking = new QCheckBox(tr("Start staking after every wallet load"), automationBox);
+    m_autostart_staking->setObjectName(QStringLiteral("automationAutostartStaking"));
+    m_autostart_pow = new QCheckBox(tr("Start Gold Rush PoW after wallet startup"), automationBox);
+    m_autostart_pow->setObjectName(QStringLiteral("automationAutostartPow"));
+    m_auto_qqsignal = new QCheckBox(tr("Automatically submit eligible fee-paying QQSIGNAL transactions"), automationBox);
+    m_auto_qqsignal->setObjectName(QStringLiteral("automationQqSignal"));
+    m_auto_demurrage_attest = new QCheckBox(tr("Automatically submit fee-paying demurrage liveness attestations"), automationBox);
+    m_auto_demurrage_attest->setObjectName(QStringLiteral("automationDemurrageAttest"));
+    m_auto_redelegate = new QCheckBox(tr("Automatically redelegate eligible quantum cold stake"), automationBox);
+    m_auto_redelegate->setObjectName(QStringLiteral("automationRedelegate"));
+    m_allow_auto_key_creation = new QCheckBox(tr("Allow background creation of new non-HD quantum keys"), automationBox);
+    m_allow_auto_key_creation->setObjectName(QStringLiteral("automationAllowNewKeys"));
+    m_automation_status = new QLabel(automationBox);
+    m_automation_status->setObjectName(QStringLiteral("automationStatus"));
+    configureInfoPanel(m_automation_status);
+    automationLayout->addWidget(automationIntro);
+    automationLayout->addWidget(m_autostart_staking);
+    automationLayout->addWidget(m_autostart_pow);
+    automationLayout->addWidget(m_auto_qqsignal);
+    automationLayout->addWidget(m_auto_demurrage_attest);
+    automationLayout->addWidget(m_auto_redelegate);
+    automationLayout->addWidget(m_allow_auto_key_creation);
+    automationLayout->addWidget(m_automation_status);
+    miningLayout->addWidget(automationBox);
+
     // ---- Gold Rush Proof-of-Work section ----
     auto* powBox = new QGroupBox(tr("Gold Rush Proof-of-Work mining"), this);
     auto* pgrid = new QGridLayout(powBox);
@@ -625,9 +691,9 @@ void StakingMiningPage::setupUi()
     m_pow_warning->setWordWrap(true);
     m_pow_warning->setTextFormat(Qt::RichText);
     m_pow_warning->setText(tr("<b>Important:</b> Gold Rush PoW rewards are paid to the quantum address above. "
-                              "Back up this wallet after the address is created, then move Gold Rush rewards "
-                              "to a fresh quantum address before final lockout."));
-    m_pow_warning->setStyleSheet(QStringLiteral("QLabel { color: #8a6d00; background: #fff6d6; padding: 6px; border-radius: 4px; }"));
+                              "Back up this wallet after the address is created. Rewards remain locked until Gold Rush ends, "
+                              "then become ordinary direct quantum funds after normal maturity."));
+    GUIUtil::ConfigureThemedLabelPanel(m_pow_warning, QPalette::Highlight, QPalette::HighlightedText, 6);
     auto* powHelp = makeHelpButton(
         tr("PoW"),
         tr("Gold Rush Proof-of-Work guide"),
@@ -651,7 +717,7 @@ void StakingMiningPage::setupUi()
         tr("<h3>Payout address</h3>"
            "<p>The payout address is a wallet-backed quantum address. Back up the wallet after it is created.</p>"
            "<h3>Using mined rewards</h3>"
-           "<p>Gold Rush rewards must be moved once to a fresh wallet-backed quantum address before normal use. The wallet can perform that move automatically before staking, node bonding, or delegation when quantum spending is active.</p>"
+           "<p>Gold Rush rewards remain phase-locked until Gold Rush ends. After maturity and the boundary, the original wallet-backed quantum outputs are ordinary direct quantum funds. A fresh-address consolidation is optional, not a spendability requirement.</p>"
            "<h3>Why the control transaction has a fee</h3>"
            "<p>The QQSPROOF itself is anchored on the legacy chain through a normal transaction. That transaction pays the standard network fee. The quantum reward is not a legacy output.</p>"),
         powBox);
@@ -701,7 +767,7 @@ void StakingMiningPage::setupUi()
            "<h3>Confirmations and availability</h3>"
            "<p>New node bonds and delegations are visible immediately as pending, then become active after normal confirmations. There is no extra waiting period beyond confirmation and the fixed unbonding rules.</p>"
            "<h3>Gold Rush reward handling</h3>"
-           "<p>If the wallet uses unmoved Gold Rush reward outputs, the wallet first moves those rewards to a fresh quantum address and then completes the staking or delegation step when possible.</p>"),
+           "<p>Gold Rush reward outputs remain unavailable during Gold Rush. After Gold Rush and maturity, they can fund staking or delegation directly without a required first move.</p>"),
         coldstakeBox);
     auto* coldstakeSummaryRow = new QHBoxLayout();
     coldstakeSummaryRow->addWidget(m_coldstake_summary, 1);
@@ -862,8 +928,10 @@ void StakingMiningPage::setupUi()
            "<li>Delegate coins. Pending funding appears immediately and becomes active after confirmation.</li>"
            "<li>Use Stop delegation to owner-spend back to a fresh quantum address.</li>"
            "</ol>"
+           "<h3>Automatic redelegation</h3>"
+           "<p>When enabled, automatic redelegation requires a normally unlocked private-key owner wallet and a safe owner-spendable delegation. It runs only after a clamped zero-win interval, activation probation, rate limits, and deterministic jitter, and only when a meaningfully better verified target is available. An over-cap current pool does not trigger it. The cap excludes over-cap targets only while an under-cap alternative exists; the all-over-cap bootstrap can still select one.</p>"
            "<h3>Gold Rush rewards</h3>"
-           "<p>If your selected amount depends on unmoved Gold Rush rewards, the wallet first creates the required fresh quantum move and then completes delegation when possible.</p>"),
+           "<p>Gold Rush reward outputs cannot fund delegation during Gold Rush. After Gold Rush and maturity, they are ordinary direct quantum funds and do not require a preliminary move.</p>"),
         coldstakeBox);
     m_coldstake_quantum_available = new QLabel(QStringLiteral("-"), coldstakeBox);
     m_coldstake_quantum_available->setObjectName(QStringLiteral("coldstakeQuantumAvailable"));
@@ -1034,9 +1102,9 @@ void StakingMiningPage::setupUi()
     m_migration_legacy_sweep = new QPushButton(tr("Move legacy to quantum"), migrationBox);
     m_migration_legacy_sweep->setObjectName(QStringLiteral("migrationLegacySweep"));
     m_migration_legacy_sweep->setToolTip(tr("Create, sign, and broadcast a transaction moving all spendable legacy wallet funds to a fresh wallet-backed quantum address."));
-    m_migration_goldrush_sweep = new QPushButton(tr("Move Gold Rush rewards"), migrationBox);
+    m_migration_goldrush_sweep = new QPushButton(tr("Consolidate Gold Rush rewards"), migrationBox);
     m_migration_goldrush_sweep->setObjectName(QStringLiteral("migrationGoldrushSweep"));
-    m_migration_goldrush_sweep->setToolTip(tr("Move wallet-owned Gold Rush reward outputs to a fresh quantum address before using them for sends, staking, or delegation."));
+    m_migration_goldrush_sweep->setToolTip(tr("Optionally consolidate mature, unlocked Gold Rush reward outputs into a fresh wallet-backed quantum address. This is not required for normal use."));
     m_migration_action_status = new QLabel(QStringLiteral("-"), migrationBox);
     m_migration_action_status->setObjectName(QStringLiteral("migrationActionStatus"));
     m_migration_action_status->setWordWrap(true);
@@ -1050,9 +1118,9 @@ void StakingMiningPage::setupUi()
     m_demurrage_guards = new QLabel(QStringLiteral("-"), migrationBox);
     m_demurrage_guards->setObjectName(QStringLiteral("demurrageGuards"));
     m_demurrage_guards->setWordWrap(true);
-    m_demurrage_attest = new QPushButton(tr("Attest selected quantum address"), migrationBox);
+    m_demurrage_attest = new QPushButton(tr("Attest selected direct/tiered address"), migrationBox);
     m_demurrage_attest->setObjectName(QStringLiteral("demurrageAttest"));
-    m_demurrage_attest->setToolTip(tr("Create a fee-paying liveness attestation for the selected wallet-backed quantum address."));
+    m_demurrage_attest->setToolTip(tr("Create a fee-paying liveness attestation for an eligible wallet-backed direct or tiered v16 address. Cold-stake outputs cannot be attested."));
     m_demurrage_sweep = new QPushButton(tr("Sweep decaying outputs"), migrationBox);
     m_demurrage_sweep->setObjectName(QStringLiteral("demurrageSweep"));
     m_demurrage_sweep->setToolTip(tr("Move currently decaying wallet-owned quantum outputs to a fresh quantum address, realizing the demurrage burn."));
@@ -1100,25 +1168,25 @@ void StakingMiningPage::setupUi()
         tr("<h3>What migration means</h3>"
            "<p>Migration moves value from legacy spend paths into quantum witness outputs. During the transition, upgraded nodes track both the legacy ledger and the quantum ledger rules.</p>"
            "<h3>Legacy to quantum</h3>"
-           "<p>Use Move legacy to quantum to sweep spendable legacy wallet funds to a fresh wallet-backed quantum address. Back up the wallet after creating new quantum addresses.</p>"
+           "<p>During Gold Rush, create and back up quantum addresses or use dry-run planning only. Ordinary v14/v16 funding and spending begin at Migration height 6,193,000. Then use Move legacy to quantum to sweep spendable legacy wallet funds to a fresh wallet-backed quantum address before Final height 6,922,000.</p>"
            "<h3>Gold Rush rewards</h3>"
-           "<p>Gold Rush reward outputs need one fresh move before normal use. This proves the owner is aware of the received quantum reward and establishes a fresh wallet-backed destination.</p>"
+           "<p>Gold Rush reward outputs remain locked throughout Gold Rush. After normal maturity and the Gold Rush boundary, the original outputs become ordinary direct quantum funds. Optional consolidation can organize outputs or rotate keys, but it is not required.</p>"
            "<h3>What to watch</h3>"
            "<ul>"
            "<li><b>Legacy left:</b> value still controlled by legacy spend paths.</li>"
            "<li><b>Quantum held:</b> value already visible to the quantum wallet.</li>"
-           "<li><b>Gold Rush to move:</b> reward value that must be moved once before use.</li>"
+           "<li><b>Gold Rush locked:</b> reward value that remains phase-locked until Gold Rush ends.</li>"
            "</ul>"),
         migrationBox);
     auto* demurrageHelp = makeHelpButton(
         tr("Demurrage"),
         tr("Demurrage and liveness attestations"),
         tr("<h3>Purpose</h3>"
-           "<p>Demurrage is a post-migration inactivity rule for quantum outputs. It is not active during Gold Rush and does not replace the migration deadline.</p>"
+           "<p>Demurrage is a post-migration inactivity rule for eligible quantum outputs. It is inactive during Gold Rush and Migration, then starts automatically with Final Lockout at height 6,922,000.</p>"
            "<h3>Attestations</h3>"
-           "<p>A liveness attestation is a small fee-paying transaction for a selected quantum address. It proves the key is still being actively maintained and resets the inactivity clock for that key.</p>"
-           "<h3>Exemptions</h3>"
-           "<p>Cold-stake contract outputs, treasury outputs, young outputs, and recently attested keys are guarded according to the consensus rules. The panel shows the current exposure, effective value, and guard state.</p>"),
+           "<p>A liveness attestation is a small fee-paying transaction for an eligible wallet-backed direct or tiered v16 address. It resets that key's inactivity clock. Cold-stake outputs cannot be attested. Automatic attempts require staking to be enabled, a normally unlocked private-key wallet, a safe spendable fee input, and available capacity; construction or broadcast failures can defer them.</p>"
+           "<h3>Scope and burn</h3>"
+           "<p>Direct, tiered, and cold-stake quantum outputs are subject to the inactivity schedule; delegation alone is not exempt, and mainnet configures no exempt scripts. Any decay realized by a valid spend is permanently burned and is not paid to a miner, staker, treasury, reward pool, or claim participant. The panel shows current exposure, effective value, and guard state.</p>"),
         migrationBox);
     auto* assetHelp = makeHelpButton(
         tr("Assets"),
@@ -1126,11 +1194,11 @@ void StakingMiningPage::setupUi()
         tr("<h3>RGB assets</h3>"
            "<p>RGB records wallet-known client-side asset state. The table shows assets, balances, supply, assignments, and contract identifiers known to this wallet.</p>"
            "<h3>EUTXO states</h3>"
-           "<p>EUTXO records extended UTXO metadata such as datum and validator commitments. This is advanced state data for contract-like flows.</p>"
+           "<p>EUTXO records persisted metadata for the reserved witness-v15 datum/validator commitment shape.</p>"
            "<h3>Current workflow status</h3>"
-           "<p>The wallet can display known RGB and EUTXO state. Guided creation, transfer, import, and export flows remain advanced console workflows until those screens are built out further.</p>"
+           "<p>The wallet can display known RGB state and EUTXO metadata. EUTXO v15 is frozen in v30.1.1 because it lacks quantum ownership authorization: funding and spending are disabled, creation RPCs intentionally fail, and this table is inspection-only. Do not send BLK to a v15 address. RGB consignment workflows remain advanced console operations until guided screens are built.</p>"
            "<h3>Safe use</h3>"
-           "<p>Use the tables for inspection. Do not assume an asset or state transition is complete until the corresponding wallet or RPC workflow reports the transition as accepted and confirmed.</p>"),
+           "<p>Use the tables for inspection. Do not assume an RGB asset transfer is complete until the corresponding wallet or RPC workflow reports it as accepted and confirmed.</p>"),
         migrationBox);
 
     r = 0;
@@ -1143,7 +1211,7 @@ void StakingMiningPage::setupUi()
     mgrid->addWidget(m_migration_legacy_amount, r++, 1, 1, 2);
     mgrid->addWidget(new QLabel(tr("Quantum held:"), migrationBox), r, 0);
     mgrid->addWidget(m_migration_quantum_amount, r++, 1, 1, 2);
-    mgrid->addWidget(new QLabel(tr("Gold Rush to move:"), migrationBox), r, 0);
+    mgrid->addWidget(new QLabel(tr("Gold Rush locked:"), migrationBox), r, 0);
     mgrid->addWidget(m_migration_goldrush_amount, r++, 1, 1, 2);
     mgrid->addWidget(new QLabel(tr("Quantum addresses:"), migrationBox), r, 0);
     mgrid->addWidget(m_quantum_address_count, r++, 1);
@@ -1182,17 +1250,124 @@ void StakingMiningPage::setupUi()
 void StakingMiningPage::setClientModel(ClientModel* clientModel)
 {
     m_client_model = clientModel;
+    refreshAutomationControls();
+}
+
+void StakingMiningPage::onAutomationToggled(QCheckBox* control, const std::string& setting, bool enabled)
+{
+    if (m_updating || !m_client_model || !control) return;
+
+    if (m_client_model->node().isSettingIgnored(setting)) {
+        QMessageBox::warning(this, tr("Setting controlled at startup"),
+            tr("This choice is controlled by the command-line option -%1. No setting was changed. Remove or change that option and restart Blackcoin before using this control.")
+                .arg(QString::fromStdString(setting)));
+        refreshAutomationControls();
+        return;
+    }
+
+    const bool auto_keys = gArgs.GetBoolArg("-qqallowautokeycreation", wallet::DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION);
+    const bool auto_redelegate = gArgs.GetBoolArg("-qqautoredelegate", wallet::DEFAULT_AUTO_REDELEGATE);
+    if (setting == "qqautoredelegate" && enabled && !auto_keys) {
+        QMessageBox::warning(this, tr("Additional consent required"),
+            tr("Automatic redelegation creates a new non-HD quantum owner key and therefore requires 'Allow background creation of new non-HD quantum keys'. No setting was changed. Enable and acknowledge key creation first, then back up the wallet after every generated key."));
+        refreshAutomationControls();
+        return;
+    }
+    if (setting == "qqallowautokeycreation" && !enabled && auto_redelegate) {
+        QMessageBox::warning(this, tr("Disable redelegation first"),
+            tr("Automatic redelegation currently depends on background quantum-key creation. No setting was changed. Disable automatic redelegation first, then disable background key creation."));
+        refreshAutomationControls();
+        return;
+    }
+
+    QString consequence;
+    if (setting == "autostartstaking") {
+        consequence = tr("Blackcoin will start staking for every eligible private-key wallet on its next load or process restart. This persistent policy does not change the runtime staking switch for any wallet that is already loaded, and it never unlocks an encrypted wallet. Use the runtime staking control above for the current wallet.");
+    } else if (setting == "powmining") {
+        consequence = tr("On each wallet's next load or process restart, Blackcoin will try to start its built-in Gold Rush PoW miner using %1 core(s) at %2% CPU per core. This persistent policy does not start or stop the current wallet's runtime worker; use Apply / Start Miner above for that. Each successful claim spends a legacy fee UTXO. Startup fails safely for a wallet that is locked or has no existing payout key.")
+            .arg(m_pow_cores ? m_pow_cores->value() : 1)
+            .arg(m_pow_percent ? m_pow_percent->value() : 1);
+    } else if (setting == "qqautoshadowsignal") {
+        consequence = tr("This process-wide scheduler setting takes effect immediately for every eligible normally unlocked wallet that is already loaded and also applies to future loads. Blackcoin may automatically create and broadcast fee-paying QQSIGNAL transactions. This does not activate consensus rules or unlock any wallet.");
+    } else if (setting == "qqautodemurrageattest") {
+        consequence = tr("This process-wide scheduler setting takes effect immediately for loaded wallets and also applies to future loads. After Final activation, every eligible normally unlocked wallet may automatically create and broadcast fee-paying liveness attestations. Mandatory consensus demurrage and burn are automatic and remain active whether this optional wallet automation is on or off.");
+    } else if (setting == "qqautoredelegate") {
+        consequence = tr("This process-wide scheduler setting takes effect immediately for loaded wallets and also applies to future loads. In every eligible normally unlocked wallet, Blackcoin may spend delegated outputs and a transaction fee to create a replacement delegation after the configured no-win threshold. Each redelegation creates a new non-HD owner key that requires an immediate wallet backup.");
+    } else if (setting == "qqallowautokeycreation") {
+        consequence = tr("This process-wide permission takes effect immediately for loaded wallets and also applies to future loads. Background wallet tasks may create new non-HD ML-DSA keys. These keys are not recoverable from the wallet seed. You must back up the wallet after every generated key; an older backup cannot recover it.");
+    }
+
+    if (enabled && QMessageBox::question(this, tr("Confirm optional automation"),
+            consequence + tr("\n\nEnable this persistent setting?"),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+        refreshAutomationControls();
+        return;
+    }
+
+    m_client_model->node().updateRwSetting(setting, enabled);
+    if (setting == "powmining" && enabled) {
+        m_client_model->node().updateRwSetting("powminingthreads", m_pow_cores ? m_pow_cores->value() : 1);
+        m_client_model->node().updateRwSetting("powminingcpu", m_pow_percent ? m_pow_percent->value() : 1);
+    }
+    refreshAutomationControls();
+}
+
+void StakingMiningPage::refreshAutomationControls()
+{
+    if (!m_autostart_staking) return;
+
+    const struct {
+        QCheckBox* control;
+        const char* setting;
+        bool value;
+    } controls[] = {
+        {m_autostart_staking, "autostartstaking", wallet::IsStakingAutostartEnabled()},
+        {m_autostart_pow, "powmining", gArgs.GetBoolArg("-powmining", false)},
+        {m_auto_qqsignal, "qqautoshadowsignal", gArgs.GetBoolArg("-qqautoshadowsignal", wallet::DEFAULT_AUTO_SHADOW_SIGNAL)},
+        {m_auto_demurrage_attest, "qqautodemurrageattest", gArgs.GetBoolArg("-qqautodemurrageattest", wallet::DEFAULT_AUTO_DEMURRAGE_ATTEST)},
+        {m_auto_redelegate, "qqautoredelegate", gArgs.GetBoolArg("-qqautoredelegate", wallet::DEFAULT_AUTO_REDELEGATE)},
+        {m_allow_auto_key_creation, "qqallowautokeycreation", gArgs.GetBoolArg("-qqallowautokeycreation", wallet::DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION)},
+    };
+
+    int enabled_count{0};
+    QStringList startup_overrides;
+    for (const auto& item : controls) {
+        QSignalBlocker blocker(item.control);
+        item.control->setChecked(item.value);
+        const bool overridden = m_client_model && m_client_model->node().isSettingIgnored(item.setting);
+        item.control->setEnabled(m_client_model && !overridden);
+        if (item.value) ++enabled_count;
+        if (overridden) startup_overrides.push_back(QStringLiteral("-") + QString::fromLatin1(item.setting));
+    }
+
+    QString status = tr("<b>%1 of 6 optional automations enabled.</b> Staking and PoW autostart changes apply on the next wallet load or process restart and do not change currently loaded runtime switches. QQSIGNAL, optional attestation, redelegation, and background-key scheduler permissions take effect process-wide immediately for loaded eligible wallets and also apply to future loads. Runtime controls above never imply persistent consent. Consensus Final demurrage/burn is mandatory and independent of the optional attestation setting.")
+        .arg(enabled_count);
+    if (!startup_overrides.isEmpty()) {
+        status += tr("<br>Controlled by startup options (restart required to change here): %1")
+            .arg(startup_overrides.join(QStringLiteral(", ")));
+    }
+    if (!gArgs.IsArgSet("-autostartstaking") && gArgs.IsArgSet("-staking")) {
+        status += tr("<br>Staking autostart currently follows the explicitly configured legacy -staking value for upgrade compatibility. Setting the checkbox writes an explicit -autostartstaking policy that takes precedence.");
+    }
+    m_automation_status->setText(status);
 }
 
 void StakingMiningPage::setWalletModel(WalletModel* walletModel)
 {
     if (m_timer) m_timer->stop();
     if (m_wallet_model) {
+        if (m_detail_refresh_in_flight) {
+            m_wallet_model->cancelStakingMiningSnapshot(m_detail_request_in_flight);
+        }
         disconnect(m_wallet_model, nullptr, this, nullptr);
     }
 
+    ++m_wallet_generation;
     m_wallet_model = walletModel;
     m_updating = false;
+    m_detail_refresh_in_flight = false;
+    m_detail_refresh_pending = false;
+    m_detail_request_in_flight = 0;
     m_pow_apply_pending = false;
     m_pow_settings_dirty = false;
     m_operator_registry_loaded = false;
@@ -1200,10 +1375,16 @@ void StakingMiningPage::setWalletModel(WalletModel* walletModel)
     m_operator_last_action_status.clear();
 
     if (m_wallet_model) {
+        connect(m_wallet_model, &WalletModel::stakingMiningSnapshotReady,
+                this, &StakingMiningPage::onStakingMiningSnapshotReady);
         connect(m_wallet_model, &QObject::destroyed, this, [this] {
+            ++m_wallet_generation;
             m_wallet_model = nullptr;
             if (m_timer) m_timer->stop();
             m_updating = false;
+            m_detail_refresh_in_flight = false;
+            m_detail_refresh_pending = false;
+            m_detail_request_in_flight = 0;
             m_pow_apply_pending = false;
             m_pow_settings_dirty = false;
             m_operator_registry_loaded = false;
@@ -1402,7 +1583,9 @@ void StakingMiningPage::onApplyPow()
     if (enabled && !current_info.enabled) {
         const QString body = tr("This will start the built-in Gold Rush PoW miner with %1 CPU core(s) at %2% target duty cycle.\n\n"
                                 "The wallet must be normally unlocked so it can sign QQSPROOF claim transactions. "
-                                "A wallet-backed quantum payout key may be created automatically; back up this wallet after enabling mining.\n\n"
+                                "The miner also needs a confirmed, spendable legacy BLK UTXO to authenticate and pay the fee for each claim. "
+                                "If no existing payout key is available, approving this dialog is one-time consent to create one new non-HD quantum key. "
+                                "That key is not recoverable from the wallet seed; back up this wallet immediately if one is created.\n\n"
                                 "Start mining now?")
                                  .arg(cores)
                                  .arg(percent);
@@ -1427,7 +1610,14 @@ void StakingMiningPage::onApplyPow()
     refreshControlsEnabled();
 
     std::string error;
-    const bool ok = m_wallet_model->wallet().setPowMining(enabled, cores, percent, error);
+    bool created_payout_key{false};
+    // The immediately preceding confirmation explicitly covers creation of a
+    // new non-HD payout key. Reconfiguration of an already-running miner does
+    // not grant any additional key-creation consent.
+    const bool ok = m_wallet_model->wallet().setPowMining(
+        enabled, cores, percent, error,
+        /*allow_new_payout_key=*/enabled && !current_info.enabled,
+        &created_payout_key);
     m_pow_apply_pending = false;
     if (!ok) {
         m_pow_enable->setChecked(false);
@@ -1440,7 +1630,16 @@ void StakingMiningPage::onApplyPow()
         return;
     }
     m_pow_settings_dirty = false;
-    updateStatus();
+    m_pow_status->setText(enabled
+        ? tr("Gold Rush PoW mining is enabled with %1 core(s) at %2% target duty cycle. Press Refresh details for the payout address and live statistics.")
+              .arg(cores)
+              .arg(percent)
+        : tr("Gold Rush PoW mining is off."));
+    if (created_payout_key) {
+        const QString backup_warning = tr("A new non-HD quantum PoW payout key was created and stored in this wallet. It is not recoverable from the wallet seed. Back up this wallet now before relying on mined rewards.");
+        m_pow_status->setText(m_pow_status->text() + tr(" ") + backup_warning);
+    }
+    refreshControlsEnabled();
 }
 
 void StakingMiningPage::onCopyPayoutAddress()
@@ -1453,6 +1652,12 @@ void StakingMiningPage::onCopyPayoutAddress()
 void StakingMiningPage::onCreateQuantumAddress()
 {
     if (!m_wallet_model) return;
+    if (!confirmBroadcast(
+            this,
+            tr("Create quantum address"),
+            tr("This creates and stores one new non-HD ML-DSA private key. The key is not derived from the wallet seed, and a backup made before this key exists cannot recover it. No funds are moved by this step.\n\nCreate the address and then back up this wallet immediately?"))) {
+        return;
+    }
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
@@ -1486,16 +1691,17 @@ void StakingMiningPage::onCopyQuantumPubkey()
 void StakingMiningPage::onMigrateLegacyToQuantum()
 {
     if (!m_wallet_model) return;
-    const int rc = QMessageBox::question(
-        this,
-        tr("Move legacy funds to quantum"),
-        tr("This will create a fresh wallet-backed quantum address and move all spendable legacy wallet funds into it. Back up the wallet after the transaction is created. Continue?"));
-    if (rc != QMessageBox::Yes) return;
+    if (!confirmBroadcast(
+            this,
+            tr("Move legacy funds to quantum"),
+            tr("This will create a fresh non-HD wallet-backed quantum address and move all spendable legacy wallet funds into it. The new key is written to the wallet before final transaction construction or broadcast, is not recoverable from the wallet seed, and may remain even if migration later fails. If any failure reports that a key was created, back up the wallet immediately. Continue?"))) {
+        return;
+    }
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().migrateLegacyToQuantum();
+    auto result = m_wallet_model->wallet().migrateLegacyToQuantum(/*allow_new_quantum_key=*/true);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_migration_action_status->setText(msg);
@@ -1516,25 +1722,26 @@ void StakingMiningPage::onMigrateLegacyToQuantum()
 void StakingMiningPage::onMigrateGoldRushRewards()
 {
     if (!m_wallet_model) return;
-    const int rc = QMessageBox::question(
-        this,
-        tr("Move Gold Rush rewards"),
-        tr("This will create a fresh wallet-backed quantum address and move wallet-owned Gold Rush reward outputs into it. After confirmation, those funds can be used for sends, staking, node bonds, or cold-stake delegation. Continue?"));
-    if (rc != QMessageBox::Yes) return;
+    if (!confirmBroadcast(
+            this,
+            tr("Consolidate Gold Rush rewards"),
+            tr("This optional action creates a fresh non-HD wallet-backed quantum address and consolidates mature, unlocked Gold Rush reward outputs into it. The key is written to the wallet before final transaction construction or broadcast, is not recoverable from the wallet seed, and may remain even if consolidation later fails. If any failure reports that a key was created, back up the wallet immediately. The original outputs are already ordinary quantum funds after Gold Rush; consolidation is not required for use. Continue?"))) {
+        return;
+    }
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().migrateGoldRushRewards();
+    auto result = m_wallet_model->wallet().migrateGoldRushRewards(/*allow_new_quantum_key=*/true);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_migration_action_status->setText(msg);
-        QMessageBox::warning(this, tr("Move Gold Rush rewards"), msg);
+        QMessageBox::warning(this, tr("Consolidate Gold Rush rewards"), msg);
         return;
     }
 
     m_quantum_address->setText(QString::fromStdString(result->address));
-    m_migration_action_status->setText(tr("Gold Rush reward move broadcast: %1. Fresh quantum address: %2. Moved %3 from %4 output(s); fee %5. Back up this wallet now.")
+    m_migration_action_status->setText(tr("Gold Rush reward consolidation broadcast: %1. Fresh quantum address: %2. Consolidated %3 from %4 output(s); fee %5. Back up this wallet now.")
         .arg(QString::fromStdString(result->txid))
         .arg(QString::fromStdString(result->address))
         .arg(formatBLK(result->amount))
@@ -1549,15 +1756,16 @@ void StakingMiningPage::onSendDemurrageAttestation()
     if (!m_wallet_model) return;
     const QString address = m_quantum_address->text().trimmed();
     if (address.isEmpty()) {
-        m_demurrage_status->setText(tr("Select or create a quantum address before sending an attestation."));
+        m_demurrage_status->setText(tr("Select or create an eligible direct or tiered v16 address before sending an attestation."));
         return;
     }
-    const int rc = QMessageBox::question(
-        this,
-        tr("Demurrage attestation"),
-        tr("This will create a small fee-paying liveness attestation for the selected quantum address:\n%1\n\nContinue?")
-            .arg(address));
-    if (rc != QMessageBox::Yes) return;
+    if (!confirmBroadcast(
+            this,
+            tr("Demurrage attestation"),
+            tr("This will create and broadcast a small fee-paying liveness attestation for the selected eligible direct or tiered v16 address:\n%1\n\nChange returns to an existing wallet-owned direct quantum fee-input address (or the explicitly configured demurrage change address); this action does not create a hidden key. Mandatory consensus demurrage and burn are independent of this optional transaction. Continue?")
+                .arg(address))) {
+        return;
+    }
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
@@ -1580,16 +1788,17 @@ void StakingMiningPage::onSendDemurrageAttestation()
 void StakingMiningPage::onSweepDemurrageDecay()
 {
     if (!m_wallet_model) return;
-    const int rc = QMessageBox::question(
-        this,
-        tr("Sweep decaying quantum outputs"),
-        tr("This will create a fresh wallet-backed quantum address, spend all currently decaying direct quantum outputs, realize the demurrage burn, and move the remaining effective value minus fees to the fresh address.\n\nContinue?"));
-    if (rc != QMessageBox::Yes) return;
+    if (!confirmBroadcast(
+            this,
+            tr("Sweep decaying quantum outputs"),
+            tr("This will create a fresh non-HD wallet-backed quantum address, spend all currently decaying direct quantum outputs, permanently burn the realized demurrage, and move the remaining effective value minus fees to the fresh address. The key is written to the wallet before final transaction construction or broadcast, is not recoverable from the wallet seed, and may remain even if the sweep later fails. If any failure reports that a key was created, back up the wallet immediately.\n\nContinue?"))) {
+        return;
+    }
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().sweepDemurrageDecay();
+    auto result = m_wallet_model->wallet().sweepDemurrageDecay(/*allow_new_quantum_key=*/true);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_demurrage_status->setText(msg);
@@ -1625,10 +1834,17 @@ void StakingMiningPage::onCopySelectedRGBContract()
 void StakingMiningPage::onCreateSelfStakeAddress()
 {
     if (!m_wallet_model) return;
+    const uint16_t unbonding_blocks = selectedStakeLockBlocks(m_selfstake_lock_period);
+    if (!confirmBroadcast(
+            this,
+            tr("Create quantum staking address"),
+            tr("This creates and stores one new non-HD ML-DSA private key for a staking address with %1 bonded blocks. The key is not derived from the wallet seed, and an older backup cannot recover it. No coins are locked until you separately fund the address.\n\nCreate the address and then back up this wallet immediately?")
+                .arg(unbonding_blocks))) {
+        return;
+    }
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    const uint16_t unbonding_blocks = selectedStakeLockBlocks(m_selfstake_lock_period);
     auto result = m_wallet_model->wallet().createQuantumStakeAddress("quantum-stake", unbonding_blocks);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
@@ -1672,7 +1888,7 @@ void StakingMiningPage::onFundSelfStakeAddress()
             this,
             tr("Activate quantum staking"),
             tr("This will broadcast a wallet transaction funding quantum staking address:\n%1\n\nAmount: %2\n\n"
-               "If the address has a lock period, stopping staking later will require the unbonding period before withdrawal. Continue?")
+               "If the address has a lock period, stopping staking later will require the unbonding period before withdrawal. Transaction construction first writes a fresh non-HD quantum change key to the wallet. That key is not seed-recoverable and may remain even if funding later fails. If a failure reports key creation, back up this wallet immediately. Continue?")
                 .arg(m_selfstake_address->text())
                 .arg(formatBLK(amount)))) {
         return;
@@ -1681,7 +1897,7 @@ void StakingMiningPage::onFundSelfStakeAddress()
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().fundQuantumStakeAddress(m_selfstake_address->text().toStdString(), amount);
+    auto result = m_wallet_model->wallet().fundQuantumStakeAddress(m_selfstake_address->text().toStdString(), amount, /*allow_new_quantum_key=*/true);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_selfstake_status->setText(msg);
@@ -1710,27 +1926,37 @@ void StakingMiningPage::onWithdrawSelfStakeAddress()
     const interfaces::WalletQuantumOperatorBondInfo info =
         m_wallet_model->wallet().getQuantumStakeAddressBondInfo(m_selfstake_address->text().toStdString());
     if (selected_outpoint) {
-        const int rc = QMessageBox::question(
-            this,
-            tr("Stop selected quantum stake"),
-            tr("This will act only on the selected staking output:\n%1\n\nIf it is bonded, unbonding starts. If it is already mature, it withdraws to a fresh quantum address. Continue?")
-                .arg(m_selfstake_output_selector->currentText()));
-        if (rc != QMessageBox::Yes) return;
+        if (!confirmBroadcast(
+                this,
+                tr("Stop selected quantum stake"),
+                tr("This will act only on the selected staking output:\n%1\n\nIf it is bonded, a fee-paying unbond transaction starts the lock period and first writes a fresh non-HD quantum change key to the wallet. If it is already mature, it first writes a fresh non-HD quantum withdrawal key. Either key is not seed-recoverable and may remain even if the later transaction fails. If a failure reports key creation, back up this wallet immediately. Continue?")
+                    .arg(m_selfstake_output_selector->currentText()))) {
+            return;
+        }
     } else if (info.valid_operator_address && info.bonded_outputs > 0) {
-        const int rc = QMessageBox::question(
-            this,
-            tr("Stop quantum staking"),
-            tr("This will start unbonding for %1. The principal remains locked until the staking address's unlock height. Continue?")
-                .arg(formatBLK(info.bonded_amount)));
-        if (rc != QMessageBox::Yes) return;
+        if (!confirmBroadcast(
+                this,
+                tr("Stop quantum staking"),
+                tr("This will broadcast a fee-paying transaction that starts unbonding for %1. The principal remains locked until the staking address's unlock height. Transaction construction first writes a fresh non-HD quantum change key to the wallet. It is not seed-recoverable and may remain even if the transaction later fails. If a failure reports key creation, back up this wallet immediately. Continue?")
+                    .arg(formatBLK(info.bonded_amount)))) {
+            return;
+        }
+    } else if (info.valid_operator_address && info.withdrawable_outputs > 0) {
+        if (!confirmBroadcast(
+                this,
+                tr("Withdraw quantum stake"),
+                tr("This will broadcast a fee-paying transaction that withdraws %1 to a fresh non-HD quantum address. The new key is written before final transaction construction or broadcast, is not recoverable from the wallet seed, and may remain even if withdrawal later fails. If a failure reports key creation, back up this wallet immediately. Continue?")
+                    .arg(formatBLK(info.withdrawable_amount)))) {
+            return;
+        }
     }
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
     auto result = selected_outpoint
-        ? m_wallet_model->wallet().withdrawQuantumStakeOutput(m_selfstake_address->text().toStdString(), *selected_outpoint)
-        : m_wallet_model->wallet().withdrawQuantumStakeAddress(m_selfstake_address->text().toStdString());
+        ? m_wallet_model->wallet().withdrawQuantumStakeOutput(m_selfstake_address->text().toStdString(), *selected_outpoint, /*allow_new_quantum_key=*/true)
+        : m_wallet_model->wallet().withdrawQuantumStakeAddress(m_selfstake_address->text().toStdString(), /*allow_new_quantum_key=*/true);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_selfstake_status->setText(msg);
@@ -1759,6 +1985,12 @@ void StakingMiningPage::onWithdrawSelfStakeAddress()
 void StakingMiningPage::onCreateOperatorKey()
 {
     if (!m_wallet_model) return;
+    if (!confirmBroadcast(
+            this,
+            tr("Create cold-staking node key"),
+            tr("This creates and stores one new non-HD ML-DSA private key for a 30-day node-bond address. The key is not derived from the wallet seed, and an older backup cannot recover it. No coins are bonded until you separately fund the address.\n\nCreate the key and then back up this wallet immediately?"))) {
+        return;
+    }
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
@@ -1813,7 +2045,7 @@ void StakingMiningPage::onFundOperatorBond()
             this,
             tr("Activate cold-staking node"),
             tr("This will broadcast a wallet transaction funding this node's 30-day operator bond:\n%1\n\nAmount: %2\n\n"
-               "Delegators use this bond to verify the node. Stopping the node later starts the fixed 30-day unbonding period. Continue?")
+               "Delegators use this bond to verify the node. Stopping the node later starts the fixed 30-day unbonding period. Transaction construction first writes a fresh non-HD quantum change key to the wallet. It is not seed-recoverable and may remain even if funding later fails. If a failure reports key creation, back up this wallet immediately. Continue?")
                 .arg(m_operator_address->text())
                 .arg(formatBLK(amount)))) {
         return;
@@ -1822,7 +2054,7 @@ void StakingMiningPage::onFundOperatorBond()
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().fundQuantumOperatorBond(m_operator_address->text().toStdString(), amount);
+    auto result = m_wallet_model->wallet().fundQuantumOperatorBond(m_operator_address->text().toStdString(), amount, /*allow_new_quantum_key=*/true);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_operator_status->setText(msg);
@@ -1850,18 +2082,27 @@ void StakingMiningPage::onWithdrawOperatorBond()
     const interfaces::WalletQuantumOperatorBondInfo info =
         m_wallet_model->wallet().getQuantumOperatorBondInfo(m_operator_address->text().toStdString());
     if (info.valid_operator_address && info.bonded_outputs > 0) {
-        const int rc = QMessageBox::question(
-            this,
-            tr("Stop cold-staking node"),
-            tr("This will start the 30-day unbonding period for %1. The principal remains locked until the unbonding height. Continue?")
-                .arg(formatBLK(info.bonded_amount)));
-        if (rc != QMessageBox::Yes) return;
+        if (!confirmBroadcast(
+                this,
+                tr("Stop cold-staking node"),
+                tr("This will broadcast a fee-paying transaction that starts the 30-day unbonding period for %1. The principal remains locked until the unbonding height. Transaction construction first writes a fresh non-HD quantum change key to the wallet. It is not seed-recoverable and may remain even if the transaction later fails. If a failure reports key creation, back up this wallet immediately. Continue?")
+                    .arg(formatBLK(info.bonded_amount)))) {
+            return;
+        }
+    } else if (info.valid_operator_address && info.withdrawable_outputs > 0) {
+        if (!confirmBroadcast(
+                this,
+                tr("Withdraw node bond"),
+                tr("This will broadcast a fee-paying transaction that withdraws %1 to a fresh non-HD quantum address. The new key is written before final transaction construction or broadcast, is not recoverable from the wallet seed, and may remain even if withdrawal later fails. If a failure reports key creation, back up this wallet immediately. Continue?")
+                    .arg(formatBLK(info.withdrawable_amount)))) {
+            return;
+        }
     }
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().withdrawQuantumOperatorBond(m_operator_address->text().toStdString());
+    auto result = m_wallet_model->wallet().withdrawQuantumOperatorBond(m_operator_address->text().toStdString(), /*allow_new_quantum_key=*/true);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_operator_status->setText(msg);
@@ -1889,7 +2130,8 @@ void StakingMiningPage::onWithdrawOperatorBond()
 
 void StakingMiningPage::onRefreshOperatorRegistry()
 {
-    refreshOperatorRegistry();
+    m_force_full_refresh = true;
+    updateStatus();
 }
 
 void StakingMiningPage::onUseRegistryOperatorForDelegation()
@@ -1922,10 +2164,18 @@ void StakingMiningPage::onCreateColdStakeAddress()
         m_coldstake_status->setText(tr("Select a cold-staking node before creating a delegation address."));
         return;
     }
+    const uint16_t unbonding_blocks = selectedStakeLockBlocks(m_coldstake_lock_period);
+    if (!confirmBroadcast(
+            this,
+            tr("Create delegation address"),
+            tr("This creates and stores a new non-HD ML-DSA owner key for a delegation address tied to node %1 with %2 bonded blocks. The key is not derived from the wallet seed, and an older backup cannot recover it. No coins are delegated until you separately fund the address.\n\nCreate the address and then back up this wallet immediately?")
+                .arg(shortenHex(staking_pubkey.toStdString()))
+                .arg(unbonding_blocks))) {
+        return;
+    }
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    const uint16_t unbonding_blocks = selectedStakeLockBlocks(m_coldstake_lock_period);
     auto result = m_wallet_model->wallet().createQuantumColdStakeAddress(staking_pubkey.toStdString(), "coldstake-gui", unbonding_blocks);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
@@ -1988,7 +2238,7 @@ void StakingMiningPage::onFundColdStakeAddress()
             this,
             tr("Delegate coins"),
             tr("This will broadcast a wallet transaction delegating coins to cold-staking address:\n%1\n\nAmount: %2\nSelected node: %3\n\n"
-               "If unmoved Gold Rush reward outputs must be used, the wallet will first move them to a fresh quantum address when quantum spending is active. Continue?")
+               "Gold Rush reward outputs are unavailable during Gold Rush and become ordinary direct quantum funds after Gold Rush and maturity. Transaction construction first writes a fresh non-HD quantum change key to the wallet. It is not seed-recoverable and may remain even if funding later fails. If a failure reports key creation, back up this wallet immediately. Continue?")
                 .arg(m_coldstake_address->text())
                 .arg(formatBLK(amount))
                 .arg(shortenHex(selected_operator_pubkey.toStdString())))) {
@@ -1998,7 +2248,7 @@ void StakingMiningPage::onFundColdStakeAddress()
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().fundQuantumColdStakeAddress(m_coldstake_address->text().toStdString(), amount);
+    auto result = m_wallet_model->wallet().fundQuantumColdStakeAddress(m_coldstake_address->text().toStdString(), amount, /*allow_new_quantum_key=*/true);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_coldstake_status->setText(msg);
@@ -2007,7 +2257,7 @@ void StakingMiningPage::onFundColdStakeAddress()
     }
 
     if (result->created_migration && result->completed_delegation) {
-        m_coldstake_last_action_status = tr("Gold Rush rewards were first moved to fresh quantum address %1 (%2, fee %3), then delegation funding was broadcast: %4. Delegated %5; delegation fee %6.")
+        m_coldstake_last_action_status = tr("Gold Rush rewards were optionally consolidated to fresh quantum address %1 (%2, fee %3), then delegation funding was broadcast: %4. Delegated %5; delegation fee %6.")
             .arg(QString::fromStdString(result->migration_address))
             .arg(QString::fromStdString(result->migration_txid))
             .arg(formatBLK(result->migration_fee))
@@ -2015,12 +2265,12 @@ void StakingMiningPage::onFundColdStakeAddress()
             .arg(formatBLK(result->amount))
             .arg(formatBLK(result->fee));
     } else if (result->created_migration) {
-        m_coldstake_last_action_status = tr("Gold Rush rewards were moved to fresh quantum address %1 (%2, fee %3). Delegation was not broadcast yet: %4")
+        m_coldstake_last_action_status = tr("Gold Rush rewards were optionally consolidated to fresh quantum address %1 (%2, fee %3). Delegation was not broadcast yet: %4")
             .arg(QString::fromStdString(result->migration_address))
             .arg(QString::fromStdString(result->migration_txid))
             .arg(formatBLK(result->migration_fee))
             .arg(QString::fromStdString(result->warning));
-        QMessageBox::information(this, tr("Gold Rush rewards moved"), m_coldstake_last_action_status);
+        QMessageBox::information(this, tr("Gold Rush rewards consolidated"), m_coldstake_last_action_status);
     } else {
         m_coldstake_last_action_status = tr("Cold-stake delegation funding broadcast: %1. Amount: %2. Fee: %3.")
             .arg(QString::fromStdString(result->txid))
@@ -2043,18 +2293,19 @@ void StakingMiningPage::onWithdrawColdStakeAddress()
     const interfaces::WalletQuantumColdStakeBalanceInfo info =
         m_wallet_model->wallet().getQuantumColdStakeBalanceInfo(m_coldstake_address->text().toStdString());
     if (info.valid_delegation_address && info.spendable_amount > 0) {
-        const int rc = QMessageBox::question(
-            this,
-            tr("Withdraw cold-stake delegation"),
-            tr("This will owner-spend %1 from the selected delegation to a fresh quantum address controlled by this wallet. The selected node will stop staking those funds. Continue?")
-                .arg(formatBLK(info.spendable_amount)));
-        if (rc != QMessageBox::Yes) return;
+        if (!confirmBroadcast(
+                this,
+                tr("Withdraw cold-stake delegation"),
+                tr("This will owner-spend %1 from the selected delegation. If it is still bonded, a fee-paying transaction starts unbonding after first writing a fresh non-HD quantum change key; if it is mature, the funds move minus fees after first writing a fresh non-HD quantum withdrawal key. The selected node will stop staking those funds. Either key is not seed-recoverable and may remain even if the later transaction fails. If a failure reports key creation, back up this wallet immediately. Continue?")
+                    .arg(formatBLK(info.spendable_amount)))) {
+            return;
+        }
     }
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().withdrawQuantumColdStakeAddress(m_coldstake_address->text().toStdString());
+    auto result = m_wallet_model->wallet().withdrawQuantumColdStakeAddress(m_coldstake_address->text().toStdString(), /*allow_new_quantum_key=*/true);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_coldstake_status->setText(msg);
@@ -2098,7 +2349,7 @@ void StakingMiningPage::onRedelegateColdStake()
     const std::string target = target_pubkey.toStdString();
 
     // Plan first so the user can review amounts, fee, and pool policy before broadcasting.
-    auto plan = m_wallet_model->wallet().redelegateQuantumColdStake(source, target, /*dry_run=*/true, /*label=*/"");
+    auto plan = m_wallet_model->wallet().redelegateQuantumColdStake(source, target, /*dry_run=*/true, /*label=*/"", /*allow_new_quantum_key=*/false);
     if (!plan) {
         const QString msg = QString::fromStdString(util::ErrorString(plan).original);
         m_coldstake_status->setText(msg);
@@ -2119,13 +2370,13 @@ void StakingMiningPage::onRedelegateColdStake()
     if (!plan->operator_commitment_verified) {
         body += tr("\n\nWarning: the target node has no locally verified operator commitment.");
     }
-    body += tr("\n\nContinue?");
+    body += tr("\n\nBroadcasting first writes a fresh non-HD quantum owner key to the wallet for the new delegation. The key is not recoverable from the wallet seed and may remain even if transaction construction or broadcast later fails. If a failure reports key creation, back up this wallet immediately.\n\nContinue?");
     if (!confirmBroadcast(this, tr("Redelegate"), body)) return;
 
     WalletModel::UnlockContext ctx(m_wallet_model->requestUnlock());
     if (!ctx.isValid()) return;
 
-    auto result = m_wallet_model->wallet().redelegateQuantumColdStake(source, target, /*dry_run=*/false, /*label=*/"");
+    auto result = m_wallet_model->wallet().redelegateQuantumColdStake(source, target, /*dry_run=*/false, /*label=*/"", /*allow_new_quantum_key=*/true);
     if (!result) {
         const QString msg = QString::fromStdString(util::ErrorString(result).original);
         m_coldstake_status->setText(msg);
@@ -2193,13 +2444,12 @@ void StakingMiningPage::onOptimizeUTXOSet()
     updateStatus();
 }
 
-void StakingMiningPage::refreshOperatorRegistry()
+void StakingMiningPage::applyOperatorRegistry(const interfaces::WalletQuantumPoolInfo& pool)
 {
     if (!m_wallet_model || !m_operator_registry || !m_coldstake_operator_selector) return;
 
     const QString previous_selection = m_coldstake_operator_user_selected ? selectedColdStakeOperatorPubKey() : QString();
     const QString previous_label = m_coldstake_operator_selector->currentText();
-    interfaces::WalletQuantumPoolInfo pool = m_wallet_model->wallet().getQuantumPoolInfo();
 
     QSignalBlocker selector_blocker(m_coldstake_operator_selector);
     m_operator_registry->setRowCount(0);
@@ -2315,11 +2565,12 @@ void StakingMiningPage::updateStatus()
     if (!isVisible() || window()->isMinimized()) {
         return;
     }
+    refreshAutomationControls();
     if (!m_wallet_model) {
         resetStatusForNoWallet();
         return;
     }
-    m_updating = true;
+    QScopedValueRollback<bool> updating_guard(m_updating, true);
     // Only the Refresh button and wallet-changing actions (which set
     // m_force_full_refresh) trigger the expensive detail sweep. The periodic
     // timer and tab switches fall through with full_refresh=false and update
@@ -2344,7 +2595,10 @@ void StakingMiningPage::updateStatus()
 
     // Staking
     const bool staking = w.getEnabledStaking();
-    const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getEncryptionStatus();
+    // Never enter cs_wallet from this timer-driven GUI callback. QQSIGNAL
+    // construction and signing may legitimately own the wallet mutex for a
+    // bounded interval; waiting here would stop the entire Qt event loop.
+    const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getCachedEncryptionStatus();
     const bool normal_unlocked = encryption_status == WalletModel::Unlocked &&
                                  !w.getWalletUnlockStakingOnly();
     const bool normal_signing_available = encryption_status == WalletModel::Unencrypted || normal_unlocked;
@@ -2360,19 +2614,118 @@ void StakingMiningPage::updateStatus()
 
     refreshDonationControls();
 
-    // Everything below walks large parts of the wallet: getPowMiningInfo()
-    // scans the full UTXO set (AvailableCoins + per-output IsMine), as do the
-    // migration/RGB/EUTXO/quantum sections further down. On a large wallet each
-    // pass costs seconds on the GUI thread, so run it only on the slow
-    // full-refresh cadence (and on show), never on every 5-second tick.
-    if (!full_refresh) {
-        refreshControlsEnabled();
-        m_updating = false;
+    // A full detail refresh is a single immutable WalletWorker snapshot. This
+    // callback only queues/coalesces work and returns, so even a multi-second
+    // wallet walk cannot stop event delivery, painting, or window teardown.
+    if (full_refresh) queueFullDetailRefresh();
+    refreshControlsEnabled();
+}
+
+void StakingMiningPage::queueFullDetailRefresh()
+{
+    if (!m_wallet_model) return;
+
+    m_detail_refresh_pending = true;
+    if (m_detail_refresh_in_flight) {
+        // At most one snapshot executes at a time. Repeated clicks collapse to
+        // one latest request and cooperatively stop the obsolete pass between
+        // wallet calls.
+        m_wallet_model->cancelStakingMiningSnapshot(m_detail_request_in_flight);
+        if (m_refresh_hint) m_refresh_hint->setText(tr("A newer detail refresh is queued..."));
+        return;
+    }
+    startFullDetailRefresh();
+}
+
+void StakingMiningPage::startFullDetailRefresh()
+{
+    if (!m_wallet_model || !m_detail_refresh_pending || m_detail_refresh_in_flight) return;
+
+    m_detail_refresh_pending = false;
+    m_detail_refresh_in_flight = true;
+    m_detail_request_in_flight = ++m_detail_request_sequence;
+
+    WalletModel::StakingMiningSnapshotRequest request;
+    request.request_id = m_detail_request_in_flight;
+    request.generation = m_wallet_generation;
+    request.expected_tip = m_wallet_model->getLastBlockProcessed().GetHex();
+    request.selfstake_address = m_selfstake_address->text().toStdString();
+    request.operator_address = m_operator_address->text().toStdString();
+    request.coldstake_address = m_coldstake_address->text().toStdString();
+
+    if (m_refresh_hint) m_refresh_hint->setText(tr("Loading detail panels in the background..."));
+    m_wallet_model->requestStakingMiningSnapshot(request);
+}
+
+void StakingMiningPage::onStakingMiningSnapshotReady(quint64 request_id, quint64 generation)
+{
+    WalletModel* const source = qobject_cast<WalletModel*>(sender());
+    if (!source || source != m_wallet_model ||
+        request_id != m_detail_request_in_flight ||
+        generation != m_wallet_generation) {
         return;
     }
 
-    // PoW
-    const interfaces::WalletPowMiningInfo info = w.getPowMiningInfo();
+    const std::shared_ptr<const WalletModel::StakingMiningSnapshot> snapshot =
+        source->takeStakingMiningSnapshot(request_id);
+    m_detail_refresh_in_flight = false;
+    m_detail_request_in_flight = 0;
+
+    // Do not apply an obsolete result when a click/action arrived while the
+    // worker was active. Run exactly one coalesced latest request instead.
+    if (m_detail_refresh_pending) {
+        startFullDetailRefresh();
+        return;
+    }
+    if (!snapshot) {
+        if (m_refresh_hint) m_refresh_hint->setText(tr("Detail refresh did not return a result. Press Refresh to retry."));
+        return;
+    }
+    if (snapshot->cancelled) {
+        if (m_refresh_hint) m_refresh_hint->setText(tr("Detail refresh was cancelled."));
+        return;
+    }
+    if (!snapshot->error.empty()) {
+        if (m_refresh_hint) m_refresh_hint->setText(tr("Detail refresh failed: %1").arg(QString::fromStdString(snapshot->error)));
+        return;
+    }
+
+    const std::string current_tip = m_wallet_model->getLastBlockProcessed().GetHex();
+    if (snapshot->stale_tip ||
+        snapshot->request.expected_tip != current_tip ||
+        snapshot->start_tip != current_tip ||
+        snapshot->end_tip != current_tip) {
+        if (m_refresh_hint) m_refresh_hint->setText(tr("The chain tip changed during refresh. Press Refresh to load a consistent snapshot."));
+        return;
+    }
+
+    applyFullDetailSnapshot(*snapshot);
+}
+
+void StakingMiningPage::applyFullDetailSnapshot(const WalletModel::StakingMiningSnapshot& snapshot)
+{
+    Q_ASSERT(QThread::currentThread() == thread());
+    if (!m_wallet_model || snapshot.request.generation != m_wallet_generation) return;
+
+    QScopedValueRollback<bool> updating_guard(m_updating, true);
+    m_selfstake_withdraw_available = false;
+    m_operator_withdraw_available = false;
+    m_coldstake_fund_available = false;
+    m_coldstake_withdraw_available = false;
+    m_demurrage_sweep_available = false;
+
+    interfaces::Wallet& w = m_wallet_model->wallet();
+    const interfaces::WalletBalances balances = m_wallet_model->getCachedBalance();
+    const bool staking = w.getEnabledStaking();
+    const WalletModel::EncryptionStatus encryption_status = m_wallet_model->getCachedEncryptionStatus();
+    const bool normal_unlocked = encryption_status == WalletModel::Unlocked &&
+                                 !w.getWalletUnlockStakingOnly();
+    const bool normal_signing_available = encryption_status == WalletModel::Unencrypted || normal_unlocked;
+    const bool auto_qqsignal = gArgs.GetBoolArg("-qqautoshadowsignal", wallet::DEFAULT_AUTO_SHADOW_SIGNAL);
+
+    // UI mutations happen only here, after the worker-owned immutable result
+    // has returned to this object's Qt event thread.
+    const interfaces::WalletPowMiningInfo& info = snapshot.pow;
     if (info.shadow_whitelist_height > 0) {
         QString eligibility;
         if (!info.wallet_goldrush_status_available) {
@@ -2381,6 +2734,8 @@ void StakingMiningPage::updateStatus()
             eligibility = tr("This wallet has no spendable script in the Gold Rush whitelist.");
         } else if (info.wallet_active_signal) {
             eligibility = tr("This wallet is whitelisted and actively signaled.");
+        } else if (info.wallet_recent_solve_qualified && !auto_qqsignal) {
+            eligibility = tr("This wallet is whitelisted and has a recent solve; automatic QQSIGNAL is off until you explicitly enable it.");
         } else if (info.wallet_recent_solve_qualified) {
             eligibility = tr("This wallet is whitelisted and has a recent solve; unlock normally to signal.");
         } else {
@@ -2415,8 +2770,16 @@ void StakingMiningPage::updateStatus()
     }
 
     m_goldrush_badge->setText(info.epoch_active
-        ? tr("Gold Rush: ACTIVE (%1 blocks remaining)").arg(info.blocks_remaining)
-        : tr("Gold Rush: not active"));
+        ? tr("Gold Rush shadow ledger: ACTIVE at height %1 (next reward height %2; %3 blocks remaining)")
+              .arg(info.current_height)
+              .arg(info.current_height + 1)
+              .arg(info.blocks_remaining)
+        : info.current_height >= 0
+            ? tr("Gold Rush shadow ledger: not active at height %1 (reward window %2-%3)")
+                  .arg(info.current_height)
+                  .arg(info.shadow_reward_start_height)
+                  .arg(info.shadow_reward_end_height)
+            : tr("Gold Rush shadow ledger: chain state unavailable"));
     const QString last_pos_payout = info.pos_last_payout_height > 0
         ? QString::number(info.pos_last_payout_height)
         : tr("none yet");
@@ -2439,7 +2802,9 @@ void StakingMiningPage::updateStatus()
               .arg(last_pos_payout)
         : tr("PoS Gold Rush jackpot: %1 accrued; Gold Rush is not active.")
               .arg(formatBLK(info.pos_accrued_jackpot));
-    if (info.epoch_active && !normal_signing_available) {
+    if (info.epoch_active && !auto_qqsignal) {
+        pos_goldrush_text += tr("   |   Automatic QQSIGNAL is off (explicit opt-in below).");
+    } else if (info.epoch_active && !normal_signing_available) {
         pos_goldrush_text += tr("   |   Unlock Quantum and Legacy Staking to broadcast QQSIGNAL.");
     }
     pos_goldrush_text += tr("   |   This wallet: %1.").arg(wallet_signal_text);
@@ -2455,6 +2820,43 @@ void StakingMiningPage::updateStatus()
     } else {
         unlock_mode = tr("locked");
     }
+
+    QString pow_runtime_summary;
+    switch (info.state) {
+    case interfaces::WalletPowMiningState::DISABLED:
+        pow_runtime_summary = tr("off");
+        break;
+    case interfaces::WalletPowMiningState::STARTING:
+        pow_runtime_summary = tr("starting");
+        break;
+    case interfaces::WalletPowMiningState::CHAIN_UNAVAILABLE:
+        pow_runtime_summary = tr("waiting for chain state");
+        break;
+    case interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY:
+        pow_runtime_summary = tr("waiting for a normal wallet unlock");
+        break;
+    case interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO:
+        pow_runtime_summary = tr("waiting for a spendable legacy fee UTXO");
+        break;
+    case interfaces::WalletPowMiningState::EPOCH_INACTIVE:
+        pow_runtime_summary = tr("waiting for Gold Rush");
+        break;
+    case interfaces::WalletPowMiningState::CLAIM_IN_FLIGHT:
+        pow_runtime_summary = tr("waiting for the submitted claim to resolve");
+        break;
+    case interfaces::WalletPowMiningState::CLAIM_QUARANTINED:
+        pow_runtime_summary = tr("paused for a quarantined claim");
+        break;
+    case interfaces::WalletPowMiningState::READY:
+        pow_runtime_summary = tr("ready at %1 tries/s").arg(QString::number(info.hashrate, 'f', 1));
+        break;
+    case interfaces::WalletPowMiningState::HASHING:
+        pow_runtime_summary = tr("hashing at %1 tries/s").arg(QString::number(info.hashrate, 'f', 1));
+        break;
+    case interfaces::WalletPowMiningState::RUNTIME_ERROR:
+        pow_runtime_summary = tr("stopped after an error");
+        break;
+    }
     m_staking_summary->setText(tr(
         "<b>Wallet mining snapshot</b><br>"
         "Legacy spendable: %1 &nbsp;|&nbsp; Quantum-controlled: %2<br>"
@@ -2464,39 +2866,58 @@ void StakingMiningPage::updateStatus()
         .arg(formatBLK(balances.quantum_balance))
         .arg(wallet_signal_text)
         .arg(formatBLK(info.pos_estimated_payout_per_signaler))
-        .arg(info.enabled ? tr("running") : tr("off"))
+        .arg(pow_runtime_summary)
         .arg(formatBLK(info.next_claim_payout))
         .arg(unlock_mode));
 
+    const bool autostart_staking = wallet::IsStakingAutostartEnabled();
+    const bool autostart_pow = gArgs.GetBoolArg("-powmining", false);
     m_dashboard_wallet->setText(tr(
         "<b>Wallet</b><br>"
         "Legacy: %1<br>"
         "Quantum-controlled: %2<br>"
-        "Unlock: %3")
+        "Unlock: %3<br>"
+        "PoS runtime: %4; autostart: %5")
         .arg(formatBLK(balances.legacy_balance))
         .arg(formatBLK(balances.quantum_balance))
-        .arg(unlock_mode));
+        .arg(unlock_mode)
+        .arg(staking ? tr("ON") : tr("OFF"))
+        .arg(autostart_staking ? tr("ON") : tr("OFF")));
 
     m_dashboard_pos->setText(tr(
         "<b>PoS Gold Rush</b><br>"
         "%1<br>"
         "Next split: %2<br>"
-        "Active signalers: %3")
+        "Active signalers: %3<br>"
+        "QQSIGNAL automation: %4")
         .arg(wallet_signal_text)
         .arg(formatBLK(info.pos_estimated_payout_per_signaler))
-        .arg(QString::number(info.pos_active_signalers)));
+        .arg(QString::number(info.pos_active_signalers))
+        .arg(auto_qqsignal ? tr("ON") : tr("OFF")));
 
     m_dashboard_pow->setText(tr(
         "<b>PoW Gold Rush</b><br>"
         "%1<br>"
         "Next claim: %2<br>"
-        "Payout: %3")
-        .arg(info.enabled ? tr("running at %1 tries/s").arg(QString::number(info.hashrate, 'f', 1)) : tr("off"))
+        "Payout: %3<br>"
+        "Autostart: %4")
+        .arg(pow_runtime_summary)
         .arg(formatBLK(info.next_claim_payout))
-        .arg(info.payout_address.empty() ? tr("not created yet") : shortenHex(info.payout_address)));
+        .arg(info.payout_address.empty() ? tr("not created yet") : shortenHex(info.payout_address))
+        .arg(autostart_pow ? tr("ON") : tr("OFF")));
 
     QString recommended_action;
-    if (info.epoch_active && info.wallet_whitelisted_scripts > 0 && !normal_signing_available) {
+    if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
+        recommended_action = tr("Send this wallet a confirmed, spendable legacy BLK UTXO so it can authenticate and pay the fee for a Gold Rush PoW claim.");
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED) {
+        recommended_action = tr("A prior Gold Rush PoW claim is quarantined outside the local mempool. Its fee input remains reserved so the wallet does not create an unsafe competing claim. Waiting for on-chain resolution is safest. For advanced, explicit recovery, copy the claim txid from Transactions and use createshadowpowclaimresolution in the debug console; it previews first, never broadcasts, and requires separate fee-risk consent and sendrawtransaction.");
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
+        recommended_action = tr("Unlock this wallet normally. Gold Rush PoW claims cannot be signed while the wallet is locked or unlocked for staking only.");
+    } else if (info.state == interfaces::WalletPowMiningState::RUNTIME_ERROR) {
+        recommended_action = tr("The Gold Rush PoW worker stopped after an error. Review debug.log, correct the reported problem, and restart the miner.");
+    } else if (info.epoch_active && info.wallet_recent_solve_qualified && !info.wallet_active_signal && !auto_qqsignal) {
+        recommended_action = tr("This wallet has a recent PoS solve. Enable <b>Automatically submit eligible fee-paying QQSIGNAL transactions</b> below if you consent to signal automatically, or use the sendshadowsignal RPC manually.");
+    } else if (info.epoch_active && info.wallet_whitelisted_scripts > 0 && !normal_signing_available) {
         recommended_action = tr("Unlock with <b>Quantum and Legacy Staking</b> if you want this wallet to broadcast Gold Rush PoS signals. Legacy staking-only unlock will not create quantum signal transactions.");
     } else if (info.epoch_active && info.wallet_recent_solve_qualified && !info.wallet_active_signal) {
         recommended_action = tr("This wallet has a recent PoS solve. Keep staking enabled and use a normal unlock so the wallet can publish the Gold Rush signal.");
@@ -2513,6 +2934,22 @@ void StakingMiningPage::updateStatus()
         m_pow_status->setText(m_pow_pending_enabled ? tr("Starting Gold Rush PoW mining...") : tr("Stopping Gold Rush PoW mining..."));
     } else if (m_pow_settings_dirty && info.enabled) {
         m_pow_status->setText(tr("PoW miner settings changed. Click Apply to update the miner."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::NO_SPENDABLE_LEGACY_FEE_UTXO) {
+        m_pow_status->setText(tr("PoW mining is enabled but waiting for a confirmed, spendable legacy BLK UTXO to authenticate and pay the next claim fee."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::WALLET_LOCKED_OR_STAKING_ONLY) {
+        m_pow_status->setText(tr("PoW mining is enabled but waiting for a normal wallet unlock; locked and staking-only wallets cannot sign claims."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CHAIN_UNAVAILABLE) {
+        m_pow_status->setText(tr("PoW mining is enabled but waiting for an available chain tip."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::STARTING) {
+        m_pow_status->setText(tr("PoW mining is starting and checking wallet and chain readiness."));
+    } else if (info.state == interfaces::WalletPowMiningState::RUNTIME_ERROR) {
+        m_pow_status->setText(tr("PoW mining stopped after an error. Review debug.log before restarting the miner."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::EPOCH_INACTIVE) {
+        m_pow_status->setText(tr("PoW mining is enabled and waiting until the Gold Rush epoch is active."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_QUARANTINED) {
+        m_pow_status->setText(tr("PoW mining is enabled but paused because a prior claim is quarantined outside the local mempool. Its fee input remains reserved; the wallet will not create a second fee-input claim. Waiting is safest. Advanced recovery is available through the preview-only createshadowpowclaimresolution debug-console RPC and a separate explicit broadcast."));
+    } else if (info.enabled && info.state == interfaces::WalletPowMiningState::CLAIM_IN_FLIGHT) {
+        m_pow_status->setText(tr("PoW mining is enabled and waiting for the submitted claim to confirm, conflict, or expire at the next tip."));
     } else if (info.enabled && info.epoch_active) {
         m_pow_status->setText(tr("Hashrate: %1 tries/s   |   Next claim payout: %2   |   Claims submitted: %3")
             .arg(QString::number(info.hashrate, 'f', 1))
@@ -2533,12 +2970,19 @@ void StakingMiningPage::updateStatus()
     CAmount goldrush_reward_amount_needing_move{0};
     CAmount staked_quantum_amount{0};
     unsigned int goldrush_reward_outputs_needing_move{0};
-    const interfaces::WalletMigrationStatus migration = w.getMigrationStatus();
+    const interfaces::WalletMigrationStatus& migration = snapshot.migration;
     if (migration.available) {
         m_migration_phase->setText(QString::fromStdString(migration.phase));
-        m_migration_deadline->setText(migration.deadline_scheduled
-            ? tr("%1 blocks estimated").arg(QString::number(migration.blocks_until_deadline_est))
-            : tr("Not scheduled"));
+        if (!migration.deadline_scheduled) {
+            m_migration_deadline->setText(tr("Not scheduled"));
+        } else if (migration.height_boundaries_authoritative) {
+            m_migration_deadline->setText(tr("%1 blocks (ends at height %2)")
+                .arg(QString::number(migration.blocks_until_deadline))
+                .arg(QString::number(migration.deadline_height)));
+        } else {
+            m_migration_deadline->setText(tr("%1 blocks estimated")
+                .arg(QString::number(migration.blocks_until_deadline_est)));
+        }
         m_migration_legacy_amount->setText(tr("%1 across %2 inputs")
             .arg(formatBLK(migration.eligible_legacy_amount))
             .arg(QString::number(migration.eligible_legacy_inputs)));
@@ -2552,19 +2996,16 @@ void StakingMiningPage::updateStatus()
         goldrush_reward_amount_needing_move = migration.goldrush_reward_amount_needing_move;
         goldrush_reward_outputs_needing_move = migration.goldrush_reward_outputs_needing_move;
         staked_quantum_amount = migration.staked_quantum_amount;
-        const bool wallet_migration_complete = migration.eligible_legacy_inputs == 0 &&
-                                               migration.goldrush_reward_outputs_needing_move == 0;
+        const bool wallet_migration_complete = migration.eligible_legacy_inputs == 0;
         applyDonationDefaults(wallet_migration_complete);
         refreshDonationControls();
-        m_coldstake_fund_available = direct_delegation_balance > 0 ||
-                                     (migration.goldrush_remigration_active &&
-                                      migration.goldrush_reward_amount_needing_move > 0);
+        m_coldstake_fund_available = direct_delegation_balance > 0;
         const QString staked_note = migration.staked_quantum_amount > 0
             ? tr(" %1 is already bonded or delegated for staking.")
                   .arg(formatBLK(migration.staked_quantum_amount))
             : QString();
         if (migration.goldrush_reward_amount_needing_move > 0) {
-            m_coldstake_quantum_available->setText(tr("%1 total quantum wallet balance. %2 direct quantum available for delegation. %3 Gold Rush rewards need a fresh quantum migration before cold staking; Delegate coins will move them first when quantum spending is active.%4")
+            m_coldstake_quantum_available->setText(tr("%1 total quantum wallet balance. %2 direct quantum available for delegation. %3 Gold Rush rewards remain locked until Gold Rush ends; after maturity they become direct quantum funds without a required move.%4")
                 .arg(formatBLK(balances.quantum_balance))
                 .arg(formatBLK(direct_delegation_balance))
                 .arg(formatBLK(migration.goldrush_reward_amount_needing_move))
@@ -2581,7 +3022,7 @@ void StakingMiningPage::updateStatus()
         m_coldstake_quantum_available->setText(tr("Wallet is busy; quantum balance will refresh shortly."));
     }
 
-    const interfaces::WalletDemurrageInfo demurrage = w.getDemurrageInfo();
+    const interfaces::WalletDemurrageInfo& demurrage = snapshot.demurrage;
     if (demurrage.available) {
         m_demurrage_status->setText(demurrage.demurrage_active
             ? tr("Demurrage active at evaluation height %1. Outputs due for attestation: %2.")
@@ -2609,7 +3050,7 @@ void StakingMiningPage::updateStatus()
         m_demurrage_sweep_available = false;
     }
 
-    const std::vector<interfaces::WalletRGBAssetInfo> rgb_assets = w.listRGBAssets(/*include_spent=*/false);
+    const std::vector<interfaces::WalletRGBAssetInfo>& rgb_assets = snapshot.rgb_assets;
     {
         QSignalBlocker rgb_blocker(m_rgb_assets);
         m_rgb_assets->setRowCount(static_cast<int>(rgb_assets.size()));
@@ -2631,7 +3072,7 @@ void StakingMiningPage::updateStatus()
         : tr("%1 RGB asset(s) loaded. Consignment import/export and transfer construction remain advanced console workflows.")
               .arg(static_cast<int>(rgb_assets.size())));
 
-    const std::vector<interfaces::WalletEUTXOStateInfo> eutxo_states = w.listEUTXOStates(/*include_spent=*/true);
+    const std::vector<interfaces::WalletEUTXOStateInfo>& eutxo_states = snapshot.eutxo_states;
     {
         QSignalBlocker eutxo_blocker(m_eutxo_states);
         m_eutxo_states->setRowCount(static_cast<int>(eutxo_states.size()));
@@ -2652,12 +3093,16 @@ void StakingMiningPage::updateStatus()
         }
     }
     m_eutxo_status->setText(eutxo_states.empty()
-        ? tr("No EUTXO state metadata is stored in this wallet yet.")
-        : tr("%1 EUTXO state record(s) loaded. Use the RPC console for create/verify transition tooling until the guided EUTXO workflow is complete.")
+        ? tr("No EUTXO inspection metadata is stored in this wallet. Witness v15 remains frozen in v30.1.1.")
+        : tr("%1 EUTXO metadata record(s) loaded for inspection only. Witness-v15 funding and spending are disabled in v30.1.1; do not send BLK to these addresses.")
               .arg(static_cast<int>(eutxo_states.size())));
 
-    const std::vector<interfaces::WalletQuantumAddressInfo> quantum_addresses = w.listQuantumAddresses();
-    const std::vector<interfaces::WalletQuantumColdStakeInfo> coldstake_delegations = w.listQuantumColdStakeDelegations();
+    const std::vector<interfaces::WalletQuantumAddressInfo>& quantum_addresses = snapshot.quantum_addresses;
+    const std::vector<interfaces::WalletQuantumColdStakeInfo>& coldstake_delegations = snapshot.coldstake_delegations;
+    std::set<std::string> unverified_quantum_keys;
+    for (const interfaces::WalletQuantumAddressInfo& info : quantum_addresses) {
+        if (!info.backup_verified) unverified_quantum_keys.insert(info.public_key);
+    }
     m_quantum_address_count->setText(QString::number(static_cast<int>(quantum_addresses.size())));
     m_coldstake_count->setText(QString::number(static_cast<int>(coldstake_delegations.size())));
 
@@ -2754,10 +3199,11 @@ void StakingMiningPage::updateStatus()
         }
     }
 
-    std::vector<interfaces::WalletQuantumStakeOutputInfo> selfstake_outputs;
-    if (!m_selfstake_address->text().isEmpty()) {
-        selfstake_outputs = w.listQuantumStakeOutputs(m_selfstake_address->text().toStdString());
-    }
+    const bool selfstake_snapshot_matches = snapshot.selfstake_queried &&
+        snapshot.selfstake_query_address == m_selfstake_address->text().toStdString();
+    const std::vector<interfaces::WalletQuantumStakeOutputInfo> empty_selfstake_outputs;
+    const std::vector<interfaces::WalletQuantumStakeOutputInfo>& selfstake_outputs =
+        selfstake_snapshot_matches ? snapshot.selfstake_outputs : empty_selfstake_outputs;
     {
         QSignalBlocker output_blocker(m_selfstake_output_selector);
         m_selfstake_output_selector->clear();
@@ -2775,10 +3221,9 @@ void StakingMiningPage::updateStatus()
         }
     }
 
-    if (!m_selfstake_address->text().isEmpty()) {
+    if (!m_selfstake_address->text().isEmpty() && selfstake_snapshot_matches) {
         const uint16_t lock_blocks = stakingAddressLockBlocks(m_selfstake_address->text());
-        const interfaces::WalletQuantumOperatorBondInfo stake_info =
-            w.getQuantumStakeAddressBondInfo(m_selfstake_address->text().toStdString());
+        const interfaces::WalletQuantumOperatorBondInfo& stake_info = snapshot.selfstake_bond;
         if (stake_info.valid_operator_address) {
             if (stake_info.bonded_outputs > 0) {
                 m_selfstake_withdraw_available = true;
@@ -2825,9 +3270,10 @@ void StakingMiningPage::updateStatus()
             m_operator_status->setText(tr("No node key selected. Nodes must fund a 30-day bonded staking address before delegators can verify them."));
         }
     }
-    if (!m_operator_address->text().isEmpty()) {
-        const interfaces::WalletQuantumOperatorBondInfo bond_info =
-            w.getQuantumOperatorBondInfo(m_operator_address->text().toStdString());
+    const bool operator_snapshot_matches = snapshot.operator_queried &&
+        snapshot.operator_query_address == m_operator_address->text().toStdString();
+    if (!m_operator_address->text().isEmpty() && operator_snapshot_matches) {
+        const interfaces::WalletQuantumOperatorBondInfo& bond_info = snapshot.operator_bond;
         if (bond_info.valid_operator_address) {
             if (bond_info.bonded_outputs > 0) {
                 local_bonded_operator = true;
@@ -2871,8 +3317,11 @@ void StakingMiningPage::updateStatus()
     int selected_operator_pending_count{0};
     const QString selected_operator_hash = selectedColdStakeOperatorHash();
     for (const interfaces::WalletQuantumColdStakeInfo& info : coldstake_delegations) {
-        const interfaces::WalletQuantumColdStakeBalanceInfo balance =
-            w.getQuantumColdStakeBalanceInfo(info.address);
+        const auto balance_it = std::find_if(snapshot.coldstake_balances.begin(), snapshot.coldstake_balances.end(), [&info](const WalletModel::StakingMiningColdStakeBalance& entry) {
+            return entry.address == info.address;
+        });
+        if (balance_it == snapshot.coldstake_balances.end()) continue;
+        const interfaces::WalletQuantumColdStakeBalanceInfo& balance = balance_it->balance;
         wallet_delegated_amount += balance.confirmed_amount;
         wallet_delegated_outputs += balance.confirmed_outputs;
         wallet_pending_delegated_amount += balance.unconfirmed_amount;
@@ -2912,10 +3361,10 @@ void StakingMiningPage::updateStatus()
             ? tr("no local node selected")
             : tr("node key selected; fund or wait for confirmations"));
     const QString goldrush_move_note = goldrush_reward_outputs_needing_move > 0
-        ? tr("%1 Gold Rush reward output(s), %2, must first move to a fresh quantum address.")
+        ? tr("%1 Gold Rush reward output(s), %2, remain locked until Gold Rush ends.")
               .arg(goldrush_reward_outputs_needing_move)
               .arg(formatBLK(goldrush_reward_amount_needing_move))
-        : tr("no unmoved Gold Rush reward outputs");
+        : tr("no phase-locked Gold Rush reward outputs");
     m_coldstake_summary->setText(tr(
         "<b>Cold-staking snapshot</b><br>"
         "Available for delegation: %1 direct quantum &nbsp;|&nbsp; Already bonded/delegated: %2<br>"
@@ -2939,8 +3388,11 @@ void StakingMiningPage::updateStatus()
         .arg(formatBLK(staked_quantum_amount + wallet_delegated_amount))
         .arg(formatBLK(wallet_pending_delegated_amount)));
 
-    if (goldrush_reward_outputs_needing_move > 0) {
-        m_dashboard_action->setText(tr("<b>Recommended next step</b><br>Move %1 in Gold Rush rewards to a fresh quantum address before using those rewards for sends, staking, node bonds, or delegation.")
+    if (!unverified_quantum_keys.empty()) {
+        m_dashboard_action->setText(tr("<b>Backup required</b><br>%1 non-HD quantum key(s) do not have a completed reopen-and-sign backup verification event. Unlock this wallet and use Backup Wallet before mining, staking, or creating another quantum address. The wallet cannot track whether an external backup file is later moved or deleted.")
+            .arg(static_cast<int>(unverified_quantum_keys.size())));
+    } else if (goldrush_reward_outputs_needing_move > 0) {
+        m_dashboard_action->setText(tr("<b>Recommended next step</b><br>Keep the wallet backed up and wait for %1 in Gold Rush rewards to unlock. After Gold Rush and normal maturity, no preliminary move is required.")
             .arg(formatBLK(goldrush_reward_amount_needing_move)));
     } else if (migration.available && migration.eligible_legacy_amount > 0 && migration.quantum_spends_active) {
         m_dashboard_action->setText(tr("<b>Recommended next step</b><br>Move remaining legacy funds to a quantum address before the final migration deadline."));
@@ -2948,9 +3400,10 @@ void StakingMiningPage::updateStatus()
         m_dashboard_action->setText(tr("<b>Recommended next step</b><br>You have spendable quantum funds available. Choose <b>Stake my coins</b> to stake locally or <b>Delegate coins</b> to use a verified cold-staking node."));
     }
 
-    if (!m_coldstake_address->text().isEmpty()) {
-        const interfaces::WalletQuantumColdStakeBalanceInfo delegation_info =
-            w.getQuantumColdStakeBalanceInfo(m_coldstake_address->text().toStdString());
+    const bool selected_coldstake_snapshot_matches = snapshot.selected_coldstake_queried &&
+        snapshot.selected_coldstake_query_address == m_coldstake_address->text().toStdString();
+    if (!m_coldstake_address->text().isEmpty() && selected_coldstake_snapshot_matches) {
+        const interfaces::WalletQuantumColdStakeBalanceInfo& delegation_info = snapshot.selected_coldstake_balance;
         if (delegation_info.valid_delegation_address) {
             if (delegation_info.confirmed_outputs > 0) {
                 m_coldstake_withdraw_available = true;
@@ -2982,19 +3435,8 @@ void StakingMiningPage::updateStatus()
         m_coldstake_status->setText(m_coldstake_last_action_status + QStringLiteral("\n") + m_coldstake_status->text());
     }
 
-    ++m_operator_registry_refresh_seconds;
-    const bool registry_empty = m_operator_registry && m_operator_registry->rowCount() == 0;
-    const bool should_refresh_registry =
-        !m_operator_registry_loaded ||
-        (local_bonded_operator && registry_empty && m_operator_registry_refresh_seconds >= 10) ||
-        m_operator_registry_refresh_seconds >= 60;
-    if (should_refresh_registry) {
-        refreshOperatorRegistry();
-    } else {
-        refreshControlsEnabled();
-    }
+    applyOperatorRegistry(snapshot.pool);
     if (m_refresh_hint) m_refresh_hint->setText(tr("Detail panels updated. Press Refresh to reload."));
-    m_updating = false;
 }
 
 void StakingMiningPage::resetStatusForNoWallet()
@@ -3019,6 +3461,7 @@ void StakingMiningPage::resetStatusForNoWallet()
     m_dashboard_pos->setText(tr("<b>PoS Gold Rush</b><br>No wallet loaded."));
     m_dashboard_pow->setText(tr("<b>PoW Gold Rush</b><br>No wallet loaded."));
     m_dashboard_coldstake->setText(tr("<b>Cold staking</b><br>No wallet loaded."));
+    if (m_refresh_hint) m_refresh_hint->setText(tr("Load a wallet to refresh detail panels."));
 
     m_donation_enable->setChecked(false);
     m_donation_status->setText(tr("Load a wallet to configure staking reward donations."));
@@ -3104,7 +3547,7 @@ void StakingMiningPage::refreshControlsEnabled()
     // Config is always editable; the backend only mines during the Gold Rush epoch.
     const bool has_wallet = m_wallet_model != nullptr;
     const WalletModel::EncryptionStatus encryption_status = has_wallet
-        ? m_wallet_model->getEncryptionStatus()
+        ? m_wallet_model->getCachedEncryptionStatus()
         : WalletModel::NoKeys;
     const bool tune = has_wallet && m_pow_enable->isChecked();
     m_staking_enable->setEnabled(has_wallet);
@@ -3127,8 +3570,17 @@ void StakingMiningPage::refreshControlsEnabled()
     m_quantum_new->setEnabled(can_create_quantum);
     m_quantum_copy->setEnabled(m_quantum_address && !m_quantum_address->text().isEmpty());
     m_quantum_pubkey_copy->setEnabled(m_quantum_pubkey && !m_quantum_pubkey->text().isEmpty());
-    m_migration_legacy_sweep->setEnabled(can_create_quantum);
-    m_migration_goldrush_sweep->setEnabled(can_create_quantum);
+    // Re-evaluate all lifecycle-dependent actions from one active-tip snapshot
+    // on every lightweight refresh. The backend remains the final authority if
+    // the tip changes after this nonblocking check.
+    const interfaces::WalletQuantumFundingStatus funding_status = has_wallet
+        ? m_wallet_model->wallet().getQuantumFundingStatus()
+        : interfaces::WalletQuantumFundingStatus{};
+    const bool can_fund_quantum = can_create_quantum && funding_status.quantum_outputs_active;
+    const bool can_migrate_legacy = can_create_quantum && funding_status.legacy_migration_active;
+    const bool can_fund_stake_tiers = can_create_quantum && funding_status.stake_tiers_active;
+    m_migration_legacy_sweep->setEnabled(can_migrate_legacy);
+    m_migration_goldrush_sweep->setEnabled(can_fund_quantum);
     m_demurrage_attest->setEnabled(can_create_quantum && m_quantum_address && !m_quantum_address->text().isEmpty());
     m_demurrage_sweep->setEnabled(can_create_quantum && m_demurrage_sweep_available);
     m_rgb_copy_contract->setEnabled(has_wallet && m_rgb_assets && !m_rgb_assets->selectedItems().empty());
@@ -3138,16 +3590,16 @@ void StakingMiningPage::refreshControlsEnabled()
     m_selfstake_copy->setEnabled(m_selfstake_address && !m_selfstake_address->text().isEmpty());
     m_selfstake_output_selector->setEnabled(has_wallet && m_selfstake_output_selector->count() > 1);
     const bool has_selfstake_address = m_selfstake_address && !m_selfstake_address->text().isEmpty();
-    m_selfstake_fund_amount->setEnabled(can_create_quantum && has_selfstake_address);
-    m_selfstake_fund->setEnabled(can_create_quantum && has_selfstake_address);
+    m_selfstake_fund_amount->setEnabled(can_fund_stake_tiers && has_selfstake_address);
+    m_selfstake_fund->setEnabled(can_fund_stake_tiers && has_selfstake_address);
     m_selfstake_withdraw->setEnabled(can_create_quantum && has_selfstake_address && m_selfstake_withdraw_available);
     m_operator_new->setEnabled(can_create_quantum);
     m_operator_selector->setEnabled(has_wallet && m_operator_selector->count() > 1);
     m_operator_copy->setEnabled(m_operator_pubkey && !m_operator_pubkey->text().isEmpty());
     m_operator_use_for_delegation->setEnabled(m_operator_pubkey && !m_operator_pubkey->text().isEmpty());
     const bool has_operator_address = m_operator_address && !m_operator_address->text().isEmpty();
-    m_operator_bond_amount->setEnabled(can_create_quantum && has_operator_address);
-    m_operator_fund->setEnabled(can_create_quantum && has_operator_address);
+    m_operator_bond_amount->setEnabled(can_fund_stake_tiers && has_operator_address);
+    m_operator_fund->setEnabled(can_fund_stake_tiers && has_operator_address);
     m_operator_withdraw->setEnabled(can_create_quantum && has_operator_address && m_operator_withdraw_available);
     m_operator_registry_refresh->setEnabled(has_wallet);
     bool registry_selection_has_pubkey{false};
@@ -3174,8 +3626,11 @@ void StakingMiningPage::refreshControlsEnabled()
     m_coldstake_new->setEnabled(can_create_quantum && !selectedColdStakeOperatorPubKey().isEmpty());
     m_coldstake_copy->setEnabled(m_coldstake_address && !m_coldstake_address->text().isEmpty());
     const bool has_coldstake_address = m_coldstake_address && !m_coldstake_address->text().isEmpty();
-    m_coldstake_fund_amount->setEnabled(can_create_quantum && has_coldstake_address);
-    m_coldstake_fund->setEnabled(can_create_quantum && has_coldstake_address && !selectedColdStakeOperatorPubKey().isEmpty() && m_coldstake_fund_available);
+    const bool coldstake_funding_active = has_coldstake_address && isTieredQuantumAddress(m_coldstake_address->text())
+        ? can_fund_stake_tiers
+        : can_fund_quantum;
+    m_coldstake_fund_amount->setEnabled(coldstake_funding_active && has_coldstake_address);
+    m_coldstake_fund->setEnabled(coldstake_funding_active && has_coldstake_address && !selectedColdStakeOperatorPubKey().isEmpty() && m_coldstake_fund_available);
     m_coldstake_withdraw->setEnabled(can_create_quantum && has_coldstake_address && m_coldstake_withdraw_available);
     m_donation_enable->setEnabled(has_wallet);
     m_donation_percent->setEnabled(has_wallet);

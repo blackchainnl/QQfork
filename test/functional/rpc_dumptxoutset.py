@@ -103,18 +103,32 @@ class DumptxoutsetTest(BitcoinTestFramework):
         assert_raises_rpc_error(
             -8, "Couldn't open file {}.incomplete for writing".format(invalid_path), node.dumptxoutset, invalid_path)
 
-        self.log.info("Check snapshots omit Blackcoin internal marker coins")
+        self.log.info("Check snapshots remain available before the shadow whitelist height")
         self.restart_node(0, extra_args=["-shadowwhitelistheight=20", "-shadowgoldrushblocks=500"])
         node = self.nodes[0]
         node.setmocktime(node.getblockheader(node.getbestblockhash())['time'] + 1)
-        self.generate(node, 15)
+        self.generate(node, 9)
 
-        marker_filename = "txoutset_with_markers.dat"
-        marker_out = node.dumptxoutset(marker_filename)
-        marker_path = node.datadir_path / self.chain / marker_filename
-        metadata_count, serialized_count = count_snapshot_coins(marker_path)
-        assert_equal(metadata_count, marker_out["coins_written"])
-        assert_equal(serialized_count, marker_out["coins_written"])
+        pre_whitelist_filename = "txoutset_before_whitelist.dat"
+        pre_whitelist_out = node.dumptxoutset(pre_whitelist_filename)
+        pre_whitelist_path = node.datadir_path / self.chain / pre_whitelist_filename
+        metadata_count, serialized_count = count_snapshot_coins(pre_whitelist_path)
+        assert_equal(pre_whitelist_out["base_height"], 19)
+        assert_equal(metadata_count, pre_whitelist_out["coins_written"])
+        assert_equal(serialized_count, pre_whitelist_out["coins_written"])
+
+        self.log.info("Check snapshots fail closed at the shadow whitelist height")
+        self.generate(node, 1)
+        post_whitelist_filename = "txoutset_after_whitelist.dat"
+        post_whitelist_path = node.datadir_path / self.chain / post_whitelist_filename
+        assert_raises_rpc_error(
+            -1,
+            "Quantum Quasar snapshots are disabled at and after shadow whitelist height 20",
+            node.dumptxoutset,
+            post_whitelist_filename,
+        )
+        assert not post_whitelist_path.exists()
+        assert not post_whitelist_path.with_name(post_whitelist_path.name + ".incomplete").exists()
 
 
 if __name__ == '__main__':

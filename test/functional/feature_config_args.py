@@ -9,6 +9,8 @@
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -65,9 +67,9 @@ class ConfArgsTest(BitcoinTestFramework):
         with open(inc_conf_file_path, 'w', encoding='utf-8') as conf:
             conf.write('reindex=1\n')
 
-        with self.nodes[0].assert_debug_log(expected_msgs=['Warning: reindex=1 is set in the configuration file, which will significantly slow down startup. Consider removing or commenting out this option for better performance, unless there is currently a condition which makes rebuilding the indexes necessary']):
-            self.start_node(0)
-        self.stop_node(0)
+        self.nodes[0].assert_start_raises_init_error(
+            expected_msg='Error: reindex=1 is set persistently. Remove it from blackcoin.conf or settings.json and pass -reindex only once on the command line.'
+        )
 
         with open(inc_conf_file_path, 'w', encoding='utf-8') as conf:
             conf.write('-dash=1\n')
@@ -145,7 +147,7 @@ class ConfArgsTest(BitcoinTestFramework):
         # Check that correct configuration file path is actually logged
         # (conf_path, not node.bitcoinconf)
         with self.nodes[0].assert_debug_log(expected_msgs=[f"Config file: {conf_path}"]):
-            self.start_node(0, ["-allowignoredconf"], env=env)
+            self.start_node(0, ["-allowignoredconf", "-migratewallet=none"], env=env)
             self.stop_node(0)
 
         # Restore node arguments after the test
@@ -218,6 +220,25 @@ class ConfArgsTest(BitcoinTestFramework):
         self.stop_node(0)
         with self.nodes[0].assert_debug_log(expected_msgs=['SetNetworkActive: false\n']):
             self.start_node(0, extra_args=['-nonetworkactive=1'])
+
+    def test_listenonion_bind(self):
+        self.log.info('Test -listenonion=0 does not create the default onion bind')
+        self.stop_node(0)
+        with self.nodes[0].assert_debug_log(
+                expected_msgs=['opencon thread start'],
+                unexpected_msgs=['Bound to 127.0.0.1:35717']):
+            self.start_node(0, extra_args=['-listenonion=0'])
+        self.stop_node(0)
+
+        self.log.info('Test an explicit onion bind remains active with -listenonion=0')
+        explicit_onion_port = util.p2p_port(1)
+        with self.nodes[0].assert_debug_log(
+                expected_msgs=[f'Bound to 127.0.0.1:{explicit_onion_port}']):
+            self.start_node(0, extra_args=[
+                '-listenonion=0',
+                f'-bind=127.0.0.1:{explicit_onion_port}=onion',
+            ])
+        self.stop_node(0)
 
     def test_seed_peers(self):
         self.log.info('Test seed peers')
@@ -367,11 +388,45 @@ class ConfArgsTest(BitcoinTestFramework):
         # config file.
         node_args = node.args
         node.args = [arg for arg in node.args if not arg.startswith("-datadir=")]
-        node.assert_start_raises_init_error([], re.escape(
+        node.assert_start_raises_init_error(["-migratewallet=none"], re.escape(
             f'Error: Data directory "{node.datadir_path}" contains a "blackcoin.conf" file which is ignored, because a '
             f'different configuration file "{default_datadir}/blackcoin.conf" from data directory "{default_datadir}" '
             f'is being used instead.') + r"[\s\S]*", env=env, match=ErrorMatch.FULL_REGEX)
         node.args = node_args
+
+    def test_early_info_commands_do_not_touch_wallet_data(self):
+        if sys.platform == "win32":
+            return
+
+        self.log.info("Test -help and -version exit before legacy wallet-data inspection")
+        env_overrides, default_datadir = util.get_temp_default_datadir(
+            Path(self.options.tmpdir, "early_info_home")
+        )
+        default_datadir.mkdir(parents=True)
+        (default_datadir / "blackcoin.conf").write_text("server=1\n", encoding="utf8")
+        wallet_path = default_datadir / "wallet.dat"
+        wallet_bytes = b"read-only informational command wallet fixture\n"
+        wallet_path.write_bytes(wallet_bytes)
+        backup_root = default_datadir.parent / f"{default_datadir.name}.backup"
+        marker_path = default_datadir / ".blackcoin-migration-done"
+        process_env = dict(os.environ)
+        process_env.update(env_overrides)
+
+        for argument, expected in (("-version", "Source commit:"), ("-help", "Options")):
+            result = subprocess.run(
+                [self.nodes[0].binary, argument],
+                env=process_env,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+            assert_equal(result.returncode, 0)
+            assert expected in result.stdout
+            assert "Legacy datadir migration" not in result.stderr
+            assert_equal(wallet_path.read_bytes(), wallet_bytes)
+            assert not marker_path.exists()
+            assert not backup_root.exists()
 
     def _legacy_datadir_for_env(self, env):
         if sys.platform == "win32":
@@ -449,6 +504,41 @@ class ConfArgsTest(BitcoinTestFramework):
             node.datadir_path = original_datadir
             node.bitcoinconf = original_bitcoinconf
 
+    def _kill_default_datadir_migration_after(self, node, env, default_datadir, transition):
+        """Pause at an exact durable migration boundary and kill the process."""
+        original_args = node.args
+        original_datadir = node.datadir_path
+        original_bitcoinconf = node.bitcoinconf
+        pause_marker = default_datadir.parent / f"{default_datadir.name}.migration-test-pause"
+        pause_marker.unlink(missing_ok=True)
+        try:
+            node.args = [arg for arg in node.args if not arg.startswith("-datadir=")]
+            node.datadir_path = default_datadir
+            node.bitcoinconf = default_datadir / "blackcoin.conf"
+            node.start(
+                extra_args=self._default_datadir_args(node) + [
+                    "-migratewallet=blackmore",
+                    f"-testdatadirmigrationpauseafter={transition}",
+                ],
+                env=env,
+            )
+            self.wait_until(lambda: pause_marker.exists(), timeout=60)
+            assert_equal(pause_marker.read_text(encoding="utf8"), f"{transition}\n")
+            node.process.kill()
+            node.process.wait(timeout=node.rpc_timeout)
+            node.stdout.close()
+            node.stderr.close()
+            node.running = False
+            node.process = None
+            node.rpc_connected = False
+            node.rpc = None
+        finally:
+            self._stop_node_if_started(node)
+            pause_marker.unlink(missing_ok=True)
+            node.args = original_args
+            node.datadir_path = original_datadir
+            node.bitcoinconf = original_bitcoinconf
+
     def _assert_default_datadir_start_error(self, node, env, default_datadir, expected_msg, extra_args=None):
         original_args = node.args
         original_datadir = node.datadir_path
@@ -477,10 +567,13 @@ class ConfArgsTest(BitcoinTestFramework):
 
         node = self.nodes[0]
 
-        self.log.info("Test .blackmore-only first-run migration imports into .blackcoin and preserves a backup")
+        self.log.info("Test .blackmore-only first run requires explicit consent before any migration write")
         env, default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_home"))
         legacy_datadir = self._legacy_datadir_for_env(env)
         self._write_legacy_datadir(legacy_datadir, wallet_text="blackmore wallet\n")
+        nested_payload = bytes(range(256)) * 17
+        (legacy_datadir / "wallets" / "archive").mkdir(parents=True)
+        (legacy_datadir / "wallets" / "archive" / "keys.bin").write_bytes(nested_payload)
 
         original_args = node.args
         original_datadir = node.datadir_path
@@ -490,16 +583,28 @@ class ConfArgsTest(BitcoinTestFramework):
             node.args = [arg for arg in node.args if not arg.startswith("-datadir=")]
             node.datadir_path = default_datadir
             node.bitcoinconf = default_datadir / "blackcoin.conf"
-            self.start_node(0, env=env)
+            node.assert_start_raises_init_error(
+                extra_args=self._default_datadir_args(node),
+                expected_msg="explicit one-shot legacy wallet-data choice is required",
+                match=ErrorMatch.PARTIAL_REGEX,
+                env=env,
+            )
+            assert not default_datadir.exists()
+            assert_equal((legacy_datadir / "wallet.dat").read_text(encoding="utf8"), "blackmore wallet\n")
+            assert_equal(self._backup_dirs(default_datadir, "blackmore"), [])
+
+            self.start_node(0, ["-migratewallet=blackmore"], env=env)
             self.stop_node(0)
 
             assert (default_datadir / "blackmore.conf").exists()
             assert (default_datadir / "blackcoin.conf").exists()
             assert_equal((default_datadir / "blackcoin.conf").read_text(encoding="utf8"), (legacy_datadir / "blackmore.conf").read_text(encoding="utf8"))
             assert_equal((default_datadir / "wallet.dat").read_text(encoding="utf8"), "blackmore wallet\n")
+            assert_equal((default_datadir / "wallets" / "archive" / "keys.bin").read_bytes(), nested_payload)
             assert (default_datadir / "blocks").is_dir()
             assert self._migration_marker(default_datadir).exists()
             self._assert_backup_wallet(default_datadir, "blackmore", "blackmore wallet\n")
+            assert any((backup / "wallets" / "archive" / "keys.bin").read_bytes() == nested_payload for backup in self._backup_dirs(default_datadir, "blackmore"))
 
             backup_count = len(self._backup_dirs(default_datadir, "blackmore"))
             self.start_node(0, env=env)
@@ -514,7 +619,7 @@ class ConfArgsTest(BitcoinTestFramework):
         self.log.info("Test original .blackcoin-only first-run migration keeps the active wallet and preserves a backup")
         blackcoin_env, blackcoin_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_blackcoin_home"))
         self._write_legacy_datadir(blackcoin_default_datadir, conf_name="blackcoin.conf", wallet_text="original blackcoin wallet\n")
-        self._run_default_datadir_node_once(node, blackcoin_env, blackcoin_default_datadir)
+        self._run_default_datadir_node_once(node, blackcoin_env, blackcoin_default_datadir, extra_args=["-migratewallet=blackcoin"])
         assert_equal((blackcoin_default_datadir / "wallet.dat").read_text(encoding="utf8"), "original blackcoin wallet\n")
         assert self._migration_marker(blackcoin_default_datadir).exists()
         self._assert_backup_wallet(blackcoin_default_datadir, "original-blackcoin", "original blackcoin wallet\n")
@@ -531,12 +636,66 @@ class ConfArgsTest(BitcoinTestFramework):
         self._assert_backup_wallet(dual_default_datadir, "active-blackcoin", "dual original wallet\n")
         self._assert_backup_wallet(dual_default_datadir, "blackmore", "dual blackmore wallet\n")
 
-        self.log.info("Test dual legacy datadirs with no flag keeps .blackcoin and preserves .blackmore")
+        for transition in (
+            "staged-import-ready",
+            "recovery-record-ready",
+            "active-moved",
+            "promoted",
+        ):
+            self.log.info(f"Kill first-run migration after durable {transition} and recover deterministically")
+            kill_env, kill_default_datadir = util.get_temp_default_datadir(
+                Path(self.options.tmpdir, f"legacy_migration_kill_{transition.replace('-', '_')}_home")
+            )
+            kill_blackmore_datadir = self._legacy_datadir_for_env(kill_env)
+            self._write_legacy_datadir(
+                kill_default_datadir,
+                conf_name="blackcoin.conf",
+                wallet_text=f"{transition} original wallet\n",
+            )
+            self._write_legacy_datadir(
+                kill_blackmore_datadir,
+                wallet_text=f"{transition} blackmore wallet\n",
+            )
+            self._kill_default_datadir_migration_after(
+                node, kill_env, kill_default_datadir, transition)
+            self._run_default_datadir_node_once(
+                node,
+                kill_env,
+                kill_default_datadir,
+                extra_args=["-migratewallet=blackmore"],
+            )
+            assert_equal(
+                (kill_default_datadir / "wallet.dat").read_text(encoding="utf8"),
+                f"{transition} blackmore wallet\n",
+            )
+            assert self._migration_marker(kill_default_datadir).exists()
+            self._assert_backup_wallet(
+                kill_default_datadir,
+                "blackmore",
+                f"{transition} blackmore wallet\n",
+            )
+            self._assert_backup_wallet(
+                kill_default_datadir,
+                "original-blackcoin",
+                f"{transition} original wallet\n",
+            )
+
+        self.log.info("Test dual legacy datadirs require an explicit choice before preserving or selecting either source")
         dual_auto_env, dual_auto_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_dual_auto_home"))
         dual_auto_blackmore_datadir = self._legacy_datadir_for_env(dual_auto_env)
         self._write_legacy_datadir(dual_auto_default_datadir, conf_name="blackcoin.conf", wallet_text="auto original wallet\n")
         self._write_legacy_datadir(dual_auto_blackmore_datadir, wallet_text="auto blackmore wallet\n")
-        self._run_default_datadir_node_once(node, dual_auto_env, dual_auto_default_datadir)
+        self._assert_default_datadir_start_error(
+            node,
+            dual_auto_env,
+            dual_auto_default_datadir,
+            expected_msg=r"explicit one-shot legacy wallet-data choice is required.*-migratewallet=blackmore.*-migratewallet=blackcoin.*-migratewallet=none",
+        )
+        assert_equal((dual_auto_default_datadir / "wallet.dat").read_text(encoding="utf8"), "auto original wallet\n")
+        assert_equal((dual_auto_blackmore_datadir / "wallet.dat").read_text(encoding="utf8"), "auto blackmore wallet\n")
+        assert not self._migration_marker(dual_auto_default_datadir).exists()
+        assert not self._migration_backup_root(dual_auto_default_datadir).exists()
+        self._run_default_datadir_node_once(node, dual_auto_env, dual_auto_default_datadir, extra_args=["-migratewallet=blackcoin"])
         assert_equal((dual_auto_default_datadir / "wallet.dat").read_text(encoding="utf8"), "auto original wallet\n")
         assert self._migration_marker(dual_auto_default_datadir).exists()
         self._assert_backup_wallet(dual_auto_default_datadir, "original-blackcoin", "auto original wallet\n")
@@ -545,7 +704,7 @@ class ConfArgsTest(BitcoinTestFramework):
 
         self.log.info("Test marker-absent rerun does not displace a populated live .blackcoin")
         self._migration_marker(dual_auto_default_datadir).unlink()
-        self._run_default_datadir_node_once(node, dual_auto_env, dual_auto_default_datadir)
+        self._run_default_datadir_node_once(node, dual_auto_env, dual_auto_default_datadir, extra_args=["-migratewallet=blackcoin"])
         assert_equal((dual_auto_default_datadir / "wallet.dat").read_text(encoding="utf8"), "auto original wallet\n")
         assert self._migration_marker(dual_auto_default_datadir).exists()
         assert_equal(len(self._backup_dirs(dual_auto_default_datadir, "active-blackcoin")), 0)
@@ -569,12 +728,58 @@ class ConfArgsTest(BitcoinTestFramework):
         crash_active_backup = crash_backup_root / "active-blackcoin-999999999"
         self._write_legacy_datadir(crash_active_backup, conf_name="blackcoin.conf", wallet_text="crash original wallet\n")
         (crash_backup_root / ".blackcoin-migration-recovery").write_text(f"{crash_active_backup}\n", encoding="utf8")
-        self._run_default_datadir_node_once(node, crash_env, crash_default_datadir)
+        self._run_default_datadir_node_once(node, crash_env, crash_default_datadir, extra_args=["-migratewallet=blackcoin"])
         assert_equal((crash_default_datadir / "wallet.dat").read_text(encoding="utf8"), "crash original wallet\n")
         assert self._migration_marker(crash_default_datadir).exists()
         assert crash_active_backup.exists()
         assert_equal((crash_active_backup / "wallet.dat").read_text(encoding="utf8"), "crash original wallet\n")
         assert not (crash_backup_root / ".blackcoin-migration-recovery").exists()
+
+        self.log.info("Test a recovery record committed before a rolled-back move retains the original destination")
+        pre_move_env, pre_move_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_pre_move_crash_home"))
+        self._write_legacy_datadir(pre_move_default_datadir, conf_name="blackcoin.conf", wallet_text="pre-move original wallet\n")
+        pre_move_backup_root = self._migration_backup_root(pre_move_default_datadir)
+        pre_move_missing_backup = pre_move_backup_root / "active-blackcoin-444444444"
+        pre_move_recovery = pre_move_backup_root / ".blackcoin-migration-recovery"
+        pre_move_backup_root.mkdir(parents=True)
+        pre_move_recovery.write_text(f"{pre_move_missing_backup}\n", encoding="utf8")
+        self._run_default_datadir_node_once(node, pre_move_env, pre_move_default_datadir, extra_args=["-migratewallet=blackcoin"])
+        assert_equal((pre_move_default_datadir / "wallet.dat").read_text(encoding="utf8"), "pre-move original wallet\n")
+        assert self._migration_marker(pre_move_default_datadir).exists()
+        assert not pre_move_recovery.exists()
+        assert not pre_move_missing_backup.exists()
+
+        self.log.info("Test recovery preserves a valid-looking unmarked partial destination before restoring the original")
+        partial_env, partial_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_partial_destination_home"))
+        self._write_legacy_datadir(partial_default_datadir, conf_name="blackcoin.conf", wallet_text="unmarked partial destination wallet\n")
+        partial_backup_root = self._migration_backup_root(partial_default_datadir)
+        partial_active_backup = partial_backup_root / "active-blackcoin-222222222"
+        self._write_legacy_datadir(partial_active_backup, conf_name="blackcoin.conf", wallet_text="recoverable original wallet\n")
+        partial_recovery = partial_backup_root / ".blackcoin-migration-recovery"
+        partial_recovery.write_text(f"{partial_active_backup}\n", encoding="utf8")
+        self._run_default_datadir_node_once(node, partial_env, partial_default_datadir, extra_args=["-migratewallet=blackcoin"])
+        assert_equal((partial_default_datadir / "wallet.dat").read_text(encoding="utf8"), "recoverable original wallet\n")
+        assert self._migration_marker(partial_default_datadir).exists()
+        assert not partial_recovery.exists()
+        interrupted_destinations = self._backup_dirs(partial_default_datadir, "interrupted-destination")
+        assert interrupted_destinations
+        assert any((backup / "wallet.dat").read_text(encoding="utf8") == "unmarked partial destination wallet\n" for backup in interrupted_destinations)
+        assert_equal((partial_active_backup / "wallet.dat").read_text(encoding="utf8"), "recoverable original wallet\n")
+
+        self.log.info("Test a marked promoted destination wins a crash race and only the stale recovery record is cleared")
+        promoted_env, promoted_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_promoted_destination_home"))
+        self._write_legacy_datadir(promoted_default_datadir, conf_name="blackcoin.conf", wallet_text="promoted blackmore wallet\n")
+        self._migration_marker(promoted_default_datadir).write_text("durably promoted before crash\n", encoding="utf8")
+        promoted_backup_root = self._migration_backup_root(promoted_default_datadir)
+        promoted_active_backup = promoted_backup_root / "active-blackcoin-333333333"
+        self._write_legacy_datadir(promoted_active_backup, conf_name="blackcoin.conf", wallet_text="pre-promotion original wallet\n")
+        promoted_recovery = promoted_backup_root / ".blackcoin-migration-recovery"
+        promoted_recovery.write_text(f"{promoted_active_backup}\n", encoding="utf8")
+        self._run_default_datadir_node_once(node, promoted_env, promoted_default_datadir)
+        assert_equal((promoted_default_datadir / "wallet.dat").read_text(encoding="utf8"), "promoted blackmore wallet\n")
+        assert not promoted_recovery.exists()
+        assert_equal((promoted_active_backup / "wallet.dat").read_text(encoding="utf8"), "pre-promotion original wallet\n")
+        assert_equal(self._backup_dirs(promoted_default_datadir, "interrupted-destination"), [])
 
         self.log.info("Test stale active backup without recovery record is not auto-restored")
         stale_env, stale_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_stale_active_home"))
@@ -594,11 +799,128 @@ class ConfArgsTest(BitcoinTestFramework):
         self._write_legacy_datadir(real_blackmore_datadir, wallet_text="symlink blackmore wallet\n")
         symlink_blackmore_datadir.parent.mkdir(parents=True, exist_ok=True)
         os.symlink(real_blackmore_datadir, symlink_blackmore_datadir, target_is_directory=True)
-        self._run_default_datadir_node_once(node, symlink_env, symlink_default_datadir)
+        self._run_default_datadir_node_once(node, symlink_env, symlink_default_datadir, extra_args=["-migratewallet=blackmore"])
         assert_equal((symlink_default_datadir / "wallet.dat").read_text(encoding="utf8"), "symlink blackmore wallet\n")
         assert self._migration_marker(symlink_default_datadir).exists()
         self._assert_backup_wallet(symlink_default_datadir, "blackmore", "symlink blackmore wallet\n")
         assert_equal((real_blackmore_datadir / "wallet.dat").read_text(encoding="utf8"), "symlink blackmore wallet\n")
+
+        self.log.info("Test a symlinked blocks store is preserved in the active import but excluded from the recovery backup")
+        blocks_link_env, blocks_link_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_blocks_link_home"))
+        blocks_link_blackmore_datadir = self._legacy_datadir_for_env(blocks_link_env)
+        blocks_link_blackmore_datadir.mkdir(parents=True)
+        util.write_config(blocks_link_blackmore_datadir / "blackmore.conf", n=0, chain=self.chain, disable_autoconnect=self.disable_autoconnect)
+        (blocks_link_blackmore_datadir / "wallet.dat").write_text("blocks-link blackmore wallet\n", encoding="utf8")
+        external_blocks = Path(self.options.tmpdir, "legacy_migration_external_blocks")
+        external_blocks.mkdir()
+        (external_blocks / "external-store.sentinel").write_bytes(b"external block store sentinel")
+        os.symlink(external_blocks, blocks_link_blackmore_datadir / "blocks", target_is_directory=True)
+        self._run_default_datadir_node_once(node, blocks_link_env, blocks_link_default_datadir, extra_args=["-migratewallet=blackmore"])
+        assert (blocks_link_default_datadir / "blocks").is_symlink()
+        assert_equal((blocks_link_default_datadir / "blocks" / "external-store.sentinel").read_bytes(), b"external block store sentinel")
+        blocks_link_backups = self._backup_dirs(blocks_link_default_datadir, "blackmore")
+        assert blocks_link_backups
+        assert all(not (backup / "blocks").is_symlink() and not (backup / "blocks").exists() for backup in blocks_link_backups)
+
+        self.log.info("Test a competing migration lock prevents cleanup and all mutation until the owner exits")
+        import fcntl
+        concurrent_env, concurrent_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_concurrent_home"))
+        concurrent_blackmore_datadir = self._legacy_datadir_for_env(concurrent_env)
+        self._write_legacy_datadir(concurrent_blackmore_datadir, wallet_text="concurrent blackmore wallet\n")
+        stale_stage = concurrent_default_datadir.parent / f"{concurrent_default_datadir.name}.tmp-competing-process"
+        stale_stage.mkdir(parents=True)
+        stale_sentinel = stale_stage / "must-not-be-cleaned-before-lock"
+        stale_sentinel.write_text("owned by first process\n", encoding="utf8")
+        operation_lock = concurrent_default_datadir.parent / f"{concurrent_default_datadir.name}.migration.lock"
+        operation_lock.parent.mkdir(parents=True, exist_ok=True)
+        with operation_lock.open("a+") as competing_lock:
+            fcntl.lockf(competing_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._assert_default_datadir_start_error(
+                node,
+                concurrent_env,
+                concurrent_default_datadir,
+                expected_msg=r"first-run migration operation is already locked",
+            )
+            assert stale_sentinel.exists()
+            assert_equal((concurrent_blackmore_datadir / "wallet.dat").read_text(encoding="utf8"), "concurrent blackmore wallet\n")
+            assert not concurrent_default_datadir.exists()
+        self._run_default_datadir_node_once(node, concurrent_env, concurrent_default_datadir, extra_args=["-migratewallet=blackmore"])
+        assert not stale_stage.exists()
+        assert_equal((concurrent_default_datadir / "wallet.dat").read_text(encoding="utf8"), "concurrent blackmore wallet\n")
+        assert self._migration_marker(concurrent_default_datadir).exists()
+
+        self.log.info("Test a running legacy daemon's root datadir lock blocks every migration write")
+        source_lock_env, source_lock_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_source_lock_home"))
+        source_lock_blackmore = self._legacy_datadir_for_env(source_lock_env)
+        self._write_legacy_datadir(source_lock_blackmore, wallet_text="source-locked blackmore wallet\n")
+        source_lock_path = source_lock_blackmore / ".lock"
+        with source_lock_path.open("a+") as source_lock:
+            fcntl.lockf(source_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._assert_default_datadir_start_error(
+                node,
+                source_lock_env,
+                source_lock_default_datadir,
+                expected_msg=r"legacy source datadir is already locked at .*\.blackmore/\.lock",
+            )
+            assert not source_lock_default_datadir.exists()
+            assert_equal((source_lock_blackmore / "wallet.dat").read_text(encoding="utf8"), "source-locked blackmore wallet\n")
+            assert_equal(self._backup_dirs(source_lock_default_datadir, "blackmore"), [])
+        self._run_default_datadir_node_once(node, source_lock_env, source_lock_default_datadir, extra_args=["-migratewallet=blackmore"])
+        assert_equal((source_lock_default_datadir / "wallet.dat").read_text(encoding="utf8"), "source-locked blackmore wallet\n")
+        assert self._migration_marker(source_lock_default_datadir).exists()
+
+        self.log.info("Test a locked legacy network subdatadir blocks migration without a partial destination")
+        network_lock_env, network_lock_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_network_lock_home"))
+        network_lock_blackmore = self._legacy_datadir_for_env(network_lock_env)
+        self._write_legacy_datadir(network_lock_blackmore, wallet_text="network-locked blackmore wallet\n")
+        locked_network = network_lock_blackmore / "regtest"
+        locked_network.mkdir()
+        network_lock_path = locked_network / ".lock"
+        with network_lock_path.open("a+") as network_lock:
+            fcntl.lockf(network_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._assert_default_datadir_start_error(
+                node,
+                network_lock_env,
+                network_lock_default_datadir,
+                expected_msg=r"legacy source datadir is already locked at .*regtest/.lock",
+            )
+            assert not network_lock_default_datadir.exists()
+            assert_equal((network_lock_blackmore / "wallet.dat").read_text(encoding="utf8"), "network-locked blackmore wallet\n")
+            assert_equal(self._backup_dirs(network_lock_default_datadir, "blackmore"), [])
+        self._run_default_datadir_node_once(node, network_lock_env, network_lock_default_datadir, extra_args=["-migratewallet=blackmore"])
+        assert_equal((network_lock_default_datadir / "wallet.dat").read_text(encoding="utf8"), "network-locked blackmore wallet\n")
+        assert self._migration_marker(network_lock_default_datadir).exists()
+
+        self.log.info("Test disk exhaustion fails before copying and a deterministic retry succeeds")
+        disk_env, disk_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_disk_full_home"))
+        disk_blackmore_datadir = self._legacy_datadir_for_env(disk_env)
+        self._write_legacy_datadir(disk_blackmore_datadir, wallet_text="disk-full blackmore wallet\n")
+        oversized_file = disk_blackmore_datadir / "oversized-sparse.dat"
+        disk_default_datadir.parent.mkdir(parents=True, exist_ok=True)
+        disk_test_supported = True
+        try:
+            oversized_size = shutil.disk_usage(disk_default_datadir.parent).free + 1024 * 1024 * 1024
+            with oversized_file.open("wb") as sparse_file:
+                sparse_file.truncate(oversized_size)
+        except OSError as e:
+            disk_test_supported = False
+            self.log.info(f"Skipping sparse-file disk-exhaustion case on this filesystem: {e}")
+        if disk_test_supported:
+            self._assert_default_datadir_start_error(
+                node,
+                disk_env,
+                disk_default_datadir,
+                expected_msg=r"failed to preserve a backup of the legacy \.blackmore datadir",
+                extra_args=["-migratewallet=blackmore"],
+            )
+            assert not disk_default_datadir.exists()
+            assert_equal((disk_blackmore_datadir / "wallet.dat").read_text(encoding="utf8"), "disk-full blackmore wallet\n")
+            assert_equal(oversized_file.stat().st_size, oversized_size)
+            assert_equal(self._backup_dirs(disk_default_datadir, "blackmore"), [])
+            oversized_file.unlink()
+            self._run_default_datadir_node_once(node, disk_env, disk_default_datadir, extra_args=["-migratewallet=blackmore"])
+            assert_equal((disk_default_datadir / "wallet.dat").read_text(encoding="utf8"), "disk-full blackmore wallet\n")
+            assert self._migration_marker(disk_default_datadir).exists()
 
         self.log.info("Test fresh first run does not create migration backup state")
         fresh_env, fresh_default_datadir = util.get_temp_default_datadir(Path(self.options.tmpdir, "legacy_migration_fresh_home"))
@@ -618,7 +940,7 @@ class ConfArgsTest(BitcoinTestFramework):
         util.write_config(empty_blackmore_datadir / "blackmore.conf", n=0, chain=self.chain, disable_autoconnect=self.disable_autoconnect)
         (empty_blackmore_datadir / "wallet.dat").write_text("empty-dest blackmore wallet\n", encoding="utf8")
         empty_default_datadir.mkdir(parents=True)  # simulate the GUI Intro pre-creating the datadir
-        self._run_default_datadir_node_once(node, empty_env, empty_default_datadir)
+        self._run_default_datadir_node_once(node, empty_env, empty_default_datadir, extra_args=["-migratewallet=blackmore"])
         assert_equal((empty_default_datadir / "wallet.dat").read_text(encoding="utf8"), "empty-dest blackmore wallet\n")
         assert (empty_default_datadir / "blackcoin.conf").exists()
         assert self._migration_marker(empty_default_datadir).exists()
@@ -632,7 +954,7 @@ class ConfArgsTest(BitcoinTestFramework):
         (lock_blackmore_datadir / "wallet.dat").write_text("lock-dest blackmore wallet\n", encoding="utf8")
         lock_default_datadir.mkdir(parents=True)
         (lock_default_datadir / ".lock").write_text("", encoding="utf8")  # a crashed prior run leaves this behind
-        self._run_default_datadir_node_once(node, lock_env, lock_default_datadir)
+        self._run_default_datadir_node_once(node, lock_env, lock_default_datadir, extra_args=["-migratewallet=blackmore"])
         assert_equal((lock_default_datadir / "wallet.dat").read_text(encoding="utf8"), "lock-dest blackmore wallet\n")
         assert self._migration_marker(lock_default_datadir).exists()
         # The non-wallet contents were preserved in a backup rather than deleted.
@@ -709,6 +1031,7 @@ class ConfArgsTest(BitcoinTestFramework):
         self.test_args_log()
         self.test_seed_peers()
         self.test_networkactive()
+        self.test_listenonion_bind()
         self.test_connect_with_seednode()
 
         self.test_config_file_parser()
@@ -716,6 +1039,7 @@ class ConfArgsTest(BitcoinTestFramework):
         self.test_invalid_command_line_options()
         self.test_ignored_conf()
         self.test_ignored_default_conf()
+        self.test_early_info_commands_do_not_touch_wallet_data()
         self.test_legacy_datadir_migration()
         self.test_acceptstalefeeestimates_arg_support()
         self.test_powmining_arg_ranges()

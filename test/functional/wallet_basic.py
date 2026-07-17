@@ -102,6 +102,14 @@ class WalletTest(BitcoinTestFramework):
         assert_equal(self.nodes[1].getbalance(), 10000)
         assert_equal(self.nodes[2].getbalance(), 0)
 
+        node1_balances = self.nodes[1].getbalances()["mine"]
+        assert_equal(node1_balances["trusted"], 10000)
+        assert_equal(node1_balances["lifecycle"]["ordinary_available"], 10000)
+        assert_equal(
+            node1_balances["lifecycle"]["categories"]["immature_legacy"]["count"],
+            COINBASE_MATURITY,
+        )
+
         # Check that only first and second nodes have UTXOs
         utxos = self.nodes[0].listunspent()
         assert_equal(len(utxos), 1)
@@ -505,6 +513,20 @@ class WalletTest(BitcoinTestFramework):
             # 1. Send some coins to generate new UTXO
             address_to_import = self.nodes[2].getnewaddress()
             txid = self.nodes[0].sendtoaddress(address_to_import, 1)
+            # This assertion is about wallet ownership, not randomized INV
+            # timing. Relay the complete local mempool in dependency order.
+            pending = set(self.nodes[0].getrawmempool())
+            while pending:
+                relayable = [
+                    mempool_txid for mempool_txid in pending
+                    if not (set(self.nodes[0].getmempoolentry(mempool_txid)["depends"]) & pending)
+                ]
+                assert relayable
+                for mempool_txid in relayable:
+                    raw = self.nodes[0].getrawtransaction(mempool_txid)
+                    for recipient in self.nodes[1:3]:
+                        recipient.sendrawtransaction(raw)
+                    pending.remove(mempool_txid)
             self.sync_mempools(self.nodes[0:3])
             vout = find_vout_for_address(self.nodes[2], txid, address_to_import)
             self.nodes[2].lockunspent(False, [{"txid": txid, "vout": vout}])

@@ -25,7 +25,7 @@ BOOST_FIXTURE_TEST_CASE(SubtractFee, TestChain100Setup)
     CAmount input_amount;
     COutPoint input_outpoint;
     {
-        LOCK(wallet->cs_wallet);
+        LOCK2(::cs_main, wallet->cs_wallet);
         std::vector<COutput> coins = AvailableCoins(*wallet).All();
         BOOST_REQUIRE(!coins.empty());
         input_amount = coins.front().txout.nValue;
@@ -83,7 +83,7 @@ BOOST_FIXTURE_TEST_CASE(wallet_duplicated_preset_inputs_test, TestChain100Setup)
     for (int i = 0; i < 4; i++) CreateAndProcessBlock({}, GetScriptForRawPubKey(coinbaseKey.GetPubKey()));
     auto wallet = CreateSyncedWallet(*m_node.chain, WITH_LOCK(Assert(m_node.chainman)->GetMutex(), return m_node.chainman->ActiveChain()), coinbaseKey);
 
-    LOCK(wallet->cs_wallet);
+    LOCK2(::cs_main, wallet->cs_wallet);
     auto available_coins = AvailableCoins(*wallet);
     std::vector<COutput> coins = available_coins.All();
     // Preselect the first 3 UTXOs.

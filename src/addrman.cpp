@@ -1,4 +1,5 @@
 // Copyright (c) 2012 Pieter Wuille
+// Copyright (c) 2012-2022 The Bitcoin Core developers
 // Copyright (c) 2012-2022 Blackcoin Core Developers
 // Copyright (c) 2012-2022 Blackcoin More Developers
 // Copyright (c) 2012-2022 Quantum Quasar Developers

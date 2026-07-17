@@ -24,8 +24,9 @@ bool FileCommit(FILE* file);
 /**
  * Sync directory contents. This is required on some environments to ensure that
  * newly created files are committed to disk.
+ * @return true if the directory entry was durably committed.
  */
-void DirectoryCommit(const fs::path& dirname);
+bool DirectoryCommit(const fs::path& dirname);
 
 bool TruncateFile(FILE* file, unsigned int length);
 int RaiseFileDescriptorLimit(int nMinFD);
@@ -36,6 +37,19 @@ void AllocateFileRange(FILE* file, unsigned int offset, unsigned int length);
  * @return true if the rename was successful.
  */
 [[nodiscard]] bool RenameOver(fs::path src, fs::path dest);
+
+/**
+ * Rename src to a destination that must not already exist.
+ *
+ * On Windows the rename is issued with a native write-through durability
+ * barrier because DirectoryCommit() cannot flush directory entries there.
+ * This is intentionally separate from RenameOver(): callers preserving a
+ * recovery source must never replace an existing destination.
+ *
+ * @return true if the rename was successful and dest did not previously
+ * exist.
+ */
+[[nodiscard]] bool RenameNoReplace(fs::path src, fs::path dest);
 
 bool LockDirectory(const fs::path& directory, const fs::path& lockfile_name, bool probe_only = false);
 void UnlockDirectory(const fs::path& directory, const fs::path& lockfile_name);

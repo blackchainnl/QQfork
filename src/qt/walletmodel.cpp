@@ -28,8 +28,11 @@
 #include <wallet/coincontrol.h>
 #include <wallet/wallet.h> // for CRecipient
 
-#include <stdint.h>
+#include <algorithm>
+#include <exception>
 #include <functional>
+#include <stdint.h>
+#include <utility>
 
 #include <QDebug>
 #include <QMessageBox>
@@ -78,6 +81,10 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     updateStakeWeight(true),
     worker(0)
 {
+    // Establish the GUI-thread cache before any view is attached. Later
+    // keystore notifications update it in updateStatus(). Timer-driven views
+    // read this cache instead of entering cs_wallet themselves.
+    cachedEncryptionStatus.store(getEncryptionStatus(), std::memory_order_release);
     fHaveWatchOnly = m_wallet->haveWatchOnly();
     addressTableModel = new AddressTableModel(this);
     transactionTableModel = new TransactionTableModel(platformStyle, this);
@@ -86,6 +93,10 @@ WalletModel::WalletModel(std::unique_ptr<interfaces::Wallet> wallet, ClientModel
     // Start thread
     worker = new WalletWorker(this);
     worker->moveToThread(&(t));
+    // WalletWorker has thread affinity and deliberately has no QObject parent.
+    // Retire it on its own thread when the event loop finishes instead of
+    // leaking one worker for every WalletModel lifetime.
+    connect(&t, &QThread::finished, worker, &QObject::deleteLater);
     t.start();
 
     subscribeToCoreSignals();
@@ -121,9 +132,27 @@ void WalletModel::setClientModel(ClientModel* client_model)
 
 void WalletModel::updateStatus()
 {
-    EncryptionStatus newEncryptionStatus = getEncryptionStatus();
+    interfaces::WalletEncryptionStatus status;
+    if (!m_wallet->tryGetEncryptionStatus(status)) {
+        // Keystore notifications can race with QQSIGNAL signing. Never wait
+        // for cs_wallet on the Qt thread; coalesce retries until the signer
+        // releases it instead.
+        if (!m_status_update_retry_scheduled) {
+            m_status_update_retry_scheduled = true;
+            QTimer::singleShot(50, this, [this] {
+                m_status_update_retry_scheduled = false;
+                updateStatus();
+            });
+        }
+        return;
+    }
 
-    if(cachedEncryptionStatus != newEncryptionStatus) {
+    const EncryptionStatus newEncryptionStatus = !status.encrypted
+        ? (status.private_keys_disabled ? NoKeys : Unencrypted)
+        : (status.locked ? Locked : Unlocked);
+
+    if (cachedEncryptionStatus.load(std::memory_order_acquire) != newEncryptionStatus) {
+        cachedEncryptionStatus.store(newEncryptionStatus, std::memory_order_release);
         Q_EMIT encryptionStatusChanged();
     }
 }
@@ -192,6 +221,133 @@ bool WalletModel::checkBalanceChanged(const interfaces::WalletBalances& new_bala
 interfaces::WalletBalances WalletModel::getCachedBalance() const
 {
     return m_cached_balances;
+}
+
+void WalletModel::requestStakingMiningSnapshot(const StakingMiningSnapshotRequest& request)
+{
+    // Only the GUI thread owns request/coalescing state. The cancellation flag
+    // is the sole object shared with WalletWorker and is checked between every
+    // wallet walk so teardown and wallet switches never wait in the view.
+    cancelStakingMiningSnapshot();
+    m_completed_staking_snapshot.reset();
+    m_staking_snapshot_request_id = request.request_id;
+    const auto cancel = std::make_shared<std::atomic<bool>>(false);
+    m_staking_snapshot_cancel = cancel;
+
+    const bool invoked = QMetaObject::invokeMethod(worker, [this, request, cancel] {
+        assert(QThread::currentThread() == worker->thread());
+        auto snapshot = std::make_shared<StakingMiningSnapshot>();
+        snapshot->request = request;
+
+        const auto publish = [this, snapshot] {
+            QMetaObject::invokeMethod(this, [this, snapshot] {
+                if (m_staking_snapshot_request_id == snapshot->request.request_id) {
+                    m_completed_staking_snapshot = snapshot;
+                    m_staking_snapshot_cancel.reset();
+                }
+                Q_EMIT stakingMiningSnapshotReady(snapshot->request.request_id, snapshot->request.generation);
+            }, Qt::QueuedConnection);
+        };
+        const auto checkpoint = [this, cancel, snapshot] {
+            if (cancel->load(std::memory_order_acquire) || m_node.shutdownRequested()) {
+                snapshot->cancelled = true;
+                return true;
+            }
+            return false;
+        };
+
+        if (checkpoint()) {
+            publish();
+            return;
+        }
+
+        try {
+            snapshot->start_tip = m_node.getBestBlockHash().GetHex();
+            if (!request.expected_tip.empty() && snapshot->start_tip != request.expected_tip) {
+                snapshot->stale_tip = true;
+                publish();
+                return;
+            }
+
+            snapshot->pow = m_wallet->getPowMiningInfo();
+            if (checkpoint()) { publish(); return; }
+            snapshot->migration = m_wallet->getMigrationStatus();
+            if (checkpoint()) { publish(); return; }
+            snapshot->demurrage = m_wallet->getDemurrageInfo();
+            if (checkpoint()) { publish(); return; }
+            snapshot->rgb_assets = m_wallet->listRGBAssets(/*include_spent=*/false);
+            if (checkpoint()) { publish(); return; }
+            snapshot->eutxo_states = m_wallet->listEUTXOStates(/*include_spent=*/true);
+            if (checkpoint()) { publish(); return; }
+            snapshot->quantum_addresses = m_wallet->listQuantumAddresses();
+            if (checkpoint()) { publish(); return; }
+            snapshot->coldstake_delegations = m_wallet->listQuantumColdStakeDelegations();
+            if (checkpoint()) { publish(); return; }
+
+            snapshot->selfstake_query_address = request.selfstake_address;
+            if (snapshot->selfstake_query_address.empty()) {
+                const auto selfstake = std::find_if(snapshot->quantum_addresses.begin(), snapshot->quantum_addresses.end(), [](const interfaces::WalletQuantumAddressInfo& info) {
+                    return info.tiered && info.label == "quantum-stake";
+                });
+                if (selfstake != snapshot->quantum_addresses.end()) snapshot->selfstake_query_address = selfstake->address;
+            }
+            if (!snapshot->selfstake_query_address.empty()) {
+                snapshot->selfstake_queried = true;
+                snapshot->selfstake_outputs = m_wallet->listQuantumStakeOutputs(snapshot->selfstake_query_address);
+                if (checkpoint()) { publish(); return; }
+                snapshot->selfstake_bond = m_wallet->getQuantumStakeAddressBondInfo(snapshot->selfstake_query_address);
+                if (checkpoint()) { publish(); return; }
+            }
+            snapshot->operator_query_address = request.operator_address;
+            if (!snapshot->operator_query_address.empty()) {
+                snapshot->operator_queried = true;
+                snapshot->operator_bond = m_wallet->getQuantumOperatorBondInfo(snapshot->operator_query_address);
+                if (checkpoint()) { publish(); return; }
+            }
+
+            snapshot->coldstake_balances.reserve(snapshot->coldstake_delegations.size());
+            for (const interfaces::WalletQuantumColdStakeInfo& info : snapshot->coldstake_delegations) {
+                snapshot->coldstake_balances.push_back({info.address, m_wallet->getQuantumColdStakeBalanceInfo(info.address)});
+                if (checkpoint()) { publish(); return; }
+            }
+            snapshot->selected_coldstake_query_address = request.coldstake_address;
+            if (!snapshot->selected_coldstake_query_address.empty()) {
+                snapshot->selected_coldstake_queried = true;
+                snapshot->selected_coldstake_balance = m_wallet->getQuantumColdStakeBalanceInfo(snapshot->selected_coldstake_query_address);
+                if (checkpoint()) { publish(); return; }
+            }
+
+            snapshot->pool = m_wallet->getQuantumPoolInfo();
+            if (checkpoint()) { publish(); return; }
+            snapshot->end_tip = m_node.getBestBlockHash().GetHex();
+            snapshot->stale_tip = snapshot->start_tip != snapshot->end_tip ||
+                (!request.expected_tip.empty() && snapshot->end_tip != request.expected_tip);
+        } catch (const std::exception& e) {
+            snapshot->error = e.what();
+        } catch (...) {
+            snapshot->error = "Unknown error while building staking and mining details";
+        }
+
+        publish();
+    }, Qt::QueuedConnection);
+    assert(invoked);
+}
+
+void WalletModel::cancelStakingMiningSnapshot(uint64_t request_id)
+{
+    if (m_staking_snapshot_cancel &&
+        (request_id == 0 || request_id == m_staking_snapshot_request_id)) {
+        m_staking_snapshot_cancel->store(true, std::memory_order_release);
+    }
+}
+
+std::shared_ptr<const WalletModel::StakingMiningSnapshot> WalletModel::takeStakingMiningSnapshot(uint64_t request_id)
+{
+    if (!m_completed_staking_snapshot ||
+        m_completed_staking_snapshot->request.request_id != request_id) {
+        return {};
+    }
+    return std::exchange(m_completed_staking_snapshot, {});
 }
 
 void WalletModel::updateTransaction()
@@ -622,7 +778,7 @@ CAmount WalletModel::getAvailableBalance(const CCoinControl* control)
 
 uint64_t WalletModel::getStakeWeight()
 {
-    return nWeight;
+    return nWeight.load(std::memory_order_relaxed);
 }
 
 bool WalletModel::getWalletUnlockStakingOnly()
@@ -637,7 +793,9 @@ void WalletModel::setWalletUnlockStakingOnly(bool unlock)
 
 void WalletModel::checkStakeWeightChanged()
 {
-    if (updateStakeWeight && m_wallet->tryGetStakeWeight(nWeight)) {
+    uint64_t weight{0};
+    if (updateStakeWeight && m_wallet->tryGetStakeWeight(weight)) {
+        nWeight.store(weight, std::memory_order_relaxed);
         updateStakeWeight = false;
     }
 }
@@ -648,11 +806,17 @@ void WalletModel::join()
     if (timer)
         timer->stop();
 
+    cancelStakingMiningSnapshot();
+
     // Quit thread
     if (t.isRunning()) {
         if (worker)
             worker->disconnect(this);
         t.quit();
         t.wait();
+        // The finished-to-deleteLater connection destroys the worker in its
+        // owning thread before wait() returns. Avoid retaining a dangling
+        // pointer when join() is called again during WalletModel destruction.
+        worker = nullptr;
     }
 }

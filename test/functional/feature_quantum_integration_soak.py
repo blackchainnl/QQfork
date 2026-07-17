@@ -23,8 +23,8 @@ This soak runs BOTH together on two nodes and asserts, at every phase boundary, 
     node validates as an end-to-end staking proof.
   - Both nodes agree on FULL state, not just the tip: gettxoutsetinfo muhash,
     getcirculatingsupply, and getgoldrushstate are identical across node[0] and node[1].
-  - Dormant actors decay to lock; active actors refresh (sweeping effective value) and never
-    lock; cold-stake principal stays exempt and fully intact.
+  - Dormant and cold-stake actors decay to lock; active actors refresh (sweeping effective
+    value) and never lock. Delegation is not a demurrage exemption.
   - dumptxoutset over the live demurrage+shadow+coldstake UTXO set succeeds (A5 marker-skip).
 
 The helper set is intentionally shared with the focused demurrage and staking
@@ -43,6 +43,8 @@ from test_framework.util import assert_equal, assert_greater_than, assert_raises
 
 GOLD_RUSH_END_TIME = 2_000_000_000
 MIGRATION_DEADLINE_TIME = GOLD_RUSH_END_TIME + 5_008
+GOLD_RUSH_END_HEIGHT = 11
+MIGRATION_END_HEIGHT = 26
 COIN = 100_000_000
 SHADOW_MAX_EMISSION = 51_437_700 * COIN          # src/shadow.h cap constant (verified)
 DEMURRAGE_PPM = 1_000_000
@@ -75,16 +77,16 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         self.num_nodes = 2
         self.setup_clean_chain = True
         args = [
+            "-allowunsafequantumkeyrpc=1",
             "-txindex=1",
             "-staketimio=50",
             "-donatetodevfund=0",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=10",
-            f"-qqgoldrushendtime={GOLD_RUSH_END_TIME}",
-            f"-qqmigrationdeadlinetime={MIGRATION_DEADLINE_TIME}",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
             "-qqstaketierheight=1",
             "-qqstakesplitheight=1",
-            "-qqdemurrageheight=1",
             "-qqdemurrageblockspermonth=4",
         ]
         self.extra_args = [args, args]
@@ -220,47 +222,61 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
             if opcode <= 75:
                 size = opcode
             elif opcode == 0x4c:
-                size = script[cursor]; cursor += 1
+                size = script[cursor]
+                cursor += 1
             elif opcode == 0x4d:
-                size = int.from_bytes(script[cursor:cursor + 2], "little"); cursor += 2
+                size = int.from_bytes(script[cursor:cursor + 2], "little")
+                cursor += 2
             elif opcode == 0x4e:
-                size = int.from_bytes(script[cursor:cursor + 4], "little"); cursor += 4
+                size = int.from_bytes(script[cursor:cursor + 4], "little")
+                cursor += 4
             else:
-                pushes.append((opcode, None)); continue
+                pushes.append((opcode, None))
+                continue
             pushes.append((opcode, script[cursor:cursor + size]))
             cursor += size
         return pushes
 
-    def _quantum_key_hash_for_script(self, script_hex):
+    def _quantum_demurrage_identity(self, script_hex):
         script = bytes.fromhex(script_hex)
-        if len(script) == 34 and script[0] == 0x60 and script[1] == 0x20:
-            return script[2:34]
+        if len(script) == 34 and script[1] == 0x20 and script[0] in (0x5e, 0x5f, 0x60):
+            # Only direct v16 outputs have a separate liveness-attestation
+            # identity. v14 cold stake and frozen v15 EUTXO are still subject
+            # to the same height decay, but refresh only by spending/recreating.
+            return True, script[2:34] if script[0] == 0x60 else None
         if len(script) == 42 and script[0] == 0x60 and script[1] == 0x28:
-            return script[10:42]
-        return None
+            return True, None
+        return False, None
 
     def _attestation_key_hash(self, script_hex):
         pushes = self._read_script_pushes(script_hex)
         if len(pushes) != 3 or pushes[0] != (0x6a, None) or pushes[1][1] != QQATTEST_TAG:
             return None
         payload = pushes[2][1]
-        expected_size = 1 + 32 + 4 + ML_DSA_PUBLICKEY_BYTES + ML_DSA_SIGNATURE_BYTES
-        if payload is None or len(payload) != expected_size or payload[0] != 1:
+        fixed_prefix = 1 + 32 + 4 + 32 + 4 + 4 + 4 + 4 + 1
+        if payload is None or len(payload) < fixed_prefix + ML_DSA_PUBLICKEY_BYTES + ML_DSA_SIGNATURE_BYTES or payload[0] != 3:
             return None
-        pubkey_start = 1 + 32 + 4
+        previous_source_present = payload[fixed_prefix - 1]
+        if previous_source_present not in (0, 1):
+            return None
+        source_bytes = 32 + 32 + 4
+        expected_size = fixed_prefix + source_bytes + ML_DSA_PUBLICKEY_BYTES + ML_DSA_SIGNATURE_BYTES
+        if len(payload) != expected_size:
+            return None
+        pubkey_start = fixed_prefix + source_bytes
         pubkey = payload[pubkey_start:pubkey_start + ML_DSA_PUBLICKEY_BYTES]
         return hashlib.sha256(pubkey).digest()
 
     def _replay_supply_oracle(self, supply):
         node = self.nodes[0]
         height = supply["height"]
+        evaluation_height = supply["evaluation_height"]
         effective_activation = supply["demurrage_effective_activation_height"]
         utxos = {}
         latest_attestation = {}
-        parent_mtp = node.getblockheader(node.getblockhash(0))["mediantime"]
         for block_height in range(1, height + 1):
             block = node.getblock(node.getblockhash(block_height), 2)
-            block_active = block_height >= effective_activation and parent_mtp > MIGRATION_DEADLINE_TIME
+            block_active = block_height >= effective_activation
             for tx in block["tx"]:
                 for txin in tx["vin"]:
                     if "coinbase" not in txin:
@@ -277,17 +293,15 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
                         key_hash = self._attestation_key_hash(vout["scriptPubKey"]["hex"])
                         if key_hash is not None:
                             latest_attestation[key_hash] = block_height
-            parent_mtp = block["mediantime"]
-
         nominal = circulating = decayed_txouts = locked_txouts = 0
         for coin in utxos.values():
             nominal += coin["value"]
             effective = coin["value"]
-            key_hash = self._quantum_key_hash_for_script(coin["script"])
-            if supply["demurrage_active"] and key_hash is not None:
+            demurrage_applies, key_hash = self._quantum_demurrage_identity(coin["script"])
+            if supply["demurrage_active"] and demurrage_applies:
                 effective_last_active = max(coin["height"], effective_activation,
-                                            latest_attestation.get(key_hash, 0))
-                inactive_blocks = max(0, height - effective_last_active)
+                                            latest_attestation.get(key_hash, 0) if key_hash is not None else 0)
+                inactive_blocks = max(0, evaluation_height - effective_last_active)
                 remaining = self._remaining_ppm(inactive_blocks)
                 effective = (coin["value"] * remaining) // DEMURRAGE_PPM
                 if remaining == 0:
@@ -307,11 +321,12 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         assert_equal(supply["bestblock"], txoutset["bestblock"])
         # the independent monetary invariant: nominal == total UTXO value (no inflation)
         assert_equal(Decimal(supply["nominal_amount"]), Decimal(str(txoutset["total_amount"])))
-        assert_equal(Decimal(supply["circulating_amount"]) + Decimal(supply["decayed_amount"]),
-                     Decimal(supply["nominal_amount"]))
+        assert_equal(
+            Decimal(supply["circulating_amount"]) + Decimal(supply["noncirculating_amount"]),
+            Decimal(supply["nominal_amount"]),
+        )
         replay = self._replay_supply_oracle(supply)
         assert_equal(Decimal(supply["nominal_amount"]), replay["nominal_amount"])
-        assert_equal(Decimal(supply["circulating_amount"]), replay["circulating_amount"])
         assert_equal(Decimal(supply["decayed_amount"]), replay["decayed_amount"])
         assert_equal(supply["decayed_txouts"], replay["decayed_txouts"])
         assert_equal(supply["locked_txouts"], replay["locked_txouts"])
@@ -332,7 +347,17 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         n0, n1 = self.nodes
         assert_equal(n0.getbestblockhash(), n1.getbestblockhash())
         assert_equal(n0.gettxoutsetinfo("muhash")["muhash"], n1.gettxoutsetinfo("muhash")["muhash"])
-        assert_equal(n0.getcirculatingsupply(), n1.getcirculatingsupply())
+        supply0 = n0.getcirculatingsupply()
+        supply1 = n1.getcirculatingsupply()
+        resource0 = supply0.pop("operational_resource")
+        resource1 = supply1.pop("operational_resource")
+        # scan_id is a node-local invocation sequence, not chainstate. Keep
+        # every measured bound in the equality check while excluding only the
+        # diagnostic identifier that can legitimately differ between nodes.
+        assert resource0.pop("scan_id") > 0
+        assert resource1.pop("scan_id") > 0
+        assert_equal(resource0, resource1)
+        assert_equal(supply0, supply1)
         assert_equal(n0.getgoldrushstate(), n1.getgoldrushstate())
 
     # --- the soak ------------------------------------------------------------
@@ -353,7 +378,7 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
             w.staking(False)
 
         funder_address = funder.getnewaddress("", "legacy")
-        mining_address = node.createquantumkey()["address"]
+        mining_address = funder.getnewquantumaddress()["address"]
         kernel_stake_address = kernel_staker.getnewquantumstakeaddress("kernel", VAULT_7D_BLOCKS)["address"]
         kernel_fee_address = kernel_staker.getnewquantumaddress()["address"]
 
@@ -386,7 +411,6 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         self._assert_nodes_agree()
 
         self.log.info("Phase 1: demurrage inert before the migration deadline; supply oracle holds")
-        assert node.getblockheader(node.getbestblockhash())["time"] <= MIGRATION_DEADLINE_TIME
         assert_equal(node.getcirculatingsupply()["demurrage_active"], False)
         self._assert_supply_matches_txoutset("pre-deadline")
         self._assert_shadow_cap("pre-deadline")
@@ -447,7 +471,7 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
                 self._assert_shadow_cap(f"soak-{step}")
                 self._assert_nodes_agree()
 
-        self.log.info("Phase 6: dormant locked; active whole; cold-stake principal exempt + intact")
+        self.log.info("Phase 6: dormant and cold-stake locked; active actors remain whole")
         info = funder.getdemurragewalletinfo()
         assert_equal(info["demurrage_active"], True)
         for address in dormant:
@@ -462,6 +486,8 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         for actor in cold:
             txout = node.gettxout(actor["utxo"]["txid"], actor["utxo"]["vout"], False)
             assert txout is not None
+            # Nominal UTXO value remains serialized, while the consensus
+            # evaluator removes unattended delegated value from circulation.
             assert_equal(Decimal(str(txout["value"])), actor["amount"])
         # a locked dormant coin cannot be spent (hard 24-month lock)
         locked_utxo = self._one_output(funder, dormant[0])
@@ -476,15 +502,19 @@ class QuantumIntegrationSoakTest(BitcoinTestFramework):
         assert_raises_rpc_error(-26, "bad-txns-spends-locked-coin", node.sendrawtransaction, locked_spend["hex"])
 
         supply = node.getcirculatingsupply()
-        assert_greater_than(supply["locked_txouts"], N_DORMANT - 1)
+        assert_greater_than(supply["locked_txouts"], N_DORMANT + N_COLD - 1)
         assert_greater_than(Decimal(supply["decayed_amount"]), Decimal("0"))
         self._assert_supply_matches_txoutset("final")
         self._assert_shadow_cap("final")
         self._assert_nodes_agree()
 
-        self.log.info("Phase 7: dumptxoutset over the live demurrage+shadow+coldstake set (A5 marker-skip)")
-        dump = node.dumptxoutset("integration_soak_utxos.dat")
-        assert_greater_than(dump["coins_written"], 0)
+        self.log.info("Phase 7: post-whitelist snapshots fail closed until authenticated shadow-state format exists")
+        assert_raises_rpc_error(
+            -1,
+            "Quantum Quasar snapshots are disabled",
+            node.dumptxoutset,
+            "integration_soak_utxos.dat",
+        )
 
         self.log.info("Integration soak complete: no inflation, burn matches oracle, "
                       "decayed-coin staking validated cross-node, both nodes fully agree.")

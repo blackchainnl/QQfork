@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2009-2020 The Bitcoin Core developers
 // Copyright (c) 2009-2020 Blackcoin Core Developers
 // Copyright (c) 2009-2020 Blackcoin More Developers
 // Copyright (c) 2009-2020 Quantum Quasar Developers
@@ -84,6 +85,8 @@ typedef enum ScriptError_t
     SCRIPT_ERR_ML_DSA_SIG_SIZE,
     SCRIPT_ERR_ML_DSA_PUBKEY_SIZE,
     SCRIPT_ERR_ML_DSA_SIG,
+    /** Local cryptographic-library failure; never a consensus-invalid result. */
+    SCRIPT_ERR_ML_DSA_INTERNAL,
     SCRIPT_ERR_QUANTUM_COLDSTAKE_BRANCH,
     SCRIPT_ERR_QUANTUM_COLDSTAKE_NOT_COINSTAKE,
     SCRIPT_ERR_QUANTUM_COLDSTAKE_OWNER_COINSTAKE,

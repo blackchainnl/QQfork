@@ -32,6 +32,8 @@
 #include <validation.h>
 
 #include <functional>
+#include <cstddef>
+#include <limits>
 #include <map>
 #include <string>
 
@@ -192,7 +194,7 @@ BOOST_FIXTURE_TEST_SUITE(transaction_tests, BasicTestingSetup)
 BOOST_AUTO_TEST_CASE(tx_valid)
 {
     BOOST_CHECK_MESSAGE(CheckMapFlagNames(), "mapFlagNames is missing a script verification flag");
-    BOOST_TEST_MESSAGE("Skipping imported Bitcoin tx_valid.json vectors: they do not encode Blackcoin v1 transaction nTime.");
+    BOOST_TEST_MESSAGE("Skipping imported Bitcoin tx_valid.json vectors: v1 entries do not encode Blackcoin nTime.");
     return;
 
     // Read tests from test/data/tx_valid.json
@@ -283,7 +285,7 @@ BOOST_AUTO_TEST_CASE(tx_valid)
 
 BOOST_AUTO_TEST_CASE(tx_invalid)
 {
-    BOOST_TEST_MESSAGE("Skipping imported Bitcoin tx_invalid.json vectors: they do not encode Blackcoin v1 transaction nTime.");
+    BOOST_TEST_MESSAGE("Skipping imported Bitcoin tx_invalid.json vectors: v1 entries do not encode Blackcoin nTime.");
     return;
 
     // Read tests from test/data/tx_invalid.json
@@ -389,6 +391,40 @@ BOOST_AUTO_TEST_CASE(basic_transaction_tests)
     // Check that duplicate txins fail
     tx.vin.push_back(tx.vin[0]);
     BOOST_CHECK_MESSAGE(!CheckTransaction(CTransaction(tx), state) || !state.IsValid(), "Transaction with duplicate txins should be invalid.");
+}
+
+BOOST_AUTO_TEST_CASE(high_bit_transaction_version_preserves_signed_legacy_wire_format)
+{
+    CMutableTransaction original;
+    original.nVersion = std::numeric_limits<int32_t>::min();
+    original.nTime = 0x11223344U; // Negative legacy versions serialize nTime.
+    original.vin.emplace_back(COutPoint{uint256::ONE, 0});
+    original.vout.emplace_back(COIN, CScript{} << OP_TRUE);
+
+    DataStream encoded;
+    encoded << TX_NO_WITNESS(original);
+    const std::vector<DataStream::value_type> raw(encoded.begin(), encoded.end());
+    BOOST_REQUIRE_GE(raw.size(), 9U);
+    BOOST_CHECK(raw[0] == std::byte{0x00});
+    BOOST_CHECK(raw[1] == std::byte{0x00});
+    BOOST_CHECK(raw[2] == std::byte{0x00});
+    BOOST_CHECK(raw[3] == std::byte{0x80});
+    BOOST_CHECK(raw[4] == std::byte{0x44});
+    BOOST_CHECK(raw[5] == std::byte{0x33});
+    BOOST_CHECK(raw[6] == std::byte{0x22});
+    BOOST_CHECK(raw[7] == std::byte{0x11});
+    BOOST_CHECK(raw[8] == std::byte{0x01}); // vin count follows legacy nTime.
+
+    CMutableTransaction decoded;
+    encoded >> TX_NO_WITNESS(decoded);
+    BOOST_CHECK_EQUAL(decoded.nVersion, std::numeric_limits<int32_t>::min());
+    BOOST_CHECK_EQUAL(decoded.nTime, original.nTime);
+    BOOST_CHECK(decoded.vin == original.vin);
+    BOOST_CHECK(decoded.vout == original.vout);
+
+    DataStream reencoded;
+    reencoded << TX_NO_WITNESS(decoded);
+    BOOST_CHECK(std::equal(raw.begin(), raw.end(), reencoded.begin(), reencoded.end()));
 }
 
 BOOST_AUTO_TEST_CASE(test_Get)

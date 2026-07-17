@@ -16,12 +16,24 @@
 
 static GlobalMutex g_warnings_mutex;
 static bilingual_str g_misc_warnings GUARDED_BY(g_warnings_mutex);
+static bilingual_str g_shadow_resource_warning GUARDED_BY(g_warnings_mutex);
 static bool fLargeWorkInvalidChainFound GUARDED_BY(g_warnings_mutex) = false;
 
 void SetMiscWarning(const bilingual_str& warning)
 {
     LOCK(g_warnings_mutex);
     g_misc_warnings = warning;
+}
+
+bool SetShadowResourceWarning(const bilingual_str& warning)
+{
+    LOCK(g_warnings_mutex);
+    if (g_shadow_resource_warning.original == warning.original &&
+        g_shadow_resource_warning.translated == warning.translated) {
+        return false;
+    }
+    g_shadow_resource_warning = warning;
+    return true;
 }
 
 void SetfLargeWorkInvalidChainFound(bool flag)
@@ -47,6 +59,15 @@ bilingual_str GetWarnings(bool verbose)
     if (!g_misc_warnings.empty()) {
         warnings_concise = g_misc_warnings;
         warnings_verbose.emplace_back(warnings_concise);
+    }
+
+    // A separately registered resource warning must never erase an existing
+    // clock, disk, pre-release, or invalid-chain warning.
+    if (!g_shadow_resource_warning.empty()) {
+        if (warnings_concise.empty()) {
+            warnings_concise = g_shadow_resource_warning;
+        }
+        warnings_verbose.emplace_back(g_shadow_resource_warning);
     }
 
     if (fLargeWorkInvalidChainFound) {

@@ -124,6 +124,21 @@ static bool ParseArgs(ArgsManager& args, int argc, char* argv[])
         return InitError(Untranslated(strprintf("Error parsing command line arguments: %s", error)));
     }
 
+    // Informational commands must not inspect, lock, back up, or migrate the
+    // default datadir. ProcessInitCommands() prints their output immediately
+    // after ParseArgs() returns. Keep loose-token validation below so
+    // `blackcoind -version unexpected` is still rejected as malformed.
+    const bool early_info_command =
+        HelpRequested(args) || args.IsArgSet("-version");
+
+    // Error out when loose non-argument tokens are encountered on command line
+    for (int i = 1; i < argc; i++) {
+        if (!IsSwitchChar(argv[i][0])) {
+            return InitError(Untranslated(strprintf("Command line contains unexpected token '%s', see bitcoind -h for a list of options.", argv[i])));
+        }
+    }
+    if (early_info_command) return true;
+
     const auto migration_progress = [](const std::string& phase, int progress_percent) {
         // Long first-run datadir migration: keep the operator informed on the
         // terminal so the daemon does not look hung during multi-GB copies.
@@ -144,12 +159,6 @@ static bool ParseArgs(ArgsManager& args, int argc, char* argv[])
         return InitError(error->message, error->details);
     }
 
-    // Error out when loose non-argument tokens are encountered on command line
-    for (int i = 1; i < argc; i++) {
-        if (!IsSwitchChar(argv[i][0])) {
-            return InitError(Untranslated(strprintf("Command line contains unexpected token '%s', see bitcoind -h for a list of options.", argv[i])));
-        }
-    }
     return true;
 }
 
@@ -158,6 +167,7 @@ static bool ProcessInitCommands(ArgsManager& args)
     // Process help and version before taking care about datadir
     if (HelpRequested(args) || args.IsArgSet("-version")) {
         std::string strUsage = PACKAGE_NAME " version " + FormatFullVersion() + "\n";
+        strUsage += FormatSourceIdentity() + "\n";
 
         if (args.IsArgSet("-version")) {
             strUsage += FormatParagraph(LicenseInfo());
@@ -246,7 +256,12 @@ static bool AppInit(NodeContext& node)
             // If locking the data directory failed, exit immediately
             return false;
         }
-        fRet = AppInitInterfaces(node) && AppInitMain(node);
+        if (!AppInitInterfaces(node)) {
+            fRet = false;
+        } else {
+            const interfaces::AppInitResult result = AppInitMain(node);
+            fRet = result != interfaces::AppInitResult::FAILURE;
+        }
     }
     catch (const std::exception& e) {
         PrintExceptionContinue(&e, "AppInit()");

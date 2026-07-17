@@ -7,6 +7,7 @@
 #include <banman.h>
 #include <common/args.h>
 #include <netaddress.h>
+#include <netbase.h>
 #include <test/fuzz/FuzzedDataProvider.h>
 #include <test/fuzz/fuzz.h>
 #include <test/fuzz/util.h>
@@ -65,17 +66,31 @@ FUZZ_TARGET(banman, .init = initialize_banman)
         // The complexity is O(N^2), where N is the input size, because each call
         // might call DumpBanlist (or other methods that are at least linear
         // complexity of the input size).
+        bool contains_invalid{false};
         LIMITED_WHILE(fuzzed_data_provider.ConsumeBool(), 300)
         {
             CallOneOf(
                 fuzzed_data_provider,
                 [&] {
-                    ban_man.Ban(ConsumeNetAddr(fuzzed_data_provider),
-                                ConsumeBanTimeOffset(fuzzed_data_provider), fuzzed_data_provider.ConsumeBool());
+                    CNetAddr net_addr{ConsumeNetAddr(fuzzed_data_provider)};
+                    const std::optional<CNetAddr> canonical_addr{
+                        LookupHost(net_addr.ToStringAddr(), /*fAllowLookup=*/false)};
+                    if (canonical_addr.has_value() && canonical_addr->IsValid()) {
+                        net_addr = *canonical_addr;
+                    } else {
+                        contains_invalid = true;
+                    }
+                    ban_man.Ban(net_addr, ConsumeBanTimeOffset(fuzzed_data_provider), fuzzed_data_provider.ConsumeBool());
                 },
                 [&] {
-                    ban_man.Ban(ConsumeSubNet(fuzzed_data_provider),
-                                ConsumeBanTimeOffset(fuzzed_data_provider), fuzzed_data_provider.ConsumeBool());
+                    CSubNet subnet{ConsumeSubNet(fuzzed_data_provider)};
+                    CSubNet canonical_subnet;
+                    if (LookupSubNet(subnet.ToString(), canonical_subnet) && canonical_subnet.IsValid()) {
+                        subnet = canonical_subnet;
+                    } else {
+                        contains_invalid = true;
+                    }
+                    ban_man.Ban(subnet, ConsumeBanTimeOffset(fuzzed_data_provider), fuzzed_data_provider.ConsumeBool());
                 },
                 [&] {
                     ban_man.ClearBanned();
@@ -111,7 +126,9 @@ FUZZ_TARGET(banman, .init = initialize_banman)
             BanMan ban_man_read{banlist_file, /*client_interface=*/nullptr, /*default_ban_time=*/0};
             banmap_t banmap_read;
             ban_man_read.GetBanned(banmap_read);
-            assert(banmap == banmap_read);
+            if (!contains_invalid) {
+                assert(banmap == banmap_read);
+            }
         }
     }
     fs::remove(fs::PathToString(banlist_file + ".json"));

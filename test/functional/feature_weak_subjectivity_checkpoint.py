@@ -15,6 +15,7 @@ from test_framework.blocktools import (
     create_coinbase,
 )
 from test_framework.messages import CBlockHeader
+from test_framework.p2p import P2PInterface, msg_headers
 from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 
@@ -38,7 +39,8 @@ class WeakSubjectivityCheckpointTest(BitcoinTestFramework):
         self.setup_clean_chain = True
         self.num_nodes = 1
         self.good_block = make_height_one_block(salt=0)
-        self.conflicting_block = make_height_one_block(salt=1)
+        self.p2p_conflicting_block = make_height_one_block(salt=1)
+        self.rpc_conflicting_block = make_height_one_block(salt=2)
         self.extra_args = [[
             "-minimumchainwork=0x0",
             f"-testcheckpoint=1@{self.good_block.hash}",
@@ -47,7 +49,7 @@ class WeakSubjectivityCheckpointTest(BitcoinTestFramework):
     def run_test(self):
         node = self.nodes[0]
         good_header = CBlockHeader(self.good_block).serialize().hex()
-        conflicting_header = CBlockHeader(self.conflicting_block).serialize().hex()
+        conflicting_header = CBlockHeader(self.rpc_conflicting_block).serialize().hex()
 
         self.log.info("Accept the chain that matches the shipped checkpoint")
         assert_equal(node.submitblock(self.good_block.serialize().hex()), None)
@@ -61,20 +63,30 @@ class WeakSubjectivityCheckpointTest(BitcoinTestFramework):
         assert_equal(node.getbestblockhash(), self.good_block.hash)
         node.submitheader(good_header)
 
-        self.log.info("Reject a conflicting header at the checkpoint height")
+        self.log.info("Reject a benign P2P checkpoint disagreement without disconnecting the peer")
+        peer = node.add_p2p_connection(P2PInterface())
+        with node.assert_debug_log(
+            ["Misbehaving", "(0 -> 1)", "invalid header received"],
+            unexpected_msgs=["DISCOURAGE THRESHOLD EXCEEDED"],
+        ):
+            peer.send_and_ping(msg_headers([CBlockHeader(self.p2p_conflicting_block)]))
+        assert peer.is_connected
+        assert self.p2p_conflicting_block.hash not in [tip["hash"] for tip in node.getchaintips()]
+
+        self.log.info("Reject an independent conflicting header through RPC")
         assert_raises_rpc_error(
             -25,
             "bad-fork-hardened-checkpoint",
             node.submitheader,
             hexdata=conflicting_header,
         )
-        assert self.conflicting_block.hash not in [tip["hash"] for tip in node.getchaintips()]
+        assert self.rpc_conflicting_block.hash not in [tip["hash"] for tip in node.getchaintips()]
 
         self.log.info("The explicit debug escape hatch still disables checkpoint enforcement")
         self.restart_node(0, extra_args=self.extra_args[0] + ["-nocheckpoints"])
         node = self.nodes[0]
         node.submitheader(conflicting_header)
-        assert self.conflicting_block.hash in [tip["hash"] for tip in node.getchaintips()]
+        assert self.rpc_conflicting_block.hash in [tip["hash"] for tip in node.getchaintips()]
 
 
 if __name__ == "__main__":

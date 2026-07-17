@@ -58,6 +58,7 @@ public:
      * Return the fee in satoshis for the given vsize in vbytes.
      * If the calculated fee would have fractional satoshis, then the
      * returned fee will always be rounded up to the nearest satoshi.
+     * Results outside the CAmount range are saturated.
      */
     CAmount GetFee(uint32_t num_bytes) const;
 

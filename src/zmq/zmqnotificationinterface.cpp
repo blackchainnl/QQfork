@@ -1,3 +1,4 @@
+// Copyright (c) 2015-2022 The Bitcoin Core developers
 // Copyright (c) 2015-2022 Blackcoin Core Developers
 // Copyright (c) 2015-2022 Blackcoin More Developers
 // Copyright (c) 2015-2022 Quantum Quasar Developers
@@ -52,6 +53,7 @@ std::unique_ptr<CZMQNotificationInterface> CZMQNotificationInterface::Create(std
     };
     factories["pubrawtx"] = CZMQAbstractNotifier::Create<CZMQPublishRawTransactionNotifier>;
     factories["pubsequence"] = CZMQAbstractNotifier::Create<CZMQPublishSequenceNotifier>;
+    factories["pubshadow"] = CZMQAbstractNotifier::Create<CZMQPublishShadowNotifier>;
 
     std::list<std::unique_ptr<CZMQAbstractNotifier>> notifiers;
     for (const auto& entry : factories)
@@ -143,6 +145,14 @@ void TryForEachAndRemoveFailed(std::list<std::unique_ptr<CZMQAbstractNotifier>>&
 }
 
 } // anonymous namespace
+
+void CZMQNotificationInterface::NotifyShadowBlock(bool connected,
+                                                  const ShadowIndexBlockEvent& event)
+{
+    TryForEachAndRemoveFailed(notifiers, [connected, &event](CZMQAbstractNotifier* notifier) {
+        return notifier->NotifyShadowBlock(connected, event);
+    });
+}
 
 void CZMQNotificationInterface::UpdatedBlockTip(const CBlockIndex *pindexNew, const CBlockIndex *pindexFork, bool fInitialDownload)
 {

@@ -1,19 +1,19 @@
-name: build
+name: v30.1.1 release build
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: Release version without the leading v
+      target_sha:
+        description: Full 40-character commit SHA to build
         required: true
-        default: 30.1.0
-      create_release:
-        description: Create or update the GitHub release
+        type: string
+      package_label:
+        description: Explicit unpublished prerelease label (must match source RC)
         required: true
-        type: boolean
-        default: false
+        default: 30.1.1-alpha1
+        type: string
       target:
-        description: Build target to run
+        description: Build target to run (manual runs never publish)
         required: true
         type: choice
         default: all
@@ -27,82 +27,263 @@ on:
           - macos-arm-64-bit
   push:
     tags:
-      - 'v*'
+      - 'v30.1.1'
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: v30.1.1-release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
+  resolve-target:
+    name: Resolve and authorize immutable release target
+    runs-on: ubuntu-22.04
+    outputs:
+      target_sha: ${{ steps.resolve.outputs.target_sha }}
+      source_date_epoch: ${{ steps.resolve.outputs.source_date_epoch }}
+      version: ${{ steps.resolve.outputs.version }}
+      package_label: ${{ steps.resolve.outputs.package_label }}
+      configured_version: ${{ steps.resolve.outputs.configured_version }}
+      release_candidate: ${{ steps.resolve.outputs.release_candidate }}
+      prerelease_channel: ${{ steps.resolve.outputs.prerelease_channel }}
+      asset_prefix: ${{ steps.resolve.outputs.asset_prefix }}
+      target: ${{ steps.resolve.outputs.target }}
+      publish: ${{ steps.resolve.outputs.publish }}
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: Checkout requested target
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.target_sha || github.ref }}
+          fetch-depth: 0
+
+      - id: resolve
+        name: Verify identity, tag, version, and exact SHA
+        shell: bash
+        env:
+          REQUESTED_SHA: ${{ inputs.target_sha }}
+          REQUESTED_PACKAGE_LABEL: ${{ inputs.package_label }}
+          REQUESTED_TARGET: ${{ inputs.target }}
+          CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          EVENT_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TARGET_SHA=$(git rev-parse HEAD)
+          [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]
+          MAJOR=$(sed -n "s/^define(_CLIENT_VERSION_MAJOR, \([0-9]*\))$/\1/p" configure.ac)
+          MINOR=$(sed -n "s/^define(_CLIENT_VERSION_MINOR, \([0-9]*\))$/\1/p" configure.ac)
+          BUILD=$(sed -n "s/^define(_CLIENT_VERSION_BUILD, \([0-9]*\))$/\1/p" configure.ac)
+          RC=$(sed -n "s/^define(_CLIENT_VERSION_RC, \([0-9]*\))$/\1/p" configure.ac)
+          IS_RELEASE=$(sed -n "s/^define(_CLIENT_VERSION_IS_RELEASE, \(.*\))$/\1/p" configure.ac)
+          BASE_VERSION="$MAJOR.$MINOR.$BUILD"
+          test "$BASE_VERSION" = "30.1.1" || {
+            echo "::error::This workflow is locked to the v30.1.1 source line"
+            exit 1
+          }
+          [[ "$RC" =~ ^[0-9]+$ ]]
+          CONFIGURED_VERSION="$BASE_VERSION"
+          if [[ "$RC" != "0" ]]; then
+            CONFIGURED_VERSION="${BASE_VERSION}rc${RC}"
+          fi
+
+          if [[ "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            [[ "$REQUESTED_SHA" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::target_sha must be a full 40-character commit SHA"
+              exit 1
+            }
+            test "$TARGET_SHA" = "$REQUESTED_SHA"
+            [[ "$CALLER_WORKFLOW_SHA" =~ ^[0-9a-f]{40}$ ]]
+            [[ "$EVENT_SHA" =~ ^[0-9a-f]{40}$ ]]
+            test "$CALLER_WORKFLOW_SHA" = "$TARGET_SHA" || {
+              echo "::error::Run this workflow from a branch or tag whose head is target_sha; the local safety gate otherwise comes from a different revision"
+              exit 1
+            }
+            test "$EVENT_SHA" = "$TARGET_SHA" || {
+              echo "::error::The selected workflow_dispatch ref does not resolve to target_sha"
+              exit 1
+            }
+            [[ "$REQUESTED_PACKAGE_LABEL" =~ ^[0-9]+\.[0-9]+\.[0-9]+-(alpha|beta)([1-9][0-9]*)$ ]] || {
+              echo "::error::Manual builds require an explicit major.minor.patch-alphaN or major.minor.patch-betaN package label"
+              exit 1
+            }
+            PRERELEASE_CHANNEL="${BASH_REMATCH[1]}"
+            PRERELEASE_NUMBER="${BASH_REMATCH[2]}"
+            [[ "$RC" =~ ^[1-9][0-9]*$ ]]
+            test "$IS_RELEASE" = "false" || {
+              echo "::error::Manual prerelease builds require CLIENT_VERSION_IS_RELEASE=false"
+              exit 1
+            }
+            test "$PRERELEASE_NUMBER" = "$RC"
+            test "$REQUESTED_PACKAGE_LABEL" = "$BASE_VERSION-$PRERELEASE_CHANNEL$RC" || {
+              echo "::error::Package label must match the source version and RC: $BASE_VERSION-$PRERELEASE_CHANNEL$RC"
+              exit 1
+            }
+            VERSION="$BASE_VERSION"
+            PACKAGE_LABEL="$REQUESTED_PACKAGE_LABEL"
+            ASSET_PREFIX="Blackcoin-$PACKAGE_LABEL-$TARGET_SHA"
+            TARGET="$REQUESTED_TARGET"
+            TAG=""
+            PUBLISH=false
+            python3 ci/release/verify_source_identity.py \
+              --head "$TARGET_SHA" \
+              --repository "$GITHUB_REPOSITORY" \
+              --require-actor \
+              --actor "$GITHUB_ACTOR"
+          else
+            TAG="$GITHUB_REF_NAME"
+            VERSION="${TAG#v}"
+            PACKAGE_LABEL="$VERSION"
+            PRERELEASE_CHANNEL=production
+            ASSET_PREFIX="Blackcoin-$VERSION"
+            TARGET=all
+            PUBLISH=true
+            python3 ci/release/verify_source_identity.py \
+              --head "$TARGET_SHA" \
+              --repository "$GITHUB_REPOSITORY" \
+              --require-actor \
+              --actor "$GITHUB_ACTOR" \
+              --tag "$TAG" \
+              --require-unsigned-objects
+          fi
+
+          test "$VERSION" = "$BASE_VERSION"
+          if [[ "$PUBLISH" == true ]]; then
+            test "$RC" = "0"
+            test "$IS_RELEASE" = "true" || {
+              echo "::error::configure.ac still marks this commit as a development build"
+              exit 1
+            }
+            NOTES="doc/release-notes/release-notes-$VERSION.md"
+            test -s "$NOTES" || {
+              echo "::error::Final tracked release notes are required at $NOTES"
+              exit 1
+            }
+            ! grep -q 'RELEASE_NOTES_NOT_FINAL' "$NOTES" || {
+              echo "::error::Release notes are still marked non-final"
+              exit 1
+            }
+          fi
+
+          {
+            echo "target_sha=$TARGET_SHA"
+            echo "source_date_epoch=$(git show -s --format=%ct "$TARGET_SHA")"
+            echo "version=$VERSION"
+            echo "package_label=$PACKAGE_LABEL"
+            echo "configured_version=$CONFIGURED_VERSION"
+            echo "release_candidate=$RC"
+            echo "prerelease_channel=$PRERELEASE_CHANNEL"
+            echo "asset_prefix=$ASSET_PREFIX"
+            echo "target=$TARGET"
+            echo "publish=$PUBLISH"
+            echo "tag=$TAG"
+          } >> "$GITHUB_OUTPUT"
+
+  safety-gate:
+    name: Exact-SHA prerelease or production safety gate
+    needs: resolve-target
+    permissions:
+      contents: read
+    uses: ./.github/workflows/pr-gate.yml
+    with:
+      target_sha: ${{ needs.resolve-target.outputs.target_sha }}
+      # Alpha artifacts wait for the core gate. A beta adds native-platform,
+      # sanitizer, pinned-fuzz, and complete extended functional evidence.
+      # Production final runs the same complete gate.
+      release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
+      run_extended_functional: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
+
   select-targets:
     name: Select build target
+    needs:
+      - resolve-target
+      - safety-gate
     runs-on: ubuntu-22.04
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
       macos_selected: ${{ steps.matrix.outputs.macos_selected }}
-
+      macos_intel_selected: ${{ steps.matrix.outputs.macos_intel_selected }}
+      macos_arm_selected: ${{ steps.matrix.outputs.macos_arm_selected }}
+      windows_selected: ${{ steps.matrix.outputs.windows_selected }}
     steps:
       - id: matrix
         shell: bash
         env:
-          TARGET: ${{ github.event.inputs.target || 'all' }}
+          TARGET: ${{ needs.resolve-target.outputs.target }}
         run: |
           set -euo pipefail
-
           linux_64='{"name":"linux-64-bit","host":"x86_64-pc-linux-gnu","os":"ubuntu-22.04","packages":"python3","dep-opts":"","config-opts":"--enable-sse2 --enable-glibc-back-compat LDFLAGS=-static-libstdc++","goal":"install"}'
-          linux_arm_64='{"name":"linux-arm-64-bit","host":"aarch64-linux-gnu","os":"ubuntu-22.04","packages":"g++-aarch64-linux-gnu binutils-aarch64-linux-gnu","dep-opts":"","config-opts":"--enable-glibc-back-compat LDFLAGS=-static-libstdc++","goal":"install"}'
-          windows_64='{"name":"windows-64-bit","host":"x86_64-w64-mingw32","os":"ubuntu-22.04","packages":"nsis g++-mingw-w64-x86-64 build-essential libtool autotools-dev automake pkg-config bsdmainutils curl git zip","postinstall":"sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix\nsudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix","dep-opts":"","config-opts":"--enable-sse2 LDFLAGS=-static-libgcc","goal":"deploy install"}'
-          macos_64='{"name":"macos-64-bit","host":"x86_64-apple-darwin","os":"ubuntu-22.04","packages":"curl bsdmainutils cmake libz-dev python3-setuptools libtinfo5 xorriso zip","dep-opts":"","config-opts":"--enable-sse2","goal":"deploy","sdk":"12.2-12B45b"}'
-          macos_arm_64='{"name":"macos-arm-64-bit","host":"aarch64-apple-darwin","os":"ubuntu-22.04","packages":"curl bsdmainutils cmake libz-dev python3-setuptools libtinfo5 xorriso zip","dep-opts":"","config-opts":"","goal":"deploy","sdk":"12.2-12B45b"}'
-
+          linux_arm_64='{"name":"linux-arm-64-bit","host":"aarch64-linux-gnu","os":"ubuntu-22.04","packages":"g++-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-user","dep-opts":"","config-opts":"--enable-glibc-back-compat LDFLAGS=-static-libstdc++","goal":"install"}'
+          windows_64='{"name":"windows-64-bit","host":"x86_64-w64-mingw32","os":"ubuntu-22.04","packages":"nsis g++-mingw-w64-x86-64 build-essential libtool autotools-dev automake pkg-config bsdmainutils curl git zip wine64","postinstall":"sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix\nsudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix","dep-opts":"","config-opts":"--enable-sse2 LDFLAGS=-static-libgcc","goal":"deploy install"}'
+          macos_64='{"name":"macos-64-bit","host":"x86_64-apple-darwin","os":"ubuntu-22.04","packages":"curl bsdmainutils cmake libz-dev python3-setuptools libtinfo5 xorriso zip","dep-opts":"","config-opts":"--enable-sse2","goal":"deploy","sdk":"12.2-12B45b","sdk-sha256":"df75d30ecafc429e905134333aeae56ac65fac67cb4182622398fd717df77619"}'
+          macos_arm_64='{"name":"macos-arm-64-bit","host":"aarch64-apple-darwin","os":"ubuntu-22.04","packages":"curl bsdmainutils cmake libz-dev python3-setuptools libtinfo5 xorriso zip","dep-opts":"","config-opts":"","goal":"deploy","sdk":"12.2-12B45b","sdk-sha256":"df75d30ecafc429e905134333aeae56ac65fac67cb4182622398fd717df77619"}'
           case "$TARGET" in
-            all)
-              matrix="[$linux_64,$linux_arm_64,$windows_64,$macos_64,$macos_arm_64]"
-              ;;
-            linux-64-bit)
-              matrix="[$linux_64]"
-              ;;
-            linux-arm-64-bit)
-              matrix="[$linux_arm_64]"
-              ;;
-            windows-64-bit)
-              matrix="[$windows_64]"
-              ;;
-            macos-all)
-              matrix="[$macos_64,$macos_arm_64]"
-              ;;
-            macos-64-bit)
-              matrix="[$macos_64]"
-              ;;
-            macos-arm-64-bit)
-              matrix="[$macos_arm_64]"
-              ;;
-            *)
-              echo "Unknown build target: $TARGET" >&2
-              exit 1
-              ;;
+            all) matrix="[$linux_64,$linux_arm_64,$windows_64,$macos_64,$macos_arm_64]" ;;
+            linux-64-bit) matrix="[$linux_64]" ;;
+            linux-arm-64-bit) matrix="[$linux_arm_64]" ;;
+            windows-64-bit) matrix="[$windows_64]" ;;
+            macos-all) matrix="[$macos_64,$macos_arm_64]" ;;
+            macos-64-bit) matrix="[$macos_64]" ;;
+            macos-arm-64-bit) matrix="[$macos_arm_64]" ;;
+            *) echo "Unknown build target: $TARGET" >&2; exit 1 ;;
           esac
+          matrix=$(BASE_MATRIX="$matrix" python3 - <<'PY'
+          import json
+          import os
 
+          result = []
+          for target in json.loads(os.environ["BASE_MATRIX"]):
+              for builder in ("primary", "verifier"):
+                  entry = dict(target)
+                  entry["builder"] = builder
+                  result.append(entry)
+          print(json.dumps(result, separators=(",", ":")))
+          PY
+          )
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           if [[ "$matrix" == *macos-64-bit* || "$matrix" == *macos-arm-64-bit* ]]; then
             echo "macos_selected=true" >> "$GITHUB_OUTPUT"
           else
             echo "macos_selected=false" >> "$GITHUB_OUTPUT"
           fi
+          if [[ "$matrix" == *macos-64-bit* ]]; then
+            echo "macos_intel_selected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "macos_intel_selected=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$matrix" == *macos-arm-64-bit* ]]; then
+            echo "macos_arm_selected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "macos_arm_selected=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "$matrix" == *windows-64-bit* ]]; then
+            echo "windows_selected=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "windows_selected=false" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
-    name: ${{ matrix.name }}
-    needs: select-targets
+    name: ${{ matrix.name }} (${{ matrix.builder }})
+    needs:
+      - resolve-target
+      - safety-gate
+      - select-targets
     runs-on: ${{ matrix.os }}
-
     env:
       MAKEJOBS: 4
       SDK_URL: https://bitcoincore.org/depends-sources/sdks
-
+      SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
+      TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
+      VERSION: ${{ needs.resolve-target.outputs.version }}
+      PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
+      CONFIGURED_VERSION: ${{ needs.resolve-target.outputs.configured_version }}
+      ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
+      PUBLISH: ${{ needs.resolve-target.outputs.publish }}
     strategy:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.select-targets.outputs.matrix) }}
-
     steps:
       - name: Install packages
         run: |
@@ -113,257 +294,990 @@ jobs:
             sudo ln -s "$(command -v pkg-config)" "/usr/local/bin/${{ matrix.host }}-pkg-config"
           fi
 
-      - name: Post Install
+      - name: Post install
         if: ${{ matrix.postinstall }}
         run: ${{ matrix.postinstall }}
 
-      - name: Checkout
-        uses: actions/checkout@v5
+      - name: Checkout immutable candidate
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ needs.resolve-target.outputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Verify exact checkout
+        run: test "$(git rev-parse HEAD)" = "$TARGET_SHA"
 
       - name: SDK cache
         if: ${{ matrix.sdk }}
-        uses: actions/cache@v6
-        env:
-          cache-name: sdk
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ./depends/sdk-sources
-          key: ${{ matrix.name }}-${{ env.cache-name }}
+          key: ${{ matrix.name }}-sdk-${{ matrix.sdk-sha256 }}
 
-      - name: Install SDK
+      - name: Install verified SDK
         if: ${{ matrix.sdk }}
+        shell: bash
         run: |
-          mkdir -p ./depends/sdk-sources
-          mkdir -p ./depends/SDKs
-          curl --location --fail "$SDK_URL/Xcode-${{ matrix.sdk }}-extracted-SDK-with-libcxx-headers.tar.gz" -o "depends/sdk-sources/Xcode-${{ matrix.sdk }}-extracted-SDK-with-libcxx-headers.tar.gz"
-          tar -C depends/SDKs -xzf "depends/sdk-sources/Xcode-${{ matrix.sdk }}-extracted-SDK-with-libcxx-headers.tar.gz"
+          set -euo pipefail
+          archive="Xcode-${{ matrix.sdk }}-extracted-SDK-with-libcxx-headers.tar.gz"
+          mkdir -p depends/sdk-sources depends/SDKs
+          if [[ ! -f "depends/sdk-sources/$archive" ]]; then
+            curl --location --fail "$SDK_URL/$archive" -o "depends/sdk-sources/$archive"
+          fi
+          echo "${{ matrix.sdk-sha256 }}  depends/sdk-sources/$archive" | sha256sum --check --strict
+          tar -C depends/SDKs -xzf "depends/sdk-sources/$archive"
 
       - name: Dependency cache
-        uses: actions/cache@v6
-        env:
-          cache-name: depends
+        if: ${{ matrix.builder == 'primary' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ./depends/built
-          key: ${{ matrix.name }}-${{ env.cache-name }}-${{ hashFiles('depends/*.mk', 'depends/packages/*', 'depends/patches/**/*') }}
+          key: ${{ matrix.name }}-depends-${{ hashFiles('depends/*.mk', 'depends/packages/*', 'depends/patches/**/*') }}
 
       - name: Build depends
         run: make -j "$MAKEJOBS" -C depends HOST=${{ matrix.host }} ${{ matrix.dep-opts }}
 
-      - name: Verify release version matches configure.ac
+      - name: Build Blackcoin
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ github.event.inputs.version || github.ref_name }}"
-          VERSION="${VERSION#v}"
-          MAJOR=$(sed -n "s/^define(_CLIENT_VERSION_MAJOR, \([0-9]*\))$/\1/p" configure.ac)
-          MINOR=$(sed -n "s/^define(_CLIENT_VERSION_MINOR, \([0-9]*\))$/\1/p" configure.ac)
-          BUILD=$(sed -n "s/^define(_CLIENT_VERSION_BUILD, \([0-9]*\))$/\1/p" configure.ac)
-          SOURCE_VERSION="$MAJOR.$MINOR.$BUILD"
-          if [[ "$VERSION" != "$SOURCE_VERSION" ]]; then
-            echo "::error::Requested release version $VERSION does not match configure.ac version $SOURCE_VERSION. The Windows installer and packaging names are derived from configure.ac; bump it (or fix the tag/input) before releasing."
-            exit 1
-          fi
-
-      - name: Build Blackcoin
-        run: |
           ./autogen.sh
-          ./configure --prefix="$(pwd)/depends/${{ matrix.host }}" ${{ matrix.config-opts }} --enable-reduce-exports || (cat config.log && false)
+          ./configure --prefix="$PWD/depends/${{ matrix.host }}" ${{ matrix.config-opts }} --enable-reduce-exports || { cat config.log; exit 1; }
           grep -q "define USE_BDB 1" src/config/bitcoin-config.h || {
-            echo "::error::Release build configured WITHOUT Berkeley DB wallet support. Upgrading Blackcoin More users could not open their legacy wallet.dat. Aborting."
-            grep -i bdb config.log | tail -20 || true
+            echo "::error::Release build configured without Berkeley DB wallet support"
             exit 1
           }
           grep -q "define USE_SQLITE 1" src/config/bitcoin-config.h || {
-            echo "::error::Release build configured WITHOUT SQLite wallet support. Aborting."
+            echo "::error::Release build configured without SQLite wallet support"
             exit 1
           }
-          if ! make -j "$MAKEJOBS" ${{ matrix.goal }}; then
-            echo "Parallel build failed. Retrying once serially with verbose output."
-            make ${{ matrix.goal }} V=1
+          source_status=$(git status --porcelain=v1 --untracked-files=all)
+          if [[ -n "$source_status" ]]; then
+            echo "::error::Release source checkout became dirty before compilation"
+            printf '%s\n' "$source_status"
+            exit 1
           fi
+          case "${{ matrix.name }}" in
+            macos-*)
+              mkdir -p src/obj
+              unset BITCOIN_GENBUILD_FROZEN_SOURCE_COMMIT
+              ./share/genbuild.sh "$PWD/src/obj/build.h" "$PWD"
+              grep -Fx '#define BUILD_SOURCE_COMMIT "'"$TARGET_SHA"'"' src/obj/build.h
+              grep -Fx '#define BUILD_SOURCE_DIRTY 0' src/obj/build.h
+              export BITCOIN_GENBUILD_FROZEN_SOURCE_COMMIT="$TARGET_SHA"
+              ./share/genbuild.sh "$PWD/src/obj/build.h" "$PWD"
+              ;;
+          esac
+          make_args=()
+          if [[ "${{ matrix.name }}" == "windows-64-bit" ]]; then
+            make_args+=("BITCOIN_WIN_INSTALLER=$PWD/blackcoin-$CONFIGURED_VERSION-win64-setup.exe")
+          fi
+          for goal in ${{ matrix.goal }}; do
+            if ! make -j "$MAKEJOBS" "${make_args[@]}" "$goal"; then
+              make "${make_args[@]}" "$goal" V=1
+            fi
+          done
+
+      - name: Verify generated source identity and clean checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse --verify HEAD)" = "$TARGET_SHA"
+          test -s src/obj/build.h
+          case "${{ matrix.name }}" in
+            macos-*)
+              BITCOIN_GENBUILD_FROZEN_SOURCE_COMMIT="$TARGET_SHA" \
+                ./share/genbuild.sh "$PWD/src/obj/build.h" "$PWD"
+              ;;
+          esac
+          grep -Fx '#define BUILD_SOURCE_COMMIT "'"$TARGET_SHA"'"' src/obj/build.h
+          grep -Fx '#define BUILD_SOURCE_DIRTY 0' src/obj/build.h
+          if grep -q '^#define BUILD_GIT_COMMIT ' src/obj/build.h; then
+            grep -Fx '#define BUILD_GIT_COMMIT "'"${TARGET_SHA:0:12}"'"' src/obj/build.h
+          else
+            grep -Fx '#define BUILD_GIT_TAG "v'"$VERSION"'"' src/obj/build.h
+          fi
+          git diff --quiet --exit-code --
+          git diff --cached --quiet --exit-code --
+          source_status=$(git status --porcelain=v1 --untracked-files=all)
+          if [[ -n "$source_status" ]]; then
+            echo "::error::Release source checkout contains untracked output after compilation"
+            printf '%s\n' "$source_status"
+            exit 1
+          fi
+
+      - name: Build and execute target crypto vectors
+        if: ${{ !startsWith(matrix.name, 'macos-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test_target=test/test_blackcoin
+          test_binary=src/test/test_blackcoin
+          if [[ "${{ matrix.name }}" == "windows-64-bit" ]]; then
+            test_target+=.exe
+            test_binary+=.exe
+          fi
+          make -C src -j "$MAKEJOBS" "$test_target"
+          case "${{ matrix.name }}" in
+            linux-64-bit)
+              "$test_binary" --run_test=crypto_hardening_tests --log_level=test_suite
+              ;;
+            linux-arm-64-bit)
+              qemu-aarch64 -L /usr/aarch64-linux-gnu \
+                "$test_binary" --run_test=crypto_hardening_tests --log_level=test_suite
+              ;;
+            windows-64-bit)
+              wine_runner=$(
+                command -v wine64-stable || command -v wine64 ||
+                  command -v wine-stable || command -v wine || true
+              )
+              if [[ -z "$wine_runner" ]]; then
+                for candidate in \
+                  /opt/wine-stable/bin/wine64 \
+                  /usr/lib/wine/wine64 \
+                  /usr/lib/x86_64-linux-gnu/wine/wine64; do
+                  if [[ -x "$candidate" ]]; then
+                    wine_runner="$candidate"
+                    break
+                  fi
+                done
+              fi
+              test -n "$wine_runner"
+              WINEDEBUG=-all "$wine_runner" "$test_binary" \
+                --run_test=crypto_hardening_tests --log_level=test_suite
+              ;;
+          esac
+
+      - name: Verify non-macOS binary identity
+        if: ${{ !startsWith(matrix.name, 'macos-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$PUBLISH" == true ]]; then
+            expected_line="Blackcoin version v$VERSION"
+          else
+            expected_line="Blackcoin version v$CONFIGURED_VERSION-${TARGET_SHA:0:12}"
+          fi
+          binary="depends/${{ matrix.host }}/bin/blackcoind"
+          version_home="$RUNNER_TEMP/blackcoin-version-home-${{ matrix.name }}-${{ matrix.builder }}"
+          mkdir -p "$version_home"
+          case "${{ matrix.name }}" in
+            linux-64-bit)
+              version_output=$(HOME="$version_home" "$binary" -version 2>&1)
+              ;;
+            linux-arm-64-bit)
+              version_output=$(HOME="$version_home" qemu-aarch64 -L /usr/aarch64-linux-gnu "$binary" -version 2>&1)
+              ;;
+            windows-64-bit)
+              pe_binary="${binary}.exe"
+              test -s "$pe_binary" && test ! -L "$pe_binary"
+              python3 ci/release/verify_windows_payload.py identity "$pe_binary" \
+                --version "$CONFIGURED_VERSION" --source-sha "$TARGET_SHA"
+              exit 0
+              ;;
+          esac
+          normalized_output=$(printf '%s\n' "$version_output" | tr -d '\r')
+          test "$(printf '%s\n' "$normalized_output" | grep -Fxc "$expected_line")" = 1
+          printf '%s\n' "$normalized_output"
 
       - name: Package release assets
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ github.event.inputs.version || github.ref_name }}"
-          VERSION="${VERSION#v}"
           HOST="${{ matrix.host }}"
           OUT="$GITHUB_WORKSPACE/release-assets"
           mkdir -p "$OUT"
-
+          export LC_ALL=C
+          normalize_tree() {
+            find "$1" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+          }
+          deterministic_tar() {
+            local root="$1"
+            local output="$2"
+            shift 2
+            tar -C "$root" --sort=name --mtime="@$SOURCE_DATE_EPOCH" \
+              --owner=0 --group=0 --numeric-owner --format=posix \
+              --pax-option=delete=atime,delete=ctime -cf - "$@" | gzip -n -9 > "$output"
+          }
           case "${{ matrix.name }}" in
             linux-64-bit)
-              (cd "depends/$HOST/bin" && tar -czf "$OUT/Blackcoin-$VERSION-Linux-x86_64.tar.gz" blackcoin*)
+              normalize_tree "depends/$HOST/bin"
+              mapfile -t files < <(cd "depends/$HOST/bin" && find . -maxdepth 1 -type f -name 'blackcoin*' -printf '%P\n' | sort)
+              test "${#files[@]}" -gt 0
+              deterministic_tar "depends/$HOST/bin" "$OUT/$ASSET_PREFIX-Linux-x86_64.tar.gz" "${files[@]}"
               ;;
             linux-arm-64-bit)
-              (cd "depends/$HOST/bin" && tar -czf "$OUT/Blackcoin-$VERSION-Linux-ARM64.tar.gz" blackcoin*)
+              normalize_tree "depends/$HOST/bin"
+              mapfile -t files < <(cd "depends/$HOST/bin" && find . -maxdepth 1 -type f -name 'blackcoin*' -printf '%P\n' | sort)
+              test "${#files[@]}" -gt 0
+              deterministic_tar "depends/$HOST/bin" "$OUT/$ASSET_PREFIX-Linux-ARM64.tar.gz" "${files[@]}"
               ;;
             windows-64-bit)
-              (cd "depends/$HOST/bin" && zip -9j "$OUT/Blackcoin-$VERSION-Windows-x86_64-Portable.zip" blackcoin*.exe)
-              cp "blackcoin-$VERSION-win64-setup.exe" "$OUT/Blackcoin-$VERSION-Windows-x86_64-Installer.exe"
+              windows_payload=release
+              normalize_tree "$windows_payload"
+              python3 ci/release/verify_windows_payload.py directory "$windows_payload"
+              python3 ci/release/verify_windows_payload.py identity \
+                "$windows_payload/blackcoind.exe" \
+                --version "$CONFIGURED_VERSION" --source-sha "$TARGET_SHA"
+              mapfile -t files < <(python3 ci/release/verify_windows_payload.py names)
+              (cd "$windows_payload" && printf '%s\n' "${files[@]}" | \
+                zip -X -9j "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip" -@)
+              python3 ci/release/verify_windows_payload.py unsigned-archive \
+                "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
+              mapfile -t installers < <(find . -maxdepth 1 -type f -name "blackcoin-$CONFIGURED_VERSION-win64-setup.exe" -printf '%P\n' | sort)
+              test "${#installers[@]}" -eq 1
+              cp "${installers[0]}" "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+              touch -d "@$SOURCE_DATE_EPOCH" "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+              python3 ci/release/verify_windows_payload.py unsigned-file \
+                "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+              portable_verify_dir="$RUNNER_TEMP/windows-portable-${{ matrix.builder }}"
+              installer_verify_dir="$RUNNER_TEMP/windows-installer-${{ matrix.builder }}"
+              mkdir "$portable_verify_dir" "$installer_verify_dir"
+              unzip -q "$OUT/$ASSET_PREFIX-Windows-x86_64-Portable.zip" \
+                -d "$portable_verify_dir"
+              7z x -bd -y "-o$installer_verify_dir" \
+                "$OUT/$ASSET_PREFIX-Windows-x86_64-Installer.exe" >/dev/null
+              python3 ci/release/verify_windows_payload.py installer \
+                "$installer_verify_dir" --portable-dir "$portable_verify_dir" >/dev/null
               ;;
             macos-64-bit)
-              (cd dist && zip -qry "$OUT/Blackcoin-$VERSION-macOS-Intel-x86_64-Qt-app.zip" blackcoin-qt.app)
-              tar -C dist -czf "$OUT/Blackcoin-$VERSION-macOS-Intel-x86_64-Qt-app.tar.gz" blackcoin-qt.app
+              normalize_tree dist/blackcoin-qt.app
+              (cd dist && find blackcoin-qt.app -print | sort | zip -X -9 -y "$OUT/$ASSET_PREFIX-macOS-Intel-x86_64-Qt-app.zip" -@)
+              deterministic_tar dist "$OUT/$ASSET_PREFIX-macOS-Intel-x86_64-Qt-app.tar.gz" blackcoin-qt.app
               ;;
             macos-arm-64-bit)
-              (cd dist && zip -qry "$OUT/Blackcoin-$VERSION-macOS-Apple-Silicon-ARM64-Qt-app.zip" blackcoin-qt.app)
-              tar -C dist -czf "$OUT/Blackcoin-$VERSION-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz" blackcoin-qt.app
+              normalize_tree dist/blackcoin-qt.app
+              (cd dist && find blackcoin-qt.app -print | sort | zip -X -9 -y "$OUT/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.zip" -@)
+              deterministic_tar dist "$OUT/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz" blackcoin-qt.app
               ;;
           esac
+          printf '%s\n' "$TARGET_SHA" > "$OUT/$ASSET_PREFIX-${{ matrix.name }}-SOURCE_COMMIT.txt"
 
-      - name: Upload release assets
-        uses: actions/upload-artifact@v7
+      - name: Upload non-macOS release assets
+        if: ${{ !startsWith(matrix.name, 'macos-') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-${{ matrix.name }}
+          name: release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.name }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
 
-  macos-installers:
-    name: macOS installers
+      - name: Upload isolated raw macOS cross-build assets
+        if: ${{ startsWith(matrix.name, 'macos-') }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: raw-release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.name }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload configured Windows installer recipe
+        if: ${{ matrix.name == 'windows-64-bit' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: windows-installer-recipe-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
+          path: share/setup.nsi
+          if-no-files-found: error
+          retention-days: 7
+
+  macos-adhoc:
+    name: Ad-hoc sign and validate macOS ${{ matrix.label }} (${{ matrix.builder }})
     needs:
+      - resolve-target
       - select-targets
       - build
     if: ${{ needs.select-targets.outputs.macos_selected == 'true' }}
-    # macos-14 stopped provisioning (jobs die in seconds with no runner
-    # assigned); use the current GA image.
-    runs-on: macos-15
-
+    runs-on: ${{ matrix.runner }}
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
+      TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
+      VERSION: ${{ needs.resolve-target.outputs.version }}
+      PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
+      CONFIGURED_VERSION: ${{ needs.resolve-target.outputs.configured_version }}
+      ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
+      PUBLISH: ${{ needs.resolve-target.outputs.publish }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-64-bit
+            label: Intel-x86_64
+            arch: x86_64
+            runner: macos-15-intel
+            builder: primary
+            selected: ${{ needs.select-targets.outputs.macos_intel_selected }}
+          - target: macos-64-bit
+            label: Intel-x86_64
+            arch: x86_64
+            runner: macos-15-intel
+            builder: verifier
+            selected: ${{ needs.select-targets.outputs.macos_intel_selected }}
+          - target: macos-arm-64-bit
+            label: Apple-Silicon-ARM64
+            arch: arm64
+            runner: macos-15
+            builder: primary
+            selected: ${{ needs.select-targets.outputs.macos_arm_selected }}
+          - target: macos-arm-64-bit
+            label: Apple-Silicon-ARM64
+            arch: arm64
+            runner: macos-15
+            builder: verifier
+            selected: ${{ needs.select-targets.outputs.macos_arm_selected }}
     steps:
-      - name: Download build artifacts
-        uses: actions/download-artifact@v8
+      - name: Download one exact isolated raw macOS cross-build
+        if: ${{ matrix.selected == 'true' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
-          path: artifacts
-          pattern: release-macos-*
+          name: raw-release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.target }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
+          path: raw-artifact
 
-      - name: Build DMG installers
+      - name: Ad-hoc sign, execute, deterministically repack, and reverify
+        if: ${{ matrix.selected == 'true' }}
         shell: bash
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+          PLATFORM_LABEL: ${{ matrix.label }}
+          TARGET_NAME: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          VERSION="${{ github.event.inputs.version || github.ref_name }}"
-          VERSION="${VERSION#v}"
-          mkdir -p release-assets work
-          for archive in artifacts/release-macos-*/*-Qt-app.tar.gz; do
-            base="$(basename "$archive")"
-            label="${base#Blackcoin-$VERSION-macOS-}"
-            label="${label%-Qt-app.tar.gz}"
-            rm -rf work/*
-            tar -C work -xzf "$archive"
-            # Cross-built binaries carry no code signature at all; unsigned
-            # apps are reported as "damaged" by Gatekeeper and will not launch
-            # on Apple Silicon. Apply an ad-hoc signature so the app runs
-            # after the user approves it (System Settings or right-click Open).
-            codesign --force --deep --sign - work/blackcoin-qt.app
-            codesign --verify --deep --strict work/blackcoin-qt.app
-            hdiutil create -volname "Blackcoin $VERSION" \
-              -srcfolder work/blackcoin-qt.app \
-              -ov -format UDZO \
-              "release-assets/Blackcoin-$VERSION-macOS-$label.dmg"
-          done
+          umask 077
 
-      - name: Upload macOS installers
-        uses: actions/upload-artifact@v7
+          verify_plist_architecture() {
+            PLIST_PATH="$1" python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+
+          path = Path(os.environ["PLIST_PATH"])
+          with path.open("rb") as source:
+              metadata = plistlib.load(source)
+          expected_arch = os.environ["EXPECTED_ARCH"]
+          if metadata.get("LSArchitecturePriority") != [expected_arch]:
+              raise SystemExit(
+                  f"LSArchitecturePriority must be exactly [{expected_arch!r}]")
+          PY
+          }
+
+          raw_tar="raw-artifact/$ASSET_PREFIX-macOS-$PLATFORM_LABEL-Qt-app.tar.gz"
+          raw_zip="raw-artifact/$ASSET_PREFIX-macOS-$PLATFORM_LABEL-Qt-app.zip"
+          raw_source="raw-artifact/$ASSET_PREFIX-$TARGET_NAME-SOURCE_COMMIT.txt"
+          test -s "$raw_tar" && test -f "$raw_tar" && test ! -L "$raw_tar"
+          test -s "$raw_zip" && test -f "$raw_zip" && test ! -L "$raw_zip"
+          test -s "$raw_source" && test -f "$raw_source" && test ! -L "$raw_source"
+          test "$(find raw-artifact -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 3
+          test "$(tr -d '\r\n' < "$raw_source")" = "$TARGET_SHA"
+
+          mkdir -p work/tar work/zip work/verify-tar work/verify-zip release-assets
+          tar -tzf "$raw_tar" > work/tar-members.txt
+          zipinfo -1 "$raw_zip" > work/zip-members.txt
+          for members in work/tar-members.txt work/zip-members.txt; do
+            test -s "$members"
+            awk '
+              function unsafe(path, count, part, i) {
+                if (substr(path, 1, 1) == "/" || path ~ /\\\\/) return 1
+                count = split(path, part, "/")
+                for (i = 1; i <= count; ++i) {
+                  if (part[i] == "..") return 1
+                }
+                return 0
+              }
+              unsafe($0) || $0 !~ /^blackcoin-qt[.]app(\/|$)/ { exit 1 }
+            ' "$members"
+            test -z "$(sort "$members" | uniq -d)"
+          done
+          tar -tzvf "$raw_tar" | awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { exit 1 }'
+          RAW_ZIP="$raw_zip" python3 - <<'PY'
+          import os
+          import stat
+          import zipfile
+          from pathlib import PurePosixPath
+
+          seen = set()
+          total_size = 0
+          with zipfile.ZipFile(os.environ["RAW_ZIP"]) as archive:
+              for entry in archive.infolist():
+                  path = PurePosixPath(entry.filename)
+                  if (entry.filename in seen or path.is_absolute() or ".." in path.parts or
+                          "\\" in entry.filename or not path.parts or path.parts[0] != "blackcoin-qt.app"):
+                      raise SystemExit(f"unsafe or duplicate ZIP member: {entry.filename}")
+                  seen.add(entry.filename)
+                  if entry.flag_bits & 0x1:
+                      raise SystemExit(f"encrypted ZIP member: {entry.filename}")
+                  mode = (entry.external_attr >> 16) & 0xFFFF
+                  if mode and not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                      raise SystemExit(f"unsupported ZIP member type: {entry.filename}")
+                  total_size += entry.file_size
+                  if entry.file_size > 512 * 1024 * 1024 or total_size > 1024 * 1024 * 1024:
+                      raise SystemExit("ZIP payload exceeds the fail-closed size limit")
+          if not seen:
+              raise SystemExit("empty ZIP archive")
+          PY
+
+          tar -xzf "$raw_tar" -C work/tar
+          ditto -x -k "$raw_zip" work/zip
+          test -d work/tar/blackcoin-qt.app
+          test -d work/zip/blackcoin-qt.app
+          test "$(find work/tar -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 1
+          test "$(find work/zip -mindepth 1 -maxdepth 1 -print | wc -l | tr -d ' ')" = 1
+          test -z "$(find work/tar work/zip -type l -print -quit)"
+          diff -qr work/tar/blackcoin-qt.app work/zip/blackcoin-qt.app
+
+          app=work/tar/blackcoin-qt.app
+          binary="$app/Contents/MacOS/blackcoin-qt"
+          plist="$app/Contents/Info.plist"
+          test -x "$binary" && test -f "$binary" && test ! -L "$binary"
+          test -s "$plist" && test -f "$plist" && test ! -L "$plist"
+          PLIST_PATH="$plist" python3 - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+
+          path = Path(os.environ["PLIST_PATH"])
+          with path.open("rb") as source:
+              metadata = plistlib.load(source)
+          metadata["LSArchitecturePriority"] = [os.environ["EXPECTED_ARCH"]]
+          path.write_bytes(plistlib.dumps(metadata, fmt=plistlib.FMT_XML, sort_keys=False))
+          PY
+          test "$(lipo -archs "$binary")" = "$EXPECTED_ARCH"
+          file "$binary" | grep -F "Mach-O 64-bit executable $EXPECTED_ARCH"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")" = blackcoin-qt
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = 30.1.1
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = 30.1.1
+          verify_plist_architecture "$plist"
+
+          xattr -cr "$app"
+          codesign --force --deep --sign - --timestamp=none "$app"
+          codesign --verify --deep --strict --verbose=4 "$app"
+          codesign --verify --strict --verbose=4 "$binary"
+          codesign --display --verbose=4 "$app" 2> work/codesign.txt
+          grep -Fx 'Signature=adhoc' work/codesign.txt
+          grep -Fx 'TeamIdentifier=not set' work/codesign.txt
+          grep -E '^Info[.]plist entries=[1-9][0-9]*$' work/codesign.txt
+          grep -E '^Sealed Resources version=2 rules=[1-9][0-9]* files=[1-9][0-9]*$' work/codesign.txt
+          if grep -q '^Authority=' work/codesign.txt; then
+            echo 'Unexpected signing authority in ad-hoc prerelease app' >&2
+            exit 1
+          fi
+
+          if [[ "$PUBLISH" == true ]]; then
+            expected_line="Blackcoin version v$VERSION"
+          else
+            expected_line="Blackcoin version v$CONFIGURED_VERSION-${TARGET_SHA:0:12}"
+          fi
+          expected_source_line="Source commit: $TARGET_SHA"
+          mkdir -p "$RUNNER_TEMP/blackcoin-version-home"
+          version_output=$(HOME="$RUNNER_TEMP/blackcoin-version-home" "$binary" -version 2>&1)
+          test "$(printf '%s\n' "$version_output" | sed -n '1p')" = "$expected_line"
+          test "$(printf '%s\n' "$version_output" | sed -n '2p')" = "$expected_source_line"
+          printf '%s\n' "$version_output"
+
+          signed_tar="release-assets/$ASSET_PREFIX-macOS-$PLATFORM_LABEL-Qt-app.tar.gz"
+          signed_zip="release-assets/$ASSET_PREFIX-macOS-$PLATFORM_LABEL-Qt-app.zip"
+          APP_ROOT="$app" TAR_OUTPUT="$signed_tar" ZIP_OUTPUT="$signed_zip" python3 - <<'PY'
+          import datetime
+          import gzip
+          import os
+          import shutil
+          import stat
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          app = Path(os.environ["APP_ROOT"])
+          tar_output = Path(os.environ["TAR_OUTPUT"])
+          zip_output = Path(os.environ["ZIP_OUTPUT"])
+          epoch = int(os.environ["SOURCE_DATE_EPOCH"])
+          if epoch < 315532800:
+              raise SystemExit("SOURCE_DATE_EPOCH predates the ZIP format minimum")
+
+          parent = app.parent
+          entries = [app, *sorted(app.rglob("*"), key=lambda path: path.relative_to(parent).as_posix())]
+          for path in entries:
+              mode = path.lstat().st_mode
+              if not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                  raise SystemExit(f"unsupported app-bundle entry: {path}")
+
+          with tar_output.open("wb") as raw:
+              with gzip.GzipFile(filename="", mode="wb", compresslevel=9, fileobj=raw, mtime=epoch) as compressed:
+                  with tarfile.open(fileobj=compressed, mode="w", format=tarfile.PAX_FORMAT) as archive:
+                      for path in entries:
+                          arcname = path.relative_to(parent).as_posix()
+                          info = archive.gettarinfo(str(path), arcname=arcname)
+                          info.uid = 0
+                          info.gid = 0
+                          info.uname = ""
+                          info.gname = ""
+                          info.mtime = epoch
+                          info.pax_headers = {}
+                          if info.isfile():
+                              with path.open("rb") as source:
+                                  archive.addfile(info, source)
+                          else:
+                              archive.addfile(info)
+
+          timestamp = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+          zip_timestamp = (timestamp.year, timestamp.month, timestamp.day,
+                           timestamp.hour, timestamp.minute, timestamp.second)
+          with zipfile.ZipFile(zip_output, "w", compression=zipfile.ZIP_DEFLATED,
+                               compresslevel=9, strict_timestamps=True) as archive:
+              for path in entries:
+                  mode = path.lstat().st_mode
+                  arcname = path.relative_to(parent).as_posix()
+                  is_directory = stat.S_ISDIR(mode)
+                  if is_directory:
+                      arcname += "/"
+                  info = zipfile.ZipInfo(arcname, zip_timestamp)
+                  info.create_system = 3
+                  info.compress_type = zipfile.ZIP_STORED if is_directory else zipfile.ZIP_DEFLATED
+                  info.external_attr = (mode & 0xFFFF) << 16
+                  if is_directory:
+                      info.external_attr |= 0x10
+                      archive.writestr(info, b"")
+                  else:
+                      with path.open("rb") as source, archive.open(info, "w") as destination:
+                          shutil.copyfileobj(source, destination)
+          PY
+
+          test -s "$signed_tar" && test ! -L "$signed_tar"
+          test -s "$signed_zip" && test ! -L "$signed_zip"
+          tar -xzf "$signed_tar" -C work/verify-tar
+          ditto -x -k "$signed_zip" work/verify-zip
+          diff -qr "$app" work/verify-tar/blackcoin-qt.app
+          diff -qr "$app" work/verify-zip/blackcoin-qt.app
+          for verified_app in work/verify-tar/blackcoin-qt.app work/verify-zip/blackcoin-qt.app; do
+            verified_binary="$verified_app/Contents/MacOS/blackcoin-qt"
+            verified_plist="$verified_app/Contents/Info.plist"
+            test "$(lipo -archs "$verified_binary")" = "$EXPECTED_ARCH"
+            verify_plist_architecture "$verified_plist"
+            codesign --verify --deep --strict --verbose=4 "$verified_app"
+            codesign --verify --strict --verbose=4 "$verified_binary"
+            verified_output=$(HOME="$RUNNER_TEMP/blackcoin-version-home" "$verified_binary" -version 2>&1)
+            test "$(printf '%s\n' "$verified_output" | sed -n '1p')" = "$expected_line"
+            test "$(printf '%s\n' "$verified_output" | sed -n '2p')" = "$expected_source_line"
+          done
+          printf '%s\n' "$TARGET_SHA" > "release-assets/$ASSET_PREFIX-$TARGET_NAME-SOURCE_COMMIT.txt"
+
+      - name: Upload only native-validated macOS artifacts
+        if: ${{ matrix.selected == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: release-macos-installers
+          name: release-${{ needs.resolve-target.outputs.package_label }}-${{ matrix.target }}-${{ matrix.builder }}-${{ needs.resolve-target.outputs.target_sha }}
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
 
-  release:
-    name: GitHub release
+  macos-adhoc-gate:
+    name: Require native macOS validation when selected
     needs:
       - select-targets
-      - build
-      - macos-installers
-    if: ${{ needs.select-targets.outputs.macos_selected == 'true' && (startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true') && (github.event_name != 'workflow_dispatch' || github.event.inputs.target == 'all') }}
+      - macos-adhoc
+    if: ${{ always() }}
     runs-on: ubuntu-22.04
-
     steps:
-      - name: Download release assets
-        uses: actions/download-artifact@v8
+      - name: Fail closed on a skipped or failed required macOS gate
+        shell: bash
+        env:
+          SELECT_TARGETS_RESULT: ${{ needs.select-targets.result }}
+          MACOS_SELECTED: ${{ needs.select-targets.outputs.macos_selected }}
+          MACOS_ADHOC_RESULT: ${{ needs.macos-adhoc.result }}
+        run: |
+          set -euo pipefail
+          test "$SELECT_TARGETS_RESULT" = success
+          if [[ "$MACOS_SELECTED" == true ]]; then
+            test "$MACOS_ADHOC_RESULT" = success
+          else
+            test "$MACOS_ADHOC_RESULT" = skipped
+          fi
+
+  reproducibility:
+    name: Verify independent byte-for-byte rebuilds
+    needs:
+      - resolve-target
+      - select-targets
+      - build
+      - macos-adhoc-gate
+    runs-on: ubuntu-22.04
+    env:
+      TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
+      VERSION: ${{ needs.resolve-target.outputs.version }}
+      PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
+      CONFIGURED_VERSION: ${{ needs.resolve-target.outputs.configured_version }}
+      RELEASE_CANDIDATE: ${{ needs.resolve-target.outputs.release_candidate }}
+      PRERELEASE_CHANNEL: ${{ needs.resolve-target.outputs.prerelease_channel }}
+      ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
+      MACOS_SELECTED: ${{ needs.select-targets.outputs.macos_selected }}
+    steps:
+      - name: Checkout immutable verification code
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ needs.resolve-target.outputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Download both isolated build sets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           path: artifacts
+          pattern: release-${{ needs.resolve-target.outputs.package_label }}-*-${{ needs.resolve-target.outputs.target_sha }}
 
-      - name: Install release packaging tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends zip
-
-      - name: Assemble release notes
+      - name: Compare every target byte for byte
         shell: bash
         run: |
           set -euo pipefail
-          VERSION="${{ github.event.inputs.version || github.ref_name }}"
-          VERSION="${VERSION#v}"
-          TAG="v$VERSION"
-          mkdir -p dist
-          find artifacts -type f ! -name '*-Qt-app.tar.gz' -exec cp {} dist/ \;
-
-          UNIVERSAL_ROOT="Blackcoin-$VERSION-macOS-Universal-Qt-apps"
-          mkdir -p "universal/$UNIVERSAL_ROOT/Intel-x86_64" "universal/$UNIVERSAL_ROOT/Apple-Silicon-ARM64"
-          for archive in artifacts/release-macos-*/*-Qt-app.tar.gz; do
-            base="$(basename "$archive")"
-            rm -rf universal-work
-            mkdir -p universal-work
-            tar -C universal-work -xzf "$archive"
-            case "$base" in
-              *Intel-x86_64*)
-                mv universal-work/blackcoin-qt.app "universal/$UNIVERSAL_ROOT/Intel-x86_64/blackcoin-qt.app"
-                ;;
-              *Apple-Silicon-ARM64*)
-                mv universal-work/blackcoin-qt.app "universal/$UNIVERSAL_ROOT/Apple-Silicon-ARM64/blackcoin-qt.app"
-                ;;
-            esac
+          shopt -s nullglob
+          primaries=(artifacts/release-"$PACKAGE_LABEL"-*-primary-"$TARGET_SHA")
+          verifiers=(artifacts/release-"$PACKAGE_LABEL"-*-verifier-"$TARGET_SHA")
+          test "${#primaries[@]}" -gt 0
+          test "${#primaries[@]}" -eq "${#verifiers[@]}"
+          mkdir -p release-assets
+          report="release-assets/$ASSET_PREFIX-REPRODUCIBILITY.txt"
+          {
+            printf 'package_label=%s\n' "$PACKAGE_LABEL"
+            printf 'prerelease_channel=%s\n' "$PRERELEASE_CHANNEL"
+            printf 'configured_version=%s\n' "$CONFIGURED_VERSION"
+          } > "$report"
+          for primary in "${primaries[@]}"; do
+            artifact_name=$(basename "$primary")
+            artifact_prefix="release-$PACKAGE_LABEL-"
+            target="${artifact_name#"$artifact_prefix"}"
+            suffix="-primary-$TARGET_SHA"
+            target="${target%"$suffix"}"
+            verifier="artifacts/release-$PACKAGE_LABEL-$target-verifier-$TARGET_SHA"
+            test -d "$verifier"
+            python3 ci/release/verify_reproducible.py \
+              --primary "$primary" --verifier "$verifier"
+            printf 'target=%s\n' "$target" >> "$report"
+            while IFS= read -r file; do
+              printf '%s  %s/%s\n' \
+                "$(sha256sum "$primary/$file" | awk '{print $1}')" "$target" "$file"
+            done < <(cd "$primary" && find . -type f -printf '%P\n' | sort)
           done
-          (cd universal && zip -qry "../dist/$UNIVERSAL_ROOT.zip" "$UNIVERSAL_ROOT")
+          printf 'source_commit=%s\n' "$TARGET_SHA" >> "$report"
 
-          (cd dist && sha256sum * | sort -k2 > SHA256SUMS.txt)
+      - name: Download both isolated Windows installer recipes
+        if: ${{ needs.select-targets.outputs.windows_selected == 'true' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: installer-recipes
+          pattern: windows-installer-recipe-${{ needs.resolve-target.outputs.package_label }}-*-${{ needs.resolve-target.outputs.target_sha }}
+
+      - name: Verify the Windows installer recipe is reproducible
+        if: ${{ needs.select-targets.outputs.windows_selected == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ci/release/verify_reproducible.py \
+            --primary "installer-recipes/windows-installer-recipe-$PACKAGE_LABEL-primary-$TARGET_SHA" \
+            --verifier "installer-recipes/windows-installer-recipe-$PACKAGE_LABEL-verifier-$TARGET_SHA"
+
+      - name: Assemble conspicuously unsigned exact-SHA canary bundle
+        if: ${{ needs.resolve-target.outputs.publish != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p canary-assets
+          test -z "$(find artifacts -mindepth 1 -maxdepth 1 -type d -name 'raw-release-*' -print -quit)"
+          primaries=(artifacts/release-"$PACKAGE_LABEL"-*-primary-"$TARGET_SHA")
+          test "${#primaries[@]}" -gt 0
+          for primary in "${primaries[@]}"; do
+            while IFS= read -r -d '' source; do
+              test -f "$source" && test ! -L "$source"
+              destination="canary-assets/$(basename "$source")"
+              test ! -e "$destination"
+              cp "$source" "$destination"
+            done < <(find "$primary" -mindepth 1 -maxdepth 1 -print0)
+          done
+          cp "release-assets/$ASSET_PREFIX-REPRODUCIBILITY.txt" canary-assets/
+
+          marker="canary-assets/$ASSET_PREFIX-UNSIGNED-CANARY.txt"
+          {
+            echo 'UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE'
+            echo
+            echo "package_label=$PACKAGE_LABEL"
+            echo "prerelease_channel=$PRERELEASE_CHANNEL"
+            echo "source_version=$VERSION"
+            echo "configured_version=$CONFIGURED_VERSION"
+            echo "source_commit=$TARGET_SHA"
+            echo "workflow_run_id=$GITHUB_RUN_ID"
+            echo 'signed=false'
+            echo 'developer_id_signed=false'
+            echo "macos_adhoc_signed=$MACOS_SELECTED"
+            echo 'notarized=false'
+            echo 'published=false'
+            echo
+            echo "These exact-SHA $PRERELEASE_CHANNEL artifacts are for controlled canary testing only."
+            echo 'They are not release-signed, Developer-ID signed, notarized, tagged, or published as a production release.'
+            if [[ "$MACOS_SELECTED" == true ]]; then
+              echo 'The macOS app bundles have deterministic ad-hoc launch signatures only; they carry no developer identity and are not notarized.'
+            fi
+            echo 'Verify the unsigned SHA256 manifest before testing.'
+          } > "$marker"
+
+          manifest="canary-assets/$ASSET_PREFIX-MANIFEST-UNSIGNED.json"
+          manifest_args=(
+            --artifacts canary-assets
+            --package-label "$PACKAGE_LABEL"
+            --source-version "$VERSION"
+            --configured-version "$CONFIGURED_VERSION"
+            --source-sha "$TARGET_SHA"
+            --release-candidate "$RELEASE_CANDIDATE"
+            --workflow-run-id "$GITHUB_RUN_ID"
+            --output "$manifest"
+          )
+          if [[ "$MACOS_SELECTED" == true ]]; then
+            manifest_args+=(--macos-adhoc-signed)
+          fi
+          python3 ci/release/generate_canary_manifest.py "${manifest_args[@]}"
+
+          sums="canary-assets/$ASSET_PREFIX-SHA256SUMS-UNSIGNED.txt"
+          sums_name=$(basename "$sums")
+          mapfile -t checksum_files < <(
+            cd canary-assets
+            find . -maxdepth 1 -type f ! -name "$sums_name" -printf '%P\n' | sort
+          )
+          test "${#checksum_files[@]}" -gt 0
+          : > "$sums"
+          for file in "${checksum_files[@]}"; do
+            (cd canary-assets && sha256sum "$file") >> "$sums"
+          done
+          (cd canary-assets && sha256sum --check --strict "$sums_name")
+
+      - name: Upload unsigned exact-SHA canary bundle
+        if: ${{ needs.resolve-target.outputs.publish != 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: unsigned-canary-${{ needs.resolve-target.outputs.package_label }}-${{ needs.resolve-target.outputs.target_sha }}
+          path: canary-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload reproducibility evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: release-${{ needs.resolve-target.outputs.package_label }}-reproducibility-${{ needs.resolve-target.outputs.target_sha }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 7
+
+  unsigned-final-preflight:
+    name: Require explicit publisher-unsigned final acknowledgement
+    needs:
+      - resolve-target
+      - safety-gate
+    if: ${{ needs.resolve-target.outputs.publish == 'true' }}
+    runs-on: ubuntu-22.04
+    environment: production-release
+    env:
+      UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}
+    steps:
+      - name: Fail closed without the exact unsigned-final acknowledgement
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected='I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES'
+          test "$UNSIGNED_FINAL_ACK" = "$expected" || {
+            echo '::error::Protected UNSIGNED_FINAL_ACK does not authorize this publisher-unsigned final release'
+            exit 1
+          }
+
+  release:
+    name: Publish authorized GitHub release
+    needs:
+      - resolve-target
+      - select-targets
+      - build
+      - reproducibility
+      - unsigned-final-preflight
+    if: ${{ needs.resolve-target.outputs.publish == 'true' && needs.resolve-target.outputs.target == 'all' && needs.select-targets.outputs.macos_selected == 'true' && needs.select-targets.outputs.windows_selected == 'true' }}
+    runs-on: ubuntu-22.04
+    environment: production-release
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    env:
+      TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
+      VERSION: ${{ needs.resolve-target.outputs.version }}
+      PACKAGE_LABEL: ${{ needs.resolve-target.outputs.package_label }}
+      ASSET_PREFIX: ${{ needs.resolve-target.outputs.asset_prefix }}
+      TAG: ${{ needs.resolve-target.outputs.tag }}
+      SOURCE_DATE_EPOCH: ${{ needs.resolve-target.outputs.source_date_epoch }}
+      UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}
+    steps:
+      - name: Checkout immutable release source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ needs.resolve-target.outputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Download only exact-SHA release assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: artifacts
+          pattern: release-${{ needs.resolve-target.outputs.package_label }}-*-${{ needs.resolve-target.outputs.target_sha }}
+
+      - name: Download exact-SHA quantum crypto provenance evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: gate-evidence/quantum-crypto
+          name: quantum-crypto-provenance-${{ needs.resolve-target.outputs.target_sha }}
+
+      - name: Download exact-SHA resource benchmark evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: gate-evidence/resource-benchmarks
+          pattern: quantum-resource-benchmarks-*-${{ needs.resolve-target.outputs.target_sha }}
+          merge-multiple: true
+
+      - name: Install final release verification tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends p7zip-full unzip
+
+      - name: Assemble exact-SHA publisher-unsigned release
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          expected_ack='I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES'
+          test "$UNSIGNED_FINAL_ACK" = "$expected_ack"
+          mkdir -p dist
+          shopt -s nullglob
+          primaries=(artifacts/release-"$PACKAGE_LABEL"-*-primary-"$TARGET_SHA")
+          test "${#primaries[@]}" -eq 5
+          for primary in "${primaries[@]}"; do
+            while IFS= read -r -d '' source; do
+              destination="dist/$(basename "$source")"
+              test ! -e "$destination"
+              cp "$source" "$destination"
+            done < <(find "$primary" -mindepth 1 -maxdepth 1 -type f -print0)
+          done
+          reproducibility=(artifacts/release-"$PACKAGE_LABEL"-reproducibility-"$TARGET_SHA")
+          test "${#reproducibility[@]}" -eq 1
+          while IFS= read -r -d '' source; do
+            destination="dist/$(basename "$source")"
+            test ! -e "$destination"
+            cp "$source" "$destination"
+          done < <(find "${reproducibility[0]}" -mindepth 1 -maxdepth 1 -type f -print0)
+
+          test -s "dist/$ASSET_PREFIX-Linux-x86_64.tar.gz"
+          test -s "dist/$ASSET_PREFIX-Linux-ARM64.tar.gz"
+          test -s "dist/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
+          test -s "dist/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+          test -s "dist/$ASSET_PREFIX-macOS-Intel-x86_64-Qt-app.zip"
+          test -s "dist/$ASSET_PREFIX-macOS-Intel-x86_64-Qt-app.tar.gz"
+          test -s "dist/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.zip"
+          test -s "dist/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz"
+          test -s "dist/$ASSET_PREFIX-REPRODUCIBILITY.txt"
+          python3 ci/release/verify_windows_payload.py unsigned-archive \
+            "dist/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
+          python3 ci/release/verify_windows_payload.py unsigned-file \
+            "dist/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+          mkdir -p work/windows-portable work/windows-installer
+          unzip -q "dist/$ASSET_PREFIX-Windows-x86_64-Portable.zip" \
+            -d work/windows-portable
+          7z x -bd -y "-owork/windows-installer" \
+            "dist/$ASSET_PREFIX-Windows-x86_64-Installer.exe" >/dev/null
+          python3 ci/release/verify_windows_payload.py installer \
+            work/windows-installer --portable-dir work/windows-portable >/dev/null
+          test -s gate-evidence/quantum-crypto/quantum-crypto-provenance-evidence.json
+          cp gate-evidence/quantum-crypto/quantum-crypto-provenance-evidence.json \
+            "dist/Blackcoin-$VERSION-quantum-crypto-provenance.json"
+          cp contrib/devtools/quantum-crypto-provenance.json \
+            "dist/Blackcoin-$VERSION-quantum-crypto-manifest.json"
+          python3 ci/release/verify_resource_benchmark_bundle.py \
+            --directory gate-evidence/resource-benchmarks \
+            --source-sha "$TARGET_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --provenance-manifest contrib/devtools/quantum-crypto-provenance.json
+          mapfile -t resource_evidence < <(
+            find gate-evidence/resource-benchmarks -maxdepth 1 -type f \
+              -name 'quantum-resource-*-evidence.json' -print | sort
+          )
+          mapfile -t resource_raw < <(
+            find gate-evidence/resource-benchmarks -maxdepth 1 -type f \
+              -name 'quantum-resource-*-nanobench.json' -print | sort
+          )
+          test "${#resource_evidence[@]}" -eq 5
+          test "${#resource_raw[@]}" -eq 5
+          cp "${resource_evidence[@]}" "${resource_raw[@]}" dist/
+          printf '%s\n' "$TARGET_SHA" > dist/SOURCE_COMMIT.txt
+
+          python3 ci/release/verify_dependency_security.py
+          python3 ci/release/generate_spdx_sbom.py \
+            --artifacts dist --depends-packages depends/packages \
+            --dependency-manifest ci/release/dependency-security-manifest.json \
+            --version "$VERSION" --source-sha "$TARGET_SHA" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --output "dist/Blackcoin-$VERSION-SBOM.spdx.json"
+          python3 ci/release/generate_provenance.py \
+            --artifacts dist --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$TARGET_SHA" --version "$VERSION" --tag "$TAG" \
+            --workflow-run-id "$GITHUB_RUN_ID" \
+            --output "dist/Blackcoin-$VERSION-provenance.intoto.json"
+
+          python3 ci/release/generate_unsigned_release_metadata.py \
+            --artifacts dist --version "$VERSION" --source-sha "$TARGET_SHA" \
+            --tag "$TAG" --workflow-run-id "$GITHUB_RUN_ID" \
+            --acknowledgement "$UNSIGNED_FINAL_ACK" --macos-adhoc-signed \
+            --notice "dist/Blackcoin-$VERSION-UNSIGNED-PRODUCTION.txt" \
+            --manifest "dist/Blackcoin-$VERSION-UNSIGNED-PRODUCTION.json"
+          test -z "$(find dist -maxdepth 1 -type f \
+            \( -name '*.asc' -o -name '*RELEASE-KEY*' \) -print -quit)"
+          (cd dist && find . -maxdepth 1 -type f ! -name 'SHA256SUMS.txt' -printf '%P\n' |
+            sort | while IFS= read -r file; do sha256sum "$file"; done > SHA256SUMS.txt)
+          (cd dist && sha256sum --check --strict SHA256SUMS.txt)
 
           {
-            echo "Blackcoin Core — Protocol V4 (Quantum Quasar)"
+            echo '# Publisher-unsigned production release'
             echo
-            echo "PoSV4.0 upgrade release."
+            echo 'Blackcoin-Dev has no release-signing certificates for v30.1.1.'
+            echo 'Windows packages are not Authenticode-signed. macOS applications carry only identity-free ad-hoc launch signatures and are not notarized.'
+            echo 'The source commit, annotated tag, checksums, and in-toto statement have no Blackcoin-Dev OpenPGP signature.'
+            echo 'Verify the unsigned notice and manifest, SHA256 checksums, exact source commit, reproducibility report, SBOM, provenance, and GitHub attestations before installing.'
             echo
-            echo "This is a mandatory Protocol V4 upgrade for Blackcoin. Quantum Quasar adds the Gold Rush migration path, quantum-resistant address support, Gold Rush PoS/PoW participation, and the 24-month transition schedule."
+            cat "doc/release-notes/release-notes-$VERSION.md"
+            echo "## Source commit"
             echo
-            echo "Gold Rush reward accounting starts at block 5,950,000 and runs for 243,000 blocks. The deterministic 10,000 BLK whitelist snapshot is block 5,945,000."
+            echo "\`$TARGET_SHA\`"
             echo
-            echo "When upgrading from older software versions, back up wallet.dat before installation."
+            echo "## SHA256 checksums"
             echo
-            echo "## Upgrading from Blackcoin More"
-            echo
-            echo "On first launch this release automatically finds your existing Blackcoin More data directory, backs up your wallet and settings, and imports everything into the new Blackcoin data directory. Your original Blackcoin More data is never modified or deleted. A progress window shows each step; the import of a fully synced data directory can take several minutes, followed by a one-time Gold Rush state replay — please let it finish. Backups are kept next to the new data directory in a .blackcoin.backup folder."
-            echo
-            echo "### macOS installation note"
-            echo
-            echo "The macOS apps are ad-hoc signed. On first open, macOS may warn that the developer cannot be verified: right-click (Control-click) blackcoin-qt.app and choose Open, then Open again — or allow it under System Settings > Privacy & Security. If macOS reports the app is damaged after downloading, clear the quarantine flag with: xattr -dr com.apple.quarantine /Applications/blackcoin-qt.app"
-            echo
-            echo "### Windows installation note"
-            echo
-            echo "The installer is not code-signed yet; Windows SmartScreen may show \"Windows protected your PC\". Click More info, then Run anyway. Verify your download against the SHA256 checksums below first."
-            echo
-            echo "## SHA256 Checksums"
-            echo
-            echo "| Archive | Checksum |"
-            echo "| --- | --- |"
+            echo '| Archive | Checksum |'
+            echo '| --- | --- |'
             while read -r hash file; do
               echo "| $file | $hash |"
             done < dist/SHA256SUMS.txt
           } > RELEASE_NOTES.md
 
-          echo "TAG=$TAG" >> "$GITHUB_ENV"
+      - name: Publish GitHub build-provenance attestations
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3.0.0
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
 
-      - name: Create or update release
+      - name: Publish GitHub SBOM attestations
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
+          sbom-path: dist/Blackcoin-${{ needs.resolve-target.outputs.version }}-SBOM.spdx.json
+
+      - name: Create an immutable release at the annotated unsigned tag
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          REPO="${GITHUB_REPOSITORY:?}"
-          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
-            gh release edit "$TAG" --repo "$REPO" --title "Blackcoin Core — Protocol V4 (Quantum Quasar)" --notes-file RELEASE_NOTES.md --latest
-            gh release upload "$TAG" dist/* --repo "$REPO" --clobber
-          else
-            gh release create "$TAG" dist/* --repo "$REPO" --target "$GITHUB_SHA" --title "Blackcoin Core — Protocol V4 (Quantum Quasar)" --notes-file RELEASE_NOTES.md --latest
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$TARGET_SHA"
+          test "$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled')" = true || {
+            echo '::error::Repository-level immutable releases must be enabled'
+            exit 1
+          }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists; production releases are immutable"
+            exit 1
           fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft \
+            --verify-tag --title "Blackcoin Core v$VERSION" --notes-file RELEASE_NOTES.md
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

@@ -134,6 +134,8 @@ void RPCNestedTests::rpcNestedTests()
     QVERIFY(filtered == "sendshadowpowclaim(\"legacy\", \"quantum\", 1, 0.0001)");
     RPCConsole::RPCParseCommandLine(nullptr, result, "setpowmining true 1 100", false, &filtered);
     QVERIFY(filtered == "setpowmining true 1 100");
+    RPCConsole::RPCParseCommandLine(nullptr, result, "setpowmining true 1 1 true", false, &filtered);
+    QVERIFY(filtered == "setpowmining true 1 1 true");
     RPCConsole::RPCParseCommandLine(nullptr, result, "getpowmininginfo", false, &filtered);
     QVERIFY(filtered == "getpowmininginfo");
 

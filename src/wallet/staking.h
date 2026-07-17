@@ -5,8 +5,8 @@
 // Staking start/stop algos by Qtum
 // Copyright (c) 2016-2023 The Qtum developers
 
-#ifndef BLACKCOIN_WALLET_STAKE_H
-#define BLACKCOIN_WALLET_STAKE_H
+#ifndef BITCOIN_WALLET_STAKING_H
+#define BITCOIN_WALLET_STAKING_H
 
 #include <wallet/spend.h>
 #include <wallet/wallet.h>
@@ -18,13 +18,18 @@ void StartStake(CWallet& wallet);
 /* Stop staking */
 void StopStake(CWallet& wallet);
 
-uint64_t GetStakeWeight(const CWallet& wallet);
+uint64_t GetStakeWeight(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
 void AvailableCoinsForStaking(const CWallet& wallet,
                            std::vector<std::pair<const CWalletTx*, unsigned int> >& vCoins,
                            const CCoinControl* coinControl = nullptr,
-                           const CoinFilterParams& params = {}) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
-bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::set<std::pair<const CWalletTx *, unsigned int> > &setCoinsRet, CAmount& nValueRet);
-bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval, CMutableTransaction& tx, CAmount& nFees, CTxDestination destination, const std::vector<CTransactionRef>& selected_txs = {});
+                           const CoinFilterParams& params = {}) EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+bool SelectCoinsForStaking(const CWallet& wallet, CAmount& nTargetValue, std::set<std::pair<const CWalletTx *, unsigned int> > &setCoinsRet, CAmount& nValueRet)
+    EXCLUSIVE_LOCKS_REQUIRED(::cs_main, wallet.cs_wallet);
+bool CreateCoinStake(CWallet& wallet, unsigned int nBits, int64_t nSearchInterval,
+                     CMutableTransaction& tx, CAmount& nFees,
+                     CTxDestination destination,
+                     const std::vector<CTransactionRef>& selected_txs = {},
+                     std::optional<COutPoint> forced_kernel = std::nullopt);
 
 struct DemurrageAttestationTxResult
 {
@@ -32,6 +37,7 @@ struct DemurrageAttestationTxResult
     std::vector<unsigned char> public_key;
     std::vector<unsigned char> witness_program;
     COutPoint replay_anchor;
+    COutPoint target_outpoint;
     int attestation_vout{-1};
     CAmount fee{0};
 };
@@ -39,6 +45,9 @@ struct DemurrageAttestationTxResult
 struct QuantumColdStakeRedelegationOptions
 {
     bool dry_run{true};
+    //! Required for a broadcast redelegation because it creates a new
+    //! non-HD ML-DSA owner key. Dry runs never create wallet metadata.
+    bool allow_new_quantum_key{false};
     bool enforce_pool_cap{true};
     bool require_verified_operator{true};
     std::optional<CFeeRate> fee_rate;
@@ -65,6 +74,26 @@ struct QuantumColdStakeRedelegationResult
     CTransactionRef tx;
 };
 
+/** Fixed cap on exact chainstate marker reads in latency-sensitive wallet paths. */
+static constexpr size_t MAX_WALLET_SHADOW_SOLVE_REFERENCES{256};
+
+/**
+ * Per-attempt work budgets for automatic QQSIGNAL fee-input discovery.
+ * The cursor stored in CWallet resumes after the last inspected output, so a
+ * large historical wallet is covered over bounded retries without a stop-the-
+ * world AvailableCoins pass.
+ */
+static constexpr size_t MAX_AUTO_SHADOW_SIGNAL_WALLET_TX_SCAN{4096};
+static constexpr size_t MAX_AUTO_SHADOW_SIGNAL_WALLET_OUTPUT_SCAN{65536};
+
+/**
+ * Return the newest confirmed wallet-owned coinstake solve per canonical
+ * script. The wallet scan is in-memory; callers validate at most the fixed cap
+ * above through HasRecentShadowSolverActivity while holding cs_main.
+ */
+std::vector<WalletShadowSolveReference> GetWalletShadowSolveReferences(
+    const CWallet& wallet, int tip_height) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet);
+
 bool CreateDemurrageAttestationTransaction(
     CWallet& wallet,
     const std::vector<unsigned char>& witness_program,
@@ -87,4 +116,4 @@ int MaybeAutoRedelegateQuantumColdStake(CWallet& wallet);
 
 } // namespace wallet
 
-#endif // BLACKCOIN_WALLET_STAKE_H
+#endif // BITCOIN_WALLET_STAKING_H

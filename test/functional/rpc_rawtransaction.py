@@ -101,6 +101,29 @@ class RawTransactionsTest(BitcoinTestFramework):
             self.import_deterministic_coinbase_privkeys()
             self.raw_multisig_transaction_legacy_tests()
         self.getrawtransaction_verbosity_tests()
+        self.invalid_txversion_tests()
+
+    def invalid_txversion_tests(self):
+        self.log.info("Malformed -txversion fails RPC and wallet construction without terminating the node")
+        self.restart_node(0, self.extra_args[0] + ["-txversion=not-a-number"])
+        assert_raises_rpc_error(
+            -8,
+            "Invalid -txversion value: not-a-number",
+            self.nodes[0].createrawtransaction,
+            [],
+            {},
+        )
+        assert_equal(self.nodes[0].getblockchaininfo()["chain"], "regtest")
+
+        if self.is_specified_wallet_compiled() and not self.options.descriptors:
+            address = self.nodes[0].getnewaddress()
+            assert_raises_rpc_error(
+                -6,
+                "Invalid -txversion value: not-a-number",
+                self.nodes[0].sendtoaddress,
+                address,
+                1,
+            )
 
 
     def getrawtransaction_tests(self):
@@ -468,8 +491,8 @@ class RawTransactionsTest(BitcoinTestFramework):
     def transaction_version_number_tests(self):
         self.log.info("Test transaction version numbers")
 
-        # Test the minimum transaction version number that fits in a signed 32-bit integer.
-        # As transaction version is unsigned, this should convert to its unsigned equivalent.
+        # Test the first transaction version with the high bit set. Serialize
+        # its signed representation; the legacy decoder reports it unsigned.
         tx = CTransaction()
         tx.nVersion = -0x80000000
         rawtx = tx.serialize().hex()
@@ -509,6 +532,9 @@ class RawTransactionsTest(BitcoinTestFramework):
 
         # send 1.2 BTC to msig adr
         txId = self.nodes[0].sendtoaddress(mSigObj, 1.2)
+        tx_hex = self.nodes[0].gettransaction(txId)["hex"]
+        for node in self.nodes[1:]:
+            assert_equal(node.sendrawtransaction(tx_hex), txId)
         self.sync_all()
         self.generate(self.nodes[0], 1)
         # node2 has both keys of the 2of2 ms addr, tx should affect the balance
@@ -530,6 +556,8 @@ class RawTransactionsTest(BitcoinTestFramework):
         txId = self.nodes[0].sendtoaddress(mSigObj, 2.2)
         decTx = self.nodes[0].gettransaction(txId)
         rawTx = self.nodes[0].decoderawtransaction(decTx['hex'])
+        for node in self.nodes[1:]:
+            assert_equal(node.sendrawtransaction(decTx["hex"]), txId)
         self.sync_all()
         self.generate(self.nodes[0], 1)
 
@@ -554,7 +582,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         rawTx = self.nodes[0].decoderawtransaction(rawTxSigned['hex'])
         self.sync_all()
         self.generate(self.nodes[0], 1)
-        assert_equal(self.nodes[0].getbalance(), bal + Decimal('50.00000000') + Decimal('2.19000000'))  # block reward + tx
+        assert_equal(self.nodes[0].getbalance(), bal + Decimal('2.19000000'))  # tx; the new block reward is immature
 
         # 2of2 test for combining transactions
         bal = self.nodes[2].getbalance()
@@ -571,6 +599,10 @@ class RawTransactionsTest(BitcoinTestFramework):
         txId = self.nodes[0].sendtoaddress(mSigObj, 2.2)
         decTx = self.nodes[0].gettransaction(txId)
         rawTx2 = self.nodes[0].decoderawtransaction(decTx['hex'])
+        # Match the earlier multisig fixtures: this test covers raw-transaction
+        # RPCs, not randomized fee-filter relay at the wallet's default rate.
+        for node in self.nodes[1:]:
+            assert_equal(node.sendrawtransaction(decTx["hex"]), txId)
         self.sync_all()
         self.generate(self.nodes[0], 1)
 
@@ -597,7 +629,7 @@ class RawTransactionsTest(BitcoinTestFramework):
         rawTx2 = self.nodes[0].decoderawtransaction(rawTxComb)
         self.sync_all()
         self.generate(self.nodes[0], 1)
-        assert_equal(self.nodes[0].getbalance(), bal + Decimal('50.00000000') + Decimal('2.19000000'))  # block reward + tx
+        assert_equal(self.nodes[0].getbalance(), bal + Decimal('2.19000000'))  # tx; the new block reward is immature
 
 
 if __name__ == '__main__':

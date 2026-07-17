@@ -138,6 +138,7 @@ BOOST_AUTO_TEST_CASE(b4_reward_split_uses_demurrage_effective_principal)
 {
     const CAmount nominal_principal = 1000 * COIN;
     const CAmount effective_principal = 750 * COIN;
+    const CAmount burned_principal = nominal_principal - effective_principal;
     const CScript self_script = QuantumMigrationScriptForPubkey(QuantumPubkey(0x59));
 
     CMutableTransaction cs;
@@ -152,6 +153,17 @@ BOOST_AUTO_TEST_CASE(b4_reward_split_uses_demurrage_effective_principal)
     BOOST_CHECK(CheckStakeRewardSplit(CTransaction(cs), undo, /*block_fees=*/0, /*candidate_height=*/200, /*stake_tiers_active=*/true, split, reason, &effective_principals));
     BOOST_CHECK_EQUAL(split.total_reward, GetProofOfStakeSubsidy());
     BOOST_CHECK_EQUAL(split.required_outputs[self_script], effective_principal + GetProofOfStakeSubsidy());
+    BOOST_CHECK_NE(split.total_reward, GetProofOfStakeSubsidy() + burned_principal);
+
+    CMutableTransaction burn_overclaim{cs};
+    burn_overclaim.vout[1].nValue += burned_principal;
+    reason.clear();
+    BOOST_CHECK(!CheckStakeRewardSplit(CTransaction(burn_overclaim), undo,
+                                       /*block_fees=*/0,
+                                       /*candidate_height=*/200,
+                                       /*stake_tiers_active=*/true,
+                                       split, reason, &effective_principals));
+    BOOST_CHECK_EQUAL(reason, "bad-stake-reward-split");
 
     reason.clear();
     BOOST_CHECK(!CheckStakeRewardSplit(CTransaction(cs), undo, /*block_fees=*/0, /*candidate_height=*/200, /*stake_tiers_active=*/true, split, reason));

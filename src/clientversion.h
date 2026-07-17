@@ -18,6 +18,7 @@
 #error Client version information missing: version is not defined by bitcoin-config.h or in any other way
 #endif
 
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 //! Copyright string used in Windows .rc files
 #define COPYRIGHT_STR "2009-" STRINGIZE(COPYRIGHT_YEAR) " " COPYRIGHT_HOLDERS_FINAL
 
@@ -41,6 +42,12 @@ extern const std::string CLIENT_NAME;
 
 
 std::string FormatFullVersion();
+/** Full immutable 40-character source commit, or empty when unavailable. */
+std::string FormatSourceCommit();
+/** Whether tracked source differed from the reported commit at build time. */
+bool IsSourceTreeDirty();
+/** Human-readable source identity for command-line version output. */
+std::string FormatSourceIdentity();
 std::string FormatSubVersion(const std::string& name, int nClientVersion, const std::vector<std::string>& comments);
 
 std::string CopyrightHolders(const std::string& strPrefix);

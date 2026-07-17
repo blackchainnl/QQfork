@@ -1,4 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
+// Copyright (c) 2009-2022 The Bitcoin Core developers
 // Copyright (c) 2009-2022 Blackcoin Core Developers
 // Copyright (c) 2009-2022 Blackcoin More Developers
 // Copyright (c) 2009-2022 Quantum Quasar Developers
@@ -168,6 +169,7 @@ public:
 
     bool GetKey(COutPoint &key) const override;
     bool GetValue(Coin &coin) const override;
+    bool GetValueAt(const COutPoint& key, Coin& coin) override;
 
     bool Valid() const override;
     void Next() override;
@@ -211,6 +213,19 @@ bool CCoinsViewDBCursor::GetKey(COutPoint &key) const
 bool CCoinsViewDBCursor::GetValue(Coin &coin) const
 {
     return pcursor->GetValue(coin);
+}
+
+bool CCoinsViewDBCursor::GetValueAt(const COutPoint& key, Coin& coin)
+{
+    pcursor->Seek(CoinEntry(&key));
+    CoinEntry entry(&keyTmp.second);
+    if (!pcursor->Valid() || !pcursor->GetKey(entry)) {
+        keyTmp.first = 0;
+        return false;
+    }
+    keyTmp.first = entry.key;
+    return keyTmp.first == DB_COIN && keyTmp.second == key &&
+           pcursor->GetValue(coin);
 }
 
 bool CCoinsViewDBCursor::Valid() const

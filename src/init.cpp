@@ -31,6 +31,7 @@
 #include <httpserver.h>
 #include <index/blockfilterindex.h>
 #include <index/coinstatsindex.h>
+#include <index/shadowindex.h>
 #include <index/txindex.h>
 #include <init/common.h>
 #include <interfaces/chain.h>
@@ -47,6 +48,7 @@
 #include <node/blockstorage.h>
 #include <node/caches.h>
 #include <node/chainstate.h>
+#include <node/chainstate_rebuild.h>
 #include <node/chainstatemanager_args.h>
 #include <node/context.h>
 #include <node/interface_ui.h>
@@ -55,6 +57,7 @@
 #include <node/mempool_persist_args.h>
 #include <node/miner.h>
 #include <node/peerman_args.h>
+#include <node/shadow_resource_monitor.h>
 #include <node/validation_cache_args.h>
 #include <policy/feerate.h>
 #include <policy/fees.h>
@@ -102,13 +105,16 @@
 #include <functional>
 #include <limits>
 #include <set>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #ifndef WIN32
 #include <cerrno>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #endif
 
@@ -244,9 +250,13 @@ static void ShutdownNotify(const ArgsManager& args)
 
 void Interrupt(NodeContext& node)
 {
+    if (node.rebuild_restart_required.load()) {
+        LogPrintf("Skipping -shutdownnotify for planned chainstate rebuild restart\n");
+    } else {
 #if HAVE_SYSTEM
-    ShutdownNotify(*node.args);
+        ShutdownNotify(*node.args);
 #endif
+    }
     InterruptHTTPServer();
     InterruptHTTPRPC();
     InterruptRPC();
@@ -262,6 +272,9 @@ void Interrupt(NodeContext& node)
     ForEachBlockFilterIndex([](BlockFilterIndex& index) { index.Interrupt(); });
     if (g_coin_stats_index) {
         g_coin_stats_index->Interrupt();
+    }
+    if (g_shadow_index) {
+        g_shadow_index->Interrupt();
     }
 }
 
@@ -346,6 +359,10 @@ void Shutdown(NodeContext& node)
     if (g_coin_stats_index) {
         g_coin_stats_index->Stop();
         g_coin_stats_index.reset();
+    }
+    if (g_shadow_index) {
+        g_shadow_index->Stop();
+        g_shadow_index.reset();
     }
     ForEachBlockFilterIndex([](BlockFilterIndex& index) { index.Stop(); });
     DestroyAllBlockFilterIndexes();
@@ -472,6 +489,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-blockreconstructionextratxn=<n>", strprintf("Extra transactions to keep in memory for compact block reconstructions (default: %u)", DEFAULT_BLOCK_RECONSTRUCTION_EXTRA_TXN), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-blocksonly", strprintf("Whether to reject transactions from network peers. Automatic broadcast and rebroadcast of any transactions from inbound peers is disabled, unless the peer has the 'forcerelay' permission. RPC transactions are not affected. (default: %u)", DEFAULT_BLOCKSONLY), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-coinstatsindex", strprintf("Maintain coinstats index used by the gettxoutsetinfo RPC (default: %u)", DEFAULT_COINSTATSINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-shadowindex", strprintf("Maintain the persistent reorg-aware synthetic shadow-ledger and quantum-witness history index used by getshadowblock, getshadowtransaction, getshadowoutpoint, getshadowaddress, getshadowscript, getshadowsupply, and getquantumwitnessinventory (default: %u). Initial construction requires historical block files; use -prune=0 for a rebuildable explorer node.", DEFAULT_SHADOWINDEX), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-conf=<file>", strprintf("Specify path to read-only configuration file. Relative paths will be prefixed by datadir location (only useable from command line, not configuration file) (default: %s)", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-datadir=<dir>", "Specify data directory", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-dbbatchsize", strprintf("Maximum database write batch size in bytes (default: %u)", nDefaultDbBatchSize), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::OPTIONS);
@@ -479,7 +497,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-includeconf=<file>", "Specify additional configuration file, relative to the -datadir path (only useable from configuration file, not command line)", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-allowignoredconf", strprintf("For backwards compatibility, treat an unused %s file in the datadir as a warning, not an error.", BITCOIN_CONF_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-loadblock=<file>", "Imports blocks from external file on startup", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-migratewallet=<auto|blackmore|blackcoin|none>", "Choose the first-run legacy wallet/datadir migration source when both .blackmore and the original .blackcoin datadirs are present (default: auto). This option is read before the configuration file, so pass it on the command line.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-migratewallet=<blackmore|blackcoin|none>", "One-shot explicit consent for first-run legacy wallet/datadir handling. blackmore copies the detected .blackmore source into .blackcoin after verified backups; blackcoin keeps the populated .blackcoin source after verified backups; none preserves verified backups without importing or replacing wallet data. Omit this option to receive an interactive GUI choice or a fail-closed blackcoind error with the exact command. Pass it only on the command line and remove it after the successful first run.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-maxmempool=<n>", strprintf("Keep the transaction memory pool below <n> megabytes (default: %u)", DEFAULT_MAX_MEMPOOL_SIZE_MB), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-maxorphantx=<n>", strprintf("Keep at most <n> unconnectable transactions in memory (default: %u)", DEFAULT_MAX_ORPHAN_TRANSACTIONS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-mempoolexpiry=<n>", strprintf("Do not keep transactions in the mempool longer than <n> hours (default: %u)", DEFAULT_MEMPOOL_EXPIRY_HOURS), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -493,7 +511,7 @@ void SetupServerArgs(ArgsManager& argsman)
                              DEFAULT_PERSIST_V1_DAT),
                    ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-pid=<file>", strprintf("Specify pid file. Relative paths will be prefixed by a net-specific datadir location. (default: %s)", BITCOIN_PID_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
-    argsman.AddArg("-prune=<n>", strprintf("Reduce storage requirements by enabling pruning and deleting old blocks. This mode is incompatible with -txindex. Warning: Reverting this setting requires re-downloading the entire blockchain. 0 = disable pruning, 1 = allow manual pruning via RPC, >=%u = automatically prune block files to stay under the target size in MiB (default: 0)", MIN_DISK_SPACE_FOR_BLOCK_FILES / 1024 / 1024), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
+    argsman.AddArg("-prune=<n>", "Block pruning is disabled on mainnet, testnet, and signet in v30.1.1 pending a Blackcoin proof-of-stake retention and recovery audit. Use 0 (default). Nonzero values remain available only on regtest for test coverage.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reindex", "If enabled, wipe chain state and block index, and rebuild them from blk*.dat files on disk. Also wipe and rebuild other optional indexes that are active. If an assumeutxo snapshot was loaded, its chainstate will be wiped as well. The snapshot can then be reloaded via RPC.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-reindex-chainstate", "If enabled, wipe chain state, and rebuild it from blk*.dat files on disk. If an assumeutxo snapshot was loaded, its chainstate will be wiped as well. The snapshot can then be reloaded via RPC.", ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
     argsman.AddArg("-settings=<file>", strprintf("Specify path to dynamic settings data file. Can be disabled with -nosettings. File is written at runtime and not meant to be edited by users (use %s instead for custom settings). Relative paths will be prefixed by datadir location. (default: %s)", BITCOIN_CONF_FILENAME, BITCOIN_SETTINGS_FILENAME), ArgsManager::ALLOW_ANY, OptionsCategory::OPTIONS);
@@ -575,22 +593,26 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-zmqpubrawblock=<address>", "Enable publish raw block in <address>", ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubrawtx=<address>", "Enable publish raw transaction in <address>", ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubsequence=<address>", "Enable publish hash block and tx sequence in <address>", ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
+    argsman.AddArg("-zmqpubshadow=<address>", "Enable versioned shadow-ledger block delta notifications in <address> (requires -shadowindex=1)", ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubhashblockhwm=<n>", strprintf("Set publish hash block outbound message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubhashtxhwm=<n>", strprintf("Set publish hash transaction outbound message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubrawblockhwm=<n>", strprintf("Set publish raw block outbound message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubrawtxhwm=<n>", strprintf("Set publish raw transaction outbound message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
     argsman.AddArg("-zmqpubsequencehwm=<n>", strprintf("Set publish hash sequence message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
+    argsman.AddArg("-zmqpubshadowhwm=<n>", strprintf("Set publish shadow-ledger outbound message high water mark (default: %d)", CZMQAbstractNotifier::DEFAULT_ZMQ_SNDHWM), ArgsManager::ALLOW_ANY, OptionsCategory::ZMQ);
 #else
     hidden_args.emplace_back("-zmqpubhashblock=<address>");
     hidden_args.emplace_back("-zmqpubhashtx=<address>");
     hidden_args.emplace_back("-zmqpubrawblock=<address>");
     hidden_args.emplace_back("-zmqpubrawtx=<address>");
     hidden_args.emplace_back("-zmqpubsequence=<n>");
+    hidden_args.emplace_back("-zmqpubshadow=<address>");
     hidden_args.emplace_back("-zmqpubhashblockhwm=<n>");
     hidden_args.emplace_back("-zmqpubhashtxhwm=<n>");
     hidden_args.emplace_back("-zmqpubrawblockhwm=<n>");
     hidden_args.emplace_back("-zmqpubrawtxhwm=<n>");
     hidden_args.emplace_back("-zmqpubsequencehwm=<n>");
+    hidden_args.emplace_back("-zmqpubshadowhwm=<n>");
 #endif
 
     argsman.AddArg("-checkblocks=<n>", strprintf("How many blocks to check at startup (default: %u, 0 = all)", DEFAULT_CHECKBLOCKS), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
@@ -610,6 +632,12 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-addrmantest", "Allows to test address relay on localhost", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-capturemessages", "Capture all P2P messages to disk", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-mocktime=<n>", "Replace actual time with " + UNIX_EPOCH_TIME + " (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testchainstaterebuildpauseafter=<phase>", "Regtest-only recovery test hook: pause after the named chainstate rebuild journal phase is durably committed (prepared, building, rolling-back, commit-ready, or cleanup-ready). The process must be killed or the marker removed by the test harness.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testchainstaterebuildfilesizelimit=<n>", "Regtest-only POSIX recovery test hook: after the BUILDING journal phase is durable, apply an operating-system file-size limit of <n> bytes so reconstruction encounters a real write failure (default: 0, disabled).", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-testdatadirmigrationpauseafter=<transition>", "Regtest-only recovery test hook: pause after the named first-run datadir migration transition is durably committed (staged-import-ready, recovery-record-ready, active-moved, or promoted). The process must be killed or the marker removed by the test harness.", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-shadowindexmockobsoleteschema", "Regtest-only: treat the current shadowindex schema as obsolete and exercise its rebuild path", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-shadowrpcsnapshotdelaymillis=<n>", "Regtest-only shadow RPC snapshot race-test barrier delay in milliseconds (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
+    argsman.AddArg("-prematurewitness", "Allow witness transaction relay before witness activation (default: 0)", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-maxsigcachesize=<n>", strprintf("Limit sum of signature cache and script execution cache sizes to <n> MiB (default: %u)", DEFAULT_MAX_SIG_CACHE_BYTES >> 20), ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::DEBUG_TEST);
     argsman.AddArg("-maxtipage=<n>",
                    strprintf("Maximum tip age in seconds to consider node in initial block download (default: %u)",
@@ -646,6 +674,7 @@ void SetupServerArgs(ArgsManager& argsman)
     argsman.AddArg("-blockversion=<n>", "Override block version to test forking scenarios", ArgsManager::ALLOW_ANY | ArgsManager::DEBUG_ONLY, OptionsCategory::BLOCK_CREATION);
 
     argsman.AddArg("-rest", strprintf("Accept public REST requests (default: %u)", DEFAULT_REST_ENABLE), ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
+    argsman.AddArg("-allowunsafequantumkeyrpc", "Expert opt-in for wallet-scoped dumpquantumkey only. The selected wallet must be normally unlocked; staking-only unlock is rejected. This option does not disable networking or restrict RPC access. Use only in an independently isolated offline process. Raw unstored createquantumkey generation was removed in v30.1.1. Disabled by default.", ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
     argsman.AddArg("-rpcallowip=<ip>", "Allow JSON-RPC connections from specified source. Valid values for <ip> are a single IP (e.g. 1.2.3.4), a network/netmask (e.g. 1.2.3.4/255.255.255.0), a network/CIDR (e.g. 1.2.3.4/24), all ipv4 (0.0.0.0/0), or all ipv6 (::/0). This option can be specified multiple times", ArgsManager::ALLOW_ANY, OptionsCategory::RPC);
     argsman.AddArg("-rpcauth=<userpw>", "Username and HMAC-SHA-256 hashed password for JSON-RPC connections. The field <userpw> comes in the format: <USERNAME>:<SALT>$<HASH>. A canonical python script is included in share/rpcauth. The client then connects normally using the rpcuser=<USERNAME>/rpcpassword=<PASSWORD> pair of arguments. This option can be specified multiple times", ArgsManager::ALLOW_ANY | ArgsManager::SENSITIVE, OptionsCategory::RPC);
     argsman.AddArg("-rpcbind=<addr>[:port]", "Bind to given address to listen for JSON-RPC connections. Do not expose the RPC server to untrusted networks such as the public internet! This option is ignored unless -rpcallowip is also passed. Port is optional and overrides -rpcport. Use [host]:port notation for IPv6. This option can be specified multiple times (default: 127.0.0.1 and ::1 i.e., localhost)", ArgsManager::ALLOW_ANY | ArgsManager::NETWORK_ONLY, OptionsCategory::RPC);
@@ -827,7 +856,9 @@ namespace { // Variables internal to initialization process only
 int nMaxConnections;
 int nUserMaxConnections;
 int nFD;
-ServiceFlags nLocalServices = NODE_WITNESS;
+// Advertise shadow-ledger awareness without making it a desirable/required
+// peer service. Legacy peers remain eligible during the staged migration.
+ServiceFlags nLocalServices = ServiceFlags(NODE_WITNESS | NODE_QUANTUM_QUASAR);
 int64_t peer_connect_timeout;
 std::set<BlockFilterType> g_enabled_filter_types;
 
@@ -890,10 +921,28 @@ bool AppInitParameterInteraction(const ArgsManager& args)
 
     // also see: InitParameterInteraction()
 
+    // Reindex modes are one-shot recovery operations. Persisting either flag
+    // can create an endless destructive/rebuild loop after a service or GUI
+    // restart, so fail before opening chainstate and require the operator to
+    // remove the persistent entry.
+    for (const std::string& option : {"reindex-chainstate", "reindex"}) {
+        if (SettingToBool(args.GetPersistentSetting(option), false)) {
+            return InitError(strprintf(_(
+                "%s=1 is set persistently. Remove it from blackcoin.conf or settings.json and pass -%s only once on the command line."),
+                option, option));
+        }
+    }
+
     // Error if network-specific options (-addnode, -connect, etc) are
     // specified in default section of config file, but not overridden
     // on the command line or in this chain's section of the config file.
     ChainType chain = args.GetChainType();
+#if ENABLE_ZMQ
+    if (args.IsArgSet("-zmqpubshadow") &&
+        !args.GetBoolArg("-shadowindex", DEFAULT_SHADOWINDEX)) {
+        return InitError(_("-zmqpubshadow requires -shadowindex=1 so every notification follows an atomically persisted, reorg-aware delta."));
+    }
+#endif
     if (chain == ChainType::SIGNET) {
         LogPrintf("Signet derived magic (message start): %s\n", HexStr(chainparams.MessageStart()));
     }
@@ -917,6 +966,13 @@ bool AppInitParameterInteraction(const ArgsManager& args)
                   ChainTypeToString(chain), SHADOW_WHITELIST_HEIGHT, SHADOW_REWARD_START_HEIGHT, SHADOW_REWARD_END_HEIGHT);
     }
 
+    if (args.IsArgSet("-shadowcompetingclaimsheight") && chain != ChainType::REGTEST) {
+        return InitError(_("-shadowcompetingclaimsheight is only supported on regtest."));
+    }
+    if (args.IsArgSet("-shadowqqp4height") && chain != ChainType::REGTEST) {
+        return InitError(_("-shadowqqp4height is only supported on regtest."));
+    }
+
     if (args.IsArgSet("-solostaking") && chain != ChainType::TESTNET && chain != ChainType::REGTEST) {
         return InitError(_("-solostaking is only supported on testnet/regtest in the test schedule branch."));
     }
@@ -935,6 +991,9 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         const int64_t migration_deadline = Params().GetConsensus().nQuantumMigrationDeadlineTime;
         const int goldrush_end_height = Params().GetConsensus().nGoldRushEndHeight;
         const int migration_end_height = Params().GetConsensus().nQuantumMigrationEndHeight;
+        if (args.IsArgSet("-qqgoldrushendheight") != args.IsArgSet("-qqmigrationendheight")) {
+            return InitError(_("-qqgoldrushendheight and -qqmigrationendheight must be provided together; mixed height/time lifecycle boundaries are not supported."));
+        }
         if (v4_time < 0 || goldrush_end < 0 || migration_deadline < 0) {
             return InitError(_("-qqv4time, -qqgoldrushendtime, and -qqmigrationdeadlinetime must be non-negative."));
         }
@@ -949,6 +1008,9 @@ bool AppInitParameterInteraction(const ArgsManager& args)
         }
         if (goldrush_end_height != 0 && goldrush_end_height < SHADOW_REWARD_END_HEIGHT) {
             return InitError(strprintf(_("-qqgoldrushendheight (%d) must not be below the shadow reward end height (%d); the Gold Rush reward window would outlive the Gold Rush phase."), goldrush_end_height, SHADOW_REWARD_END_HEIGHT));
+        }
+        if ((goldrush_end_height > 0) != (migration_end_height > 0)) {
+            return InitError(_("-qqgoldrushendheight and -qqmigrationendheight must be set together; mixed height/time lifecycle boundaries are not supported."));
         }
         LogPrintf("Quantum Quasar: %s phase boundaries overridden: v4=%d goldrush_end=%d migration_deadline=%d goldrush_end_height=%d migration_end_height=%d\n",
                   ChainTypeToString(chain), v4_time, goldrush_end, migration_deadline, goldrush_end_height, migration_end_height);
@@ -1161,10 +1223,27 @@ bool AppInitInterfaces(NodeContext& node)
     return true;
 }
 
-bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
+static bool AppInitMainImpl(NodeContext& node,
+                            interfaces::BlockAndHeaderTipInfo* tip_info,
+                            bool& rebuild_restart_required)
 {
-    const ArgsManager& args = *Assert(node.args);
+    node.rebuild_restart_required = false;
+    rebuild_restart_required = false;
+    ArgsManager& args = *Assert(node.args);
     const CChainParams& chainparams = Params();
+    const bool requested_chainstate_rebuild =
+        args.GetBoolArg("-reindex-chainstate", false);
+    const bool chainstate_verification_pending =
+        node::GetChainstateRebuildJournalStatus(args.GetDataDirNet()) ==
+        node::ChainstateRebuildJournalStatus::VERIFICATION_PENDING;
+    // A command-line/manual rebuild and a service-managed verification restart
+    // receive the same fail-closed protection as the GUI assistant. These
+    // settings are process-local; command-line, config, and settings.json
+    // values are preserved and restored only after the replacement has been
+    // authenticated and the durable journal has been retired.
+    if (requested_chainstate_rebuild || chainstate_verification_pending) {
+        node::SetChainstateRebuildSafetyOverrides(args, true);
+    }
 
     auto opt_max_upload = ParseByteUnits(args.GetArg("-maxuploadtarget", DEFAULT_MAX_UPLOAD_TARGET), ByteUnit::M);
     if (!opt_max_upload) {
@@ -1238,8 +1317,21 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         }
     }, std::chrono::minutes{5});
 
+    // Advisory and diagnostic-only. Crossing this reviewed operating envelope
+    // never rejects a block, disables P2P/staking/mining, or initiates shutdown.
+    // The ordinary 50 MiB corruption guard above remains the only automatic
+    // disk-space action here.
+    node.scheduler->scheduleEvery([&node]{
+        if (!ShutdownRequested()) node::RefreshShadowResourceWarning(node);
+    }, std::chrono::minutes{5});
+
     GetMainSignals().RegisterBackgroundSignalScheduler(*node.scheduler);
 
+    // All normal service setup is deliberately deferred until chainstate
+    // bootstrap has either completed or failed closed. This keeps a staged or
+    // committed rebuild out of wallet, RPC, ZMQ, and P2P initialization.
+    PeerManager::Options peerman_opts{};
+    auto initialize_normal_services = [&]() -> bool {
     // Create client interfaces for wallets that are supposed to be loaded
     // according to -wallet and -disablewallet options. This only constructs
     // the interfaces, it doesn't load wallet data. Wallets actually get loaded
@@ -1290,7 +1382,6 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     fListen = args.GetBoolArg("-listen", DEFAULT_LISTEN);
     fDiscover = args.GetBoolArg("-discover", true);
 
-    PeerManager::Options peerman_opts{};
     ApplyArgsManOptions(args, peerman_opts);
 
     {
@@ -1380,6 +1471,7 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         "-zmqpubrawblock",
         "-zmqpubrawtx",
         "-zmqpubsequence",
+        "-zmqpubshadow",
     }) {
         for (const std::string& socket_addr : args.GetArgs(port_option)) {
             std::string host_out;
@@ -1525,17 +1617,35 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         RegisterValidationInterface(g_zmq_notification_interface.get());
     }
 #endif
+        return true;
+    };
 
     // ********************************************************* Step 7: load block chain
 
     node.notifications = std::make_unique<KernelNotifications>(node.exit_status);
     ReadNotificationArgs(args, *node.notifications);
     fReindex = args.GetBoolArg("-reindex", false);
-    bool fReindexChainState = args.GetBoolArg("-reindex-chainstate", false);
+    bool fReindexChainState = requested_chainstate_rebuild;
+    const std::string gui_rebuild_phase =
+        args.GetArg("-gui-chainstate-rebuild", "");
+    if (gui_rebuild_phase == "rebuild") {
+        uiInterface.InitMessage(_(
+            "Protected v30.1.1 chainstate rebuild in progress — wallet automation is disabled…").translated);
+        LogPrintf("GUI chainstate rebuild assistant: protected rebuild process started; wallet automation is disabled\n");
+    } else if (gui_rebuild_phase == "verify") {
+        uiInterface.InitMessage(_(
+            "Verifying the rebuilt v30.1.1 chainstate before loading wallets…").translated);
+        LogPrintf("GUI chainstate rebuild assistant: verification process started; wallet automation remains disabled\n");
+    }
     ChainstateManager::Options chainman_opts{
         .chainparams = chainparams,
         .datadir = args.GetDataDirNet(),
         .adjusted_time_callback = GetAdjustedTime,
+        .chainstate_rebuild_commit_callback = [&node] {
+            node.chainstate_rebuild_status.store(
+                node::ChainstateRebuildStatus::REBUILD_COMMITTED);
+            StartShutdown();
+        },
         .notifications = *node.notifications,
     };
     Assert(ApplyArgsManOptions(args, chainman_opts)); // no error can happen, already checked in AppInitParameterInteraction
@@ -1612,6 +1722,80 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         options.check_level = args.GetIntArg("-checklevel", DEFAULT_CHECKLEVEL);
         options.require_full_verification = args.IsArgSet("-checkblocks") || args.IsArgSet("-checklevel");
         options.check_interrupt = ShutdownRequested;
+        const std::string rebuild_pause_phase =
+            args.GetArg("-testchainstaterebuildpauseafter", "");
+        const int64_t rebuild_file_size_limit =
+            args.GetIntArg("-testchainstaterebuildfilesizelimit", 0);
+        if (rebuild_file_size_limit < 0) {
+            return InitError(_("-testchainstaterebuildfilesizelimit cannot be negative"));
+        }
+        if (rebuild_file_size_limit > 0 &&
+            chainparams.GetChainType() != ChainType::REGTEST) {
+            return InitError(_("-testchainstaterebuildfilesizelimit is only supported on regtest"));
+        }
+#ifdef WIN32
+        if (rebuild_file_size_limit > 0) {
+            return InitError(_("-testchainstaterebuildfilesizelimit requires a POSIX file-size resource limit"));
+        }
+#endif
+        if (!rebuild_pause_phase.empty()) {
+            static const std::set<std::string> supported_rebuild_pause_phases{
+                "prepared", "building", "rolling-back", "commit-ready",
+                "cleanup-ready"};
+            if (chainparams.GetChainType() != ChainType::REGTEST) {
+                return InitError(_("-testchainstaterebuildpauseafter is only supported on regtest"));
+            }
+            if (!supported_rebuild_pause_phases.count(rebuild_pause_phase)) {
+                return InitError(strprintf(
+                    _("Unknown -testchainstaterebuildpauseafter phase: %s"),
+                    rebuild_pause_phase));
+            }
+        }
+        if (!rebuild_pause_phase.empty() || rebuild_file_size_limit > 0) {
+            const fs::path pause_marker =
+                chainman_opts.datadir / "chainstate-rebuild-test-pause";
+            options.rebuild_durable_transition_cb =
+                [rebuild_pause_phase, rebuild_file_size_limit, pause_marker](std::string_view phase) {
+                    if (!rebuild_pause_phase.empty() && phase == rebuild_pause_phase) {
+                        {
+                            std::ofstream marker{pause_marker};
+                            if (!marker.is_open()) {
+                                throw std::runtime_error(strprintf(
+                                    "unable to create chainstate rebuild test pause marker %s",
+                                    fs::PathToString(pause_marker)));
+                            }
+                            marker << phase << '\n';
+                            marker.flush();
+                            if (!marker.good()) {
+                                throw std::runtime_error(strprintf(
+                                    "unable to write chainstate rebuild test pause marker %s",
+                                    fs::PathToString(pause_marker)));
+                            }
+                        }
+                        DirectoryCommit(pause_marker.parent_path());
+                        LogPrintf("Regtest chainstate rebuild paused after durable %s transition; kill the process or remove %s to resume\n",
+                                  phase, fs::PathToString(pause_marker));
+                        while (fs::exists(pause_marker)) {
+                            UninterruptibleSleep(std::chrono::milliseconds{10});
+                        }
+                    }
+#ifndef WIN32
+                    if (phase == "building" && rebuild_file_size_limit > 0) {
+                        const struct rlimit limit{
+                            static_cast<rlim_t>(rebuild_file_size_limit),
+                            static_cast<rlim_t>(rebuild_file_size_limit)};
+                        if (signal(SIGXFSZ, SIG_IGN) == SIG_ERR ||
+                            setrlimit(RLIMIT_FSIZE, &limit) != 0) {
+                            throw std::runtime_error(strprintf(
+                                "unable to apply chainstate rebuild file-size limit: %s",
+                                SysErrorString(errno)));
+                        }
+                        LogPrintf("Regtest chainstate rebuild applied a %d-byte process file-size limit after durable BUILDING\n",
+                                  rebuild_file_size_limit);
+                    }
+#endif
+                };
+        }
         options.coins_error_cb = [] {
             uiInterface.ThreadSafeMessageBox(
                 _("Error reading from database, shutting down."),
@@ -1640,12 +1824,49 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             */
             std::tie(status, error) = catch_exceptions([&]{ return VerifyLoadedChainstate(chainman, options);});
             if (status == node::ChainstateLoadStatus::SUCCESS) {
+                // Every reopened COMMIT_READY replacement, including daemon
+                // and manual restarts, must be authenticated and retired here
+                // before wallets load or any automation can start.
+                if (node::GetChainstateRebuildJournalStatus(args.GetDataDirNet()) ==
+                    node::ChainstateRebuildJournalStatus::VERIFICATION_PENDING) {
+                    bilingual_str finalize_error;
+                    if (!node::FinalizeChainstateRebuild(chainman, finalize_error)) {
+                        return InitError(finalize_error);
+                    }
+                }
+                if (chainstate_verification_pending) {
+                    node::SetChainstateRebuildSafetyOverrides(args, false);
+                }
+                if (node.gui_process && gui_rebuild_phase == "verify") {
+                    node.chainstate_rebuild_status.store(
+                        node::ChainstateRebuildStatus::VERIFICATION_COMPLETE);
+                }
                 fLoaded = true;
                 LogPrintf(" block index %15dms\n", Ticks<std::chrono::milliseconds>(SteadyClock::now() - load_block_index_start_time));
             }
         }
 
-        if (status == node::ChainstateLoadStatus::FAILURE_FATAL || status == node::ChainstateLoadStatus::FAILURE_INCOMPATIBLE_DB || status == node::ChainstateLoadStatus::FAILURE_INSUFFICIENT_DBCACHE) {
+        if (node.gui_process &&
+            status == node::ChainstateLoadStatus::FAILURE_CHAINSTATE_REBUILD_REQUIRED) {
+            node.chainstate_rebuild_status.store(
+                node::ChainstateRebuildStatus::REQUIRED);
+            return false;
+        }
+        if (node.gui_process && gui_rebuild_phase == "rebuild" &&
+            status == node::ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED) {
+            node.chainstate_rebuild_status.store(
+                node::ChainstateRebuildStatus::FULL_REINDEX_REQUIRED);
+            return false;
+        }
+
+        if (status == node::ChainstateLoadStatus::FAILURE_FATAL ||
+            status == node::ChainstateLoadStatus::FAILURE_INCOMPATIBLE_DB ||
+            status == node::ChainstateLoadStatus::FAILURE_INSUFFICIENT_DBCACHE ||
+            status == node::ChainstateLoadStatus::FAILURE_CHAINSTATE_REBUILD_REQUIRED ||
+            status == node::ChainstateLoadStatus::FAILURE_FULL_REINDEX_REQUIRED ||
+            (options.reindex_chainstate &&
+             status != node::ChainstateLoadStatus::SUCCESS &&
+             status != node::ChainstateLoadStatus::INTERRUPTED)) {
             return InitError(error);
         }
 
@@ -1653,8 +1874,8 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
             // first suggest a reindex
             if (!options.reindex) {
                 bool fRet = uiInterface.ThreadSafeQuestion(
-                    error + Untranslated(".\n\n") + _("Do you want to rebuild the block database now?"),
-                    error.original + ".\nPlease restart with -reindex or -reindex-chainstate to recover.",
+                    error + Untranslated(".\n\n") + _("Do you want to rebuild the full block database now?"),
+                    error.original + ".\nPlease restart with -reindex to rebuild the full block database.",
                     "", CClientUIInterface::MSG_ERROR | CClientUIInterface::BTN_ABORT);
                 if (fRet) {
                     fReindex = true;
@@ -1678,6 +1899,50 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     }
 
     ChainstateManager& chainman = *Assert(node.chainman);
+    const bool staged_chainstate_rebuild =
+        chainman.m_chainstate_rebuild_staged_this_process.load();
+    const bool reopened_committed_rebuild =
+        chainman.m_chainstate_rebuild_reopened_committed_this_process.load();
+
+    if (staged_chainstate_rebuild && reopened_committed_rebuild) {
+        return InitError(_("Chainstate rebuild lifecycle is internally inconsistent. Normal services were not started."));
+    }
+    if (staged_chainstate_rebuild || reopened_committed_rebuild) {
+        // No PeerManager, index, wallet, RPC, ZMQ, or normal import path exists
+        // yet. Use a dedicated bootstrap thread so the protected lifecycle has
+        // the same threading boundary as regular block import, then join it
+        // before any service can observe or modify the rebuilt state.
+        uiInterface.InitMessage(
+            staged_chainstate_rebuild
+                ? _("Rebuilding protected chainstate…").translated
+                : _("Verifying rebuilt chainstate…").translated);
+        assert(!chainman.m_thread_load.joinable());
+        chainman.m_thread_load = std::thread(
+            &util::TraceThread, "rebuildbootstrap", [&chainman] {
+                ImportBlocks(chainman, {});
+            });
+        chainman.m_thread_load.join();
+
+        if (staged_chainstate_rebuild) {
+            if (!chainman.m_chainstate_rebuild_committed_this_process.load()) {
+                return InitError(_("The protected chainstate rebuild did not reach a durable commit. Normal services were not started; restart to recover the preserved databases."));
+            }
+            rebuild_restart_required = true;
+            uiInterface.InitMessage(
+                _("Chainstate rebuild completed. Restart Blackcoin to begin normal operation.").translated);
+            LogPrintf("Protected chainstate rebuild committed; a clean restart is required before normal services may start\n");
+            node.rebuild_restart_required = true;
+            StartShutdown();
+            return true;
+        }
+
+        if (!chainman.m_chainstate_rebuild_cleanup_completed_this_process.load()) {
+            return InitError(_("The committed chainstate rebuild did not complete protected verification and cleanup. Normal services were not started; preserve the datadir and retry."));
+        }
+        LogPrintf("Protected chainstate rebuild verification completed before normal service initialization\n");
+    }
+
+    if (!initialize_normal_services()) return false;
 
     assert(!node.peerman);
     node.peerman = PeerManager::make(*node.connman, *node.addrman,
@@ -1700,6 +1965,23 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     if (args.GetBoolArg("-coinstatsindex", DEFAULT_COINSTATSINDEX)) {
         g_coin_stats_index = std::make_unique<CoinStatsIndex>(interfaces::MakeChain(node), /*cache_size=*/0, false, fReindex);
         node.indexes.emplace_back(g_coin_stats_index.get());
+    }
+
+    if (args.GetBoolArg("-shadowindex", DEFAULT_SHADOWINDEX)) {
+        ShadowIndexEventCallback event_callback;
+#if ENABLE_ZMQ
+        if (args.IsArgSet("-zmqpubshadow")) {
+            event_callback = [](bool connected, const ShadowIndexBlockEvent& event) {
+                if (g_zmq_notification_interface) {
+                    g_zmq_notification_interface->NotifyShadowBlock(connected, event);
+                }
+            };
+        }
+#endif
+        g_shadow_index = std::make_unique<ShadowIndex>(
+            interfaces::MakeChain(node), /*cache_size=*/0, false, fReindex,
+            std::move(event_callback));
+        node.indexes.emplace_back(g_shadow_index.get());
     }
 
     // Init indexes
@@ -1781,6 +2063,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
     chainman.m_thread_load = std::thread(&util::TraceThread, "initload", [=, &chainman, &args, &node] {
         // Import blocks
         ImportBlocks(chainman, vImportFiles);
+        if (ShutdownRequested()) {
+            LogPrintf("Block import reached a requested shutdown; skipping index and mempool startup\n");
+            return;
+        }
         if (args.GetBoolArg("-stopafterblockimport", DEFAULT_STOPAFTERBLOCKIMPORT)) {
             LogPrintf("Stopping after block import\n");
             StartShutdown();
@@ -1913,15 +2199,16 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
         }
     }
 
+    const bool listen_onion = args.GetBoolArg("-listenonion", DEFAULT_LISTEN_ONION);
     CService onion_service_target;
     if (!connOptions.onion_binds.empty()) {
         onion_service_target = connOptions.onion_binds.front();
-    } else {
+    } else if (listen_onion) {
         onion_service_target = DefaultOnionServiceTarget();
         connOptions.onion_binds.push_back(onion_service_target);
     }
 
-    if (args.GetBoolArg("-listenonion", DEFAULT_LISTEN_ONION)) {
+    if (listen_onion) {
         if (connOptions.onion_binds.size() > 1) {
             InitWarning(strprintf(_("More than one onion bind address is provided. Using %s "
                                     "for the automatically created Tor onion service."),
@@ -1998,6 +2285,10 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 
     uiInterface.InitMessage(_("Done loading").translated);
 
+    // Publish an initial result instead of waiting for the first monitor
+    // interval. GUI, CLI/RPC, and daemon users share this warning registry.
+    node::RefreshShadowResourceWarning(node);
+
     for (const auto& client : node.chain_clients) {
         client->start(*node.scheduler);
     }
@@ -2014,6 +2305,19 @@ bool AppInitMain(NodeContext& node, interfaces::BlockAndHeaderTipInfo* tip_info)
 #endif
 
     return true;
+}
+
+interfaces::AppInitResult AppInitMain(
+    NodeContext& node,
+    interfaces::BlockAndHeaderTipInfo* tip_info)
+{
+    bool rebuild_restart_required{false};
+    if (!AppInitMainImpl(node, tip_info, rebuild_restart_required)) {
+        return interfaces::AppInitResult::FAILURE;
+    }
+    return rebuild_restart_required
+        ? interfaces::AppInitResult::REBUILD_RESTART_REQUIRED
+        : interfaces::AppInitResult::SUCCESS;
 }
 
 bool StartIndexBackgroundSync(NodeContext& node)

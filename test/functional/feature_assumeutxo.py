@@ -128,7 +128,11 @@ class AssumeutxoTest(BitcoinTestFramework):
         chainstate_snapshot_path.mkdir()
         with open(chainstate_snapshot_path / "base_blockhash", 'wb') as f:
             f.write(b'z' * 32)
-        expected_error = f"Error: A fatal internal error occurred, see debug.log for details"
+        expected_error = (
+            "Error: The snapshot chainstate base is not an approved entry in the local "
+            "block index. No chainstate was moved or wiped. Move the "
+            "chainstate_snapshot directory aside or use full -reindex."
+        )
         self.nodes[0].assert_start_raises_init_error(expected_msg=expected_error)
 
         # resurrect node again
@@ -306,10 +310,18 @@ class AssumeutxoTest(BitcoinTestFramework):
                 self.wait_for_indexes(n, n2_indexes)
 
         self.log.info("Test -reindex-chainstate of an assumeutxo-synced node")
-        self.restart_node(2, extra_args=[
-            '-reindex-chainstate=1', *self.extra_args[2]])
-        assert_equal(n2.getblockchaininfo()["blocks"], FINAL_HEIGHT)
-        self.wait_until(lambda: n2.getblockcount() == FINAL_HEIGHT)
+        self.stop_node(2)
+        self.run_chainstate_rebuild_first_pass(
+            n2, ['-reindex-chainstate=1', *self.extra_args[2]])
+        rebuild_journal = n2.chain_path / "chainstate-rebuild.journal"
+        rebuild_backup = n2.chain_path / "chainstate.rebuild-backup"
+        assert rebuild_journal.is_file()
+        assert rebuild_backup.is_dir()
+
+        self.log.info("Verify the rebuilt chainstate before testing full -reindex")
+        self.restart_after_chainstate_rebuild(2, extra_args=self.extra_args[2])
+        assert_equal(n2.getblockcount(), FINAL_HEIGHT)
+        self.wait_for_indexes(n2, n2_indexes)
 
         self.log.info("Test -reindex of an assumeutxo-synced node")
         self.restart_node(2, extra_args=['-reindex=1', *self.extra_args[2]])

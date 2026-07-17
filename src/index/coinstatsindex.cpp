@@ -18,6 +18,9 @@
 #include <undo.h>
 #include <validation.h>
 
+#include <limits>
+#include <stdexcept>
+
 using kernel::ApplyCoinHash;
 using kernel::CCoinsStats;
 using kernel::GetBogoSize;
@@ -27,6 +30,11 @@ static constexpr uint8_t DB_BLOCK_HASH{'s'};
 static constexpr uint8_t DB_BLOCK_HEIGHT{'t'};
 static constexpr uint8_t DB_MUHASH{'M'};
 static constexpr uint8_t DB_SHADOW_PAYOUTS{'q'};
+static constexpr uint8_t DB_SCHEMA_VERSION{'V'};
+// Schema 3 invalidates prerelease schema-2 MuHash and per-block synthetic
+// payout records derived with the superseded height-5,950,000 competing-claim
+// activation boundary.
+static constexpr uint32_t COINSTATS_SCHEMA_VERSION{3};
 
 namespace {
 
@@ -143,7 +151,31 @@ CoinStatsIndex::CoinStatsIndex(std::unique_ptr<interfaces::Chain> chain, size_t 
     fs::path path{gArgs.GetDataDirNet() / "indexes" / "coinstats"};
     fs::create_directories(path);
 
-    m_db = std::make_unique<CoinStatsIndex::DB>(path / "db", n_cache_size, f_memory, f_wipe);
+    const fs::path db_path{path / "db"};
+    m_db = std::make_unique<CoinStatsIndex::DB>(db_path, n_cache_size, f_memory, f_wipe);
+
+    uint32_t stored_version{0};
+    const bool has_version = m_db->Read(DB_SCHEMA_VERSION, stored_version);
+    if (!has_version && m_db->Exists(DB_SCHEMA_VERSION)) {
+        throw std::runtime_error("Unable to read coinstatsindex schema version");
+    }
+    if (has_version && stored_version > COINSTATS_SCHEMA_VERSION) {
+        throw std::runtime_error(strprintf(
+            "Unsupported newer coinstatsindex schema %u (maximum supported %u)",
+            stored_version, COINSTATS_SCHEMA_VERSION));
+    }
+    const bool populated_unversioned_index = !has_version && !m_db->IsEmpty();
+    const bool obsolete_version = has_version && stored_version < COINSTATS_SCHEMA_VERSION;
+    if (!f_wipe && (populated_unversioned_index || obsolete_version)) {
+        LogPrintf("CoinStatsIndex: rebuilding incompatible schema %s as version %u\n",
+                  populated_unversioned_index ? "without a version" : strprintf("version %u", stored_version),
+                  COINSTATS_SCHEMA_VERSION);
+        m_db.reset();
+        m_db = std::make_unique<CoinStatsIndex::DB>(db_path, n_cache_size, f_memory, /*f_wipe=*/true);
+    }
+    if (!m_db->Write(DB_SCHEMA_VERSION, COINSTATS_SCHEMA_VERSION)) {
+        throw std::runtime_error("Unable to write coinstatsindex schema version");
+    }
 }
 
 void CoinStatsIndex::AddCreatedCoin(const COutPoint& outpoint, const Coin& coin)
@@ -237,8 +269,8 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
 
             for (uint32_t j = 0; j < tx->vout.size(); ++j) {
                 const CTxOut& out{tx->vout[j]};
-                const unsigned int coin_time = (tx->nVersion < 2) ? tx->nTime : block.data->GetBlockTime();
-                Coin coin{out, block.height, tx->IsCoinBase(), tx->IsCoinStake(), static_cast<int>(coin_time)};
+                const uint32_t coin_time = GetCoinTime(*tx, block.data->nTime);
+                Coin coin{out, block.height, tx->IsCoinBase(), tx->IsCoinStake(), coin_time};
                 COutPoint outpoint{tx->GetHash(), j};
 
                 // Skip unspendable coins
@@ -247,8 +279,6 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
                     m_total_unspendables_scripts += coin.out.nValue;
                     continue;
                 }
-                if (IsShadowMarkerScript(coin.out.scriptPubKey)) continue;
-
                 AddCreatedCoin(outpoint, coin);
             }
 
@@ -259,8 +289,6 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
                 for (size_t j = 0; j < tx_undo.vprevout.size(); ++j) {
                     Coin coin{tx_undo.vprevout[j]};
                     COutPoint outpoint{tx->vin[j].prevout.hash, tx->vin[j].prevout.n};
-                    if (IsShadowMarkerScript(coin.out.scriptPubKey)) continue;
-
                     RemoveSpentCoin(outpoint, coin);
                 }
             }
@@ -269,7 +297,10 @@ bool CoinStatsIndex::CustomAppend(const interfaces::BlockInfo& block)
         {
             LOCK(cs_main);
             for (const ShadowSyntheticPayoutCoin& payout : GetAppliedShadowClaimPayoutCoins(m_chainstate->CoinsTip(), block.height, block.hash, block.data->GetBlockTime())) {
-                Coin coin{payout.txout, static_cast<int>(payout.height), /*fCoinBaseIn=*/true, /*fCoinStakeIn=*/false, static_cast<int>(payout.time)};
+                if (payout.time < 0 || payout.time > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+                    return error("%s: synthetic payout time is outside the serialized block-time range", __func__);
+                }
+                Coin coin{payout.txout, static_cast<int>(payout.height), /*fCoinBaseIn=*/true, /*fCoinStakeIn=*/false, static_cast<uint32_t>(payout.time)};
                 shadow_payouts.emplace_back(payout.outpoint, coin);
                 AddCreatedCoin(payout.outpoint, coin);
                 m_total_subsidy += coin.out.nValue;
@@ -518,8 +549,8 @@ bool CoinStatsIndex::ReverseBlock(const CBlock& block, const CBlockIndex* pindex
         for (uint32_t j = 0; j < tx->vout.size(); ++j) {
             const CTxOut& out{tx->vout[j]};
             COutPoint outpoint{tx->GetHash(), j};
-            const unsigned int coin_time = (tx->nVersion < 2) ? tx->nTime : block.GetBlockTime();
-            Coin coin{out, pindex->nHeight, tx->IsCoinBase(), tx->IsCoinStake(), static_cast<int>(coin_time)};
+            const uint32_t coin_time = GetCoinTime(*tx, block.nTime);
+            Coin coin{out, pindex->nHeight, tx->IsCoinBase(), tx->IsCoinStake(), coin_time};
 
             // Skip unspendable coins
             if (coin.out.scriptPubKey.IsUnspendable()) {
@@ -527,8 +558,6 @@ bool CoinStatsIndex::ReverseBlock(const CBlock& block, const CBlockIndex* pindex
                 m_total_unspendables_scripts -= coin.out.nValue;
                 continue;
             }
-            if (IsShadowMarkerScript(coin.out.scriptPubKey)) continue;
-
             RemoveCreatedCoin(outpoint, coin);
         }
 
@@ -539,8 +568,6 @@ bool CoinStatsIndex::ReverseBlock(const CBlock& block, const CBlockIndex* pindex
             for (size_t j = 0; j < tx_undo.vprevout.size(); ++j) {
                 Coin coin{tx_undo.vprevout[j]};
                 COutPoint outpoint{tx->vin[j].prevout.hash, tx->vin[j].prevout.n};
-                if (IsShadowMarkerScript(coin.out.scriptPubKey)) continue;
-
                 RestoreSpentCoin(outpoint, coin);
             }
         }

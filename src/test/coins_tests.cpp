@@ -1,3 +1,4 @@
+// Copyright (c) 2014-2022 The Bitcoin Core developers
 // Copyright (c) 2014-2022 Blackcoin Core Developers
 // Copyright (c) 2014-2022 Blackcoin More Developers
 // Copyright (c) 2014-2022 Quantum Quasar Developers
@@ -17,12 +18,13 @@
 #include <util/strencodings.h>
 
 #include <map>
+#include <limits>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
 
 int ApplyTxInUndo(Coin&& undo, CCoinsViewCache& view, const COutPoint& out);
-void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight, int nBlockTime = 0);
+void UpdateCoins(const CTransaction& tx, CCoinsViewCache& inputs, CTxUndo &txundo, int nHeight, int64_t nBlockTime = 0);
 
 namespace
 {
@@ -817,6 +819,27 @@ BOOST_AUTO_TEST_CASE(ccoins_add)
     CheckAddCoin(VALUE2, VALUE3, VALUE3, DIRTY|FRESH, DIRTY|FRESH, true );
 }
 
+BOOST_AUTO_TEST_CASE(ccoins_v2_block_time_uint32_boundary)
+{
+    CMutableTransaction mutable_tx;
+    mutable_tx.nVersion = 2;
+    mutable_tx.vin.emplace_back();
+    mutable_tx.vout.emplace_back(1, CScript{});
+    const CTransaction tx{mutable_tx};
+    constexpr int64_t block_time{std::numeric_limits<uint32_t>::max()};
+
+    BOOST_CHECK_EQUAL(GetCoinTime(tx, block_time),
+                      std::numeric_limits<uint32_t>::max());
+
+    CCoinsView base;
+    CCoinsViewCache cache{&base};
+    AddCoins(cache, tx, /*nHeight=*/1, /*check=*/false, block_time);
+
+    Coin coin;
+    BOOST_REQUIRE(cache.GetCoin(COutPoint{tx.GetHash(), 0}, coin));
+    BOOST_CHECK_EQUAL(coin.nTime, std::numeric_limits<uint32_t>::max());
+}
+
 void CheckWriteCoins(CAmount parent_value, CAmount child_value, CAmount expected_value, char parent_flags, char child_flags, char expected_flags)
 {
     SingleEntryCacheTest test(ABSENT, parent_value, parent_flags);
@@ -1126,6 +1149,51 @@ BOOST_AUTO_TEST_CASE(coins_resource_is_used)
     }
 
     PoolResourceTester::CheckAllDataAccountedFor(resource);
+}
+
+BOOST_AUTO_TEST_CASE(cursor_exact_lookup_preserves_immutable_snapshot)
+{
+    CCoinsViewDB base{{.path = "snapshot-seek", .cache_bytes = 1 << 23,
+                       .memory_only = true}, {}};
+    const COutPoint first{uint256{1}, 0};
+    const COutPoint second{uint256{2}, 0};
+    const COutPoint later{uint256{3}, 0};
+    const Coin first_coin{CTxOut{11, CScript{} << OP_1}, 10, false, false, 100};
+    const Coin second_coin{CTxOut{22, CScript{} << OP_2}, 11, false, false, 101};
+    const Coin later_coin{CTxOut{33, CScript{} << OP_3}, 12, false, false, 102};
+
+    {
+        CCoinsViewCache initial{&base, true};
+        initial.AddCoin(first, Coin{first_coin}, false);
+        initial.AddCoin(second, Coin{second_coin}, false);
+        initial.SetBestBlock(uint256::ONE);
+        BOOST_REQUIRE(initial.Flush());
+    }
+
+    std::unique_ptr<CCoinsViewCursor> snapshot = base.Cursor();
+    BOOST_REQUIRE(snapshot);
+    BOOST_CHECK(snapshot->GetBestBlock() == uint256::ONE);
+
+    {
+        CCoinsViewCache mutation{&base, true};
+        BOOST_REQUIRE(mutation.SpendCoin(first));
+        mutation.AddCoin(later, Coin{later_coin}, false);
+        mutation.SetBestBlock(uint256{2});
+        BOOST_REQUIRE(mutation.Flush());
+    }
+
+    Coin found;
+    BOOST_REQUIRE(snapshot->GetValueAt(first, found));
+    BOOST_CHECK(found.out == first_coin.out);
+    BOOST_REQUIRE(snapshot->GetValueAt(second, found));
+    BOOST_CHECK(found.out == second_coin.out);
+    BOOST_CHECK(!snapshot->GetValueAt(later, found));
+
+    std::unique_ptr<CCoinsViewCursor> current = base.Cursor();
+    BOOST_REQUIRE(current);
+    BOOST_CHECK(!current->GetValueAt(first, found));
+    BOOST_REQUIRE(current->GetValueAt(later, found));
+    BOOST_CHECK(found.out == later_coin.out);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

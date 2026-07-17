@@ -198,6 +198,8 @@ public:
         std::optional<int> shadow_gold_rush_start_height{};
         std::optional<int> shadow_gold_rush_blocks{};
         std::optional<int> shadow_halving_interval_blocks{};
+        std::optional<int> shadow_competing_claims_activation_height{};
+        std::optional<int> shadow_qqp4_activation_height{};
     };
 
     static std::unique_ptr<const CChainParams> RegTest(const RegTestOptions& options);

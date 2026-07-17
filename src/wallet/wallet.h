@@ -13,6 +13,7 @@
 #include <consensus/tx_verify.h>
 #include <interfaces/chain.h>
 #include <interfaces/handler.h>
+#include <interfaces/pow_mining.h>
 #include <kernel/cs_main.h>
 #include <logging.h>
 #include <outputtype.h>
@@ -61,6 +62,7 @@ class CKeyID;
 class CPubKey;
 class Coin;
 class SigningProvider;
+struct ShadowPowWork;
 enum class MemPoolRemovalReason;
 enum class SigningResult;
 enum class TransactionError;
@@ -69,6 +71,39 @@ class Wallet;
 }
 namespace wallet {
 class CWallet;
+
+enum class WalletCommitStatus {
+    ACCEPTED,
+    PERSISTED_PENDING,
+    REJECTED_NOT_ADDED,
+    REJECTED_ABANDONED,
+};
+
+/** Exact wallet input selected to authenticate one fee-paying Gold Rush PoW claim. */
+struct ShadowPowClaimInput {
+    COutPoint outpoint;
+    CScript target;
+    CTxDestination destination;
+    CAmount value{0};
+};
+
+enum class ShadowPowClaimInputSelectionResult {
+    SELECTED,
+    NO_ELIGIBLE_INPUT,
+    FEE_EXCEEDS_MAX,
+};
+
+enum class ShadowPowClaimSubmitResult {
+    SUBMITTED,
+    INPUT_UNAVAILABLE,
+    FAILED,
+};
+
+/** Block timing captured before taking cs_wallet. */
+struct WalletBlockTime {
+    int64_t block_time{0};
+    int64_t block_max_time{0};
+};
 class WalletBatch;
 enum class DBErrors : int;
 } // namespace wallet
@@ -177,6 +212,22 @@ static constexpr size_t DUMMY_NESTED_P2WPKH_INPUT_SIZE = 91;
 static const CAmount DEFAULT_MIN_STAKING_AMOUNT = 0.1 * COIN;
 //! -reservebalance default
 static const CAmount DEFAULT_RESERVE_BALANCE = 0;
+//! Optional wallet automation is opt-in. Consensus lifecycle and demurrage
+//! rules are independent and remain mandatory at their configured heights.
+static constexpr bool DEFAULT_AUTOSTART_STAKING{false};
+static constexpr bool DEFAULT_AUTO_SHADOW_SIGNAL{false};
+static constexpr bool DEFAULT_AUTO_DEMURRAGE_ATTEST{false};
+static constexpr bool DEFAULT_AUTO_REDELEGATE{false};
+static constexpr bool DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION{false};
+
+/**
+ * Return the effective process-wide staking autostart consent.
+ *
+ * New installations fail closed unless -autostartstaking is enabled. An
+ * explicitly configured legacy -staking=1 is retained as upgrade-compatible
+ * consent, while -autostartstaking always takes precedence when both exist.
+ */
+bool IsStakingAutostartEnabled();
 //! -donatetodevfund default
 static const unsigned int DEFAULT_DONATION_PERCENTAGE = 0;
 static const unsigned int DEFAULT_DONATION_SUGGESTED_PERCENTAGE = 1;
@@ -350,6 +401,17 @@ struct QuantumKeyInfo
     std::vector<unsigned char> public_key;
     int64_t creation_time{0};
     bool encrypted{false};
+    bool durably_stored{false};
+    // A completed verification event was recorded; external file existence is
+    // intentionally not implied.
+    bool backup_verified{false};
+};
+
+/** Result of resolving an explicit wallet-backed quantum address option. */
+enum class QuantumAddressBindingResult {
+    UNSET,
+    RESOLVED,
+    INVALID,
 };
 
 struct QuantumColdStakeDelegationRecord
@@ -507,6 +569,14 @@ struct EUTXOStateRecord
     }
 };
 
+struct WalletShadowSolveReference
+{
+    CScript target;
+    uint32_t solve_height{0};
+    uint256 solve_hash;
+    uint256 solve_txid;
+};
+
 class WalletRescanReserver; //forward declarations for ScanForWalletTransactions/RescanFromTime
 /**
  * A CWallet maintains a set of transactions and balances, and provides the ability to create new transactions.
@@ -524,11 +594,22 @@ private:
         CKeyingMaterial private_key;
         std::vector<unsigned char> crypted_private_key;
         int64_t creation_time{0};
+        bool durably_stored{false};
+        // Records a completed reopen-and-sign verification event. It cannot
+        // prove that an external backup file still exists.
+        bool backup_verified{false};
 
         bool IsCrypted() const { return !crypted_private_key.empty(); }
     };
 
     std::map<std::vector<unsigned char>, QuantumKeyRecord> m_quantum_keys GUARDED_BY(cs_wallet);
+    using QuantumKeySnapshot = std::map<std::vector<unsigned char>, std::vector<unsigned char>>;
+    bool VerifyQuantumBackup(const fs::path& backup_path, const QuantumKeySnapshot& expected_keys,
+                             const CKeyingMaterial& master_key, bool require_verified_markers,
+                             bool write_verified_markers,
+                             bilingual_str& error) const;
+    bool SetQuantumKeyBackupState(const QuantumKeySnapshot& expected_keys, bool verified,
+                                  bilingual_str& error);
     std::map<std::vector<unsigned char>, QuantumColdStakeDelegationRecord> m_quantum_coldstake_delegations GUARDED_BY(cs_wallet);
     std::map<uint256, RGBContractRecord> m_rgb_contracts GUARDED_BY(cs_wallet);
     std::map<std::pair<uint256, COutPoint>, RGBOwnedAssignmentRecord> m_rgb_assignments GUARDED_BY(cs_wallet);
@@ -558,6 +639,52 @@ private:
     std::atomic<int64_t> m_best_block_time {0};
 
     std::map<COutPoint, CStakeCache> stakeCache;
+
+    // Ordered, broad producer-side prefilter for staking. This contains every
+    // wallet-known output that is not currently spent by a non-conflicted,
+    // non-abandoned wallet transaction. Ownership, maturity, phase, lock,
+    // lineage, RGB, demurrage, and solvability policy remains authoritative in
+    // AvailableCoinsForStaking and is deliberately not cached here.
+    std::set<COutPoint> m_live_unspent_stake_outpoints GUARDED_BY(cs_wallet);
+    bool IsSpentForStakeIndex(const COutPoint& outpoint) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RefreshLiveUnspentStakeOutpoint(const COutPoint& outpoint) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RefreshLiveUnspentStakeOutpoints(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RecomputeLiveUnspentStakeOutpoints() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RefreshMempoolStatus(CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+
+    // Confirmed legacy PoS solves indexed by canonical wallet script. The
+    // complete wallet-known solve-only history is rebuilt once at load, then updated on
+    // wallet transaction state transitions. Retaining the history makes a
+    // disconnect restore the prior latest solve in logarithmic time instead
+    // of walking the complete wallet once per disconnected block.
+    using ShadowSolveHistoryKey = std::pair<int, uint256>;
+    struct ShadowSolveScriptDescending {
+        bool operator()(const CScript& a, const CScript& b) const
+        {
+            return b < a;
+        }
+    };
+    std::map<CScript, std::map<ShadowSolveHistoryKey, WalletShadowSolveReference>> m_shadow_solve_history GUARDED_BY(cs_wallet);
+    std::map<uint256, std::pair<CScript, ShadowSolveHistoryKey>> m_shadow_solve_by_txid GUARDED_BY(cs_wallet);
+    std::map<CScript, WalletShadowSolveReference> m_shadow_solve_latest GUARDED_BY(cs_wallet);
+    // Newest height first, with canonical script bytes as the deterministic
+    // tie-break. There is exactly one entry per script.
+    std::map<int, std::set<CScript, ShadowSolveScriptDescending>, std::greater<int>> m_shadow_solve_latest_by_height GUARDED_BY(cs_wallet);
+    std::set<uint256> m_pending_shadow_signal_txids GUARDED_BY(cs_wallet);
+    std::set<CScript> m_owned_legacy_shadow_scripts GUARDED_BY(cs_wallet);
+    std::map<uint256, std::set<uint256>> m_confirmed_synthetic_payouts_by_block GUARDED_BY(cs_wallet);
+    std::map<uint256, uint256> m_confirmed_synthetic_payout_block_by_txid GUARDED_BY(cs_wallet);
+    void RefreshLatestShadowSolve(const CScript& target) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RemoveIndexedShadowSolve(const uint256& txid) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void IndexConfirmedShadowSolve(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RecomputeShadowSolveIndex() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void UpdatePendingShadowSignalIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void IndexOwnedLegacyShadowScripts(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void UpdateConfirmedSyntheticPayoutIndex(const CWalletTx& wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void RecomputeConfirmedSyntheticPayoutIndex() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool ReconcileWalletShadowPayoutsForBlock(const uint256& block_hash, int block_height,
+                                              const std::set<COutPoint>& authenticated_outpoints,
+                                              WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     // First created key time. Used to skip blocks prior to this time.
     // 'std::numeric_limits<int64_t>::max()' if wallet is blank.
@@ -589,7 +716,8 @@ private:
      * Should be called with rescanning_old_block set to true, if the transaction is
      * not discovered in real time, but during a rescan of old blocks.
      */
-    bool AddToWalletIfInvolvingMe(const CTransactionRef& tx, const SyncTxState& state, bool fUpdate, bool rescanning_old_block) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool AddToWalletIfInvolvingMe(const CTransactionRef& tx, const SyncTxState& state, bool fUpdate, bool rescanning_old_block,
+                                  std::optional<WalletBlockTime> block_time = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** Mark a transaction (and its in-wallet descendants) as conflicting with a particular block. */
     void MarkConflicted(const uint256& hashBlock, int conflicting_height, const uint256& hashTx);
@@ -606,7 +734,8 @@ private:
 
     void SyncMetaData(std::pair<TxSpends::iterator, TxSpends::iterator>) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
-    void SyncTransaction(const CTransactionRef& tx, const SyncTxState& state, bool update_tx = true, bool rescanning_old_block = false) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void SyncTransaction(const CTransactionRef& tx, const SyncTxState& state, bool update_tx = true, bool rescanning_old_block = false,
+                         std::optional<WalletBlockTime> block_time = std::nullopt) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /** WalletFlags set on this wallet. */
     std::atomic<uint64_t> m_wallet_flags{0};
@@ -818,7 +947,9 @@ public:
     bool EncryptWallet(const SecureString& strWalletPassphrase);
 
     void GetKeyBirthTimes(std::map<CKeyID, int64_t> &mapKeyBirth) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
-    unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block) const;
+    unsigned int ComputeTimeSmart(const CWalletTx& wtx, bool rescanning_old_block,
+                                  std::optional<WalletBlockTime> block_time = std::nullopt) const
+        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
 
     /**
      * Increment the next transaction order id
@@ -841,8 +972,10 @@ public:
      * Add the transaction to the wallet, wrapping it up inside a CWalletTx
      * @return the recently added wtx pointer or nullptr if there was a db write error.
      */
-    CWalletTx* AddToWallet(CTransactionRef tx, const TxState& state, const UpdateWalletTxFn& update_wtx=nullptr, bool fFlushOnClose=true, bool rescanning_old_block = false);
-    bool LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    CWalletTx* AddToWallet(CTransactionRef tx, const TxState& state, const UpdateWalletTxFn& update_wtx=nullptr,
+                           bool fFlushOnClose=true, bool rescanning_old_block = false,
+                           std::optional<WalletBlockTime> block_time = std::nullopt);
+    bool LoadToWallet(const uint256& hash, const UpdateWalletTxFn& fill_wtx, bool reconcile_chainstate = true) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void transactionAddedToMempool(const CTransactionRef& tx) override;
     void blockConnected(ChainstateRole role, const interfaces::BlockInfo& block) override;
     void blockDisconnected(const interfaces::BlockInfo& block) override;
@@ -870,6 +1003,8 @@ public:
     void SetNextResend() { m_next_resend = GetDefaultNextResend(); }
     /** Return true if all conditions for periodically resending transactions are met. */
     bool ShouldResend() const;
+    /** Validate and repair stale Gold Rush proofs independently of relay policy. */
+    void RepairStaleShadowTransactions(bool force);
     void ResubmitWalletTransactions(bool relay, bool force);
 
     OutputType TransactionChangeType(const std::optional<OutputType>& change_type, const std::vector<CRecipient>& vecSend) const;
@@ -904,7 +1039,7 @@ public:
                   bool sign = true,
                   bool bip32derivs = true,
                   size_t* n_signed = nullptr,
-                  bool finalize = true) const;
+                  bool finalize = true) const LOCKS_EXCLUDED(cs_wallet);
 
     //! Return wallet/script verification flags for the active chain tip.
     unsigned int GetActiveScriptVerifyFlags() const;
@@ -921,12 +1056,12 @@ public:
      * @param[in] mapValue key-values to be set on the transaction.
      * @param[in] orderForm BIP 70 / BIP 21 order form details to be set on the transaction.
      */
-    bool CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm, std::string* broadcast_error = nullptr);
+    bool CommitTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm,
+                           std::string* broadcast_error = nullptr, WalletCommitStatus* commit_status = nullptr);
     bool CommitRGBTransaction(CTransactionRef tx, mapValue_t mapValue, std::vector<std::pair<std::string, std::string>> orderForm, const RGBTxCommitData& rgb_data, std::string& error);
 
     /** Pass this transaction to node for mempool insertion and relay to peers if flag set to true */
-    bool SubmitTxMemoryPoolAndRelay(CWalletTx& wtx, std::string& err_string, bool relay) const
-        EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool SubmitTxMemoryPoolAndRelay(const uint256& txid, std::string& err_string, bool relay);
 
     bool ImportScripts(const std::set<CScript> scripts, int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool ImportPrivKeys(const std::map<CKeyID, CKey>& privkey_map, const int64_t timestamp) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -962,8 +1097,11 @@ public:
     // serves to disable the trivial sendmoney when OS account compromised
     // provides no real security
     std::atomic<bool> m_wallet_unlock_staking_only{false};
-    int64_t m_last_coin_stake_search_time{0};
-    int64_t m_last_coin_stake_search_interval{0};
+    int64_t m_last_coin_stake_search_time GUARDED_BY(cs_wallet){0};
+    // Published by the staking thread and sampled by GUI/RPC health checks.
+    // Keep this atomic so status reads never have to wait behind a wallet scan.
+    std::atomic<int64_t> m_last_coin_stake_search_interval{0};
+    uint256 m_last_coin_stake_search_tip GUARDED_BY(cs_wallet){};
     CAmount m_min_staking_amount{DEFAULT_MIN_STAKING_AMOUNT};
     CAmount m_reserve_balance{DEFAULT_RESERVE_BALANCE};
     unsigned int m_donation_percentage{DEFAULT_DONATION_PERCENTAGE};
@@ -972,6 +1110,20 @@ public:
     int m_demurrage_last_auto_attest_scan_height GUARDED_BY(cs_wallet){-1};
     std::map<uint256, int> m_demurrage_last_auto_attest_attempt_height GUARDED_BY(cs_wallet);
     int m_shadow_signal_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
+    // The staking thread and the periodic wallet scheduler can both request an
+    // automatic QQSIGNAL. Keep construction single-flight per wallet and use a
+    // non-blocking retry deadline so transient validation/signing failures do
+    // not become a tight loop or permanently suppress retries at the same tip.
+    std::atomic<bool> m_shadow_signal_inflight{false};
+    std::atomic<unsigned int> m_shadow_signal_retry_failures{0};
+    std::atomic<int64_t> m_shadow_signal_next_retry_ms{0};
+    // Resume automatic QQSIGNAL fee-input discovery after the last bounded
+    // wallet-history slice instead of rescanning mapWallet from the beginning.
+    COutPoint m_shadow_signal_coin_scan_cursor GUARDED_BY(cs_wallet);
+    // GetStakeWeight is an O(wallet history) calculation. The staking worker
+    // publishes its most recent complete result for non-blocking RPC/GUI reads.
+    mutable std::atomic<uint64_t> m_cached_stake_weight{0};
+    mutable std::atomic<int> m_cached_stake_weight_height{-1};
     int m_redelegation_last_auto_scan_height GUARDED_BY(cs_wallet){-1};
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_attempt_height GUARDED_BY(cs_wallet);
     std::map<std::vector<unsigned char>, int> m_redelegation_last_auto_success_height GUARDED_BY(cs_wallet);
@@ -980,6 +1132,7 @@ public:
     // Built-in Gold Rush Proof-of-Work miner (in-process; NO external miner). Configured from the
     // GUI "Staking & Mining" tab / setpowmining RPC; the in-process Argon2id solver reads these.
     std::atomic<bool> m_pow_mining_enabled{false};
+    std::atomic<interfaces::WalletPowMiningState> m_pow_state{interfaces::WalletPowMiningState::DISABLED};
     std::atomic<int> m_pow_threads{1};         // CPU cores / worker threads
     std::atomic<int> m_pow_cpu_percent{1};     // per-core CPU duty-cycle target, 1..100
     std::atomic<double> m_pow_hashrate{0.0};   // aggregate Argon2id tries/s reported by the solver
@@ -988,12 +1141,35 @@ public:
     std::atomic<uint64_t> m_pow_next_nonce{0};
     std::atomic<uint64_t> m_pow_total_tries{0};
     std::atomic<int64_t> m_pow_hashrate_start_ms{0};
-    std::string m_pow_payout_quantum GUARDED_BY(cs_wallet); // auto-created ML-DSA payout address
+    // Serializes the fee-paying claim path across the built-in miner and
+    // sendshadowpowclaim RPC. Grinding workers may still search in parallel,
+    // but only one caller per wallet may select an input, sign, and commit a
+    // QQSPROOF transaction at a time.
+    std::atomic<bool> m_shadow_pow_claim_submission_inflight{false};
+    std::string m_pow_payout_quantum GUARDED_BY(cs_wallet); // configured, reused, or explicitly consented ML-DSA payout
+    // Runtime cache used to emit the configured QQSIGNAL binding once per
+    // wallet process instead of once per retry attempt.
+    std::string m_shadow_signal_payout_quantum GUARDED_BY(cs_wallet);
     Mutex m_pow_miner_mutex;
     uint256 m_pow_tip_hash GUARDED_BY(m_pow_miner_mutex);
     bool m_pow_claim_inflight GUARDED_BY(m_pow_miner_mutex){false};
+    std::set<uint256> m_inflight_wallet_broadcasts GUARDED_BY(cs_wallet);
 
-    uint64_t GetStakeWeight() const;
+    uint64_t GetStakeWeight() const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+
+    /** Broad ordered staking prefilter. Caller must keep cs_wallet held while
+     *  using the returned reference. */
+    const std::set<COutPoint>& GetLiveUnspentStakeOutpoints() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        return m_live_unspent_stake_outpoints;
+    }
+
+    /** O(1) scheduling/diagnostic count which does not expose wallet history. */
+    size_t GetLiveUnspentStakeOutputCount() const
+    {
+        LOCK(cs_wallet);
+        return m_live_unspent_stake_outpoints.size();
+    }
 
     /** Number of pre-generated keys/scripts by each spkm (part of the look-ahead process, used to detect payments) */
     int64_t m_keypool_size{DEFAULT_KEYPOOL_SIZE};
@@ -1048,9 +1224,13 @@ public:
 
     bool LoadQuantumKey(const std::vector<unsigned char>& public_key, const CKeyingMaterial& private_key, int64_t creation_time) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadCryptedQuantumKey(const std::vector<unsigned char>& public_key, const std::vector<unsigned char>& crypted_private_key, int64_t creation_time) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    bool LoadQuantumKeyBackupState(const std::vector<unsigned char>& witness_program, bool verified) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadQuantumColdStakeDelegation(const std::vector<unsigned char>& witness_program, const QuantumColdStakeDelegationRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RecordQuantumRedelegationWins(const CTransaction& tx, int height, WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     void RecomputeQuantumRedelegationWinHistory(WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::vector<WalletShadowSolveReference> GetRecentShadowSolveReferences(int tip_height, size_t limit) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::vector<uint256> GetPendingShadowSignalTxids() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    std::vector<CScript> GetOwnedLegacyShadowScripts(size_t limit) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadRGBContract(const uint256& contract_id, const RGBContractRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadRGBAssignment(const uint256& contract_id, const COutPoint& outpoint, const RGBOwnedAssignmentRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool LoadRGBGenesisProof(const uint256& contract_id, const RGBGenesisProofRecord& record) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1083,7 +1263,7 @@ public:
     std::set<COutPoint> GetProtectedRGBSeals() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     /** Sync each owned RGB assignment's spent flag to the chain (IsSpent of its seal) so a
      *  reorged-out / abandoned / conflicted transfer no longer desyncs the RGB ledger. */
-    void ReconcileRGBAssignments() EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    void ReconcileRGBAssignments() LOCKS_EXCLUDED(cs_wallet);
     bool HasPlaintextQuantumKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool HasCryptedQuantumKeys() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
     bool EncryptQuantumKeys(const CKeyingMaterial& master_key, WalletBatch& batch) EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
@@ -1180,7 +1360,7 @@ public:
     bool TransactionCanBeAbandoned(const uint256& hashTx) const;
 
     /* Mark a transaction (and it in-wallet descendants) as abandoned so its inputs may be respent. */
-    bool AbandonTransaction(const uint256& hashTx);
+    bool AbandonTransaction(const uint256& hashTx, bool automatic_shadow_stale = false);
 
     /* Initializes the wallet, returns a new CWallet instance or a null pointer in case of an error */
     static std::shared_ptr<CWallet> Create(WalletContext& context, const std::string& name, std::unique_ptr<WalletDatabase> database, uint64_t wallet_creation_flags, bilingual_str& error, std::vector<bilingual_str>& warnings);
@@ -1191,7 +1371,19 @@ public:
      */
     void postInitProcess();
 
-    bool BackupWallet(const std::string& strDest) const;
+    /**
+     * Copy the wallet database. By default, wallets containing non-HD quantum
+     * keys reopen the produced file, independently sign/verify every key, and
+     * only then persist the per-key verified-backup state.
+     *
+     * Internal pre-migration safety copies may opt out because they preserve
+     * the exact source database and are not represented to the user as a
+     * verified current-generation quantum-key backup.
+     */
+    bool BackupWallet(const std::string& strDest, bilingual_str* error = nullptr, bool verify_quantum_keys = true);
+
+    /** In-process fault injection for wallet backup tests. Never persisted or exposed through RPC. */
+    std::function<bool(std::string_view)> m_quantum_backup_failpoint;
 
     /* Returns true if HD is enabled */
     bool IsHDEnabled() const;
@@ -1287,6 +1479,12 @@ public:
         assert(m_last_block_processed_height >= 0);
         return m_last_block_processed_height;
     };
+    std::optional<int> GetLastBlockHeightIfSet() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
+    {
+        AssertLockHeld(cs_wallet);
+        if (m_last_block_processed_height < 0) return std::nullopt;
+        return m_last_block_processed_height;
+    }
     uint256 GetLastBlockHash() const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet)
     {
         AssertLockHeld(cs_wallet);
@@ -1364,19 +1562,101 @@ public:
     bool IsStakeClosing();
 
     /* Staking thread group */
-    std::unique_ptr<std::vector<std::thread>> threadStakeMinerGroup;
+    Mutex m_staking_thread_mutex;
+    std::unique_ptr<std::vector<std::thread>> threadStakeMinerGroup GUARDED_BY(m_staking_thread_mutex);
 
     /* Built-in Gold Rush PoW miner */
-    bool SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error, bool* created_payout = nullptr);
+    bool SetPowMining(bool enabled, int threads, int cpu_percent, bilingual_str& error,
+                      bool* created_payout = nullptr, bool allow_new_payout_key = false);
     void StopPowMining();
     bool IsPowMiningClosing() const;
     void ThreadShadowPoWMiner(int worker_id);
-    bool EnsurePowPayoutAddress(bilingual_str& error, bool* created = nullptr);
-    bool SubmitShadowPowClaim(const CScript& target, const CTxDestination& dest, const std::vector<unsigned char>& proof, bilingual_str& error);
+    QuantumAddressBindingResult ResolveConfiguredQuantumAddress(
+        const std::string& option,
+        const std::string& purpose,
+        CTxDestination& destination,
+        bilingual_str& error) const;
+    bool EnsurePowPayoutAddress(bilingual_str& error, bool* created = nullptr,
+                                bool allow_new_key = false);
+    bool EnsureShadowSignalPayoutAddress(
+        CScript& payout_script,
+        std::string& payout_address,
+        bilingual_str& error,
+        bool* created = nullptr);
+    bool PrepareAutomaticDemurrageChangeAddress(CCoinControl& coin_control, bilingual_str& error) const;
+    bool TryBeginShadowPowClaimSubmission()
+    {
+        bool expected{false};
+        return m_shadow_pow_claim_submission_inflight.compare_exchange_strong(
+            expected, true, std::memory_order_acquire, std::memory_order_relaxed);
+    }
+    void EndShadowPowClaimSubmission()
+    {
+        m_shadow_pow_claim_submission_inflight.store(false, std::memory_order_release);
+    }
+    /**
+     * Count wallet-authored QQSPROOF transactions that remain capable of
+     * confirming. Such a transaction must keep its inputs quarantined even
+     * after local mempool eviction because a peer may still retain it. An
+     * incoming proof that merely pays this wallet is not wallet-authored and
+     * must not occupy its single-flight slot.
+     */
+    size_t CountUnresolvedShadowPowClaims() const;
+    /** Count only QQSPROOF transactions currently in the local mempool, which
+     * occupy relay/template capacity. Non-mempool proofs are handled by the
+     * quarantine gate and never authorize a new fee-input claim. */
+    size_t CountLiveShadowPowClaims() const;
+    /** Count every wallet-authored unconfirmed QQSPROOF absent from the local
+     * mempool. Even without a persisted marker, a peer may still confirm it,
+     * so a new fee-input claim must not be created until this count is zero. */
+    size_t CountQuarantinedShadowPowClaims() const;
+    /** Return true only for a persisted, locally recognized quarantine. This
+     * is intentionally narrower than CountQuarantinedShadowPowClaims(), which
+     * fail-closes for every absent unconfirmed proof. */
+    bool IsQuarantinedShadowPowClaim(const uint256& txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Identify a compatibility transaction created by an older release for
+     * one exact claim. Callers must still validate its inputs and outputs. */
+    bool IsLegacyShadowPowCleanupFor(const CWalletTx& wtx, const uint256& claim_txid) const EXCLUSIVE_LOCKS_REQUIRED(cs_wallet);
+    /** Persist input quarantine after a claim was added to the wallet but
+     * could not be kept in the local mempool. */
+    bool QuarantineShadowPowClaim(const uint256& txid);
+    ShadowPowClaimInputSelectionResult SelectShadowPowClaimInput(
+        const std::optional<CScript>& required_target,
+        const CScript& quantum_payout_script,
+        const std::vector<unsigned char>* proof,
+        const CCoinControl& coin_control,
+        ShadowPowClaimInput& selected,
+        bilingual_str& error) const EXCLUSIVE_LOCKS_REQUIRED(::cs_main, cs_wallet);
+    void MaybeDelayShadowPowClaimSubmissionForTest(const COutPoint& selected_outpoint);
+    ShadowPowClaimSubmitResult SubmitShadowPowClaim(const ShadowPowClaimInput& selected_input, const ShadowPowWork& work, const std::vector<unsigned char>& proof, bilingual_str& error);
     std::unique_ptr<std::vector<std::thread>> threadPowMinerGroup GUARDED_BY(m_pow_miner_mutex);
 
     //! Whether the (external) signer performs R-value signature grinding
     bool CanGrindR() const;
+};
+
+/** Non-blocking, exception-safe reservation for one wallet QQSPROOF submitter. */
+class ShadowPowClaimSubmissionGuard
+{
+public:
+    explicit ShadowPowClaimSubmissionGuard(CWallet& wallet)
+        : m_wallet(wallet), m_acquired(wallet.TryBeginShadowPowClaimSubmission())
+    {
+    }
+
+    ShadowPowClaimSubmissionGuard(const ShadowPowClaimSubmissionGuard&) = delete;
+    ShadowPowClaimSubmissionGuard& operator=(const ShadowPowClaimSubmissionGuard&) = delete;
+
+    ~ShadowPowClaimSubmissionGuard()
+    {
+        if (m_acquired) m_wallet.EndShadowPowClaimSubmission();
+    }
+
+    explicit operator bool() const { return m_acquired; }
+
+private:
+    CWallet& m_wallet;
+    bool m_acquired{false};
 };
 
 /**

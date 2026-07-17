@@ -9,21 +9,27 @@ TESTS += qt/test/test_blackcoin-qt
 
 TEST_QT_MOC_CPP = \
   qt/test/moc_apptests.cpp \
+  qt/test/moc_chainstaterebuildassistanttests.cpp \
   qt/test/moc_optiontests.cpp \
   qt/test/moc_rpcnestedtests.cpp \
+  qt/test/moc_shadowresourcedialogtests.cpp \
   qt/test/moc_uritests.cpp
 
 if ENABLE_WALLET
 TEST_QT_MOC_CPP += \
   qt/test/moc_addressbooktests.cpp \
+  qt/test/moc_themetests.cpp \
   qt/test/moc_wallettests.cpp
 endif # ENABLE_WALLET
 
 TEST_QT_H = \
   qt/test/addressbooktests.h \
   qt/test/apptests.h \
+  qt/test/chainstaterebuildassistanttests.h \
   qt/test/optiontests.h \
   qt/test/rpcnestedtests.h \
+  qt/test/shadowresourcedialogtests.h \
+  qt/test/themetests.h \
   qt/test/uritests.h \
   qt/test/util.h \
   qt/test/wallettests.h
@@ -34,8 +40,10 @@ qt_test_test_blackcoin_qt_CPPFLAGS = $(AM_CPPFLAGS) $(BITCOIN_INCLUDES) $(BITCOI
 qt_test_test_blackcoin_qt_SOURCES = \
   init/bitcoin-qt.cpp \
   qt/test/apptests.cpp \
+  qt/test/chainstaterebuildassistanttests.cpp \
   qt/test/optiontests.cpp \
   qt/test/rpcnestedtests.cpp \
+  qt/test/shadowresourcedialogtests.cpp \
   qt/test/test_main.cpp \
   qt/test/uritests.cpp \
   qt/test/util.cpp \
@@ -43,6 +51,7 @@ qt_test_test_blackcoin_qt_SOURCES = \
 if ENABLE_WALLET
 qt_test_test_blackcoin_qt_SOURCES += \
   qt/test/addressbooktests.cpp \
+  qt/test/themetests.cpp \
   qt/test/wallettests.cpp \
   wallet/test/wallet_test_fixture.cpp
 endif # ENABLE_WALLET

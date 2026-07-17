@@ -55,7 +55,7 @@ void PSBTOperationsDialog::openWithPSBT(PartiallySignedTransaction psbtx)
     CMutableTransaction finalized_tx;
     bool complete = m_wallet_model
         ? m_wallet_model->wallet().finalizePSBT(psbtx, finalized_tx)
-        : FinalizePSBT(psbtx); // Make sure all existing signatures are fully combined before checking for completeness.
+        : false; // Lifecycle/ForkID context is unavailable without a loaded wallet.
     if (m_wallet_model) {
         size_t n_could_sign;
         TransactionError err = m_wallet_model->wallet().fillPSBT(SIGHASH_ALL, /*sign=*/false, /*bip32derivs=*/true, &n_could_sign, m_transaction_data, complete);
@@ -111,7 +111,7 @@ void PSBTOperationsDialog::broadcastTransaction()
     CMutableTransaction mtx;
     const bool complete = m_wallet_model
         ? m_wallet_model->wallet().finalizePSBT(m_transaction_data, mtx)
-        : FinalizeAndExtractPSBT(m_transaction_data, mtx);
+        : false;
     if (!complete) {
         // This is never expected to fail unless we were given a malformed PSBT
         // (e.g. with an invalid signature.)
@@ -193,9 +193,12 @@ std::string PSBTOperationsDialog::renderTransaction(const PartiallySignedTransac
         tx_description.append("<br>");
     }
 
-    PSBTAnalysis analysis = AnalyzePSBT(psbtx);
+    const auto psbt_context = m_wallet_model
+        ? m_wallet_model->wallet().getPSBTAnalysisContext()
+        : std::pair<unsigned int, uint32_t>{STANDARD_SCRIPT_VERIFY_FLAGS, 0};
+    PSBTAnalysis analysis = AnalyzePSBT(psbtx, psbt_context.first, psbt_context.second);
     tx_description.append(" * ");
-    if (!*analysis.fee) {
+    if (!analysis.fee) {
         // This happens if the transaction is missing input UTXO information.
         tx_description.append(tr("Unable to calculate transaction fee or total transaction amount."));
     } else {
@@ -261,7 +264,12 @@ size_t PSBTOperationsDialog::couldSignInputs(const PartiallySignedTransaction &p
 }
 
 void PSBTOperationsDialog::showTransactionStatus(const PartiallySignedTransaction &psbtx) {
-    PSBTAnalysis analysis = AnalyzePSBT(psbtx);
+    if (!m_wallet_model) {
+        showStatus(tr("Load a wallet connected to the active chain to verify this PSBT's Quantum Quasar lifecycle and ForkID context."), StatusLevel::WARN);
+        return;
+    }
+    const auto psbt_context = m_wallet_model->wallet().getPSBTAnalysisContext();
+    PSBTAnalysis analysis = AnalyzePSBT(psbtx, psbt_context.first, psbt_context.second);
     size_t n_could_sign = couldSignInputs(psbtx);
 
     switch (analysis.next) {

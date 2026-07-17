@@ -8,6 +8,7 @@
 #define BITCOIN_NODE_CONTEXT_H
 
 #include <kernel/context.h>
+#include <node/chainstate_rebuild.h>
 
 #include <atomic>
 #include <cassert>
@@ -75,6 +76,15 @@ struct NodeContext {
     std::function<void()> rpc_interruption_point = [] {};
     std::unique_ptr<KernelNotifications> notifications;
     std::atomic<int> exit_status{EXIT_SUCCESS};
+    //! Set only for the intentional clean exit after a protected chainstate
+    //! rebuild first pass. Shutdown hooks must not treat it as an operational
+    //! node shutdown.
+    std::atomic<bool> rebuild_restart_required{false};
+    //! Set only by the in-process GUI so AppInitMain can hand mandatory
+    //! rebuild outcomes to a blocking Qt assistant instead of a generic error.
+    bool gui_process{false};
+    std::atomic<ChainstateRebuildStatus> chainstate_rebuild_status{
+        ChainstateRebuildStatus::NONE};
 
     //! Declare default constructor and destructor that are not inline, so code
     //! instantiating the NodeContext struct doesn't need to #include class

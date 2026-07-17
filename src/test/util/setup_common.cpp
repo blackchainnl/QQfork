@@ -28,6 +28,7 @@
 #include <node/blockstorage.h>
 #include <node/blockmanager_args.h>
 #include <node/chainstate.h>
+#include <node/chainstate_rebuild.h>
 #include <node/chainstatemanager_args.h>
 #include <node/context.h>
 #include <node/kernel_notifications.h>
@@ -47,6 +48,7 @@
 #include <scheduler.h>
 #include <script/sign.h>
 #include <script/sigcache.h>
+#include <shadow.h>
 #include <shutdown.h>
 #include <streams.h>
 #include <test/util/net.h>
@@ -239,6 +241,10 @@ void ChainTestingSetup::LoadVerifyActivateChainstate()
     if (!chainman.ActiveChainstate().ActivateBestChain(state)) {
         throw std::runtime_error(strprintf("ActivateBestChain failed. (%s)", state.ToString()));
     }
+    bilingual_str finalize_error;
+    if (!node::FinalizeChainstateRebuild(chainman, finalize_error)) {
+        throw std::runtime_error(finalize_error.original);
+    }
 }
 
 TestingSetup::TestingSetup(
@@ -381,7 +387,7 @@ CMutableTransaction TestChain100Setup::CreateValidMempoolTransaction(CTransactio
     {
         LOCK(cs_main);
         const CBlockIndex* tip{Assert(m_node.chainman)->ActiveChain().Tip()};
-        if (tip && Params().GetConsensus().IsNewNetworkStakeOnly(tip->GetMedianTimePast(), tip->nHeight + 1)) {
+        if (tip && IsQuantumWitnessSpendActive(Params().GetConsensus(), tip->GetMedianTimePast(), tip->nHeight + 1)) {
             nHashType |= SIGHASH_FORKID;
         }
     }
@@ -402,7 +408,8 @@ CMutableTransaction TestChain100Setup::CreateValidMempoolTransaction(CTransactio
 
     unsigned int verify_flags = STANDARD_SCRIPT_VERIFY_FLAGS;
     if ((nHashType & SIGHASH_FORKID) != 0) {
-        verify_flags |= SCRIPT_ENABLE_SIGHASH_FORKID | SCRIPT_VERIFY_ISCOINSTAKE | SCRIPT_VERIFY_V4_LARGE_SCRIPT_ELEMENT;
+        verify_flags |= SCRIPT_ENABLE_SIGHASH_FORKID |
+                        SCRIPT_VERIFY_STRICTENC;
     }
     ScriptError serror = SCRIPT_ERR_OK;
     assert(VerifyScript(

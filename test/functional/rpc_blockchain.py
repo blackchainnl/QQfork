@@ -47,7 +47,6 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import (
     assert_equal,
     assert_greater_than,
-    assert_greater_than_or_equal,
     assert_raises,
     assert_raises_rpc_error,
     assert_is_hex_string,
@@ -94,7 +93,6 @@ class BlockchainTest(BitcoinTestFramework):
         self._test_getblock()
         self._test_getdeploymentinfo()
         self._test_y2106()
-        assert self.nodes[0].verifychain(4, 0)
 
     def mine_chain(self):
         self.log.info(f"Generate {HEIGHT} blocks after the genesis block in ten-minute steps")
@@ -120,7 +118,7 @@ class BlockchainTest(BitcoinTestFramework):
             expected_msg=": The block database contains a block which appears to be from the future."
             " This may be due to your computer's date and time being set incorrectly."
             f" Only rebuild the block database if you are sure that your computer's date and time are correct.{os.linesep}"
-            "Please restart with -reindex or -reindex-chainstate to recover.",
+            "Please restart with -reindex to rebuild the full block database.",
         )
         self.log.info("A block tip of MAX_FUTURE_BLOCK_TIME in the future is fine")
         self.start_node(0, extra_args=[f"-mocktime={TIME_RANGE_TIP - MAX_FUTURE_BLOCK_TIME}"])
@@ -137,8 +135,8 @@ class BlockchainTest(BitcoinTestFramework):
             'headers',
             'initialblockdownload',
             'mediantime',
+            'pruned',
             'quantumquasar',
-            # 'pruned',
             'size_on_disk',
             'time',
             'verificationprogress',
@@ -148,6 +146,7 @@ class BlockchainTest(BitcoinTestFramework):
 
         assert_equal(res['time'], TIME_RANGE_END - TIME_RANGE_STEP)
         assert_equal(res['mediantime'], TIME_RANGE_MTP)
+        assert_equal(res['pruned'], False)
 
         # result should have these additional pruning keys if manual pruning is enabled
         # assert_equal(sorted(res.keys()), sorted(['pruneheight', 'automatic_pruning'] + keys))
@@ -223,6 +222,19 @@ class BlockchainTest(BitcoinTestFramework):
                 },
                 'active': False
             },
+            'taproot': {
+                'type': 'bip9',
+                'height': 0,
+                'active': True,
+                'bip9': {
+                    'start_time': -1,
+                    'timeout': 0x7fffffffffffffff,
+                    'min_activation_height': 0,
+                    'status': 'active',
+                    'since': 0,
+                    'status_next': 'active',
+                },
+            },
           }
         })
 
@@ -248,6 +260,12 @@ class BlockchainTest(BitcoinTestFramework):
         # calling with an explicit hash works
         self.check_signalling_deploymentinfo_result(self.nodes[0].getdeploymentinfo(gbci207["bestblockhash"]), gbci207["blocks"], gbci207["bestblockhash"], "started")
 
+        # Restore the activation schedule used to create the existing chain.
+        # Leaving the temporary segwit@6 override in place makes level-4
+        # verification reinterpret blocks 1 through 5, which were mined with
+        # the default regtest SegWit activation height.
+        self.restart_node(0)
+
     def _test_y2106(self):
         self.log.info("Check that block timestamps work until year 2106")
         self.nodes[0].setmocktime(self.nodes[0].getblockheader(self.nodes[0].getbestblockhash())["time"] + 1)
@@ -258,6 +276,16 @@ class BlockchainTest(BitcoinTestFramework):
         header = self.nodes[0].getblockheader(last)
         assert_equal(header["time"], time_2106)
         assert header["mediantime"] <= time_2106
+
+        # This is a version-2 coinbase: its UTXO time comes from the unsigned
+        # 32-bit block header, not a serialized transaction nTime. Level 4
+        # verification disconnects and reconnects it, covering the full
+        # chainstate round trip at the year-2106 boundary.
+        block = self.nodes[0].getblock(last, 2)
+        assert_equal(block["tx"][0]["version"], 2)
+        # Exercise only the max-uint32 tip before the broader chain check.
+        assert self.nodes[0].verifychain(4, 1)
+        assert self.nodes[0].verifychain(4, 0)
 
     def _test_getchaintxstats(self):
         self.log.info("Test getchaintxstats")

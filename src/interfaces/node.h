@@ -1,3 +1,4 @@
+// Copyright (c) 2018-2022 The Bitcoin Core developers
 // Copyright (c) 2018-2022 Blackcoin Core Developers
 // Copyright (c) 2018-2022 Blackcoin More Developers
 // Copyright (c) 2018-2022 Blackcoin Developers
@@ -36,7 +37,10 @@ enum class TransactionError;
 struct CNodeStateStats;
 struct bilingual_str;
 namespace node {
+enum class ChainstateRebuildStatus;
 struct NodeContext;
+struct ShadowResourceStatus;
+struct ShadowSupplyScanProgress;
 } // namespace node
 namespace wallet {
 class CCoinControl;
@@ -55,6 +59,15 @@ struct BlockAndHeaderTipInfo
     int header_height;
     int64_t header_time;
     double verification_progress;
+};
+
+//! Outcome of node bootstrap. A staged chainstate rebuild can finish its
+//! isolated first pass successfully while requiring one clean restart before
+//! normal node services may begin.
+enum class AppInitResult {
+    SUCCESS,
+    REBUILD_RESTART_REQUIRED,
+    FAILURE,
 };
 
 //! External signer interface used by the GUI.
@@ -85,6 +98,28 @@ public:
     //! Get exit status.
     virtual int getExitStatus() = 0;
 
+    //! Get mandatory chainstate-upgrade state for the GUI startup assistant.
+    virtual node::ChainstateRebuildStatus getChainstateRebuildStatus() = 0;
+
+    //! Get the current scoped shadow-resource operating status.
+    virtual node::ShadowResourceStatus getShadowResourceStatus() = 0;
+
+    //! Get the current or most recent full-supply scan progress.
+    virtual node::ShadowSupplyScanProgress getShadowSupplyScanProgress() = 0;
+
+    //! Request cooperative cancellation of the active full-supply scan.
+    virtual bool abortCirculatingSupplyScan() = 0;
+
+    /**
+     * Run one full circulating-supply scan.
+     *
+     * The boolean is authorization for this call only when the snapshot is
+     * outside the reviewed diagnostic height or chainstate-size envelope. It
+     * is never persisted and cannot bypass hard integrity or absolute work
+     * limits.
+     */
+    virtual UniValue runCirculatingSupplyScan(bool allow_unqualified_resource_scan) = 0;
+
     // Get log flags.
     virtual uint32_t getLogCategories() = 0;
 
@@ -92,7 +127,7 @@ public:
     virtual bool baseInitialize() = 0;
 
     //! Start node.
-    virtual bool appInitMain(interfaces::BlockAndHeaderTipInfo* tip_info = nullptr) = 0;
+    virtual AppInitResult appInitMain(interfaces::BlockAndHeaderTipInfo* tip_info = nullptr) = 0;
 
     //! Stop node.
     virtual void appShutdown() = 0;

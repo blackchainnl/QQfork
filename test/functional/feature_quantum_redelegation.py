@@ -12,6 +12,10 @@ from test_framework.test_framework import BitcoinTestFramework
 from test_framework.util import assert_equal, assert_raises_rpc_error
 
 
+GOLD_RUSH_END_HEIGHT = 2
+MIGRATION_END_HEIGHT = 1000
+
+
 class QuantumRedelegationTest(BitcoinTestFramework):
     def add_options(self, parser):
         self.add_wallet_options(parser)
@@ -20,10 +24,13 @@ class QuantumRedelegationTest(BitcoinTestFramework):
         self.num_nodes = 1
         self.setup_clean_chain = True
         self.extra_args = [[
+            "-allowunsafequantumkeyrpc=1",
             "-donatetodevfund=0",
             "-shadowwhitelistheight=1",
             "-shadowgoldrushblocks=1",
-            "-qqgoldrushendtime=1",
+            f"-qqgoldrushendheight={GOLD_RUSH_END_HEIGHT}",
+            f"-qqmigrationendheight={MIGRATION_END_HEIGHT}",
+            f"-qqstaketierheight={GOLD_RUSH_END_HEIGHT + 1}",
         ]]
 
     def skip_test_if_missing_module(self):
@@ -92,6 +99,7 @@ class QuantumRedelegationTest(BitcoinTestFramework):
 
         funder_address = funder.getnewaddress("", "legacy")
         self._generate(COINBASE_MATURITY + 2, funder_address)
+        assert_equal(node.getquantumquasarinfo()["phase"], "migration")
 
         current = self._register_operator(node, funder, funder_address, owner_a, staker_a, "current", Decimal("100"))
         small = self._register_operator(node, funder, funder_address, owner_b, staker_b, "small", Decimal("50"))
@@ -217,11 +225,27 @@ class QuantumRedelegationTest(BitcoinTestFramework):
         )
 
         self.log.info("Broadcasting and mining the explicit owner-spend redelegation")
+        before_broadcast_addresses = {
+            entry["address"] for entry in owner_a.listquantumcoldstakingdelegations()
+        }
+        assert_raises_rpc_error(
+            -8,
+            "allow_new_quantum_key",
+            owner_a.redelegatequantumcoldstake,
+            current["address"],
+            small["staking_pubkey"],
+            {"dry_run": False, "enforce_pool_cap": False},
+        )
+        assert_equal(
+            {entry["address"] for entry in owner_a.listquantumcoldstakingdelegations()},
+            before_broadcast_addresses,
+        )
         sent = owner_a.redelegatequantumcoldstake(
             current["address"],
             small["staking_pubkey"],
             {
                 "dry_run": False,
+                "allow_new_quantum_key": True,
                 "enforce_pool_cap": False,
                 "label": "executed-redelegated",
             },

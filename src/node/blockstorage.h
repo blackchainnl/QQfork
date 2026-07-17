@@ -55,6 +55,7 @@ public:
     using CDBWrapper::CDBWrapper;
     bool WriteBatchSync(const std::vector<std::pair<int, const CBlockFileInfo*>>& fileInfo, int nLastFile, const std::vector<const CBlockIndex*>& blockinfo);
     bool ReadBlockFileInfo(int nFile, CBlockFileInfo& info);
+    bool ReadBlockIndexEntry(const uint256& hash, CDiskBlockIndex& index);
     bool ReadLastBlockFile(int& nFile);
     bool WriteReindexing(bool fReindexing);
     void ReadReindexing(bool& fReindexing);
@@ -159,6 +160,8 @@ private:
 
     [[nodiscard]] bool FindBlockPos(FlatFilePos& pos, unsigned int nAddSize, unsigned int nHeight, uint64_t nTime, bool fKnown);
     [[nodiscard]] bool FlushChainstateBlockFile(int tip_height);
+    /** Leave assumeUTXO file segmentation after deleting the snapshot. */
+    void ExitSnapshotBlockfileMode() EXCLUSIVE_LOCKS_REQUIRED(::cs_main);
     bool FindUndoPos(BlockValidationState& state, int nFile, FlatFilePos& pos, unsigned int nAddSize);
 
     FlatFileSeq BlockFileSeq() const;
@@ -215,10 +218,7 @@ private:
      * @note Internally, only blocks at height (height_first - PRUNE_LOCK_BUFFER - 1) and
      * below will be pruned, but callers should avoid assuming any particular buffer size.
      */
-    /*
-    // Blackcoin
     std::unordered_map<std::string, PruneLockInfo> m_prune_locks GUARDED_BY(::cs_main);
-    */
 
     BlockfileType BlockfileTypeForHeight(int height);
 

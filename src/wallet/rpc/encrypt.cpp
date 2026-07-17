@@ -1,3 +1,4 @@
+// Copyright (c) 2011-2022 The Bitcoin Core developers
 // Copyright (c) 2011-2022 Blackcoin Core Developers
 // Copyright (c) 2011-2022 Blackcoin More Developers
 // Copyright (c) 2011-2022 Blackcoin Developers
@@ -278,6 +279,13 @@ RPCHelpMan encryptwallet()
     }
 
     if (!pwallet->EncryptWallet(strWalletPass)) {
+        if (pwallet->IsCrypted()) {
+            throw JSONRPCError(
+                RPC_WALLET_ENCRYPTION_FAILED,
+                "Critical: wallet encryption was committed, but post-encryption finalization failed. "
+                "The wallet remains encrypted. Restart the wallet, replace every pre-encryption backup, "
+                "and create and verify a new encrypted backup before continuing.");
+        }
         throw JSONRPCError(RPC_WALLET_ENCRYPTION_FAILED, "Error: Failed to encrypt the wallet.");
     }
 

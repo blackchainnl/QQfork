@@ -5,6 +5,7 @@
 #include <addresstype.h>
 #include <chain.h>
 #include <coins.h>
+#include <common/args.h>
 #include <consensus/demurrage.h>
 #include <consensus/tx_verify.h>
 #include <core_io.h>
@@ -40,6 +41,7 @@
 #include <univalue.h>
 
 #include <algorithm>
+#include <atomic>
 #include <limits>
 #include <map>
 #include <optional>
@@ -49,9 +51,47 @@ using node::BlockAssembler;
 
 namespace wallet {
 
+namespace {
+
+struct StakingRpcChainSnapshot
+{
+    std::atomic<int> height{-1};
+    std::atomic<uint64_t> network_weight{0};
+    std::atomic<double> difficulty{0.0};
+};
+
+StakingRpcChainSnapshot g_staking_rpc_chain_snapshot;
+
+} // namespace
+
 static CFeeRate FeeRateFromSatVbValue(const UniValue& value)
 {
     return CFeeRate{AmountFromValue(value, /*decimals=*/3)};
+}
+
+static std::string DurableQuantumKeyFailureMessage(
+    const CTxDestination& created_destination,
+    const std::string& action,
+    const std::string& failure)
+{
+    return strprintf(
+        "%s failed after creating durable non-HD ML-DSA key %s. The key remains in this wallet even though no successful action was reported. Back up the wallet now; an older backup cannot recover it. Original error: %s",
+        action,
+        EncodeDestination(created_destination),
+        failure);
+}
+
+[[noreturn]] static void ThrowQuantumActionError(
+    int code,
+    const std::string& action,
+    const std::string& failure,
+    const std::optional<CTxDestination>& created_destination = std::nullopt)
+{
+    throw JSONRPCError(
+        code,
+        created_destination
+            ? DurableQuantumKeyFailureMessage(*created_destination, action, failure)
+            : failure);
 }
 
 static bool IsDirectQuantumMigrationScript(const CScript& script_pub_key)
@@ -60,28 +100,82 @@ static bool IsDirectQuantumMigrationScript(const CScript& script_pub_key)
     return tier && !tier->tiered && !tier->cold_stake;
 }
 
-static void CommitWalletTransactionOrThrow(CWallet& wallet, const CTransactionRef& tx, mapValue_t map_value, const std::string& action)
+static void CommitWalletTransactionOrThrow(
+    CWallet& wallet,
+    const CTransactionRef& tx,
+    mapValue_t map_value,
+    const std::string& action,
+    const std::optional<CTxDestination>& created_destination = std::nullopt)
 {
     std::string broadcast_error;
-    if (!wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error)) {
+    bool committed{false};
+    try {
+        committed = wallet.CommitTransaction(tx, std::move(map_value), {}, &broadcast_error);
+    } catch (const std::exception& e) {
+        if (created_destination) {
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                action,
+                strprintf("transaction broadcast raised an exception: %s", e.what()),
+                created_destination);
+        }
+        if (!TransactionHasShadowProof(*tx)) throw;
+        const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
+        if (added_to_wallet) {
+            wallet.QuarantineShadowPowClaim(tx->GetHash());
+            wallet.WalletLogPrintf("Quarantined %s transaction %s after broadcast exception; its input remains reserved\n",
+                                   action, tx->GetHash().ToString());
+        }
+        throw JSONRPCError(RPC_WALLET_ERROR,
+                           strprintf("%s transaction broadcast raised an exception: %s", action, e.what()));
+    } catch (...) {
+        if (created_destination) {
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                action,
+                "transaction broadcast raised an unknown exception",
+                created_destination);
+        }
+        if (TransactionHasShadowProof(*tx)) {
+            const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
+            if (added_to_wallet) {
+                wallet.QuarantineShadowPowClaim(tx->GetHash());
+                wallet.WalletLogPrintf("Quarantined %s transaction %s after unknown broadcast exception; its input remains reserved\n",
+                                       action, tx->GetHash().ToString());
+            }
+        }
+        throw;
+    }
+    if (!committed) {
         const std::string reason = broadcast_error.empty() ? "transaction was not accepted into the mempool" : broadcast_error;
-        if (!wallet.AbandonTransaction(tx->GetHash())) {
+        const bool added_to_wallet = WITH_LOCK(wallet.cs_wallet, return wallet.GetWalletTx(tx->GetHash()) != nullptr);
+        if (added_to_wallet && TransactionHasShadowProof(*tx)) {
+            wallet.QuarantineShadowPowClaim(tx->GetHash());
+            wallet.WalletLogPrintf("Quarantined %s transaction %s after broadcast failure; its input remains reserved\n",
+                                   action, tx->GetHash().ToString());
+        } else if (added_to_wallet && !wallet.AbandonTransaction(tx->GetHash())) {
             wallet.WalletLogPrintf("%s transaction could not be abandoned after broadcast failure: txid=%s\n", action, tx->GetHash().ToString());
         }
-        throw JSONRPCError(RPC_WALLET_ERROR, strprintf("%s transaction was created but could not be broadcast: %s", action, reason));
+        ThrowQuantumActionError(
+            RPC_WALLET_ERROR,
+            action,
+            strprintf("transaction was created but could not be broadcast: %s", reason),
+            created_destination);
     }
 }
 
 static bool HasUnconfirmedWalletShadowSignal(const CWallet& wallet) EXCLUSIVE_LOCKS_REQUIRED(wallet.cs_wallet)
 {
-    for (const auto& [txid, wtx] : wallet.mapWallet) {
+    for (const uint256& txid : wallet.GetPendingShadowSignalTxids()) {
+        const auto it = wallet.mapWallet.find(txid);
+        if (it == wallet.mapWallet.end()) continue;
+        const CWalletTx& wtx = it->second;
         const auto comment = wtx.mapValue.find("comment");
         if (comment == wtx.mapValue.end() ||
             (comment->second != "PoS Claim" && comment->second != "Quantum PoS Claim")) {
             continue;
         }
-        if (wtx.isAbandoned() || wtx.isConflicted()) continue;
-        if (wallet.GetTxDepthInMainChain(wtx) == 0) return true;
+        if (wtx.isUnconfirmed()) return true;
     }
     return false;
 }
@@ -187,7 +281,7 @@ static std::map<uint256, std::vector<node::QuantumPoolClaim>> FindRpcWalletQuant
 {
     std::map<uint256, std::vector<node::QuantumPoolClaim>> claims_by_operator;
 
-    LOCK(wallet.cs_wallet);
+    LOCK2(::cs_main, wallet.cs_wallet);
     CoinFilterParams filter;
     filter.only_spendable = false;
     filter.skip_locked = false;
@@ -288,6 +382,21 @@ static bool ParseWithdrawAllOption(const UniValue& options)
     return options.exists("all") && options["all"].get_bool();
 }
 
+static bool RequireNewQuantumKeyConsent(const UniValue& options, const std::string& rpc_name)
+{
+    if (!options.isNull() && !options.isObject()) {
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "options must be an object");
+    }
+    const bool allowed = options.isObject() && options.exists("allow_new_quantum_key") &&
+                         options["allow_new_quantum_key"].get_bool();
+    if (!allowed) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            strprintf("%s creates a new non-HD ML-DSA key that an older wallet backup cannot recover. Retry the same command with options={\"allow_new_quantum_key\":true} only after authorizing key creation, then back up the wallet immediately. No key, transaction, or wallet metadata was created.", rpc_name));
+    }
+    return true;
+}
+
 static UniValue StakingDonationInfoToJSON(const CWallet& wallet)
 {
     const unsigned int percentage = wallet.m_donation_percentage;
@@ -330,12 +439,12 @@ static std::vector<RPCResult> QuantumStakeTxResult()
         {RPCResult::Type::NUM, "unlock_height", "Unlock height for newly unbonding funds, or 0"},
         {RPCResult::Type::BOOL, "started_unbonding", "true if the transaction started an unbonding period"},
         {RPCResult::Type::BOOL, "completed_withdrawal", "true if the transaction withdrew matured funds"},
-        {RPCResult::Type::BOOL, "created_goldrush_migration", "true if Gold Rush rewards were first moved to a fresh quantum address"},
+        {RPCResult::Type::BOOL, "created_goldrush_migration", "deprecated compatibility field; mature Gold Rush rewards do not require a preliminary move"},
         {RPCResult::Type::BOOL, "completed_delegation", "true if the requested delegation/funding transaction completed"},
-        {RPCResult::Type::STR_HEX, "migration_txid", /*optional=*/true, "Gold Rush reward migration transaction id"},
+        {RPCResult::Type::STR_HEX, "migration_txid", /*optional=*/true, "deprecated optional Gold Rush consolidation transaction id"},
         {RPCResult::Type::STR, "migration_address", /*optional=*/true, "Fresh quantum migration address"},
-        {RPCResult::Type::STR_AMOUNT, "migration_amount", /*optional=*/true, "Amount moved by the Gold Rush migration"},
-        {RPCResult::Type::STR_AMOUNT, "migration_fee", /*optional=*/true, "Fee paid by the Gold Rush migration"},
+        {RPCResult::Type::STR_AMOUNT, "migration_amount", /*optional=*/true, "Amount moved by deprecated optional Gold Rush consolidation"},
+        {RPCResult::Type::STR_AMOUNT, "migration_fee", /*optional=*/true, "Fee paid by deprecated optional Gold Rush consolidation"},
         {RPCResult::Type::STR, "warning", /*optional=*/true, "Follow-up warning"},
     };
 }
@@ -358,6 +467,13 @@ static RPCHelpMan getstakinginfo()
                     {
                         {RPCResult::Type::BOOL, "enabled", "'true' if staking is enabled"},
                         {RPCResult::Type::BOOL, "staking", "'true' if wallet is currently staking"},
+                        {RPCResult::Type::BOOL, "autostart_staking", "Effective process-wide consent to start staking for every eligible loaded wallet."},
+                        {RPCResult::Type::STR, "autostart_staking_source", "Source of the effective state: autostartstaking, legacy_staking, or default_off."},
+                        {RPCResult::Type::BOOL, "automatic_qqsignal", "Whether process-wide optional fee-paying Gold Rush PoS QQSIGNAL automation is enabled for eligible loaded wallets."},
+                        {RPCResult::Type::BOOL, "automatic_demurrage_attestation", "Whether process-wide optional fee-paying wallet demurrage-attestation automation is enabled for eligible loaded wallets."},
+                        {RPCResult::Type::BOOL, "automatic_redelegation", "Whether process-wide optional fee-paying quantum cold-stake redelegation automation is enabled for eligible loaded wallets."},
+                        {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether process-wide background automation may create new non-HD ML-DSA keys in loaded wallets."},
+                        {RPCResult::Type::BOOL, "consensus_demurrage_automatic", "Always true: mandatory consensus demurrage/burn is independent of optional wallet attestations."},
                         {RPCResult::Type::NUM, "blocks", "Current active-chain height"},
                         {RPCResult::Type::NUM, "currentblockweight", /*optional=*/true, "Weight of the last assembled block template"},
                         {RPCResult::Type::NUM, "currentblocktx", /*optional=*/true, "Transaction count of the last assembled block template"},
@@ -365,8 +481,11 @@ static RPCHelpMan getstakinginfo()
                         {RPCResult::Type::NUM, "difficulty", "The current difficulty"},
                         {RPCResult::Type::NUM, "search-interval", "The staker search interval"},
                         {RPCResult::Type::NUM, "weight", "The staker weight"},
+                        {RPCResult::Type::BOOL, "weight_cached", "Whether weight is from a completed staking-wallet scan"},
+                        {RPCResult::Type::NUM, "weight_cache_height", "Active-chain height of the completed weight scan, or -1 when unavailable"},
                         {RPCResult::Type::NUM, "netstakeweight", "Network stake weight"},
                         {RPCResult::Type::NUM, "expectedtime", "Expected time to earn reward"},
+                        {RPCResult::Type::BOOL, "chainstate_cached", "Whether chain statistics were served from the last non-blocking snapshot"},
                         {RPCResult::Type::STR, "chain", "Current chain name"},
                         {RPCResult::Type::STR, "warnings", "Current network and wallet warnings"},
                     }
@@ -379,25 +498,54 @@ static RPCHelpMan getstakinginfo()
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
+    ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
 
-    uint64_t nWeight = 0;
-    uint64_t lastCoinStakeSearchInterval = 0;
-
-    if (pwallet)
-    {
-        LOCK(pwallet->cs_wallet);
-        nWeight = pwallet->GetStakeWeight();
-        lastCoinStakeSearchInterval = pwallet->m_enabled_staking ? pwallet->m_last_coin_stake_search_interval : 0;
-    }
+    // GetStakeWeight walks the complete wallet. The staking worker publishes
+    // the last completed result, so this health RPC remains responsive while
+    // block assembly or QQSIGNAL signing owns the chain/wallet locks.
+    const int weight_cache_height = pwallet->m_cached_stake_weight_height.load(std::memory_order_acquire);
+    const bool weight_cached = weight_cache_height >= 0;
+    const uint64_t nWeight = weight_cached
+        ? pwallet->m_cached_stake_weight.load(std::memory_order_relaxed)
+        : 0;
+    const uint64_t lastCoinStakeSearchInterval = pwallet->m_enabled_staking
+        ? static_cast<uint64_t>(std::max<int64_t>(0, pwallet->m_last_coin_stake_search_interval.load(std::memory_order_relaxed)))
+        : 0;
 
     const CTxMemPool& mempool = pwallet->chain().mempool();
     ChainstateManager& chainman = pwallet->chain().chainman();
-    LOCK(cs_main);
-    const CChain& active_chain = chainman.ActiveChain();
+    int blocks = g_staking_rpc_chain_snapshot.height.load(std::memory_order_acquire);
+    uint64_t nNetworkWeight = g_staking_rpc_chain_snapshot.network_weight.load(std::memory_order_relaxed);
+    double difficulty = g_staking_rpc_chain_snapshot.difficulty.load(std::memory_order_relaxed);
+    bool chainstate_cached{true};
+    std::optional<int64_t> current_block_weight;
+    std::optional<int64_t> current_block_txs;
+    {
+        TRY_LOCK(::cs_main, main_lock);
+        if (main_lock) {
+            chainstate_cached = false;
+            blocks = chainman.ActiveChain().Height();
+            nNetworkWeight = static_cast<uint64_t>(1.1429 * GetPoSKernelPS(chainman));
+            if (chainman.m_best_header) {
+                difficulty = GetDifficulty(GetLastBlockIndex(chainman.m_best_header, true));
+            }
+            if (BlockAssembler::m_last_block_weight) current_block_weight = *BlockAssembler::m_last_block_weight;
+            if (BlockAssembler::m_last_block_num_txs) current_block_txs = *BlockAssembler::m_last_block_num_txs;
+            g_staking_rpc_chain_snapshot.network_weight.store(nNetworkWeight, std::memory_order_relaxed);
+            g_staking_rpc_chain_snapshot.difficulty.store(difficulty, std::memory_order_relaxed);
+            g_staking_rpc_chain_snapshot.height.store(blocks, std::memory_order_release);
+        }
+    }
+    if (blocks < 0) {
+        TRY_LOCK(pwallet->cs_wallet, wallet_lock);
+        const std::optional<int> wallet_height = wallet_lock
+            ? pwallet->GetLastBlockHeightIfSet()
+            : std::nullopt;
+        blocks = wallet_height.value_or(0);
+    }
 
     UniValue obj(UniValue::VOBJ);
 
-    uint64_t nNetworkWeight = 1.1429 * GetPoSKernelPS(chainman);
     bool staking = lastCoinStakeSearchInterval && nWeight;
 
     const Consensus::Params& consensusParams = Params().GetConsensus();
@@ -406,18 +554,30 @@ static RPCHelpMan getstakinginfo()
 
     obj.pushKV("enabled", pwallet->m_enabled_staking.load());
     obj.pushKV("staking", staking);
+    obj.pushKV("autostart_staking", IsStakingAutostartEnabled());
+    obj.pushKV("autostart_staking_source", gArgs.IsArgSet("-autostartstaking")
+        ? "autostartstaking"
+        : gArgs.IsArgSet("-staking") ? "legacy_staking" : "default_off");
+    obj.pushKV("automatic_qqsignal", gArgs.GetBoolArg("-qqautoshadowsignal", DEFAULT_AUTO_SHADOW_SIGNAL));
+    obj.pushKV("automatic_demurrage_attestation", gArgs.GetBoolArg("-qqautodemurrageattest", DEFAULT_AUTO_DEMURRAGE_ATTEST));
+    obj.pushKV("automatic_redelegation", gArgs.GetBoolArg("-qqautoredelegate", DEFAULT_AUTO_REDELEGATE));
+    obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));
+    obj.pushKV("consensus_demurrage_automatic", true);
 
-    obj.pushKV("blocks", active_chain.Height());
-    if (BlockAssembler::m_last_block_weight) obj.pushKV("currentblockweight", *BlockAssembler::m_last_block_weight);
-    if (BlockAssembler::m_last_block_num_txs) obj.pushKV("currentblocktx", *BlockAssembler::m_last_block_num_txs);
+    obj.pushKV("blocks", blocks);
+    if (current_block_weight) obj.pushKV("currentblockweight", *current_block_weight);
+    if (current_block_txs) obj.pushKV("currentblocktx", *current_block_txs);
     obj.pushKV("pooledtx", (uint64_t)mempool.size());
 
-    obj.pushKV("difficulty", GetDifficulty(GetLastBlockIndex(chainman.m_best_header, true)));
+    obj.pushKV("difficulty", difficulty);
 
     obj.pushKV("search-interval", (int)lastCoinStakeSearchInterval);
     obj.pushKV("weight", (uint64_t)nWeight);
+    obj.pushKV("weight_cached", weight_cached);
+    obj.pushKV("weight_cache_height", weight_cache_height);
     obj.pushKV("netstakeweight", (uint64_t)nNetworkWeight);
     obj.pushKV("expectedtime", nExpectedTime);
+    obj.pushKV("chainstate_cached", chainstate_cached);
 
     obj.pushKV("chain", chainman.GetParams().GetChainTypeString());
     obj.pushKV("warnings", GetWarnings(false).original);
@@ -431,7 +591,10 @@ static RPCHelpMan staking()
     return RPCHelpMan{"staking",
             "Gets or sets the current staking configuration.\n"
             "When called without an argument, returns the current status of staking.\n"
-            "When called with an argument, enables or disables staking.\n",
+            "When called with an argument, enables or disables staking.\n"
+            "This changes the current loaded-wallet staking state only. Use -autostartstaking=1 for process-wide persistent consent to start staking for every eligible wallet loaded by this process. An explicitly configured legacy -staking=1 remains upgrade-compatible autostart consent unless -autostartstaking is set separately; an implicit default does not.\n"
+            "Automatic QQSIGNAL is independently opt-in with -qqautoshadowsignal=1. Configure -qqpospayoutaddress with an existing backed-up wallet-owned ordinary direct quantum address, or separately consent to non-HD key creation with -qqallowautokeycreation=1.\n"
+            "Optional wallet demurrage attestations are independently opt-in with -qqautodemurrageattest=1. Mandatory consensus demurrage and burn are automatic after Final activation and cannot be disabled here.\n",
             {
                 {"generate", RPCArg::Type::BOOL, RPCArg::Optional::OMITTED, "To enable or disable staking."},
 
@@ -655,17 +818,23 @@ static RPCHelpMan listquantumstakeoutputs()
 static RPCHelpMan fundquantumstakeaddress()
 {
     return RPCHelpMan{"fundquantumstakeaddress",
-        "\nFunds a wallet-backed bonded quantum staking address from legacy wallet coins.\n" + HELP_REQUIRING_PASSPHRASE,
+        "\nFunds a wallet-backed bonded quantum staking address from direct quantum wallet coins.\n"
+        "Transaction construction creates a new non-HD ML-DSA change key that is not seed-recoverable; back up the wallet after this command succeeds.\n" + HELP_REQUIRING_PASSPHRASE,
         {
             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-backed bonded quantum staking address."},
             {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount to bond."},
+            {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Key-creation authorization.", {
+                {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicitly authorize one new non-HD ML-DSA change key. Back up the wallet whenever the result or an error reports the created address; the durable key can remain after a later failure."},
+            }},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", QuantumStakeTxResult()},
-        RPCExamples{HelpExampleCli("fundquantumstakeaddress", "\"quantum_stake_address\" 10000")},
+        RPCExamples{HelpExampleCli("fundquantumstakeaddress", "\"quantum_stake_address\" 10000 '{\"allow_new_quantum_key\":true}'")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
+    const UniValue options = request.params[2].isNull() ? UniValue(UniValue::VOBJ) : request.params[2].get_obj();
+    const bool allow_new_quantum_key = RequireNewQuantumKeyConsent(options, "fundquantumstakeaddress");
     pwallet->BlockUntilSyncedToCurrentChain();
 
     return ThrowOrReturnQuantumStakeTx(FundTieredStakeAddress(
@@ -673,7 +842,8 @@ static RPCHelpMan fundquantumstakeaddress()
         request.params[0].get_str(),
         AmountFromValue(request.params[1]),
         /*require_operator_lock=*/false,
-        "Blackcoin quantum staking address funding"));
+        "Blackcoin quantum staking address funding",
+        allow_new_quantum_key));
 },
     };
 }
@@ -681,7 +851,8 @@ static RPCHelpMan fundquantumstakeaddress()
 static RPCHelpMan withdrawquantumstakeaddress()
 {
     return RPCHelpMan{"withdrawquantumstakeaddress",
-        "\nStarts unbonding or withdraws matured quantum staking funds for a staking address.\n" + HELP_REQUIRING_PASSPHRASE,
+        "\nStarts unbonding or withdraws matured quantum staking funds for a staking address.\n"
+        "Both paths create a new non-HD ML-DSA key (change for unbonding or the withdrawal destination) that is not seed-recoverable; back up the wallet after this command succeeds.\n" + HELP_REQUIRING_PASSPHRASE,
         {
             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-backed bonded quantum staking address."},
             {"outpoint", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Optional single staking output to withdraw/unbond.", {
@@ -690,13 +861,14 @@ static RPCHelpMan withdrawquantumstakeaddress()
             }},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Withdrawal options.", {
                 {"all", RPCArg::Type::BOOL, RPCArg::Default{false}, "Permit acting on every spendable staking output for this address when no outpoint is specified."},
+                {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicitly authorize one new non-HD ML-DSA change or withdrawal key. Back up the wallet whenever the result or an error reports the created address; the durable key can remain after a later failure."},
             }},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", QuantumStakeTxResult()},
         RPCExamples{
             HelpExampleCli("withdrawquantumstakeaddress", "\"quantum_stake_address\"")
           + HelpExampleCli("withdrawquantumstakeaddress", "\"quantum_stake_address\" '{\"txid\":\"<txid>\",\"vout\":0}'")
-          + HelpExampleCli("withdrawquantumstakeaddress", "\"quantum_stake_address\" null '{\"all\":true}'")
+          + HelpExampleCli("withdrawquantumstakeaddress", "\"quantum_stake_address\" null '{\"all\":true,\"allow_new_quantum_key\":true}'")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -708,6 +880,7 @@ static RPCHelpMan withdrawquantumstakeaddress()
     if (request.params.size() > 1 && !request.params[1].isNull()) outpoint = OutPointFromRPCOptions(request.params[1]);
     const UniValue options = request.params.size() > 2 ? request.params[2] : UniValue(UniValue::VNULL);
     const bool allow_all_outputs = ParseWithdrawAllOption(options);
+    const bool allow_new_quantum_key = RequireNewQuantumKeyConsent(options, "withdrawquantumstakeaddress");
     return ThrowOrReturnQuantumStakeTx(WithdrawTieredStakeAddress(
         *pwallet,
         request.params[0].get_str(),
@@ -717,7 +890,8 @@ static RPCHelpMan withdrawquantumstakeaddress()
         "Blackcoin quantum staking address unbond",
         "Blackcoin quantum staking address withdrawal",
         outpoint,
-        allow_all_outputs));
+        allow_all_outputs,
+        allow_new_quantum_key));
 },
     };
 }
@@ -842,17 +1016,23 @@ static RPCHelpMan getwalletquantumpoolinfo()
 static RPCHelpMan fundquantumoperatorbond()
 {
     return RPCHelpMan{"fundquantumoperatorbond",
-        "\nFunds a fixed 30-day cold-stake operator bond from wallet coins eligible for quantum staking.\n" + HELP_REQUIRING_PASSPHRASE,
+        "\nFunds a fixed 30-day cold-stake operator bond from wallet coins eligible for quantum staking.\n"
+        "Transaction construction creates a new non-HD ML-DSA change key that is not seed-recoverable; back up the wallet after this command succeeds.\n" + HELP_REQUIRING_PASSPHRASE,
         {
             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-backed fixed 30-day cold-stake operator address."},
             {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount to bond."},
+            {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Key-creation authorization.", {
+                {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicitly authorize one new non-HD ML-DSA change key. Back up the wallet whenever the result or an error reports the created address; the durable key can remain after a later failure."},
+            }},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", QuantumStakeTxResult()},
-        RPCExamples{HelpExampleCli("fundquantumoperatorbond", "\"operator_address\" 10000")},
+        RPCExamples{HelpExampleCli("fundquantumoperatorbond", "\"operator_address\" 10000 '{\"allow_new_quantum_key\":true}'")},
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
+    const UniValue options = request.params[2].isNull() ? UniValue(UniValue::VOBJ) : request.params[2].get_obj();
+    const bool allow_new_quantum_key = RequireNewQuantumKeyConsent(options, "fundquantumoperatorbond");
     pwallet->BlockUntilSyncedToCurrentChain();
 
     return ThrowOrReturnQuantumStakeTx(FundTieredStakeAddress(
@@ -860,7 +1040,8 @@ static RPCHelpMan fundquantumoperatorbond()
         request.params[0].get_str(),
         AmountFromValue(request.params[1]),
         /*require_operator_lock=*/true,
-        "Blackcoin cold-stake operator bond"));
+        "Blackcoin cold-stake operator bond",
+        allow_new_quantum_key));
 },
     };
 }
@@ -868,7 +1049,8 @@ static RPCHelpMan fundquantumoperatorbond()
 static RPCHelpMan withdrawquantumoperatorbond()
 {
     return RPCHelpMan{"withdrawquantumoperatorbond",
-        "\nStarts unbonding or withdraws matured cold-stake operator bond funds.\n" + HELP_REQUIRING_PASSPHRASE,
+        "\nStarts unbonding or withdraws matured cold-stake operator bond funds.\n"
+        "Both paths create a new non-HD ML-DSA key (change for unbonding or the withdrawal destination) that is not seed-recoverable; back up the wallet after this command succeeds.\n" + HELP_REQUIRING_PASSPHRASE,
         {
             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-backed fixed 30-day cold-stake operator address."},
             {"outpoint", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Optional single operator bond output to withdraw/unbond.", {
@@ -877,13 +1059,14 @@ static RPCHelpMan withdrawquantumoperatorbond()
             }},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Withdrawal options.", {
                 {"all", RPCArg::Type::BOOL, RPCArg::Default{false}, "Permit acting on every spendable operator bond output for this address when no outpoint is specified."},
+                {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicitly authorize one new non-HD ML-DSA change or withdrawal key. Back up the wallet whenever the result or an error reports the created address; the durable key can remain after a later failure."},
             }},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", QuantumStakeTxResult()},
         RPCExamples{
             HelpExampleCli("withdrawquantumoperatorbond", "\"operator_address\"")
           + HelpExampleCli("withdrawquantumoperatorbond", "\"operator_address\" '{\"txid\":\"<txid>\",\"vout\":0}'")
-          + HelpExampleCli("withdrawquantumoperatorbond", "\"operator_address\" null '{\"all\":true}'")
+          + HelpExampleCli("withdrawquantumoperatorbond", "\"operator_address\" null '{\"all\":true,\"allow_new_quantum_key\":true}'")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -895,6 +1078,7 @@ static RPCHelpMan withdrawquantumoperatorbond()
     if (request.params.size() > 1 && !request.params[1].isNull()) outpoint = OutPointFromRPCOptions(request.params[1]);
     const UniValue options = request.params.size() > 2 ? request.params[2] : UniValue(UniValue::VNULL);
     const bool allow_all_outputs = ParseWithdrawAllOption(options);
+    const bool allow_new_quantum_key = RequireNewQuantumKeyConsent(options, "withdrawquantumoperatorbond");
     return ThrowOrReturnQuantumStakeTx(WithdrawTieredStakeAddress(
         *pwallet,
         request.params[0].get_str(),
@@ -904,7 +1088,8 @@ static RPCHelpMan withdrawquantumoperatorbond()
         "Blackcoin cold-stake operator unbond",
         "Blackcoin cold-stake operator withdrawal",
         outpoint,
-        allow_all_outputs));
+        allow_all_outputs,
+        allow_new_quantum_key));
 },
     };
 }
@@ -944,20 +1129,21 @@ static RPCHelpMan fundquantumcoldstakeaddress()
 {
     return RPCHelpMan{"fundquantumcoldstakeaddress",
         "\nFunds a quantum cold-stake delegation address from direct quantum funds.\n"
-        "If direct quantum funds are not available, wallet-owned Gold Rush reward outputs are first moved to a fresh quantum address unless options.allow_goldrush_migration is false.\n"
-        "When that migration is required, this call returns completed_delegation=false; wait for the migration transaction to confirm, then call this RPC again to fund the delegation.\n" +
+        "Mature Gold Rush payouts are ordinary direct quantum funds after Gold Rush; no preliminary move or remigration is required.\n"
+        "Transaction construction creates a new non-HD ML-DSA change key that is not seed-recoverable; back up the wallet after this command succeeds.\n"
+        "The options.allow_goldrush_migration field is retained for compatibility and has no effect.\n" +
         HELP_REQUIRING_PASSPHRASE,
         {
             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-backed quantum cold-stake delegation address."},
             {"amount", RPCArg::Type::AMOUNT, RPCArg::Optional::NO, "Amount to delegate."},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Delegation funding options.", {
-                {"allow_goldrush_migration", RPCArg::Type::BOOL, RPCArg::Default{true}, "Allow this RPC to first move wallet-owned Gold Rush reward outputs to a fresh quantum address if direct quantum funds are not currently available."},
+                {"allow_goldrush_migration", RPCArg::Type::BOOL, RPCArg::Default{true}, "Deprecated compatibility field; ignored."},
+                {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicitly authorize one new non-HD ML-DSA change key. Back up the wallet whenever the result or an error reports the created address; the durable key can remain after a later failure."},
             }},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", QuantumStakeTxResult()},
         RPCExamples{
-            HelpExampleCli("fundquantumcoldstakeaddress", "\"coldstake_delegation_address\" 1000")
-          + HelpExampleCli("fundquantumcoldstakeaddress", "\"coldstake_delegation_address\" 1000 '{\"allow_goldrush_migration\":false}'")
+            HelpExampleCli("fundquantumcoldstakeaddress", "\"coldstake_delegation_address\" 1000 '{\"allow_new_quantum_key\":true}'")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -967,12 +1153,14 @@ static RPCHelpMan fundquantumcoldstakeaddress()
 
     const UniValue options = request.params[2].isNull() ? UniValue(UniValue::VOBJ) : request.params[2].get_obj();
     const bool allow_goldrush_migration = !options.exists("allow_goldrush_migration") || options["allow_goldrush_migration"].get_bool();
+    const bool allow_new_quantum_key = RequireNewQuantumKeyConsent(options, "fundquantumcoldstakeaddress");
 
     return ThrowOrReturnQuantumStakeTx(FundColdStakeDelegationAddress(
         *pwallet,
         request.params[0].get_str(),
         AmountFromValue(request.params[1]),
-        allow_goldrush_migration));
+        allow_goldrush_migration,
+        allow_new_quantum_key));
 },
     };
 }
@@ -980,7 +1168,8 @@ static RPCHelpMan fundquantumcoldstakeaddress()
 static RPCHelpMan withdrawquantumcoldstakeaddress()
 {
     return RPCHelpMan{"withdrawquantumcoldstakeaddress",
-        "\nStarts unbonding or withdraws matured funds from a quantum cold-stake delegation address.\n" + HELP_REQUIRING_PASSPHRASE,
+        "\nStarts unbonding or withdraws matured funds from a quantum cold-stake delegation address.\n"
+        "Both paths create a new non-HD ML-DSA key (change for unbonding or the withdrawal destination) that is not seed-recoverable; back up the wallet after this command succeeds.\n" + HELP_REQUIRING_PASSPHRASE,
         {
             {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-backed quantum cold-stake delegation address."},
             {"outpoint", RPCArg::Type::OBJ, RPCArg::Optional::OMITTED, "Optional single delegation output to withdraw/unbond.", {
@@ -989,13 +1178,14 @@ static RPCHelpMan withdrawquantumcoldstakeaddress()
             }},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Withdrawal options.", {
                 {"all", RPCArg::Type::BOOL, RPCArg::Default{false}, "Permit acting on every spendable delegation output for this address when no outpoint is specified."},
+                {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicitly authorize one new non-HD ML-DSA change or withdrawal key. Back up the wallet whenever the result or an error reports the created address; the durable key can remain after a later failure."},
             }},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", QuantumStakeTxResult()},
         RPCExamples{
             HelpExampleCli("withdrawquantumcoldstakeaddress", "\"coldstake_delegation_address\"")
           + HelpExampleCli("withdrawquantumcoldstakeaddress", "\"coldstake_delegation_address\" '{\"txid\":\"<txid>\",\"vout\":0}'")
-          + HelpExampleCli("withdrawquantumcoldstakeaddress", "\"coldstake_delegation_address\" null '{\"all\":true}'")
+          + HelpExampleCli("withdrawquantumcoldstakeaddress", "\"coldstake_delegation_address\" null '{\"all\":true,\"allow_new_quantum_key\":true}'")
         },
         [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -1007,7 +1197,8 @@ static RPCHelpMan withdrawquantumcoldstakeaddress()
     if (request.params.size() > 1 && !request.params[1].isNull()) outpoint = OutPointFromRPCOptions(request.params[1]);
     const UniValue options = request.params.size() > 2 ? request.params[2] : UniValue(UniValue::VNULL);
     const bool allow_all_outputs = ParseWithdrawAllOption(options);
-    return ThrowOrReturnQuantumStakeTx(WithdrawColdStakeDelegationAddress(*pwallet, request.params[0].get_str(), outpoint, allow_all_outputs));
+    const bool allow_new_quantum_key = RequireNewQuantumKeyConsent(options, "withdrawquantumcoldstakeaddress");
+    return ThrowOrReturnQuantumStakeTx(WithdrawColdStakeDelegationAddress(*pwallet, request.params[0].get_str(), outpoint, allow_all_outputs, allow_new_quantum_key));
 },
     };
 }
@@ -1049,6 +1240,7 @@ static RPCHelpMan sendshadowsignal()
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
+    ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
 
     pwallet->BlockUntilSyncedToCurrentChain();
     EnsureWalletIsUnlocked(*pwallet);
@@ -1115,13 +1307,7 @@ static RPCHelpMan sendshadowsignal()
             if (!IsWhitelisted(chainman.ActiveChainstate().CoinsTip(), target)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "address is not in the deterministic Gold Rush whitelist");
             }
-            bool has_solver_activity = HasRecentShadowSolverActivity(chainman.ActiveChainstate().CoinsTip(), tip, target, solve_height, solve_hash);
-            if (!has_solver_activity && solve_height == static_cast<uint32_t>(tip->nHeight)) {
-                const auto recent_solvers = GetRecentShadowSolverActivity(chainman.ActiveChainstate().CoinsTip(), tip);
-                const auto it = recent_solvers.find(target);
-                has_solver_activity = it != recent_solvers.end() && it->second.height == solve_height;
-            }
-            if (!has_solver_activity) {
+            if (!HasRecentShadowSolverActivity(chainman.ActiveChainstate().CoinsTip(), tip, target, solve_height, solve_hash)) {
                 throw JSONRPCError(RPC_INVALID_PARAMETER, "referenced solve is not an active Gold Rush solver marker for this address");
             }
             if (GetActiveShadowSignalPayouts(chainman.ActiveChainstate().CoinsTip(), tip).count(target)) {
@@ -1157,7 +1343,7 @@ static RPCHelpMan sendshadowsignal()
     CAmount change{0};
     int64_t vsize{-1};
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         const int64_t current_time = GetAdjustedTimeSeconds();
         const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
         if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
@@ -1183,7 +1369,6 @@ static RPCHelpMan sendshadowsignal()
             if (candidate_fee > pwallet->m_default_max_tx_fee) {
                 throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
             }
-
             candidate.vout[0].nValue = candidate_change;
             std::map<int, bilingual_str> input_errors;
             if (!pwallet->SignTransaction(candidate, input_errors)) {
@@ -1234,7 +1419,8 @@ static RPCHelpMan sendshadowpowclaim()
                 "PoW claims are NOT whitelist-gated. A valid mined claim credits the upgraded shadow ledger to quantum_address without changing the legacy block subsidy.\n"
                 "If proof is omitted, grinding is memory-hard (Argon2id, ~1 MiB per try) and synchronous; tune max_tries accordingly.\n"
                 "If proof is supplied, it must be the hex QQSPROOF payload for the current tip, target address, and quantum payout address.\n"
-                "Only valid during the Gold Rush reward window.\n" +
+                "The active proof format is reported by getshadowpowwork. QQP2/QQP3 do not bind an exact fee input; QQP4 does so only after its separately scheduled activation. Never reuse one externally supplied proof for multiple claim transactions.\n"
+                "Only valid during the Gold Rush reward window. An unconfirmed QQSPROOF absent from the local mempool remains quarantined because a peer may still confirm it; this wallet will not create another fee-input claim until it resolves on chain.\n" +
                 HELP_REQUIRING_PASSPHRASE,
                 {
                     {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet legacy address that owns the UTXO authenticating this PoW claim. It does not need to be whitelisted."},
@@ -1249,6 +1435,8 @@ static RPCHelpMan sendshadowpowclaim()
                         {RPCResult::Type::STR_HEX, "txid", "The broadcast claim transaction id."},
                         {RPCResult::Type::STR_HEX, "hex", "The signed claim transaction hex."},
                         {RPCResult::Type::STR_HEX, "proof", "The QQSPROOF payload committed by the transaction."},
+                        {RPCResult::Type::STR, "proof_mode", "Always pow for a wallet-created fee-paying QQSPROOF claim."},
+                        {RPCResult::Type::NUM, "proof_mode_byte", "Canonical PoW mode byte (0)."},
                         {RPCResult::Type::BOOL, "external_proof", "Whether the proof was supplied by the caller instead of ground by this RPC."},
                         {RPCResult::Type::STR_AMOUNT, "fee", "The fee paid by the claim transaction."},
                         {RPCResult::Type::STR_AMOUNT, "change", "The amount paid back to the target address."},
@@ -1274,6 +1462,24 @@ static RPCHelpMan sendshadowpowclaim()
     }
     if (pwallet->m_wallet_unlock_staking_only) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to create claim transaction");
+    }
+    if (!pwallet->chain().isReadyToBroadcast()) {
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                           "Gold Rush PoW claims are paused while the node is reindexing, importing blocks, or in initial block download");
+    }
+    if (pwallet->CountQuarantinedShadowPowClaims() != 0) {
+        throw JSONRPCError(RPC_WALLET_ERROR,
+                           "Gold Rush PoW claim creation is paused because a prior claim remains quarantined outside the local mempool. Its fee input remains reserved until on-chain resolution; the wallet will not create a second fee-input claim");
+    }
+    if (pwallet->CountLiveShadowPowClaims() >= MAX_SHADOW_POW_EVALS_PER_BLOCK) {
+        throw JSONRPCError(RPC_WALLET_ERROR,
+                           strprintf("The wallet already has the maximum %u relayable Gold Rush PoW claims", MAX_SHADOW_POW_EVALS_PER_BLOCK));
+    }
+
+    ShadowPowClaimSubmissionGuard submission_guard(*pwallet);
+    if (!submission_guard) {
+        throw JSONRPCError(RPC_WALLET_ERROR,
+                           "Another Gold Rush PoW claim submission is already in progress for this wallet");
     }
 
     const std::string address = request.params[0].get_str();
@@ -1327,6 +1533,30 @@ static RPCHelpMan sendshadowpowclaim()
         coin_control.fOverrideFeeRate = true;
     }
 
+    ShadowPowClaimInput selected_input;
+    {
+        LOCK2(::cs_main, pwallet->cs_wallet);
+        const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, GetAdjustedTimeSeconds());
+        if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
+        }
+        bilingual_str selection_error;
+        const ShadowPowClaimInputSelectionResult selection_result = pwallet->SelectShadowPowClaimInput(
+            std::optional<CScript>{target},
+            quantum_payout_script,
+            supplied_proof ? &*supplied_proof : nullptr,
+            coin_control,
+            selected_input,
+            selection_error);
+        if (selection_result == ShadowPowClaimInputSelectionResult::FEE_EXCEEDS_MAX) {
+            throw JSONRPCError(RPC_WALLET_ERROR, selection_error.original);
+        }
+        if (selection_result != ShadowPowClaimInputSelectionResult::SELECTED) {
+            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable non-dust UTXO found for the target address");
+        }
+    }
+    pwallet->MaybeDelayShadowPowClaimSubmissionForTest(selected_input.outpoint);
+
     ShadowPowWork pow_work;
     {
         ChainstateManager& chainman = pwallet->chain().chainman();
@@ -1340,60 +1570,27 @@ static RPCHelpMan sendshadowpowclaim()
             throw JSONRPCError(RPC_INVALID_PARAMETER, "Shadow PoW claims are only active during the Gold Rush epoch");
         }
         const CCoinsViewCache& view = chainman.ActiveChainstate().CoinsTip();
-        pow_work = PrepareShadowPowWork(target, quantum_payout_script, tip, view);
+        pow_work = PrepareShadowPowWork(
+            target, quantum_payout_script, selected_input.outpoint, tip, view);
         if (!pow_work.valid) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, "Failed to prepare shadow PoW work (outside the reward window or invalid payout script)");
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Failed to prepare shadow PoW work (outside the reward window or invalid payout script/input)");
         }
     }
-    if (supplied_proof && !ValidateShadowPowProofForWork(pow_work, *supplied_proof)) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, "proof does not match the current tip, target address, and quantum payout address");
-    }
-
-    {
-        LOCK(pwallet->cs_wallet);
-        const int64_t current_time = GetAdjustedTimeSeconds();
-        const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
-        if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
-            throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
+    if (supplied_proof) {
+        const ShadowProofPayloadMode mode = ClassifyShadowProofPayload(
+            *supplied_proof, pow_work.input_bound);
+        if (mode == ShadowProofPayloadMode::POS) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof encodes PoS mode; fee-paying QQSPROOF claims require PoW mode byte 0");
         }
-
-        // QQSPROOF payload size is deterministic for internally ground proofs:
-        // OP_RETURN data = prefix(8) + proof header(13) + target/payout length fields(4) + scripts.
-        std::vector<unsigned char> dummy_proof;
-        const std::vector<unsigned char>* fee_probe_proof = nullptr;
-        if (supplied_proof) {
-            fee_probe_proof = &*supplied_proof;
-        } else {
-            dummy_proof.assign(GetShadowPrefix().size() + 17 + target.size() + quantum_payout_script.size(), 0);
-            std::copy(GetShadowPrefix().begin(), GetShadowPrefix().end(), dummy_proof.begin());
-            fee_probe_proof = &dummy_proof;
+        if (mode == ShadowProofPayloadMode::UNKNOWN) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "proof encodes an unknown mode; fee-paying QQSPROOF claims require PoW mode byte 0");
         }
-        bool can_submit_claim = false;
-        for (const COutput& output : AvailableCoins(*pwallet, &coin_control).All()) {
-            if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != target) continue;
-
-            CMutableTransaction candidate;
-            candidate.nVersion = CTransaction::CURRENT_VERSION;
-            candidate.nTime = current_time;
-            static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
-            candidate.vin.emplace_back(output.outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
-            candidate.vout.emplace_back(output.txout.nValue, target);
-            candidate.vout.emplace_back(0, CScript() << OP_RETURN << *fee_probe_proof);
-
-            const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(candidate), pwallet.get(), &coin_control);
-            if (tx_size.vsize <= 0) continue;
-            const CAmount candidate_fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
-            const CAmount candidate_change = output.txout.nValue - candidate_fee;
-            CTxOut change_out(candidate_change, target);
-            if (!MoneyRange(candidate_change) || candidate_change <= 0 || IsDust(change_out, pwallet->chain().relayDustFee())) continue;
-            if (candidate_fee > pwallet->m_default_max_tx_fee) {
-                throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
-            }
-            can_submit_claim = true;
-            break;
-        }
-        if (!can_submit_claim) {
-            throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable non-dust UTXO found for the target address");
+        if (!ValidateShadowPowProofForWork(pow_work, *supplied_proof)) {
+            throw JSONRPCError(
+                RPC_INVALID_PARAMETER,
+                pow_work.input_bound
+                    ? "proof does not match the current tip, exact fee input, target address, quantum payout address, and PoW channel"
+                    : "proof does not match the current tip, target address, quantum payout address, and PoW channel");
         }
     }
 
@@ -1420,31 +1617,36 @@ static RPCHelpMan sendshadowpowclaim()
     CAmount change{0};
     int64_t vsize{-1};
     {
-        LOCK(pwallet->cs_wallet);
+        LOCK2(::cs_main, pwallet->cs_wallet);
         const int64_t current_time = GetAdjustedTimeSeconds();
         const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
         if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
             throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
         }
         for (const COutput& output : AvailableCoins(*pwallet, &coin_control).All()) {
-            if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != target) continue;
+            if (output.outpoint != selected_input.outpoint) continue;
+            if (CanonicalizeLegacyStakeScript(output.txout.scriptPubKey) != selected_input.target) continue;
 
             CMutableTransaction candidate;
             candidate.nVersion = CTransaction::CURRENT_VERSION;
             candidate.nTime = current_time;
-            static constexpr uint32_t MAX_SEQUENCE_NONFINAL = 0xfffffffe;
-            candidate.vin.emplace_back(output.outpoint, CScript(), MAX_SEQUENCE_NONFINAL);
-            candidate.vout.emplace_back(output.txout.nValue, target);
+            static constexpr uint32_t SEQUENCE_REPLACEABLE = 0xfffffffd;
+            candidate.vin.emplace_back(output.outpoint, CScript(), SEQUENCE_REPLACEABLE);
+            candidate.vout.emplace_back(output.txout.nValue, selected_input.target);
             candidate.vout.emplace_back(0, CScript() << OP_RETURN << proof);
 
             const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(candidate), pwallet.get(), &coin_control);
             if (tx_size.vsize <= 0) continue;
             const CAmount candidate_fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
             const CAmount candidate_change = output.txout.nValue - candidate_fee;
-            CTxOut change_out(candidate_change, target);
+            CTxOut change_out(candidate_change, selected_input.target);
             if (!MoneyRange(candidate_change) || candidate_change <= 0 || IsDust(change_out, pwallet->chain().relayDustFee())) continue;
             if (candidate_fee > pwallet->m_default_max_tx_fee) {
                 throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
+            }
+            if (candidate_fee > CENT) {
+                throw JSONRPCError(RPC_WALLET_ERROR,
+                                   "Gold Rush PoW claim fee exceeds the maximum reimbursable fee of 0.01 BLK");
             }
 
             candidate.vout[0].nValue = candidate_change;
@@ -1465,7 +1667,9 @@ static RPCHelpMan sendshadowpowclaim()
     }
 
     if (claim_tx.vin.empty()) {
-        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable non-dust UTXO found for the target address");
+        throw JSONRPCError(RPC_VERIFY_REJECTED,
+                           strprintf("Selected Gold Rush PoW claim input %s changed while grinding; retry the PoW claim",
+                                     selected_input.outpoint.ToString()));
     }
 
     CTransactionRef tx = MakeTransactionRef(std::move(claim_tx));
@@ -1473,26 +1677,272 @@ static RPCHelpMan sendshadowpowclaim()
     {
         ChainstateManager& chainman = pwallet->chain().chainman();
         LOCK(cs_main);
+        const CBlockIndex* tip = chainman.ActiveChain().Tip();
+        if (!tip || tip->GetBlockHash() != pow_work.prev_hash ||
+            tip->nHeight + 1 != pow_work.height) {
+            throw JSONRPCError(RPC_VERIFY_REJECTED, "Active chain tip changed before the PoW claim could be committed; retry on the new tip");
+        }
         const MempoolAcceptResult accept = chainman.ProcessTransaction(tx, /*test_accept=*/true);
         if (accept.m_result_type != MempoolAcceptResult::ResultType::VALID) {
             throw JSONRPCError(RPC_VERIFY_REJECTED, strprintf("Shadow PoW claim rejected: %s", accept.m_state.ToString()));
         }
+        // Keep the final tip check atomic with wallet persistence and relay.
+        // cs_main is recursive on this codebase, so the commit validation path
+        // may re-enter it without reopening the stale-tip race.
+        mapValue_t map_value;
+        map_value["comment"] = "PoW Claim";
+        CommitWalletTransactionOrThrow(*pwallet, tx, std::move(map_value), "PoW Claim");
     }
-
-    mapValue_t map_value;
-    map_value["comment"] = "PoW Claim";
-    CommitWalletTransactionOrThrow(*pwallet, tx, std::move(map_value), "PoW Claim");
 
     UniValue result(UniValue::VOBJ);
     result.pushKV("txid", tx->GetHash().GetHex());
     result.pushKV("hex", hex);
     result.pushKV("proof", HexStr(proof));
+    result.pushKV("proof_mode", "pow");
+    result.pushKV("proof_mode_byte", 0);
     result.pushKV("external_proof", supplied_proof.has_value());
     result.pushKV("fee", ValueFromAmount(fee));
     result.pushKV("change", ValueFromAmount(change));
     result.pushKV("vsize", vsize);
     result.pushKV("address", address);
     result.pushKV("quantum_address", quantum_address);
+    return result;
+},
+    };
+}
+
+static RPCHelpMan createshadowpowclaimresolution()
+{
+    return RPCHelpMan{
+        "createshadowpowclaimresolution",
+        "\nPrepare, but do not broadcast, a signed on-chain conflict that can resolve one quarantined Gold Rush PoW claim.\n"
+        "A peer can retain a base-valid QQSPROOF after this node removes it from the mempool, so the wallet cannot safely abandon the claim or release its input based on elapsed time. This RPC instead spends the claim's exact input back to the same wallet script. Whichever transaction confirms first resolves the conflict on chain; the other cannot confirm on that active chain.\n"
+        "The default dry_run=true returns the exact fee and output without signing. dry_run=false requires an unlocked wallet and explicit acknowledge_fee_and_conflict_risk=true, but still does not broadcast. Review the result and use sendrawtransaction separately if you choose to publish it. If the resolution confirms, its base-chain fee is not reimbursed by the shadow ledger. Some peers retaining the original claim may reject the conflict, and confirmation is not guaranteed. After an explicit broadcast, ordinary wallet resubmission may relay the still-unconfirmed resolution again across restart until one side confirms.\n",
+        {
+            {"claim_txid", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Quarantined wallet QQSPROOF transaction id."},
+            {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{true}, "Return a fee/output preview without signing when true."},
+            {"acknowledge_fee_and_conflict_risk", RPCArg::Type::BOOL, RPCArg::Default{false}, "Must be true when dry_run=false. A signed transaction is returned but not broadcast."},
+            {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Optional fee rate in " + CURRENCY_ATOM + "/vB."},
+        },
+        RPCResult{RPCResult::Type::OBJ, "", "", {
+            {RPCResult::Type::BOOL, "dry_run", "Whether this is an unsigned preview."},
+            {RPCResult::Type::BOOL, "broadcast", "Always false; this RPC never broadcasts."},
+            {RPCResult::Type::BOOL, "reused_legacy_resolution", "Whether an already-signed compatibility transaction was reused instead of creating a new conflict."},
+            {RPCResult::Type::STR_HEX, "claim_txid", "The quarantined QQSPROOF transaction."},
+            {RPCResult::Type::STR_HEX, "claim_input_txid", "Transaction id of the exact input shared by the claim and resolution."},
+            {RPCResult::Type::NUM, "claim_input_vout", "Output number of the exact shared input."},
+            {RPCResult::Type::STR_AMOUNT, "input_amount", "Confirmed input value."},
+            {RPCResult::Type::STR_AMOUNT, "fee", "Base-chain fee paid only if the resolution confirms."},
+            {RPCResult::Type::STR_AMOUNT, "output_amount", "Value returned to the original wallet script."},
+            {RPCResult::Type::NUM, "vsize", "Maximum signed virtual size used for fee calculation."},
+            {RPCResult::Type::STR_HEX, "hex", /*optional=*/true, "Signed raw resolution transaction; present only when dry_run=false."},
+            {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "Resolution transaction id; present only when dry_run=false."},
+            {RPCResult::Type::STR, "next_step", "Explicit action required after reviewing this result."},
+            {RPCResult::Type::STR, "warning", "Safety and fee warning."},
+        }},
+        RPCExamples{
+            HelpExampleCli("createshadowpowclaimresolution", "\"claim_txid\"") +
+            HelpExampleCli("createshadowpowclaimresolution", "\"claim_txid\" false true") +
+            HelpExampleCli("-named createshadowpowclaimresolution", "claim_txid=\"claim_txid\" dry_run=false acknowledge_fee_and_conflict_risk=true fee_rate=1")
+        },
+        [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
+{
+    std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
+    if (!pwallet) return NullUniValue;
+
+    pwallet->BlockUntilSyncedToCurrentChain();
+    if (!pwallet->chain().isReadyToBroadcast()) {
+        throw JSONRPCError(RPC_CLIENT_IN_INITIAL_DOWNLOAD,
+                           "Gold Rush PoW claim resolution is unavailable while the node is reindexing, importing blocks, or in initial block download");
+    }
+
+    const uint256 claim_txid = ParseHashV(request.params[0], "claim_txid");
+    const bool dry_run = request.params[1].isNull() || request.params[1].get_bool();
+    const bool acknowledged = !request.params[2].isNull() && request.params[2].get_bool();
+    if (!dry_run && !acknowledged) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "acknowledge_fee_and_conflict_risk=true is required to sign a claim-resolution transaction; preview first with dry_run=true");
+    }
+    if (!dry_run) {
+        EnsureWalletIsUnlocked(*pwallet);
+        if (pwallet->IsWalletFlagSet(WALLET_FLAG_DISABLE_PRIVATE_KEYS)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Private keys are disabled for this wallet");
+        }
+        if (pwallet->m_wallet_unlock_staking_only) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to sign a claim-resolution transaction");
+        }
+    }
+
+    CCoinControl coin_control;
+    coin_control.m_allow_other_inputs = false;
+    coin_control.m_avoid_address_reuse = false;
+    if (!request.params[3].isNull()) {
+        coin_control.m_feerate = FeeRateFromSatVbValue(request.params[3]);
+        coin_control.fOverrideFeeRate = true;
+    }
+
+    CMutableTransaction resolution_tx;
+    COutPoint claim_input;
+    CAmount input_amount{0};
+    CAmount fee{0};
+    CAmount output_amount{0};
+    int64_t vsize{-1};
+    bool reused_legacy_resolution{false};
+    {
+        LOCK2(::cs_main, pwallet->cs_wallet);
+        const CWalletTx* claim = pwallet->GetWalletTx(claim_txid);
+        if (!claim) {
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Gold Rush PoW claim not found in this wallet");
+        }
+        if (!TransactionHasShadowProof(*claim->tx)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "claim_txid is not a Gold Rush PoW QQSPROOF transaction");
+        }
+        if (pwallet->GetTxDepthInMainChain(*claim) != 0 || !claim->isUnconfirmed()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim is already resolved on chain");
+        }
+        if (claim->InMempool()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim is still in the local mempool; wait for confirmation or quarantine before preparing a conflict");
+        }
+        if (!pwallet->IsQuarantinedShadowPowClaim(claim_txid)) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim is absent from the mempool but has no persisted quarantine marker; restart or rescan the wallet before using the guided resolution path");
+        }
+        if (claim->tx->vin.size() != 1) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Only a single-input wallet Gold Rush PoW claim can use the guided resolution path");
+        }
+        if (pwallet->HasWalletSpend(claim->tx)) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Gold Rush PoW claim has an unresolved wallet descendant; resolve or abandon the descendant before preparing a conflict that would invalidate it");
+        }
+        claim_input = claim->tx->vin.front().prevout;
+
+        for (const uint256& conflict_txid : pwallet->GetConflicts(claim_txid)) {
+            if (conflict_txid == claim_txid) continue;
+            const CWalletTx* other = pwallet->GetWalletTx(conflict_txid);
+            if (!other || other->isAbandoned() || other->isConflicted()) continue;
+            if (pwallet->GetTxDepthInMainChain(*other) > 0) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER,
+                                   strprintf("Gold Rush PoW claim was already resolved by confirmed conflict %s", conflict_txid.ToString()));
+            }
+            if (pwallet->IsLegacyShadowPowCleanupFor(*other, claim_txid)) {
+                if (reused_legacy_resolution) {
+                    throw JSONRPCError(RPC_WALLET_ERROR, "Multiple unresolved legacy cleanup transactions spend the claim input; manual wallet review is required");
+                }
+                if (other->tx->vin.size() != 1 ||
+                    other->tx->vin.front().prevout != claim_input ||
+                    other->tx->vout.size() != 1 ||
+                    TransactionHasShadowProof(*other->tx)) {
+                    throw JSONRPCError(RPC_WALLET_ERROR,
+                                       strprintf("Legacy cleanup %s does not match the safe single-input self-spend shape", conflict_txid.ToString()));
+                }
+                resolution_tx = CMutableTransaction{*other->tx};
+                reused_legacy_resolution = true;
+                continue;
+            }
+            throw JSONRPCError(RPC_WALLET_ERROR,
+                               strprintf("An unresolved wallet conflict %s already spends the claim input; do not create another resolution", conflict_txid.ToString()));
+        }
+
+        Coin input_coin;
+        const CCoinsViewCache& coins_tip = pwallet->chain().chainman().ActiveChainstate().CoinsTip();
+        if (!coins_tip.GetCoin(claim_input, input_coin) || input_coin.IsSpent()) {
+            throw JSONRPCError(RPC_INVALID_PARAMETER, "Gold Rush PoW claim input is already spent on the active chain; wait for wallet conflict reconciliation");
+        }
+        if ((pwallet->IsMine(input_coin.out) & ISMINE_SPENDABLE) == ISMINE_NO) {
+            throw JSONRPCError(RPC_WALLET_ERROR, "Wallet cannot spend the quarantined claim input");
+        }
+
+        input_amount = input_coin.out.nValue;
+        if (reused_legacy_resolution) {
+            if (coin_control.m_feerate) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, "fee_rate cannot modify an already-signed legacy claim-resolution transaction");
+            }
+            if (resolution_tx.vout.front().scriptPubKey != input_coin.out.scriptPubKey) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Legacy claim-resolution transaction does not return value to the exact claim-input script");
+            }
+            output_amount = resolution_tx.vout.front().nValue;
+            fee = input_amount - output_amount;
+            vsize = GetVirtualTransactionSize(CTransaction{resolution_tx}, 0, 0);
+            if (!MoneyRange(output_amount) || output_amount <= 0 || fee <= 0 ||
+                !MoneyRange(fee) || IsDust(resolution_tx.vout.front(), pwallet->chain().relayDustFee())) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Legacy claim-resolution transaction has an invalid output or fee");
+            }
+        } else {
+            const int64_t current_time = GetAdjustedTimeSeconds();
+            const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
+            if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
+                throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
+            }
+
+            resolution_tx.nVersion = CTransaction::CURRENT_VERSION;
+            resolution_tx.nTime = current_time;
+            resolution_tx.vin.emplace_back(claim_input);
+            resolution_tx.vout.emplace_back(input_coin.out.nValue, input_coin.out.scriptPubKey);
+            const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(resolution_tx), pwallet.get(), &coin_control);
+            if (tx_size.vsize <= 0) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Unable to estimate the signed claim-resolution transaction size");
+            }
+            fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
+            output_amount = input_coin.out.nValue - fee;
+            CTxOut resolution_output{output_amount, input_coin.out.scriptPubKey};
+            if (!MoneyRange(output_amount) || output_amount <= 0 || IsDust(resolution_output, pwallet->chain().relayDustFee())) {
+                throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Quarantined claim input is too small to pay the resolution fee and return a non-dust output");
+            }
+            resolution_tx.vout[0].nValue = output_amount;
+            vsize = tx_size.vsize;
+        }
+        if (fee > pwallet->m_default_max_tx_fee) {
+            throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
+        }
+
+        if (!dry_run && !reused_legacy_resolution) {
+            // The unlock mode can change after the initial RPC argument and
+            // wallet checks. Recheck it while holding cs_wallet so a
+            // concurrent staking-only unlock cannot authorize this spend.
+            if (pwallet->IsLocked()) {
+                throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.");
+            }
+            if (pwallet->m_wallet_unlock_staking_only) {
+                throw JSONRPCError(RPC_WALLET_ERROR, "Error: Wallet unlocked for staking only, unable to sign a claim-resolution transaction");
+            }
+            std::map<int, bilingual_str> input_errors;
+            if (!pwallet->SignTransaction(resolution_tx, input_errors)) {
+                const std::string detail = input_errors.empty()
+                    ? "unknown signing failure" : input_errors.begin()->second.original;
+                throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Signing claim-resolution transaction failed: %s", detail));
+            }
+        }
+    }
+
+    if (!dry_run) {
+        const CTransactionRef signed_tx = MakeTransactionRef(resolution_tx);
+        LOCK(cs_main);
+        const MempoolAcceptResult accept = pwallet->chain().chainman().ProcessTransaction(signed_tx, /*test_accept=*/true);
+        if (accept.m_result_type != MempoolAcceptResult::ResultType::VALID) {
+            throw JSONRPCError(RPC_VERIFY_REJECTED,
+                               strprintf("Claim-resolution transaction is not currently relayable: %s", accept.m_state.ToString()));
+        }
+    }
+
+    UniValue result(UniValue::VOBJ);
+    result.pushKV("dry_run", dry_run);
+    result.pushKV("broadcast", false);
+    result.pushKV("reused_legacy_resolution", reused_legacy_resolution);
+    result.pushKV("claim_txid", claim_txid.GetHex());
+    result.pushKV("claim_input_txid", claim_input.hash.GetHex());
+    result.pushKV("claim_input_vout", claim_input.n);
+    result.pushKV("input_amount", ValueFromAmount(input_amount));
+    result.pushKV("fee", ValueFromAmount(fee));
+    result.pushKV("output_amount", ValueFromAmount(output_amount));
+    result.pushKV("vsize", vsize);
+    if (!dry_run) {
+        const CTransactionRef signed_tx = MakeTransactionRef(resolution_tx);
+        result.pushKV("hex", EncodeHexTx(*signed_tx));
+        result.pushKV("txid", signed_tx->GetHash().GetHex());
+        result.pushKV("next_step", "Review the fee and warning, then call sendrawtransaction with hex only if you choose to broadcast this conflict.");
+    } else {
+        result.pushKV("next_step", "Repeat with dry_run=false and acknowledge_fee_and_conflict_risk=true to obtain a signed, non-broadcast transaction.");
+    }
+    result.pushKV("warning", "This is an explicit on-chain conflict, not abandonment. If this resolution confirms, it pays the displayed base-chain fee without a shadow reimbursement. Peers retaining the original claim may reject the conflict; confirmation is not guaranteed. The wallet keeps the input reserved until either transaction actually confirms. After you explicitly broadcast, ordinary wallet resubmission may relay the unresolved resolution again across restart.");
     return result;
 },
     };
@@ -1516,10 +1966,10 @@ static RPCHelpMan getgoldrushinfo()
                         {RPCResult::Type::STR_AMOUNT, "pow_pool_jackpot", "PoW-side jackpot currently accrued in the pool before the next block reward is added."},
                         {RPCResult::Type::NUM, "pow_pool_amount", "PoW-side jackpot currently accrued in the pool before the next block reward is added, in satoshis."},
                         {RPCResult::Type::NUM, "claimed_amount", "Total Gold Rush amount already materialized to wallet-spendable quantum payout coins in satoshis."},
-                        {RPCResult::Type::NUM, "recent_solver_participants", "Unique whitelisted solver scripts with a solve marker still inside the 14-day window."},
+                        {RPCResult::Type::NUM, "recent_solver_participants", "Bounded authenticated active-signal count used as the participant proxy. Global recent-solver enumeration is intentionally not performed by this wallet RPC."},
                         {RPCResult::Type::NUM, "active_signalers", "Whitelisted recent solvers that have an unexpired QQSIGNAL marker and can receive the next qualified PoS split."},
                         {RPCResult::Type::NUM, "recent_count", "Recent solver/claim accounting count from the consensus pool."},
-                        {RPCResult::Type::STR_AMOUNT, "estimated_pos_payout_per_recent_solver", "Estimated PoS payout if every recent solver signals in the next qualified payout block."},
+                        {RPCResult::Type::STR_AMOUNT, "estimated_pos_payout_per_recent_solver", "Deprecated bounded estimate using active signalers; identical to estimated_pos_payout_per_active_signaler."},
                         {RPCResult::Type::STR_AMOUNT, "next_pos_payout_pool", "PoS-side jackpot plus the next block's PoS-side Gold Rush reward, if the next height is inside the reward window."},
                         {RPCResult::Type::NUM, "next_pos_payout_amount", "PoS-side jackpot plus the next block's PoS-side Gold Rush reward in satoshis."},
                         {RPCResult::Type::STR_AMOUNT, "estimated_pos_payout_per_active_signaler", "Estimated next qualified PoS payout per active signaler."},
@@ -1530,8 +1980,16 @@ static RPCHelpMan getgoldrushinfo()
                         {RPCResult::Type::NUM, "pow_count", "Alias for pow_claim_count."},
                         {RPCResult::Type::NUM, "last_pos_height", "Most recent accepted PoS-side Shadow payout height, or 0 if none."},
                         {RPCResult::Type::NUM, "last_pow_height", "Most recent accepted PoW-side Shadow claim height, or 0 if none."},
-                        {RPCResult::Type::BOOL, "wallet_recent_solve_qualified", "Whether this wallet has at least one spendable whitelisted script with a recent solver marker."},
-                        {RPCResult::Type::ARR, "wallet_scripts", "Spendable wallet scripts relevant to Gold Rush signaling.",
+                        {RPCResult::Type::NUM, "competing_claim_rule_activation_height", "First block using canonical order-independent competing-claim allocation."},
+                        {RPCResult::Type::BOOL, "competing_claim_rule_active", "Whether the active tip uses canonical competing-claim allocation."},
+                        {RPCResult::Type::BOOL, "competing_claim_rule_active_next_block", "Whether the next block uses canonical competing-claim allocation."},
+                        {RPCResult::Type::NUM, "blocks_until_competing_claim_rule", "Blocks from the active tip through the activation block; zero once active."},
+                        {RPCResult::Type::BOOL, "qqp4_activation_disabled", "Whether the separate QQP4 exact-input fork is disabled by consensus schedule; readiness signalling cannot enable it."},
+                        {RPCResult::Type::NUM, "qqp4_activation_height", "Separately scheduled QQP4 activation height, or 0 when disabled."},
+                        {RPCResult::Type::BOOL, "qqp4_active", "Whether the active tip uses QQP4 exact-input proof rules."},
+                        {RPCResult::Type::BOOL, "qqp4_active_next_block", "Whether the next block requires QQP4 exact-input proof rules."},
+                        {RPCResult::Type::BOOL, "wallet_recent_solve_qualified", "Whether this wallet has at least one known whitelisted script with a recent solver marker."},
+                        {RPCResult::Type::ARR, "wallet_scripts", "Bounded wallet-known scripts relevant to Gold Rush signaling; transaction construction performs the final spendability check.",
                         {
                             {RPCResult::Type::OBJ, "", "",
                             {
@@ -1555,19 +2013,20 @@ static RPCHelpMan getgoldrushinfo()
 {
     std::shared_ptr<CWallet> const pwallet = GetWalletForJSONRPCRequest(request);
     if (!pwallet) return NullUniValue;
+    ScopedDisallowShadowSolverActivityFullScan no_full_solver_scan;
 
     pwallet->BlockUntilSyncedToCurrentChain();
 
     std::set<CScript> wallet_scripts;
+    std::vector<WalletShadowSolveReference> wallet_solves;
     {
-        LOCK(pwallet->cs_wallet);
-        CCoinControl coin_control;
-        coin_control.m_avoid_address_reuse = false;
-        for (const COutput& output : AvailableCoins(*pwallet, &coin_control).All()) {
-            if (output.txout.nValue > 0 && !output.txout.scriptPubKey.empty() && !output.txout.scriptPubKey.IsUnspendable()) {
-                wallet_scripts.insert(CanonicalizeLegacyStakeScript(output.txout.scriptPubKey));
-            }
-        }
+        LOCK2(::cs_main, pwallet->cs_wallet);
+        const std::vector<CScript> known_scripts =
+            pwallet->GetOwnedLegacyShadowScripts(MAX_WALLET_SHADOW_SOLVE_REFERENCES);
+        wallet_scripts.insert(known_scripts.begin(), known_scripts.end());
+        const CBlockIndex* tip = pwallet->chain().chainman().ActiveChain().Tip();
+        if (tip) wallet_solves = GetWalletShadowSolveReferences(*pwallet, tip->nHeight);
+        for (const WalletShadowSolveReference& solve : wallet_solves) wallet_scripts.insert(solve.target);
     }
 
     UniValue wallet_entries(UniValue::VARR);
@@ -1579,6 +2038,13 @@ static RPCHelpMan getgoldrushinfo()
     bool active{false};
     bool wallet_recent_solve_qualified{false};
     uint64_t active_signalers{0};
+    int competing_claim_rule_activation_height{std::numeric_limits<int>::max()};
+    bool competing_claim_rule_active{false};
+    bool competing_claim_rule_active_next_block{false};
+    bool qqp4_activation_disabled{true};
+    int qqp4_activation_height{0};
+    bool qqp4_active{false};
+    bool qqp4_active_next_block{false};
     {
         ChainstateManager& chainman = pwallet->chain().chainman();
         LOCK(cs_main);
@@ -1593,9 +2059,32 @@ static RPCHelpMan getgoldrushinfo()
         tip_time = tip->GetBlockTime();
         mtp = tip->GetMedianTimePast();
         active = IsShadowGoldRushRewardActive(consensus, mtp, tip->nHeight + 1);
+        competing_claim_rule_activation_height =
+            consensus.nShadowCompetingClaimsActivationHeight;
+        competing_claim_rule_active =
+            consensus.IsShadowCompetingClaimsActive(tip->nHeight);
+        competing_claim_rule_active_next_block =
+            consensus.IsShadowCompetingClaimsActive(tip->nHeight + 1);
+        qqp4_activation_disabled =
+            consensus.nShadowQQP4ActivationHeight ==
+            std::numeric_limits<int>::max();
+        qqp4_activation_height = qqp4_activation_disabled
+            ? 0 : consensus.nShadowQQP4ActivationHeight;
+        qqp4_active = consensus.IsShadowQQP4Active(tip->nHeight);
+        qqp4_active_next_block =
+            consensus.IsShadowQQP4Active(tip->nHeight + 1);
         shadow_info = GetShadowGoldRushInfo(active_chainstate.CoinsTip(), tip);
-        recent_solvers = GetRecentShadowSolverActivity(active_chainstate.CoinsTip(), tip);
         active_signalers = GetActiveShadowSignalCount(active_chainstate.CoinsTip(), tip);
+
+        for (const WalletShadowSolveReference& solve : wallet_solves) {
+            if (!wallet_scripts.count(solve.target) || !IsWhitelisted(active_chainstate.CoinsTip(), solve.target)) continue;
+            const CBlockIndex* solved = active_chainstate.m_chain[solve.solve_height];
+            if (!solved || solved->GetBlockHash() != solve.solve_hash ||
+                !HasRecentShadowSolverActivity(active_chainstate.CoinsTip(), tip, solve.target, solve.solve_height, solve.solve_hash)) {
+                continue;
+            }
+            recent_solvers.emplace(solve.target, ShadowSolverActivity{solve.solve_height, solved->GetBlockTime()});
+        }
 
         for (const CScript& script : wallet_scripts) {
             const bool whitelisted = IsWhitelisted(active_chainstate.CoinsTip(), script);
@@ -1632,8 +2121,12 @@ static RPCHelpMan getgoldrushinfo()
     const CAmount next_pos_reward = next_reward - next_pow_reward;
     const CAmount next_pow_payout = next_reward_height_active ? shadow_info.pow_amount + next_pow_reward : shadow_info.pow_amount;
     const CAmount next_pos_payout_pool = next_reward_height_active ? shadow_info.pos_amount + next_pos_reward : shadow_info.pos_amount;
-    const size_t participants = recent_solvers.size();
-    const CAmount estimated_pos_payout = participants > 0 ? shadow_info.pos_amount / static_cast<CAmount>(participants) : 0;
+    // The former participant estimate scanned every UTXO while cs_main was
+    // held. Active signals are authenticated bounded state and are also the
+    // actual recipients of the next PoS split, so retain the legacy fields as
+    // documented aliases without reintroducing a GUI/RPC chainstate stall.
+    const uint64_t participants = active_signalers;
+    const CAmount estimated_pos_payout = participants > 0 ? next_pos_payout_pool / static_cast<CAmount>(participants) : 0;
     const CAmount estimated_active_pos_payout = active_signalers > 0 ? next_pos_payout_pool / static_cast<CAmount>(active_signalers) : 0;
 
     UniValue result(UniValue::VOBJ);
@@ -1647,7 +2140,7 @@ static RPCHelpMan getgoldrushinfo()
     result.pushKV("pow_pool_jackpot", ValueFromAmount(shadow_info.pow_amount));
     result.pushKV("pow_pool_amount", shadow_info.pow_amount);
     result.pushKV("claimed_amount", shadow_info.claimed_amount);
-    result.pushKV("recent_solver_participants", static_cast<uint64_t>(participants));
+    result.pushKV("recent_solver_participants", participants);
     result.pushKV("active_signalers", active_signalers);
     result.pushKV("recent_count", shadow_info.recent_count);
     result.pushKV("estimated_pos_payout_per_recent_solver", ValueFromAmount(estimated_pos_payout));
@@ -1661,6 +2154,17 @@ static RPCHelpMan getgoldrushinfo()
     result.pushKV("pow_count", shadow_info.pow_count);
     result.pushKV("last_pos_height", shadow_info.last_pos_height);
     result.pushKV("last_pow_height", shadow_info.last_pow_height);
+    result.pushKV("competing_claim_rule_activation_height",
+                  competing_claim_rule_activation_height);
+    result.pushKV("competing_claim_rule_active", competing_claim_rule_active);
+    result.pushKV("competing_claim_rule_active_next_block",
+                  competing_claim_rule_active_next_block);
+    result.pushKV("blocks_until_competing_claim_rule",
+                  std::max(0, competing_claim_rule_activation_height - tip_height));
+    result.pushKV("qqp4_activation_disabled", qqp4_activation_disabled);
+    result.pushKV("qqp4_activation_height", qqp4_activation_height);
+    result.pushKV("qqp4_active", qqp4_active);
+    result.pushKV("qqp4_active_next_block", qqp4_active_next_block);
     result.pushKV("wallet_recent_solve_qualified", wallet_recent_solve_qualified);
     result.pushKV("wallet_scripts", std::move(wallet_entries));
     return result;
@@ -1731,9 +2235,21 @@ static RPCHelpMan checkkernel()
 
     COutPoint kernel;
     CBlockIndex* pindexPrev = active_chain.Tip();
+    const std::optional<int64_t> pos_time = GetNextBlockPoSTime(
+        active_chainstate, pindexPrev, Params().GetConsensus(),
+        GetAdjustedTimeSeconds());
+
+    UniValue result(UniValue::VOBJ);
+    // Do not floor an unavailable adjusted time to the prior stake mask. A
+    // returned kernel must always correspond to a representable, MTP-valid,
+    // future-drift-valid PoS header that the assembler can build.
+    if (!pos_time) {
+        result.pushKV("found", false);
+        return result;
+    }
+
     unsigned int nBits = GetNextTargetRequired(pindexPrev, Params().GetConsensus(), true);
-    int64_t nTime = GetAdjustedTimeSeconds();
-    nTime &= ~Params().GetConsensus().nStakeTimestampMask;
+    const int64_t nTime = *pos_time;
 
     for (unsigned int idx = 0; idx < inputs.size(); idx++) {
         const UniValue& o = inputs[idx].get_obj();
@@ -1760,7 +2276,6 @@ static RPCHelpMan checkkernel()
         }
     }
 
-    UniValue result(UniValue::VOBJ);
     result.pushKV("found", !kernel.IsNull());
 
     if (kernel.IsNull())
@@ -1778,28 +2293,14 @@ static RPCHelpMan checkkernel()
     if (!pwallet->IsLocked())
         pwallet->TopUpKeyPool();
 
-    bool fPoSCancel = false;
-    int64_t nFees;
-    std::unique_ptr<node::CBlockTemplate> pblocktemplate(BlockAssembler{active_chainstate, &mempool}.CreateNewBlock(CScript(), nullptr, &fPoSCancel, &nFees));
-    if (!pblocktemplate.get())
-        throw JSONRPCError(RPC_INTERNAL_ERROR, "Couldn't create new block");
-
-    CBlock *pblock = &pblocktemplate->block;
-    CMutableTransaction coinstakeTx(*pblock->vtx[0]);
-    pblock->nTime = coinstakeTx.nTime = nTime;
-    pblock->vtx[0] = MakeTransactionRef(std::move(coinstakeTx));
-
-    CDataStream ss(SER_DISK);
-    ss << RPCTxSerParams(*pblock);
-
-    result.pushKV("blocktemplate", HexStr(ss));
-    result.pushKV("blocktemplatefees", nFees);
-
     if (!pwallet->CanGetAddresses(true)) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: This wallet has no available keys");
     }
 
-    // Prepare reserve destination
+    // Reserve the payout/change destination before assembling the template.
+    // In addition to supplying a real output script for the coinstake, this
+    // lets the assembler prove the exact kernel reported above rather than
+    // selecting an unrelated wallet kernel at the same timestamp.
     OutputType output_type = pwallet->m_default_change_type ? *pwallet->m_default_change_type : pwallet->m_default_address_type;
     auto op_dest = pwallet->GetNewChangeDestination(output_type);
     if (!op_dest) {
@@ -1812,11 +2313,39 @@ static RPCHelpMan checkkernel()
     if (!provider) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: failed to get signing provider");
     }
+    if (vSolutionsTmp.empty()) {
+        throw JSONRPCError(RPC_WALLET_ERROR, "Error: failed to resolve template signing key");
+    }
     CKeyID ckey = CKeyID(uint160(vSolutionsTmp[0]));
     CPubKey pkey;
-    if (!provider.get()->GetPubKey(ckey, pkey)) {
+    if (!provider->GetPubKey(ckey, pkey)) {
         throw JSONRPCError(RPC_WALLET_ERROR, "Error: failed to get key");
     }
+
+    bool fPoSCancel = false;
+    int64_t nFees;
+    std::unique_ptr<node::CBlockTemplate> pblocktemplate(
+        BlockAssembler{active_chainstate, &mempool}.CreateNewBlock(
+            CScript(), pwallet.get(), &fPoSCancel, &nFees, *op_dest, kernel));
+    if (!pblocktemplate || fPoSCancel)
+        throw JSONRPCError(RPC_INTERNAL_ERROR,
+                           "Couldn't create a valid proof-of-stake block template");
+
+    CBlock *pblock = &pblocktemplate->block;
+    if (!pblock->IsProofOfStake() || pblock->vtx.size() < 2 ||
+        pblock->vtx[1]->vin.empty() ||
+        pblock->vtx[1]->vin[0].prevout != kernel ||
+        pblock->nTime != nTime) {
+        throw JSONRPCError(
+            RPC_INTERNAL_ERROR,
+            "Couldn't create a valid proof-of-stake block template for the requested kernel");
+    }
+
+    CDataStream ss(SER_DISK);
+    ss << RPCTxSerParams(*pblock);
+
+    result.pushKV("blocktemplate", HexStr(ss));
+    result.pushKV("blocktemplatefees", nFees);
     result.pushKV("blocktemplatesignkey", HexStr(pkey));
 
     return result;
@@ -1829,23 +2358,27 @@ static RPCHelpMan setpowmining()
     return RPCHelpMan{"setpowmining",
         "\nStart, stop, or reconfigure the built-in (in-process) Gold Rush Proof-of-Work miner.\n"
         "No external miner is required. Mining only produces claims during the Gold Rush reward window,\n"
-        "requires an unlocked wallet with private keys, and credits valid claims to an auto-created quantum address in the upgraded shadow ledger.\n"
+        "requires an unlocked wallet with private keys, and credits valid claims to a wallet-owned quantum address in the upgraded shadow ledger.\n"
+        "By default the miner reuses -qqpowpayoutaddress or a previously stored wallet payout and creates no key. If neither exists, the call fails without changing the wallet unless allow_new_payout_key=true gives one-call consent, or startup already supplied -qqallowautokeycreation=1. Every newly created payout key is non-HD and requires an immediate wallet backup.\n"
         "Claim submission is not whitelist-gated, but it does require a spendable non-dust legacy UTXO to authenticate the QQSPROOF transaction and pay the minimal network fee.\n",
         {
             {"enabled", RPCArg::Type::BOOL, RPCArg::Optional::NO, "true to start mining, false to stop."},
             {"threads", RPCArg::Type::NUM, RPCArg::Default{1}, "Worker threads (CPU cores) to use, 1..256."},
             {"cpu_percent", RPCArg::Type::NUM, RPCArg::Default{1}, "Per-core CPU duty-cycle target, 1..100."},
+            {"allow_new_payout_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "Explicit consent to create one new non-HD ML-DSA payout key if no configured or previously stored payout exists. Back up the wallet immediately if the result reports created_payout_key=true."},
         },
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is now enabled."},
             {RPCResult::Type::NUM, "threads", "Configured worker threads."},
             {RPCResult::Type::NUM, "cpu_percent", "Configured per-core CPU duty cycle."},
-            {RPCResult::Type::STR, "payout_address", "The quantum payout address (created if needed)."},
+            {RPCResult::Type::STR, "payout_address", "The configured, restored, or newly created wallet-owned quantum payout address."},
+            {RPCResult::Type::BOOL, "created_payout_key", "Whether this call created a new non-HD ML-DSA payout key."},
             {RPCResult::Type::STR, "warning", /*optional=*/true, "Backup reminder when a wallet-backed quantum payout key was created."},
         }},
         RPCExamples{
-            HelpExampleCli("setpowmining", "true 2 50")
-          + HelpExampleRpc("setpowmining", "true, 2, 50")
+            HelpExampleCli("setpowmining", "true 2 50 false")
+          + HelpExampleCli("setpowmining", "true 2 50 true")
+          + HelpExampleRpc("setpowmining", "true, 2, 50, false")
         },
     [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
 {
@@ -1855,9 +2388,12 @@ static RPCHelpMan setpowmining()
     const bool enabled = request.params[0].get_bool();
     const int threads = request.params[1].isNull() ? 1 : request.params[1].getInt<int>();
     const int cpu_percent = request.params[2].isNull() ? 1 : request.params[2].getInt<int>();
+    const bool allow_new_payout_key = !request.params[3].isNull() && request.params[3].get_bool();
     bilingual_str error;
     bool created_payout_key{false};
-    const bool ok = pwallet->SetPowMining(enabled, threads, cpu_percent, error, &created_payout_key);
+    const bool ok = pwallet->SetPowMining(
+        enabled, threads, cpu_percent, error, &created_payout_key,
+        allow_new_payout_key);
     if (!ok) {
         throw JSONRPCError(RPC_WALLET_ERROR, error.original);
     }
@@ -1870,6 +2406,7 @@ static RPCHelpMan setpowmining()
         LOCK(pwallet->cs_wallet);
         result.pushKV("payout_address", pwallet->m_pow_payout_quantum);
     }
+    result.pushKV("created_payout_key", created_payout_key);
     if (created_payout_key) {
         result.pushKV("warning", "A new wallet-backed ML-DSA quantum payout address was created for PoW rewards. Back up this wallet before relying on mined rewards.");
     }
@@ -1885,9 +2422,16 @@ static RPCHelpMan getpowmininginfo()
         {},
         RPCResult{RPCResult::Type::OBJ, "", "", {
             {RPCResult::Type::BOOL, "enabled", "Whether in-process PoW mining is enabled."},
+            {RPCResult::Type::BOOL, "autostart", "Whether process-wide persistent consent was given to start PoW mining for every eligible loaded wallet."},
+            {RPCResult::Type::BOOL, "allow_automatic_quantum_key_creation", "Whether process-wide background automation may create new non-HD keys in loaded wallets."},
+            {RPCResult::Type::STR, "state", "Bounded worker state: disabled, starting, chain_unavailable, wallet_locked_or_staking_only, no_spendable_legacy_fee_utxo, epoch_inactive, claim_in_flight, claim_quarantined, ready, hashing, or error."},
             {RPCResult::Type::NUM, "threads", "Worker threads configured."},
             {RPCResult::Type::NUM, "cpu_percent", "Per-core CPU duty-cycle target."},
             {RPCResult::Type::NUM, "hashrate", "Aggregate Argon2id tries per second."},
+            {RPCResult::Type::NUM, "current_height", "Active-chain tip used to evaluate Gold Rush state, or -1 if unavailable."},
+            {RPCResult::Type::NUM, "shadow_reward_next_height", "Next block height evaluated for a shadow-ledger reward, or 0 if the chain tip is unavailable."},
+            {RPCResult::Type::NUM, "shadow_reward_start_height", "First Gold Rush shadow-ledger reward height."},
+            {RPCResult::Type::NUM, "shadow_reward_end_height", "Last Gold Rush shadow-ledger reward height."},
             {RPCResult::Type::BOOL, "epoch_active", "Whether the Gold Rush reward window is currently open."},
             {RPCResult::Type::NUM, "blocks_remaining", "Blocks left in the Gold Rush reward window."},
             {RPCResult::Type::STR, "payout_address", "Quantum payout address (empty until created)."},
@@ -1895,6 +2439,9 @@ static RPCHelpMan getpowmininginfo()
             {RPCResult::Type::STR_AMOUNT, "next_claim_payout", "Estimated payout for a valid PoW claim in the next block."},
             {RPCResult::Type::NUM, "next_claim_amount", "Estimated payout for a valid PoW claim in the next block, in satoshis."},
             {RPCResult::Type::NUM, "claims_submitted", "Claims submitted by this miner since it started."},
+            {RPCResult::Type::NUM, "unresolved_claims", "Unconfirmed wallet QQSPROOF transactions, whether live or quarantined."},
+            {RPCResult::Type::NUM, "live_claims", "Unconfirmed wallet QQSPROOF transactions currently in the local mempool."},
+            {RPCResult::Type::NUM, "quarantined_claims", "Unconfirmed wallet QQSPROOF transactions absent from the local mempool whose inputs remain reserved."},
         }},
         RPCExamples{
             HelpExampleCli("getpowmininginfo", "")
@@ -1907,16 +2454,24 @@ static RPCHelpMan getpowmininginfo()
 
     UniValue obj(UniValue::VOBJ);
     obj.pushKV("enabled", pwallet->m_pow_mining_enabled.load());
+    obj.pushKV("autostart", gArgs.GetBoolArg("-powmining", false));
+    obj.pushKV("allow_automatic_quantum_key_creation", gArgs.GetBoolArg("-qqallowautokeycreation", DEFAULT_ALLOW_AUTO_QUANTUM_KEY_CREATION));
+    obj.pushKV("state", std::string(interfaces::WalletPowMiningStateName(pwallet->m_pow_state.load())));
     obj.pushKV("threads", pwallet->m_pow_threads.load());
     obj.pushKV("cpu_percent", pwallet->m_pow_cpu_percent.load());
     obj.pushKV("hashrate", pwallet->m_pow_hashrate.load());
     obj.pushKV("claims_submitted", (int64_t)pwallet->m_pow_claims_submitted.load());
+    obj.pushKV("unresolved_claims", static_cast<uint64_t>(pwallet->CountUnresolvedShadowPowClaims()));
+    obj.pushKV("live_claims", static_cast<uint64_t>(pwallet->CountLiveShadowPowClaims()));
+    obj.pushKV("quarantined_claims", static_cast<uint64_t>(pwallet->CountQuarantinedShadowPowClaims()));
     {
         LOCK(pwallet->cs_wallet);
         obj.pushKV("payout_address", pwallet->m_pow_payout_quantum);
     }
 
     bool epoch_active = false;
+    int current_height = -1;
+    int next_height = 0;
     int blocks_remaining = 0;
     CAmount accrued = 0;
     CAmount next_claim = 0;
@@ -1926,13 +2481,18 @@ static RPCHelpMan getpowmininginfo()
         const CBlockIndex* tip = chainman.ActiveChain().Tip();
         if (tip) {
             const Consensus::Params& consensus = Params().GetConsensus();
-            const int next_height = tip->nHeight + 1;
+            current_height = tip->nHeight;
+            next_height = tip->nHeight + 1;
             epoch_active = IsShadowGoldRushRewardActive(consensus, tip->GetMedianTimePast(), next_height);
             blocks_remaining = epoch_active ? std::max(0, SHADOW_REWARD_END_HEIGHT - next_height + 1) : 0;
             accrued = GetShadowGoldRushInfo(chainman.ActiveChainstate().CoinsTip(), tip).pow_amount;
             next_claim = epoch_active ? accrued + ShadowBaseReward(next_height) / 2 : accrued;
         }
     }
+    obj.pushKV("current_height", current_height);
+    obj.pushKV("shadow_reward_next_height", next_height);
+    obj.pushKV("shadow_reward_start_height", SHADOW_REWARD_START_HEIGHT);
+    obj.pushKV("shadow_reward_end_height", SHADOW_REWARD_END_HEIGHT);
     obj.pushKV("epoch_active", epoch_active);
     obj.pushKV("blocks_remaining", blocks_remaining);
     obj.pushKV("accrued_jackpot", ValueFromAmount(accrued));
@@ -2113,12 +2673,14 @@ static RPCHelpMan redelegatequantumcoldstake()
         "\nCreate or broadcast an owner-branch Quantum Cold-Stake redelegation transaction.\n"
         "The wallet spends all selected UTXOs from a wallet-owned source QCS address into a new\n"
         "wallet-backed QCS address for the target staking public key. Consensus is unchanged; this is\n"
-        "ordinary owner spending with per-pool cap and redelegation wallet policy checks.\n",
+        "ordinary owner spending with per-pool cap and redelegation wallet policy checks.\n"
+        "dry_run=true creates no wallet metadata. Broadcasting with dry_run=false creates a durable non-HD ML-DSA owner key that is not seed-recoverable; back up the wallet whenever the result or an error reports the created address because the key can remain after a later failure.\n",
         {
             {"source_coldstake_address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-owned source Quantum Cold-Stake address."},
             {"target_staking_pubkey", RPCArg::Type::STR_HEX, RPCArg::Optional::NO, "Target operator/staker ML-DSA-44 public key."},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Redelegation options.", {
                 {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{true}, "Build and return a read-only, unsigned transaction plan without broadcasting or creating wallet metadata. Set false to create the wallet-backed target QCS address and broadcast."},
+                {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "Required with dry_run=false. Explicitly authorize the new non-HD ML-DSA owner key and back up the wallet whenever the result or an error reports the created address; the durable key can remain after a later failure."},
                 {"enforce_pool_cap", RPCArg::Type::BOOL, RPCArg::Default{true}, "Refuse over-cap redelegation only when an under-cap alternative exists; otherwise allow bootstrap and report the over-cap projection."},
                 {"require_verified_operator", RPCArg::Type::BOOL, RPCArg::Default{true}, "Refuse if the target operator has no locally verified 30-day Operator-tier commitment."},
                 {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Optional fee rate in " + CURRENCY_ATOM + "/vB."},
@@ -2145,9 +2707,11 @@ static RPCHelpMan redelegatequantumcoldstake()
             }},
             {RPCResult::Type::STR_HEX, "hex", "Transaction hex. Dry-run hex is unsigned planning output and is not intended for broadcast."},
             {RPCResult::Type::STR_HEX, "txid", /*optional=*/true, "Broadcast transaction id."},
+            {RPCResult::Type::STR, "warning", /*optional=*/true, "Backup warning when a new owner key was created."},
         }},
         RPCExamples{
             HelpExampleCli("redelegatequantumcoldstake", "\"<source_qcs_address>\" \"<target_staking_pubkey>\" '{\"dry_run\":true}'")
+          + HelpExampleCli("redelegatequantumcoldstake", "\"<source_qcs_address>\" \"<target_staking_pubkey>\" '{\"dry_run\":false,\"allow_new_quantum_key\":true}'")
           + HelpExampleRpc("redelegatequantumcoldstake", "\"<source_qcs_address>\", \"<target_staking_pubkey>\", {\"dry_run\":true}")
         },
     [&](const RPCHelpMan& self, const JSONRPCRequest& request) -> UniValue
@@ -2169,6 +2733,9 @@ static RPCHelpMan redelegatequantumcoldstake()
     const UniValue options = request.params[2].isNull() ? UniValue(UniValue::VOBJ) : request.params[2].get_obj();
     QuantumColdStakeRedelegationOptions redelegation_options;
     redelegation_options.dry_run = !options.exists("dry_run") || options["dry_run"].get_bool();
+    redelegation_options.allow_new_quantum_key = redelegation_options.dry_run
+        ? false
+        : RequireNewQuantumKeyConsent(options, "redelegatequantumcoldstake");
     redelegation_options.enforce_pool_cap = !options.exists("enforce_pool_cap") || options["enforce_pool_cap"].get_bool();
     redelegation_options.require_verified_operator = !options.exists("require_verified_operator") || options["require_verified_operator"].get_bool();
     redelegation_options.label = options.exists("label") ? LabelFromValue(options["label"]) : "redelegated-coldstake";
@@ -2204,6 +2771,7 @@ static RPCHelpMan redelegatequantumcoldstake()
     obj.pushKV("hex", EncodeHexTx(*redelegation.tx));
     if (!redelegation.dry_run) {
         obj.pushKV("txid", redelegation.tx->GetHash().GetHex());
+        obj.pushKV("warning", "A new non-HD ML-DSA delegation owner key was created. Back up this wallet now; an older backup cannot recover it.");
     }
     return obj;
 },
@@ -2213,10 +2781,11 @@ static RPCHelpMan redelegatequantumcoldstake()
 static RPCHelpMan senddemurrageattestation()
 {
     return RPCHelpMan{"senddemurrageattestation",
-        "\nCreate a fee-paying demurrage liveness attestation for a wallet-backed Blackcoin ML-DSA address.\n"
+        "\nCreate a fee-paying demurrage liveness attestation for an eligible wallet-backed direct or tiered v16 Blackcoin ML-DSA address.\n"
+        "Cold-stake outputs cannot be attested.\n"
         "The attestation output carries no value; it refreshes the key's inactivity clock once mined after -qqdemurrageheight is active.\n",
         {
-            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Wallet-backed Blackcoin migration address to attest."},
+            {"address", RPCArg::Type::STR, RPCArg::Optional::NO, "Eligible wallet-backed direct or tiered v16 Blackcoin migration address to attest."},
             {"options", RPCArg::Type::OBJ, RPCArg::Default{UniValue::VOBJ}, "Attestation options.",
             {
                 {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{false}, "Build and return the transaction without committing it to the wallet."},
@@ -2229,6 +2798,7 @@ static RPCHelpMan senddemurrageattestation()
             {RPCResult::Type::STR_HEX, "witness_program", "Attested witness program / public-key hash."},
             {RPCResult::Type::STR_HEX, "public_key", "Attested ML-DSA public key."},
             {RPCResult::Type::STR_HEX, "replay_anchor", "First input outpoint bound into the ML-DSA attestation signature."},
+            {RPCResult::Type::STR_HEX, "target_outpoint", "Live quantum UTXO proving that the attested key is relevant."},
             {RPCResult::Type::NUM, "attestation_vout", "Output index carrying the zero-value demurrage attestation."},
             {RPCResult::Type::STR_AMOUNT, "fee", "Transaction fee."},
             {RPCResult::Type::NUM, "vsize", "Virtual transaction size."},
@@ -2286,6 +2856,7 @@ static RPCHelpMan senddemurrageattestation()
     obj.pushKV("witness_program", HexStr(witness->GetWitnessProgram()));
     obj.pushKV("public_key", HexStr(tx_result.public_key));
     obj.pushKV("replay_anchor", tx_result.replay_anchor.ToString());
+    obj.pushKV("target_outpoint", tx_result.target_outpoint.ToString());
     obj.pushKV("attestation_vout", tx_result.attestation_vout);
     obj.pushKV("fee", ValueFromAmount(tx_result.fee));
     obj.pushKV("vsize", (int)GetVirtualTransactionSize(*tx, 0, 0));
@@ -2318,11 +2889,11 @@ static RPCHelpMan getdemurragewalletinfo()
             {RPCResult::Type::BOOL, "demurrage_height_guard_satisfied", "Whether evaluation_height is at or above demurrage_effective_activation_height"},
             {RPCResult::Type::BOOL, "demurrage_post_migration_guard_satisfied", "Whether evaluation_time is after quantum_migration_deadline_time"},
             {RPCResult::Type::BOOL, "wallet_staking_enabled", "Whether this wallet has staking enabled"},
-            {RPCResult::Type::NUM, "quantum_outputs", "Wallet-owned direct quantum outputs considered"},
+            {RPCResult::Type::NUM, "quantum_outputs", "Wallet-owned direct or tiered v16 quantum outputs considered"},
             {RPCResult::Type::NUM, "decaying_outputs", "Outputs whose effective value is below nominal value"},
             {RPCResult::Type::NUM, "locked_outputs", "Outputs at the 24-month demurrage lock point"},
             {RPCResult::Type::NUM, "attestation_due_outputs", "Outputs at or beyond the 3-month auto-attestation policy threshold"},
-            {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal value of considered wallet-owned direct quantum outputs"},
+            {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal value of considered wallet-owned direct or tiered v16 quantum outputs"},
             {RPCResult::Type::STR_AMOUNT, "effective_amount", "Demurrage-adjusted spendable value at evaluation_height"},
             {RPCResult::Type::STR_AMOUNT, "burned_if_spent_amount", "Amount that would be burned if all considered outputs were spent at evaluation_height"},
             {RPCResult::Type::ARR, "outputs", "Per-output demurrage state",
@@ -2336,6 +2907,7 @@ static RPCHelpMan getdemurragewalletinfo()
                     {RPCResult::Type::NUM, "coin_height", "Consensus coin height used for evaluation"},
                     {RPCResult::Type::BOOL, "chainstate_backed", "Whether the output was found in chainstate/mempool lookup"},
                     {RPCResult::Type::NUM, "latest_attestation_height", /*optional=*/true, "Latest mined liveness attestation height for this key"},
+                    {RPCResult::Type::NUM, "attestation_coverage_start_height", /*optional=*/true, "Beginning of the uninterrupted attestation coverage epoch"},
                     {RPCResult::Type::NUM, "inactive_blocks", "Blocks since the effective last-active height"},
                     {RPCResult::Type::NUM, "remaining_ppm", "Remaining value in parts per million"},
                     {RPCResult::Type::STR_AMOUNT, "nominal_amount", "Nominal output value"},
@@ -2398,9 +2970,16 @@ static RPCHelpMan getdemurragewalletinfo()
 
         const auto coin_it = chain_coins.find(out.outpoint);
         const bool chainstate_backed = coin_it != chain_coins.end() && !coin_it->second.IsSpent();
-        Coin coin = chainstate_backed ? coin_it->second : Coin{out.txout, out.depth > 0 ? tip_height - out.depth + 1 : evaluation_height, false, false, static_cast<int>(out.time)};
-        const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(view, out.txout.scriptPubKey);
-        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin, consensus, evaluation_height, evaluation_time, latest_attestation);
+        if (!chainstate_backed) {
+            CHECK_NONFATAL(out.time >= 0 && out.time <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()));
+        }
+        Coin coin = chainstate_backed ? coin_it->second : Coin{out.txout, out.depth > 0 ? tip_height - out.depth + 1 : evaluation_height, false, false, static_cast<uint32_t>(out.time)};
+        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+            Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
+        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+            coin, consensus, evaluation_height, evaluation_time,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
         const bool attestation_due = demurrage_active && !eval.locked && eval.inactive_blocks >= consensus.DemurrageAutoAttestBlocks();
 
         nominal_total += eval.nominal_value;
@@ -2417,7 +2996,10 @@ static RPCHelpMan getdemurragewalletinfo()
         entry.pushKV("depth", out.depth);
         entry.pushKV("coin_height", static_cast<int>(coin.nHeight));
         entry.pushKV("chainstate_backed", chainstate_backed);
-        if (latest_attestation) entry.pushKV("latest_attestation_height", *latest_attestation);
+        if (latest_attestation) {
+            entry.pushKV("latest_attestation_height", latest_attestation->height);
+            entry.pushKV("attestation_coverage_start_height", latest_attestation->coverage_start_height);
+        }
         entry.pushKV("inactive_blocks", eval.inactive_blocks);
         entry.pushKV("remaining_ppm", eval.remaining_ppm);
         entry.pushKV("nominal_amount", ValueFromAmount(eval.nominal_value));
@@ -2434,7 +3016,7 @@ static RPCHelpMan getdemurragewalletinfo()
         } else if (eval.locked) {
             action = "locked: this output can no longer be spent";
         } else if (attestation_due && wallet_staking_enabled) {
-            action = "auto-attest eligible while staking";
+            action = "attestation due: automatic attempt also requires normal unlock and a safe fee input";
         } else if (attestation_due) {
             action = "senddemurrageattestation recommended";
         } else if (eval.burned_value > 0) {
@@ -2482,6 +3064,7 @@ static RPCHelpMan sweepdemurragedecay()
                     {"dry_run", RPCArg::Type::BOOL, RPCArg::Default{false}, "Build and return the transaction without committing it to the wallet or creating wallet metadata. Requires destination_address."},
                     {"source_address", RPCArg::Type::STR, RPCArg::Default{""}, "Sweep only decaying UTXOs paying this wallet-backed quantum address."},
                     {"destination_address", RPCArg::Type::STR, RPCArg::Default{""}, "Wallet-backed quantum address to receive the effective value; omitted generates a fresh address for broadcast mode. Required for dry_run."},
+                    {"allow_new_quantum_key", RPCArg::Type::BOOL, RPCArg::Default{false}, "When destination_address is omitted, explicitly authorize one new non-HD ML-DSA destination key. Back up the wallet whenever the result or an error reports the created address; the durable key can remain after a later failure."},
                     {"label", RPCArg::Type::STR, RPCArg::Default{"demurrage-sweep"}, "Label for a freshly generated destination address."},
                     {"fee_rate", RPCArg::Type::AMOUNT, RPCArg::Optional::OMITTED, "Fee rate in sat/vB."},
                     {"include_unsafe", RPCArg::Type::BOOL, RPCArg::Default{false}, "Include unconfirmed or unsafe selected outputs."},
@@ -2508,7 +3091,7 @@ static RPCHelpMan sweepdemurragedecay()
             {RPCResult::Type::STR, "warning", /*optional=*/true, "Backup warning"},
         }},
         RPCExamples{
-            HelpExampleCli("sweepdemurragedecay", "")
+            HelpExampleCli("sweepdemurragedecay", "'{\"allow_new_quantum_key\":true}'")
           + HelpExampleCli("sweepdemurragedecay", "'{\"dry_run\":true,\"destination_address\":\"<quantum_addr>\"}'")
           + HelpExampleRpc("sweepdemurragedecay", "{\"source_address\":\"<quantum_addr>\"}")
         },
@@ -2523,8 +3106,17 @@ static RPCHelpMan sweepdemurragedecay()
     const std::string source_address = options.exists("source_address") ? options["source_address"].get_str() : "";
     const std::string destination_address = options.exists("destination_address") ? options["destination_address"].get_str() : "";
     const std::string label = options.exists("label") ? options["label"].get_str() : "demurrage-sweep";
+    const std::optional<CFeeRate> requested_fee_rate = options.exists("fee_rate")
+        ? std::optional<CFeeRate>{FeeRateFromSatVbValue(options["fee_rate"])}
+        : std::nullopt;
     if (dry_run && destination_address.empty()) {
         throw JSONRPCError(RPC_INVALID_PARAMETER, "dry_run requires destination_address so the estimate does not create wallet metadata");
+    }
+    if (!dry_run && destination_address.empty() &&
+        (!options.exists("allow_new_quantum_key") || !options["allow_new_quantum_key"].get_bool())) {
+        throw JSONRPCError(
+            RPC_INVALID_PARAMETER,
+            "sweepdemurragedecay without destination_address creates a new non-HD ML-DSA key that an older wallet backup cannot recover. Retry with {\"allow_new_quantum_key\":true}, or supply an existing wallet-owned direct quantum destination_address. Back up the wallet after key creation. No key, transaction, or wallet metadata was created.");
     }
 
     LOCK2(cs_main, pwallet->cs_wallet);
@@ -2581,16 +3173,23 @@ static RPCHelpMan sweepdemurragedecay()
         dest = *op_dest;
         newly_generated = true;
     }
+    const std::optional<CTxDestination> created_destination = newly_generated
+        ? std::optional<CTxDestination>{dest}
+        : std::nullopt;
     if (!pwallet->GetQuantumKeyInfo(dest).has_value()) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Refusing to sweep: destination ML-DSA key is not confirmed stored in the wallet");
+        ThrowQuantumActionError(
+            RPC_WALLET_ERROR,
+            "Demurrage sweep",
+            "Refusing to sweep: destination ML-DSA key is not confirmed stored in the wallet",
+            created_destination);
     }
 
     CCoinControl coin_control;
     coin_control.m_allow_other_inputs = false;
     coin_control.m_include_unsafe_inputs = include_unsafe;
-    coin_control.destChange = CNoDestination{};
-    if (options.exists("fee_rate")) {
-        coin_control.m_feerate = FeeRateFromSatVbValue(options["fee_rate"]);
+    coin_control.destChange = dest;
+    if (requested_fee_rate) {
+        coin_control.m_feerate = *requested_fee_rate;
         coin_control.fOverrideFeeRate = true;
     }
 
@@ -2623,8 +3222,12 @@ static RPCHelpMan sweepdemurragedecay()
     for (const COutput& out : candidates) {
         const auto coin_it = chain_coins.find(out.outpoint);
         if (coin_it == chain_coins.end() || coin_it->second.IsSpent()) continue;
-        const std::optional<int> latest_attestation = Consensus::LatestDemurrageAttestationHeightForScript(view, out.txout.scriptPubKey);
-        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(coin_it->second, consensus, evaluation_height, evaluation_time, latest_attestation);
+        const std::optional<Consensus::DemurrageAttestationState> latest_attestation =
+            Consensus::LatestDemurrageAttestationStateForScript(view, out.txout.scriptPubKey);
+        const Consensus::DemurrageEvaluation eval = Consensus::EvaluateDemurrage(
+            coin_it->second, consensus, evaluation_height, evaluation_time,
+            latest_attestation ? std::optional<int>{latest_attestation->height} : std::nullopt,
+            latest_attestation ? std::optional<int>{static_cast<int>(latest_attestation->coverage_start_height)} : std::nullopt);
         if (eval.locked) {
             ++skipped_locked_outputs;
             skipped_locked_amount += eval.nominal_value;
@@ -2638,16 +3241,28 @@ static RPCHelpMan sweepdemurragedecay()
         ++selected_inputs;
     }
     if (selected_inputs == 0) {
-        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "No spendable wallet-owned quantum outputs are currently decaying");
+        ThrowQuantumActionError(
+            RPC_WALLET_INSUFFICIENT_FUNDS,
+            "Demurrage sweep",
+            "No spendable wallet-owned quantum outputs are currently decaying",
+            created_destination);
     }
     if (effective_amount <= 0) {
-        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Selected decaying outputs have no spendable effective value");
+        ThrowQuantumActionError(
+            RPC_WALLET_INSUFFICIENT_FUNDS,
+            "Demurrage sweep",
+            "Selected decaying outputs have no spendable effective value",
+            created_destination);
     }
 
     const int64_t current_time = GetAdjustedTimeSeconds();
     const CFeeRate fee_rate = GetMinimumFeeRate(*pwallet, coin_control, current_time);
     if (coin_control.m_feerate && fee_rate > *coin_control.m_feerate) {
-        throw JSONRPCError(RPC_INVALID_PARAMETER, strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)));
+        ThrowQuantumActionError(
+            RPC_INVALID_PARAMETER,
+            "Demurrage sweep",
+            strprintf("Fee rate (%s) is lower than the minimum fee rate setting (%s)", coin_control.m_feerate->ToString(FeeEstimateMode::SAT_VB), fee_rate.ToString(FeeEstimateMode::SAT_VB)),
+            created_destination);
     }
 
     CMutableTransaction sweep_tx;
@@ -2661,28 +3276,52 @@ static RPCHelpMan sweepdemurragedecay()
 
     const TxSize tx_size = CalculateMaximumSignedTxSize(CTransaction(sweep_tx), pwallet.get(), &coin_control);
     if (tx_size.vsize <= 0) {
-        throw JSONRPCError(RPC_WALLET_ERROR, "Unable to estimate demurrage sweep transaction size");
+        ThrowQuantumActionError(
+            RPC_WALLET_ERROR,
+            "Demurrage sweep",
+            "Unable to estimate demurrage sweep transaction size",
+            created_destination);
     }
     const CAmount fee = std::max(GetMinFee(static_cast<size_t>(tx_size.vsize), static_cast<uint32_t>(current_time)), fee_rate.GetFee(static_cast<uint32_t>(tx_size.vsize)));
     if (fee > pwallet->m_default_max_tx_fee) {
-        throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)));
+        ThrowQuantumActionError(
+            RPC_WALLET_ERROR,
+            "Demurrage sweep",
+            strprintf("Fee exceeds wallet max transaction fee (%s)", FormatMoney(pwallet->m_default_max_tx_fee)),
+            created_destination);
     }
     const CAmount output_amount = effective_amount - fee;
     if (!MoneyRange(output_amount) || output_amount <= 0) {
-        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Selected decaying outputs cannot pay the sweep fee");
+        ThrowQuantumActionError(
+            RPC_WALLET_INSUFFICIENT_FUNDS,
+            "Demurrage sweep",
+            "Selected decaying outputs cannot pay the sweep fee",
+            created_destination);
     }
     sweep_tx.vout[0].nValue = output_amount;
 
     if (IsDust(sweep_tx.vout[0], pwallet->chain().relayDustFee())) {
-        throw JSONRPCError(RPC_WALLET_INSUFFICIENT_FUNDS, "Demurrage sweep would strand the effective value below dust after fees");
+        ThrowQuantumActionError(
+            RPC_WALLET_INSUFFICIENT_FUNDS,
+            "Demurrage sweep",
+            "Demurrage sweep would strand the effective value below dust after fees",
+            created_destination);
     }
     if (!dry_run) {
         std::map<int, bilingual_str> input_errors;
         if (!pwallet->SignTransaction(sweep_tx, input_errors)) {
             if (!input_errors.empty()) {
-                throw JSONRPCError(RPC_WALLET_ERROR, strprintf("Signing demurrage sweep failed: %s", input_errors.begin()->second.original));
+                ThrowQuantumActionError(
+                    RPC_WALLET_ERROR,
+                    "Demurrage sweep",
+                    strprintf("Signing demurrage sweep failed: %s", input_errors.begin()->second.original),
+                    created_destination);
             }
-            throw JSONRPCError(RPC_WALLET_ERROR, "Signing demurrage sweep failed");
+            ThrowQuantumActionError(
+                RPC_WALLET_ERROR,
+                "Demurrage sweep",
+                "Signing demurrage sweep failed",
+                created_destination);
         }
     }
     CTransactionRef tx = MakeTransactionRef(std::move(sweep_tx));
@@ -2707,7 +3346,7 @@ static RPCHelpMan sweepdemurragedecay()
     if (!dry_run) {
         mapValue_t map_value;
         map_value["comment"] = "Blackcoin demurrage sweep";
-        CommitWalletTransactionOrThrow(*pwallet, tx, std::move(map_value), "Blackcoin demurrage sweep");
+        CommitWalletTransactionOrThrow(*pwallet, tx, std::move(map_value), "Demurrage sweep", created_destination);
         obj.pushKV("txid", tx->GetHash().GetHex());
     }
     if (newly_generated) {
@@ -2731,6 +3370,7 @@ static const CRPCCommand commands[] =
     { "staking",            &reservebalance,                 },
     { "staking",            &sendshadowsignal,               },
     { "staking",            &sendshadowpowclaim,             },
+    { "staking",            &createshadowpowclaimresolution, },
     { "staking",            &setpowmining,                   },
     { "staking",            &getpowmininginfo,               },
     { "staking",            &getquantumstakeaddressinfo,     },

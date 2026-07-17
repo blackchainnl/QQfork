@@ -13,6 +13,8 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <limits>
+
 BOOST_FIXTURE_TEST_SUITE(pow_tests, BasicTestingSetup)
 
 /* Test calculation of next difficulty target with no constraints applying */
@@ -68,6 +70,39 @@ BOOST_AUTO_TEST_CASE(get_next_work_negative_spacing_fix)
     unsigned int invalid_nbits = expected_nbits-1;
     BOOST_CHECK(!PermittedDifficultyTransition(chainParams->GetConsensus(), pindexLast.nHeight+1, pindexLast.nBits, invalid_nbits));
     */
+}
+
+/* Preserve historical low-32-bit retarget outputs and cover extended fuzz inputs. */
+BOOST_AUTO_TEST_CASE(get_next_work_legacy_adjustment_modulo)
+{
+    const auto chainParams = CreateChainParams(*m_node.args, ChainType::MAIN);
+    CBlockIndex pindexLast;
+    pindexLast.nHeight = 32255;
+    pindexLast.nTime = 1395223285;  // Block #32255, before the V1 retargeting fix.
+    pindexLast.nBits = 0x18010000;
+
+    struct RetargetVector {
+        int64_t first_block_time;
+        unsigned int expected_nbits;
+    };
+    const RetargetVector vectors[] = {
+        {1395223225, 0x18010000},
+        {1395223735, 0x1e0fffff},
+        {1395223736, 0x1a404040},
+        {281476288048143, 0x1a028282},
+        {std::numeric_limits<uint32_t>::max(), 0x1a29be74},
+        {std::numeric_limits<int64_t>::max(), 0x1a29be74},
+    };
+
+    for (const RetargetVector& vector : vectors) {
+        BOOST_CHECK_EQUAL(
+            CalculateNextTargetRequired(
+                &pindexLast,
+                vector.first_block_time,
+                chainParams->GetConsensus(),
+                false),
+            vector.expected_nbits);
+    }
 }
 
 /* Test the V3 constraint on the upper bound for actual time taken */
