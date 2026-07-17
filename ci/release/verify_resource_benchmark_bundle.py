@@ -11,6 +11,12 @@ from pathlib import Path
 import re
 import sys
 
+from generate_resource_benchmark_evidence import (
+    read_tracked_git_blob,
+    sha256_bytes,
+    verify_epoch_source_contract,
+)
+
 
 EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
@@ -58,14 +64,21 @@ def expected_filenames() -> set[str]:
 
 
 def verify_bundle(directory: Path, source_sha: str, repository: str,
-                  provenance_manifest: Path) -> None:
+                  provenance_manifest: Path,
+                  repo_root=None) -> None:
     require(SHA1_RE.fullmatch(source_sha) is not None,
             "source SHA must be a full lowercase commit identifier")
     require(repository == EXPECTED_REPOSITORY,
             f"repository must be exactly {EXPECTED_REPOSITORY}")
     require(directory.is_dir(), f"resource evidence directory is missing: {directory}")
-    require(provenance_manifest.is_file(),
-            f"quantum crypto provenance manifest is missing: {provenance_manifest}")
+    if repo_root is None:
+        repo_root = Path(__file__).resolve().parents[2]
+    canonical_manifest = read_tracked_git_blob(
+        repo_root, source_sha, provenance_manifest,
+    )
+    canonical_epoch_sources = verify_epoch_source_contract(
+        repo_root, source_sha,
+    )
 
     actual = {
         path.name for path in directory.iterdir()
@@ -78,7 +91,7 @@ def verify_bundle(directory: Path, source_sha: str, repository: str,
     require(not any(path.is_dir() for path in directory.iterdir()),
             "resource evidence bundle contains an unexpected directory")
 
-    manifest_sha256 = sha256_file(provenance_manifest)
+    manifest_sha256 = sha256_bytes(canonical_manifest)
     for runner, (expected_platform, expected_architecture) in EXPECTED_RUNNERS.items():
         evidence_path = directory / f"quantum-resource-{runner}-evidence.json"
         raw_path = directory / f"quantum-resource-{runner}-nanobench.json"
@@ -129,6 +142,9 @@ def verify_bundle(directory: Path, source_sha: str, repository: str,
         require(inputs.get("quantum_crypto_provenance_manifest_sha256") ==
                 manifest_sha256,
                 f"quantum crypto provenance hash mismatch: {evidence_path.name}")
+        require(inputs.get("epoch_source_contract_sha256") ==
+                canonical_epoch_sources,
+                f"epoch source contract hash mismatch: {evidence_path.name}")
         require(SHA256_RE.fullmatch(inputs.get("benchmark_binary_sha256", ""))
                 is not None,
                 f"benchmark binary hash is invalid: {evidence_path.name}")
@@ -150,12 +166,17 @@ def main() -> int:
     parser.add_argument(
         "--provenance-manifest", required=True, type=Path,
     )
+    parser.add_argument(
+        "--repo-root", type=Path,
+        default=Path(__file__).resolve().parents[2],
+    )
     args = parser.parse_args()
     verify_bundle(
         args.directory.resolve(),
         args.source_sha,
         args.repository,
         args.provenance_manifest.resolve(),
+        args.repo_root.resolve(),
     )
     print("Exact native resource benchmark bundle verified")
     return 0

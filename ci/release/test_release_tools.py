@@ -116,10 +116,8 @@ class ReleaseToolTests(unittest.TestCase):
             "UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}",
             workflow,
         )
-        self.assertIn(
-            "I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES",
-            workflow,
-        )
+        self.assertIn("expected='V30.1.2'", workflow)
+        self.assertIn("expected_ack='V30.1.2'", workflow)
         self.assertIn(
             'gh api "repos/$GITHUB_REPOSITORY/immutable-releases"',
             workflow,
@@ -288,9 +286,16 @@ class ReleaseToolTests(unittest.TestCase):
         path.write_bytes(data)
 
     def make_resource_bundle(self, directory, source_sha, repository,
-                             provenance_manifest):
+                             provenance_manifest, repo_root):
         verifier = load_module("verify_resource_benchmark_bundle")
-        manifest_hash = verifier.sha256_file(provenance_manifest)
+        manifest_hash = verifier.sha256_bytes(
+            verifier.read_tracked_git_blob(
+                repo_root, source_sha, provenance_manifest,
+            )
+        )
+        epoch_source_hashes = verifier.verify_epoch_source_contract(
+            repo_root, source_sha,
+        )
         for runner, (platform, architecture) in verifier.EXPECTED_RUNNERS.items():
             raw = directory / f"quantum-resource-{runner}-nanobench.json"
             raw.write_text('{"results": []}\n', encoding="utf-8")
@@ -322,6 +327,7 @@ class ReleaseToolTests(unittest.TestCase):
                     "benchmark_binary_sha256": "ab" * 32,
                     "nanobench_json_sha256": verifier.sha256_file(raw),
                     "quantum_crypto_provenance_manifest_sha256": manifest_hash,
+                    "epoch_source_contract_sha256": epoch_source_hashes,
                 },
                 "coverage": {
                     "crypto": True,
@@ -337,46 +343,96 @@ class ReleaseToolTests(unittest.TestCase):
     def test_resource_bundle_requires_exact_native_platform_set(self):
         verifier = load_module("verify_resource_benchmark_bundle")
         repository = "Blackcoin-Dev/Blackcoin"
-        source_sha = "12" * 20
+        repo_root = TOOLS.parent.parent
+        source_sha = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        manifest = (
+            repo_root / "contrib" / "devtools" /
+            "quantum-crypto-provenance.json"
+        )
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            manifest = directory.parent / f"{directory.name}-manifest.json"
-            manifest.write_text('{"schema": 1}\n', encoding="utf-8")
-            try:
-                self.make_resource_bundle(directory, source_sha, repository, manifest)
-                verifier.verify_bundle(directory, source_sha, repository, manifest)
+            self.make_resource_bundle(
+                directory, source_sha, repository, manifest, repo_root,
+            )
+            verifier.verify_bundle(
+                directory, source_sha, repository, manifest, repo_root,
+            )
 
-                missing = directory / "quantum-resource-linux-arm64-evidence.json"
-                missing.unlink()
-                with self.assertRaisesRegex(RuntimeError, "inventory differs"):
-                    verifier.verify_bundle(directory, source_sha, repository, manifest)
-            finally:
-                manifest.unlink(missing_ok=True)
+            missing = directory / "quantum-resource-linux-arm64-evidence.json"
+            missing.unlink()
+            with self.assertRaisesRegex(RuntimeError, "inventory differs"):
+                verifier.verify_bundle(
+                    directory, source_sha, repository, manifest, repo_root,
+                )
 
     def test_resource_bundle_rejects_mislabeled_or_substituted_evidence(self):
         verifier = load_module("verify_resource_benchmark_bundle")
         repository = "Blackcoin-Dev/Blackcoin"
-        source_sha = "34" * 20
+        repo_root = TOOLS.parent.parent
+        source_sha = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        manifest = (
+            repo_root / "contrib" / "devtools" /
+            "quantum-crypto-provenance.json"
+        )
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
-            manifest = directory.parent / f"{directory.name}-manifest.json"
-            manifest.write_text('{"schema": 1}\n', encoding="utf-8")
-            try:
-                self.make_resource_bundle(directory, source_sha, repository, manifest)
-                evidence_path = directory / "quantum-resource-linux-arm64-evidence.json"
-                evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
-                evidence["runner"]["architecture"] = "x86_64"
-                evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
-                with self.assertRaisesRegex(RuntimeError, "runner mismatch"):
-                    verifier.verify_bundle(directory, source_sha, repository, manifest)
+            self.make_resource_bundle(
+                directory, source_sha, repository, manifest, repo_root,
+            )
+            evidence_path = directory / "quantum-resource-linux-arm64-evidence.json"
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["runner"]["architecture"] = "x86_64"
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "runner mismatch"):
+                verifier.verify_bundle(
+                    directory, source_sha, repository, manifest, repo_root,
+                )
 
-                self.make_resource_bundle(directory, source_sha, repository, manifest)
-                raw_path = directory / "quantum-resource-windows-x86_64-nanobench.json"
-                raw_path.write_text('{"substituted": true}\n', encoding="utf-8")
-                with self.assertRaisesRegex(RuntimeError, "nanobench input hash mismatch"):
-                    verifier.verify_bundle(directory, source_sha, repository, manifest)
-            finally:
-                manifest.unlink(missing_ok=True)
+            self.make_resource_bundle(
+                directory, source_sha, repository, manifest, repo_root,
+            )
+            raw_path = directory / "quantum-resource-windows-x86_64-nanobench.json"
+            raw_path.write_text('{"substituted": true}\n', encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "nanobench input hash mismatch"):
+                verifier.verify_bundle(
+                    directory, source_sha, repository, manifest, repo_root,
+                )
+
+            self.make_resource_bundle(
+                directory, source_sha, repository, manifest, repo_root,
+            )
+            evidence_path = directory / "quantum-resource-windows-x86_64-evidence.json"
+            evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+            evidence["inputs"]["epoch_source_contract_sha256"]["src/shadow.h"] = (
+                "00" * 32
+            )
+            evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "epoch source contract hash mismatch"):
+                verifier.verify_bundle(
+                    directory, source_sha, repository, manifest, repo_root,
+                )
+
+            self.make_resource_bundle(
+                directory, source_sha, repository, manifest, repo_root,
+            )
+            substituted_manifest = repo_root / "ci" / "release" / (
+                "dependency-security-manifest.json"
+            )
+            with self.assertRaisesRegex(RuntimeError, "provenance hash mismatch"):
+                verifier.verify_bundle(
+                    directory, source_sha, repository,
+                    substituted_manifest, repo_root,
+                )
 
     def test_windows_native_binary_gate_is_allowlisted_and_artifact_bound(self):
         verifier = load_module("verify_windows_native_binary")
@@ -531,6 +587,29 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertTrue(evidence["runner"]["native_execution_verified"])
             self.assertEqual(
                 evidence["runner"]["binary_architecture"], native_architecture
+            )
+            self.assertEqual(
+                evidence["inputs"]["benchmark_binary_sha256"],
+                generator.sha256_file(binary),
+            )
+            self.assertEqual(
+                evidence["inputs"]["nanobench_json_sha256"],
+                generator.sha256_file(raw),
+            )
+            provenance_manifest = (
+                TOOLS.parent.parent / "contrib" / "devtools" /
+                "quantum-crypto-provenance.json"
+            )
+            provenance_hash = evidence["inputs"][
+                "quantum_crypto_provenance_manifest_sha256"
+            ]
+            self.assertEqual(
+                provenance_hash,
+                generator.sha256_bytes(
+                    generator.read_tracked_git_blob(
+                        repository, source_sha, provenance_manifest,
+                    )
+                ),
             )
 
             binary.write_bytes(b"not-an-executable")
@@ -900,6 +979,63 @@ class ReleaseToolTests(unittest.TestCase):
                 allowed_untracked=(raw,),
             )
 
+    def test_tracked_input_hash_uses_commit_blob_across_lf_and_crlf(self):
+        generator = load_module("generate_resource_benchmark_evidence")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            subprocess.run(["git", "init", "-q", repository], check=True)
+            manifest = repository / "manifest.json"
+            lf_content = b'{\n  "schema": 1\n}\n'
+            manifest.write_bytes(lf_content)
+            subprocess.run(
+                ["git", "-C", repository, "add", "manifest.json"], check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", repository,
+                    "-c", "user.name=Blackcoin-Dev",
+                    "-c", (
+                        "user.email="
+                        "298119138+Blackcoin-Dev@users.noreply.github.com"
+                    ),
+                    "commit", "-q", "-m", "fixture",
+                ],
+                check=True,
+            )
+            source_sha = generator.repository_head(repository)
+            canonical = generator.read_tracked_git_blob(
+                repository, source_sha, manifest,
+            )
+            self.assertEqual(canonical, lf_content)
+
+            crlf_content = lf_content.replace(b"\n", b"\r\n")
+            manifest.write_bytes(crlf_content)
+            self.assertNotEqual(
+                generator.sha256_file(manifest),
+                generator.sha256_bytes(canonical),
+            )
+            self.assertEqual(
+                generator.read_tracked_git_blob(
+                    repository, source_sha, manifest,
+                ),
+                lf_content,
+            )
+
+            untracked = repository / "untracked.json"
+            untracked.write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "not a blob"):
+                generator.read_tracked_git_blob(
+                    repository, source_sha, untracked,
+                )
+
+            outside = root / "outside.json"
+            outside.write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "outside repository"):
+                generator.read_tracked_git_blob(
+                    repository, source_sha, outside,
+                )
+
     def test_full_epoch_bound_arithmetic_is_fail_closed(self):
         generator = load_module("generate_resource_benchmark_evidence")
         bounds = generator.calculate_full_epoch_bounds()
@@ -920,18 +1056,52 @@ class ReleaseToolTests(unittest.TestCase):
             ["sum_of_per_block_apply_undo_thresholds_seconds"],
             486_000.0,
         )
+        source_repository = TOOLS.parent.parent
+        source_sha = generator.repository_head(source_repository)
         source_hashes = generator.verify_epoch_source_contract(
-            TOOLS.parent.parent
+            source_repository, source_sha,
         )
         self.assertTrue(all(re.fullmatch(r"[0-9a-f]{64}", digest)
                             for digest in source_hashes.values()))
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            subprocess.run(["git", "init", "-q", root], check=True)
             for relative in source_hashes:
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((TOOLS.parent.parent / relative).read_bytes())
+            subprocess.run(["git", "-C", root, "add", "."], check=True)
+            subprocess.run(
+                [
+                    "git", "-C", root,
+                    "-c", "user.name=Blackcoin-Dev",
+                    "-c", (
+                        "user.email="
+                        "298119138+Blackcoin-Dev@users.noreply.github.com"
+                    ),
+                    "commit", "-q", "-m", "epoch fixture",
+                ],
+                check=True,
+            )
+            fixture_sha = generator.repository_head(root)
+            self.assertEqual(
+                generator.verify_epoch_source_contract(root, fixture_sha),
+                source_hashes,
+            )
+
+            for relative in source_hashes:
+                target = root / relative
+                target.write_bytes(
+                    target.read_bytes().replace(b"\r\n", b"\n").replace(
+                        b"\n", b"\r\n",
+                    )
+                )
+            self.assertEqual(
+                generator.verify_epoch_source_contract(root, fixture_sha),
+                source_hashes,
+            )
+
             shadow = root / "src" / "shadow.h"
             shadow.write_text(
                 shadow.read_text(encoding="utf-8").replace(
@@ -940,9 +1110,25 @@ class ReleaseToolTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            subprocess.run(
+                ["git", "-C", root, "add", "src/shadow.h"], check=True,
+            )
+            subprocess.run(
+                [
+                    "git", "-C", root,
+                    "-c", "user.name=Blackcoin-Dev",
+                    "-c", (
+                        "user.email="
+                        "298119138+Blackcoin-Dev@users.noreply.github.com"
+                    ),
+                    "commit", "-q", "-m", "alter epoch source",
+                ],
+                check=True,
+            )
+            altered_sha = generator.repository_head(root)
             with self.assertRaisesRegex(
                     RuntimeError, "epoch-bound source contract changed"):
-                generator.verify_epoch_source_contract(root)
+                generator.verify_epoch_source_contract(root, altered_sha)
     def test_resource_benchmark_rejects_emulated_platform_identity(self):
         generator = load_module("generate_resource_benchmark_evidence")
         native_platform, native_architecture, _, _ = generator.native_runner_identity()
@@ -1928,7 +2114,7 @@ class ReleaseToolTests(unittest.TestCase):
 
     def test_unsigned_final_metadata_is_explicit_and_source_bound(self):
         generator = load_module("generate_unsigned_release_metadata")
-        version = "30.1.1"
+        version = "30.1.2"
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = Path(temporary)
             required = (
@@ -1995,7 +2181,16 @@ class ReleaseToolTests(unittest.TestCase):
             self.assertTrue(document["release"]["macos_adhoc_signed"])
             self.assertTrue(document["integrity"]["github_build_provenance_attestation"])
             self.assertTrue(document["integrity"]["github_sbom_attestation"])
-            self.assertIn("PUBLISHER-UNSIGNED", notice.read_text(encoding="utf-8"))
+            notice_text = notice.read_text(encoding="utf-8")
+            self.assertIn("PUBLISHER-UNSIGNED", notice_text)
+            self.assertIn(
+                f"no release-signing certificates for v{version}.",
+                notice_text,
+            )
+            self.assertNotIn(
+                "no release-signing certificates for v30.1.1.",
+                notice_text,
+            )
             self.assertTrue(manifest.is_file())
 
     def test_unsigned_final_metadata_rejects_missing_ack_or_signature_asset(self):
@@ -2051,7 +2246,7 @@ class ReleaseToolTests(unittest.TestCase):
         workflow = (TOOLS.parent.parent / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("default: 30.1.1-alpha1", workflow)
+        self.assertIn("default: 30.1.2-alpha1", workflow)
         self.assertIn("CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}", workflow)
         self.assertIn('test "$CALLER_WORKFLOW_SHA" = "$TARGET_SHA"', workflow)
         self.assertIn('test "$EVENT_SHA" = "$TARGET_SHA"', workflow)
@@ -2064,9 +2259,9 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn('test "$IS_RELEASE" = "false"', workflow)
         self.assertIn('test "$RC" = "0"', workflow)
         self.assertIn('test "$IS_RELEASE" = "true"', workflow)
-        self.assertIn("- 'v30.1.1'", workflow)
-        self.assertNotIn("- 'v30.1.1-alpha", workflow)
-        self.assertNotIn("- 'v30.1.1-beta", workflow)
+        self.assertIn("- 'v30.1.2'", workflow)
+        self.assertNotIn("- 'v30.1.2-alpha", workflow)
+        self.assertNotIn("- 'v30.1.2-beta", workflow)
         self.assertIn("UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE", workflow)
         self.assertIn("Verify non-macOS binary identity", workflow)
         self.assertIn("verify_windows_payload.py identity", workflow)

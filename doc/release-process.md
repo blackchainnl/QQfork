@@ -5,6 +5,26 @@ build is not release authorization. Production publication is allowed only for
 the exact commit that satisfies the mandatory safety gate and the controls
 below.
 
+## v30.1.2 corrective supersession
+
+The `v30.1.1` production attempt failed during publisher assembly before any
+release or attestation was created. Its immutable tag, run, and artifacts are
+preserved. The superseding production version is `v30.1.2` under the one-time,
+fail-closed corrective procedure in `doc/v30.1.2-corrective-release.md`.
+
+For that version only, the authenticated operator may admin-merge the narrow
+release-tool correction and inherit the exact named core results from run
+`29552432859`. The v30.1.2 workflow must verify the prior run and an allowlisted
+direct-child diff, regenerate every platform resource bundle and package,
+reproduce every package byte for byte, and create fresh checksums, metadata,
+attestations, and immutable release assets. It may not reuse the invalid
+Windows evidence or any v30.1.1 package. The protected acknowledgement is
+`V30.1.2`. Every publisher-unsigned disclosure below remains applicable.
+
+If any corrective-scope, fresh-build, provenance, reproducibility, assembly,
+attestation, protected-tag, or immutable-publication check fails, publication
+stops. The next roadmap release returns to the complete current-SHA gate.
+
 ## Release classes
 
 ### Unsigned alpha canary

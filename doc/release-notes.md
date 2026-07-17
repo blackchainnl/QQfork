@@ -1,5 +1,20 @@
-30.1.1 Release Notes
-====================
+30.1.2 Corrective Release Notes
+==============================
+
+Blackcoin version 30.1.2 supersedes the unpublished v30.1.1 production
+candidate. Runtime and consensus behavior are unchanged. The corrective source
+uses exact Git blobs for tracked provenance hashes so Windows CRLF checkout
+conversion cannot disagree with the Linux publisher. It rebuilds all platform
+packages and resource evidence at the new source SHA.
+
+The immutable v30.1.1 tag and failed run 29552432859 remain preserved. That run
+passed 35 jobs, then failed publisher assembly before attestations, draft
+creation, asset upload, or release publication. No v30.1.1 production release
+exists. See `doc/v30.1.2-corrective-release.md` and
+`doc/release-notes/release-notes-30.1.2.md`.
+
+30.1.1 Candidate History (Unpublished)
+======================================
 
 Blackcoin version 30.1.1 is the Quantum Quasar safety and deterministic-state
 upgrade release.
