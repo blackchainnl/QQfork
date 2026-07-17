@@ -221,13 +221,15 @@ class GoldRushInfoTest(BitcoinTestFramework):
         self._assert_builtin_pow_miner_lifecycle()
 
         # The built-in worker can win while its lifecycle telemetry is sampled.
-        # QQP3 claims remain eligible for the bounded late-origin window, so
-        # advance beyond that window before beginning the manual claim checks.
+        # QQP3 claims target the height after the current tip and remain
+        # eligible through origin_age == QQP3_LATE_ORIGIN_WINDOW. Advance one
+        # additional block so the next mempool evaluation is strictly beyond
+        # that inclusive window before beginning the manual claim checks.
         if self._mempool_pow_claims(node):
             self.log.info("Advancing the tip to expire a claim found by the built-in PoW miner")
             self._generate_with_peer_offline(
                 node,
-                QQP3_LATE_ORIGIN_WINDOW,
+                QQP3_LATE_ORIGIN_WINDOW + 1,
                 node.get_deterministic_priv_key().address,
             )
             self._sync_mocktime_to_tip()
@@ -331,25 +333,46 @@ class GoldRushInfoTest(BitcoinTestFramework):
             assert cli_claim["proof"].startswith(QQSPROOF_HEX)
             assert cli_claim["txid"] in node.getrawmempool()
 
+        # The lifecycle wallet can legitimately retain a quarantined claim if
+        # its fast test miner found a proof above.  That safety state has
+        # higher priority than the epoch state because its fee input remains
+        # reserved.  Use a separately funded wallet so this check tests the
+        # inactive-epoch state without depending on whether the earlier
+        # probabilistic miner happened to find a proof.
+        inactive_wallet_name = "goldrush_pow_inactive"
+        node.createwallet(wallet_name=inactive_wallet_name)
+        inactive_wallet = node.get_wallet_rpc(inactive_wallet_name)
+        inactive_target = inactive_wallet.getnewaddress()
+        wallet.sendtoaddress(inactive_target, 1)
+        self._generate_with_peer_offline(
+            node,
+            1,
+            node.get_deterministic_priv_key().address,
+        )
+        assert_equal(len(inactive_wallet.listunspent(1, 9999999, [inactive_target])), 1)
+        inactive_payout = inactive_wallet.getnewquantumaddress("PoW - Quantum Claim Address")["address"]
+
         self.log.info("An enabled miner reports epoch_inactive after the Gold Rush height window")
         remaining = GOLD_RUSH_END_HEIGHT - node.getblockcount()
         if remaining > 0:
             self._generate_with_peer_offline(node, remaining, node.get_deterministic_priv_key().address)
-        builtin_wallet = node.get_wallet_rpc("goldrush_pow_builtin")
-        builtin_wallet.walletpassphrase(POW_WALLET_PASSPHRASE, 600, False)
         try:
-            builtin_wallet.setpowmining(True, 1, 100)
+            started = inactive_wallet.setpowmining(True, 1, 100)
+            assert_equal(started["created_payout_key"], False)
+            assert_equal(started["payout_address"], inactive_payout)
             self.wait_until(
-                lambda: builtin_wallet.getpowmininginfo()["state"] == "epoch_inactive",
+                lambda: inactive_wallet.getpowmininginfo()["state"] == "epoch_inactive",
                 timeout=10,
             )
-            inactive = builtin_wallet.getpowmininginfo()
+            inactive = inactive_wallet.getpowmininginfo()
             assert_equal(inactive["enabled"], True)
             assert_equal(inactive["state"], "epoch_inactive")
+            assert_equal(inactive["epoch_active"], False)
+            assert_equal(inactive["quarantined_claims"], 0)
             assert_equal(inactive["hashrate"], 0)
         finally:
-            builtin_wallet.setpowmining(False)
-        assert_equal(builtin_wallet.getpowmininginfo()["state"], "disabled")
+            inactive_wallet.setpowmining(False)
+        assert_equal(inactive_wallet.getpowmininginfo()["state"], "disabled")
 
     def run_test(self):
         node = self.nodes[0]
