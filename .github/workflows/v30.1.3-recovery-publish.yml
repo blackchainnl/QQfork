@@ -1,0 +1,379 @@
+name: v30.1.3 exact-artifact publication recovery
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: v30.1.3-exact-artifact-publication-recovery
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish already-built and attested v30.1.3 artifacts
+    runs-on: ubuntu-22.04
+    environment: production-release
+    permissions:
+      actions: read
+      attestations: read
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SOURCE_SHA: 86c6855ab135afe784635a564f21c74d67aa366b
+      TAG_OBJECT_SHA: 7424350663798ba3bbd78544cddf51e97e2a4359
+      TAG: v30.1.3
+      VERSION: 30.1.3
+      ASSET_PREFIX: Blackcoin-30.1.3
+      SOURCE_DATE_EPOCH: '1784289827'
+      SOURCE_RUN_ID: '29579151390'
+      SOURCE_RUN_ATTEMPT: '2'
+      SIGNING_FINGERPRINT: SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70
+      RELEASE_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}
+    steps:
+      - name: Checkout the exact signed release source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Verify the frozen source, tag, authorization, and source run
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTOR" = Blackcoin-Dev
+          test "$GITHUB_REPOSITORY" = Blackcoin-Dev/Blackcoin
+          test "$RELEASE_ACK" = V30.1.3
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(git show -s --format=%ct HEAD)" = "$SOURCE_DATE_EPOCH"
+          test "$(git rev-parse "refs/tags/$TAG^{tag}")" = "$TAG_OBJECT_SHA"
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$SOURCE_SHA"
+          python3 ci/release/verify_source_identity.py \
+            --head "$SOURCE_SHA" \
+            --repository "$GITHUB_REPOSITORY" \
+            --require-actor \
+            --actor "$GITHUB_ACTOR" \
+            --tag "$TAG" \
+            --require-signatures \
+            --signing-fingerprint "$SIGNING_FINGERPRINT"
+
+          gh api "repos/$GITHUB_REPOSITORY/git/commits/$SOURCE_SHA" > commit.json
+          gh api "repos/$GITHUB_REPOSITORY/git/tags/$TAG_OBJECT_SHA" > tag.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > source-run.json
+          gh api \
+            "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/attempts/$SOURCE_RUN_ATTEMPT/jobs?per_page=100" \
+            > source-jobs.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          commit = json.loads(Path("commit.json").read_text(encoding="utf-8"))
+          tag = json.loads(Path("tag.json").read_text(encoding="utf-8"))
+          run = json.loads(Path("source-run.json").read_text(encoding="utf-8"))
+          jobs = json.loads(Path("source-jobs.json").read_text(encoding="utf-8"))["jobs"]
+          source = os.environ["SOURCE_SHA"]
+          tag_object = os.environ["TAG_OBJECT_SHA"]
+          tag_name = os.environ["TAG"]
+          run_id = int(os.environ["SOURCE_RUN_ID"])
+          attempt = int(os.environ["SOURCE_RUN_ATTEMPT"])
+
+          if commit.get("sha") != source or commit.get("verification", {}).get("verified") is not True:
+              raise SystemExit("the exact source commit is not GitHub-verified")
+          if commit.get("verification", {}).get("reason") != "valid":
+              raise SystemExit("the exact source commit signature is not valid")
+          if tag.get("sha") != tag_object or tag.get("tag") != tag_name:
+              raise SystemExit("the annotated tag object differs")
+          if (tag.get("object", {}).get("type"), tag.get("object", {}).get("sha")) != ("commit", source):
+              raise SystemExit("the annotated tag target differs")
+          if tag.get("verification", {}).get("verified") is not True:
+              raise SystemExit("the annotated tag is not GitHub-verified")
+          if tag.get("verification", {}).get("reason") != "valid":
+              raise SystemExit("the annotated tag signature is not valid")
+
+          expected_run = {
+              "id": run_id,
+              "run_attempt": attempt,
+              "event": "push",
+              "head_branch": tag_name,
+              "head_sha": source,
+              "status": "completed",
+              "conclusion": "failure",
+          }
+          for key, value in expected_run.items():
+              if run.get(key) != value:
+                  raise SystemExit(f"source run {key} differs: {run.get(key)!r}")
+
+          required_successes = {
+              "Resolve and authorize immutable release target",
+              "Verify inherited v30.1.1 core safety evidence",
+              "Exact-SHA prerelease or production safety gate / source identity, workflow syntax, and lint",
+              "Select build target",
+              "Require explicit v30.1.3 signed-source publication acknowledgement",
+              "linux-64-bit (primary)",
+              "linux-arm-64-bit (primary)",
+              "windows-64-bit (primary)",
+              "macos-64-bit (primary)",
+              "macos-arm-64-bit (primary)",
+              "Ad-hoc sign and validate macOS Intel-x86_64 (primary)",
+              "Ad-hoc sign and validate macOS Apple-Silicon-ARM64 (primary)",
+              "Require native macOS validation when selected",
+          }
+          by_name = {job.get("name"): job for job in jobs}
+          missing = sorted(required_successes - set(by_name))
+          if missing:
+              raise SystemExit(f"source run is missing required jobs: {missing}")
+          bad = sorted(name for name in required_successes if by_name[name].get("conclusion") != "success")
+          if bad:
+              raise SystemExit(f"source run required jobs did not pass: {bad}")
+          failures = [job for job in jobs if job.get("conclusion") == "failure"]
+          if len(failures) != 1 or failures[0].get("name") != "Publish authorized GitHub release":
+              raise SystemExit("source run has a failure other than the reviewed publisher permission defect")
+          PY
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists"
+            exit 1
+          fi
+
+      - name: Download the five exact primary artifact sets
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --pattern "release-$VERSION-*-primary-$SOURCE_SHA" --dir artifacts
+          gh run download "$SOURCE_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name "inherited-core-gate-$VERSION-$SOURCE_SHA" --dir inherited
+
+      - name: Reconstruct and verify the exact attested release set
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir dist
+          primaries=(artifacts/release-"$VERSION"-*-primary-"$SOURCE_SHA")
+          test "${#primaries[@]}" -eq 5
+          for primary in "${primaries[@]}"; do
+            while IFS= read -r -d '' source; do
+              test -f "$source" && test ! -L "$source"
+              destination="dist/$(basename "$source")"
+              test ! -e "$destination"
+              cp "$source" "$destination"
+            done < <(find "$primary" -mindepth 1 -maxdepth 1 -type f -print0)
+          done
+
+          test -s "dist/$ASSET_PREFIX-Linux-x86_64.tar.gz"
+          test -s "dist/$ASSET_PREFIX-Linux-ARM64.tar.gz"
+          test -s "dist/$ASSET_PREFIX-Windows-x86_64-Portable.zip"
+          test -s "dist/$ASSET_PREFIX-Windows-x86_64-Installer.exe"
+          test -s "dist/$ASSET_PREFIX-macOS-Intel-x86_64-Qt-app.zip"
+          test -s "dist/$ASSET_PREFIX-macOS-Intel-x86_64-Qt-app.tar.gz"
+          test -s "dist/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.zip"
+          test -s "dist/$ASSET_PREFIX-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz"
+          for marker in dist/*-SOURCE_COMMIT.txt; do
+            test "$(tr -d '\r\n' < "$marker")" = "$SOURCE_SHA"
+          done
+          test "$(find dist -maxdepth 1 -type f -name '*-SOURCE_COMMIT.txt' | wc -l)" -eq 5
+          test -s inherited/inherited-core-evidence.json
+          cp inherited/inherited-core-evidence.json \
+            "dist/$ASSET_PREFIX-INHERITED-CORE-EVIDENCE.json"
+          printf '%s\n' "$SOURCE_SHA" > dist/SOURCE_COMMIT.txt
+
+          python3 ci/release/verify_dependency_security.py
+          python3 ci/release/generate_spdx_sbom.py \
+            --artifacts dist --depends-packages depends/packages \
+            --dependency-manifest ci/release/dependency-security-manifest.json \
+            --version "$VERSION" --source-sha "$SOURCE_SHA" \
+            --source-date-epoch "$SOURCE_DATE_EPOCH" \
+            --output "dist/$ASSET_PREFIX-SBOM.spdx.json"
+          python3 ci/release/generate_provenance.py \
+            --artifacts dist --repository "$GITHUB_REPOSITORY" \
+            --source-sha "$SOURCE_SHA" --version "$VERSION" --tag "$TAG" \
+            --workflow-run-id "$SOURCE_RUN_ID" \
+            --output "dist/$ASSET_PREFIX-provenance.intoto.json"
+          python3 ci/release/generate_unsigned_release_metadata.py \
+            --artifacts dist --version "$VERSION" --source-sha "$SOURCE_SHA" \
+            --tag "$TAG" --workflow-run-id "$SOURCE_RUN_ID" \
+            --acknowledgement "$RELEASE_ACK" --macos-adhoc-signed \
+            --notice "dist/$ASSET_PREFIX-UNSIGNED-PRODUCTION.txt" \
+            --manifest "dist/$ASSET_PREFIX-UNSIGNED-PRODUCTION.json"
+
+          mapfile -t checksum_files < <(
+            cd dist
+            find . -maxdepth 1 -type f ! -name SHA256SUMS.txt -printf '%P\n' | sort
+          )
+          test "${#checksum_files[@]}" -eq 19
+          : > dist/SHA256SUMS.txt
+          for file in "${checksum_files[@]}"; do
+            (cd dist && sha256sum "$file") >> dist/SHA256SUMS.txt
+          done
+          (cd dist && sha256sum --check --strict SHA256SUMS.txt)
+          test "$(sha256sum dist/SHA256SUMS.txt | awk '{print $1}')" = \
+            cc5bf74b63db7fac3565d9c1c3826d9c66d68a47bf42a50d096299b5cb6b1c04
+
+          probe="dist/$ASSET_PREFIX-Linux-x86_64.tar.gz"
+          common_attestation_args=(
+            --repo "$GITHUB_REPOSITORY"
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/build.yml"
+            --signer-digest "$SOURCE_SHA"
+            --source-digest "$SOURCE_SHA"
+            --source-ref "refs/tags/$TAG"
+            --deny-self-hosted-runners
+            --format json
+          )
+          gh attestation verify "$probe" "${common_attestation_args[@]}" \
+            > slsa-verification.json
+          gh attestation verify "$probe" "${common_attestation_args[@]}" \
+            --predicate-type 'https://spdx.dev/Document/v2.3' \
+            > spdx-verification.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+
+          dist = Path("dist")
+          expected = {}
+          for path in sorted(dist.iterdir()):
+              if path.name == "SHA256SUMS.txt":
+                  continue
+              if not path.is_file() or path.is_symlink():
+                  raise SystemExit(f"unsafe release subject: {path}")
+              expected[path.name] = hashlib.sha256(path.read_bytes()).hexdigest()
+          if len(expected) != 19:
+              raise SystemExit(f"expected 19 attested subjects, found {len(expected)}")
+
+          def subject_map(entry):
+              subjects = entry["verificationResult"]["statement"]["subject"]
+              return {subject["name"]: subject["digest"]["sha256"] for subject in subjects}
+
+          for filename in ("slsa-verification.json", "spdx-verification.json"):
+              entries = json.loads(Path(filename).read_text(encoding="utf-8"))
+              if not entries or not any(subject_map(entry) == expected for entry in entries):
+                  raise SystemExit(f"{filename} does not bind the exact 19-file release set")
+          PY
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          version = "30.1.3"
+          expected = {
+              f"Blackcoin-{version}-Linux-x86_64.tar.gz",
+              f"Blackcoin-{version}-Linux-ARM64.tar.gz",
+              f"Blackcoin-{version}-Windows-x86_64-Portable.zip",
+              f"Blackcoin-{version}-Windows-x86_64-Installer.exe",
+              f"Blackcoin-{version}-macOS-Intel-x86_64-Qt-app.zip",
+              f"Blackcoin-{version}-macOS-Intel-x86_64-Qt-app.tar.gz",
+              f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.zip",
+              f"Blackcoin-{version}-macOS-Apple-Silicon-ARM64-Qt-app.tar.gz",
+              f"Blackcoin-{version}-linux-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-linux-arm-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-windows-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-macos-64-bit-SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-macos-arm-64-bit-SOURCE_COMMIT.txt",
+              "SOURCE_COMMIT.txt",
+              f"Blackcoin-{version}-INHERITED-CORE-EVIDENCE.json",
+              f"Blackcoin-{version}-SBOM.spdx.json",
+              f"Blackcoin-{version}-provenance.intoto.json",
+              f"Blackcoin-{version}-UNSIGNED-PRODUCTION.txt",
+              f"Blackcoin-{version}-UNSIGNED-PRODUCTION.json",
+              "SHA256SUMS.txt",
+          }
+          actual = {path.name for path in Path("dist").iterdir()}
+          if actual != expected:
+              raise SystemExit(f"release inventory differs: missing={sorted(expected-actual)}, extra={sorted(actual-expected)}")
+          PY
+
+      - name: Create, byte-verify, and publish the immutable release
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '# Blackcoin-Dev source-signed production release'
+            echo
+            echo "The exact v$VERSION source commit and annotated tag are SSH-signed by Blackcoin-Dev and verified by GitHub."
+            echo 'Windows packages are not Authenticode-signed. macOS applications carry only identity-free ad-hoc launch signatures and are not notarized.'
+            echo 'Verify the platform-signing notice, SHA256 checksums, exact signed source commit and tag, SBOM, provenance, and GitHub attestations before installing.'
+            echo
+            cat "doc/release-notes/release-notes-$VERSION.md"
+            echo '## Source commit'
+            echo
+            echo "\`$SOURCE_SHA\`"
+            echo
+            echo '## SHA256 checksums'
+            echo
+            echo '| Archive | Checksum |'
+            echo '| --- | --- |'
+            while read -r hash file; do
+              echo "| $file | $hash |"
+            done < dist/SHA256SUMS.txt
+          } > RELEASE_NOTES.md
+          test "$(sha256sum RELEASE_NOTES.md | awk '{print $1}')" = \
+            d99cb223a442093a2f3596c12ce02e7a4210623eb41feef7e32a1175f62ac660
+
+          test "$(git rev-parse "refs/tags/$TAG^{commit}")" = "$SOURCE_SHA"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::Release $TAG already exists"
+            exit 1
+          fi
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --draft \
+            --verify-tag --title "Blackcoin Core v$VERSION" --notes-file RELEASE_NOTES.md
+
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > draft-release.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          release = json.loads(Path("draft-release.json").read_text(encoding="utf-8"))
+          if release.get("tag_name") != os.environ["TAG"] or release.get("draft") is not True:
+              raise SystemExit("the uploaded release is not the expected draft")
+          if release.get("prerelease") is not False or release.get("name") != "Blackcoin Core v30.1.3":
+              raise SystemExit("the uploaded release title or prerelease state differs")
+          if release.get("body") != Path("RELEASE_NOTES.md").read_text(encoding="utf-8"):
+              raise SystemExit("the uploaded release notes differ")
+          expected = {}
+          for path in Path("dist").iterdir():
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              expected[path.name] = (path.stat().st_size, f"sha256:{digest}")
+          assets = {
+              asset["name"]: (asset["size"], asset.get("digest"))
+              for asset in release.get("assets", [])
+          }
+          if assets != expected:
+              raise SystemExit("the uploaded draft asset names, sizes, or SHA256 digests differ")
+          PY
+
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+          verified=false
+          for _ in {1..12}; do
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" > final-release.json
+            gh api "repos/$GITHUB_REPOSITORY/releases/latest" > latest-release.json
+            if python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          release = json.loads(Path("final-release.json").read_text(encoding="utf-8"))
+          latest = json.loads(Path("latest-release.json").read_text(encoding="utf-8"))
+          if release.get("tag_name") != os.environ["TAG"]:
+              raise SystemExit("published release tag differs")
+          if release.get("draft") is not False or release.get("prerelease") is not False:
+              raise SystemExit("published release state differs")
+          if release.get("immutable") is not True:
+              raise SystemExit("published release is not immutable")
+          if latest.get("id") != release.get("id"):
+              raise SystemExit("v30.1.3 is not the latest release")
+          if len(release.get("assets", [])) != 20:
+              raise SystemExit("published release asset count differs")
+          print(release["html_url"])
+          PY
+            then
+              verified=true
+              break
+            fi
+            sleep 5
+          done
+          test "$verified" = true
