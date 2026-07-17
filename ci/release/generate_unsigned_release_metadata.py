@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The Blackcoin developers
 # Distributed under the MIT software license, see the accompanying
 # file COPYING or http://www.opensource.org/licenses/mit-license.php.
-"""Generate fail-closed metadata for the publisher-unsigned final release."""
+"""Generate fail-closed metadata for a source-signed, platform-unsigned release."""
 
 import argparse
 import hashlib
@@ -13,7 +13,10 @@ import sys
 
 
 EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
-EXPECTED_ACKNOWLEDGEMENT = "V30.1.2"
+EXPECTED_ACKNOWLEDGEMENT = "V30.1.3"
+EXPECTED_SSH_SIGNING_FINGERPRINT = (
+    "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70"
+)
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
@@ -72,7 +75,7 @@ def generate_metadata(
     _require(re.fullmatch(r"[0-9]+", workflow_run_id) is not None,
              "workflow-run-id must be numeric")
     _require(acknowledgement == EXPECTED_ACKNOWLEDGEMENT,
-             "explicit unsigned-final acknowledgement does not match")
+             "explicit final-release acknowledgement does not match")
     _require(isinstance(macos_adhoc_signed, bool),
              "macos-adhoc-signed must be a boolean")
 
@@ -93,18 +96,6 @@ def generate_metadata(
              "SOURCE_COMMIT.txt is missing")
     _require(source_marker.read_text(encoding="utf-8").strip() == source_sha,
              "SOURCE_COMMIT.txt does not match source-sha")
-
-    reproducibility = artifacts / f"Blackcoin-{version}-REPRODUCIBILITY.txt"
-    _require(reproducibility.is_file() and not reproducibility.is_symlink(),
-             "reproducibility report is missing")
-    reproducibility_text = reproducibility.read_text(encoding="utf-8")
-    for required in (
-        f"package_label={version}",
-        "prerelease_channel=production",
-        f"source_commit={source_sha}",
-    ):
-        _require(required in reproducibility_text,
-                 f"reproducibility report is missing required text: {required}")
 
     required_assets = {
         f"Blackcoin-{version}-Linux-x86_64.tar.gz",
@@ -131,14 +122,23 @@ def generate_metadata(
         EXPECTED_ACKNOWLEDGEMENT.encode("ascii")
     ).hexdigest()
     notice.write_text(
-        "PUBLISHER-UNSIGNED BLACKCOIN CORE PRODUCTION RELEASE\n"
+        "SOURCE-SIGNED, PLATFORM-UNSIGNED BLACKCOIN CORE PRODUCTION RELEASE\n"
         "\n"
         f"version={version}\n"
         f"tag={tag}\n"
         f"source_commit={source_sha}\n"
         f"workflow_run_id={workflow_run_id}\n"
-        "signed=false\n"
-        "publisher_signed=false\n"
+        "source_commit_signed=true\n"
+        "source_commit_signature_format=ssh\n"
+        "source_commit_signer=Blackcoin-Dev\n"
+        f"source_commit_signing_key_fingerprint={EXPECTED_SSH_SIGNING_FINGERPRINT}\n"
+        "source_commit_github_verified=true\n"
+        "tag_signed=true\n"
+        "tag_signature_format=ssh\n"
+        "tag_signer=Blackcoin-Dev\n"
+        f"tag_signing_key_fingerprint={EXPECTED_SSH_SIGNING_FINGERPRINT}\n"
+        "tag_github_verified=true\n"
+        "packages_code_signed=false\n"
         "source_commit_openpgp_signed=false\n"
         "tag_openpgp_signed=false\n"
         "checksums_openpgp_signed=false\n"
@@ -149,27 +149,41 @@ def generate_metadata(
         "notarized=false\n"
         "github_build_provenance_attestation=true\n"
         "github_sbom_attestation=true\n"
-        f"unsigned_final_acknowledgement_sha256={acknowledgement_sha256}\n"
+        f"final_release_acknowledgement_sha256={acknowledgement_sha256}\n"
         "\n"
-        f"The project has no release-signing certificates for v{version}. Windows "
-        "packages have no Authenticode signature. macOS applications carry only "
-        "identity-free ad-hoc launch signatures and are not notarized. The source "
-        "commit, annotated tag, checksums, and in-toto statement have no "
-        "Blackcoin-Dev OpenPGP signature. Verify SHA256SUMS.txt, the exact source "
-        "commit, two-builder reproducibility report, SBOM, provenance, and GitHub "
-        "OIDC attestations before installing.\n",
+        "The exact source commit and annotated tag are SSH-signed by Blackcoin-Dev "
+        "and verified by GitHub. These Git-object signatures do not code-sign the "
+        "packages. Windows packages have no Authenticode signature. macOS "
+        "applications carry only identity-free ad-hoc launch signatures and are "
+        "not Developer-ID signed or notarized. Verify SHA256SUMS.txt, the exact "
+        "signed source commit and tag, fresh package structural checks, SBOM, "
+        "provenance, and GitHub OIDC attestations before installing. The "
+        "v30.1.3 corrective quick path does not claim a new duplicate-builder "
+        "reproducibility result.\n",
         encoding="utf-8",
     )
 
     subjects = _inventory(artifacts, {manifest})
     document = {
         "schema": 1,
-        "classification": "PUBLISHER_UNSIGNED_PRODUCTION_RELEASE",
+        "classification": "SOURCE_SIGNED_PLATFORM_UNSIGNED_PRODUCTION_RELEASE",
         "source": {
             "repository": EXPECTED_REPOSITORY,
             "commit": source_sha,
             "tag": tag,
-            "tag_type": "annotated-unsigned",
+            "commit_signature": {
+                "format": "ssh",
+                "signer": "Blackcoin-Dev",
+                "key_fingerprint": EXPECTED_SSH_SIGNING_FINGERPRINT,
+                "github_verified": True,
+            },
+            "tag_type": "annotated-ssh-signed",
+            "tag_signature": {
+                "format": "ssh",
+                "signer": "Blackcoin-Dev",
+                "key_fingerprint": EXPECTED_SSH_SIGNING_FINGERPRINT,
+                "github_verified": True,
+            },
         },
         "workflow": {
             "event": "push",
@@ -186,8 +200,17 @@ def generate_metadata(
         "release": {
             "version": version,
             "published": True,
-            "signed": False,
-            "publisher_signed": False,
+            "source_commit_signed": True,
+            "source_commit_signature_format": "ssh",
+            "source_commit_signer": "Blackcoin-Dev",
+            "source_commit_signing_key_fingerprint": EXPECTED_SSH_SIGNING_FINGERPRINT,
+            "source_commit_github_verified": True,
+            "tag_signed": True,
+            "tag_signature_format": "ssh",
+            "tag_signer": "Blackcoin-Dev",
+            "tag_signing_key_fingerprint": EXPECTED_SSH_SIGNING_FINGERPRINT,
+            "tag_github_verified": True,
+            "packages_code_signed": False,
             "source_commit_openpgp_signed": False,
             "tag_openpgp_signed": False,
             "checksums_openpgp_signed": False,
@@ -199,7 +222,10 @@ def generate_metadata(
         },
         "integrity": {
             "checksum_manifest": "SHA256SUMS.txt",
-            "reproducibility": "two-isolated-builds-byte-identical",
+            "reproducibility": {
+                "current_source_rerun": False,
+                "historical_evidence_separately_labeled": True,
+            },
             "sbom": f"Blackcoin-{version}-SBOM.spdx.json",
             "provenance": f"Blackcoin-{version}-provenance.intoto.json",
             "github_build_provenance_attestation": True,
@@ -240,7 +266,7 @@ def main():
         macos_adhoc_signed=args.macos_adhoc_signed,
     )
     print(
-        "Wrote publisher-unsigned final metadata for "
+        "Wrote source-signed, platform-unsigned final metadata for "
         f"{len(document['artifacts_before_manifest_and_checksums'])} artifact(s)"
     )
     return 0
@@ -250,5 +276,5 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except RuntimeError as error:
-        print(f"unsigned release metadata generation failed: {error}", file=sys.stderr)
+        print(f"release metadata generation failed: {error}", file=sys.stderr)
         sys.exit(1)

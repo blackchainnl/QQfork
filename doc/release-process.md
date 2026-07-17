@@ -1,11 +1,44 @@
 # Blackcoin Core release process
 
-This is the release runbook for Blackcoin Core v30.1.1. A successful local
+This is the release runbook for Blackcoin Core v30.1.3. A successful local
 build is not release authorization. Production publication is allowed only for
 the exact commit that satisfies the mandatory safety gate and the controls
 below.
 
-## v30.1.2 corrective supersession
+## v30.1.3 signed corrective supersession
+
+The `v30.1.2` production attempt stopped during the release-tool gate before
+package assembly or publication. Two tests changed tracked fixture files but
+did not commit them before asking the canonical-Git-blob implementation to
+observe the change. The implementation correctly read the committed blobs.
+The `v30.1.3` correction commits those fixture mutations before each assertion;
+it does not change runtime or consensus behavior. The immutable `v30.1.2` tag
+and run `29576545405` remain preserved, and no v30.1.2 release exists.
+
+The exact v30.1.3 source commit and annotated tag must both be SSH-signed by
+Blackcoin-Dev and verified by GitHub before publication. The protected
+acknowledgement is exactly `V30.1.3`. That acknowledgement authorizes the
+release workflow; the SSH signatures authenticate the source commit and tag.
+Neither mechanism code-signs package bytes. Windows packages remain without
+Authenticode signatures. macOS applications retain only identity-free ad-hoc
+signatures and are not Developer-ID signed or notarized.
+
+For v30.1.3 only, unchanged runtime, consensus, wallet, GUI, P2P, staking,
+mining, dependency, and build behavior may inherit the preserved successful
+v30.1.1 evidence. Publication still requires the v30.1.3-bound signature and
+source-identity checks, the corrected release-tool tests, fresh packages,
+checksums and metadata, and successful immutable GitHub release assembly.
+Historical results must not be represented as v30.1.3-SHA test results. The
+quick path does not rerun duplicate-builder reproducibility; it freshly builds
+and structurally validates each v30.1.3 package and labels any inherited
+reproducibility evidence as historical.
+
+The v30.1.3 procedure is defined in
+`doc/v30.1.3-corrective-release.md`. The remainder of this document records
+the earlier v30.1.1/v30.1.2 release policy where useful. Statements below that
+the source commit or tag is unsigned do not apply to v30.1.3.
+
+## v30.1.2 corrective history
 
 The `v30.1.1` production attempt failed during publisher assembly before any
 release or attestation was created. Its immutable tag, run, and artifacts are

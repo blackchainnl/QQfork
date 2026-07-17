@@ -1,11 +1,32 @@
-30.1.2 Corrective Release Notes
-==============================
+30.1.3 Signed Corrective Release Notes
+======================================
 
-Blackcoin version 30.1.2 supersedes the unpublished v30.1.1 production
-candidate. Runtime and consensus behavior are unchanged. The corrective source
-uses exact Git blobs for tracked provenance hashes so Windows CRLF checkout
-conversion cannot disagree with the Linux publisher. It rebuilds all platform
-packages and resource evidence at the new source SHA.
+Blackcoin version 30.1.3 supersedes the unpublished v30.1.2 production
+candidate. Runtime and consensus behavior are unchanged. The only functional
+correction commits tracked fixture mutations before two canonical-Git-blob
+regression assertions. The exact production source commit and annotated tag
+must be SSH-signed by Blackcoin-Dev and verified by GitHub.
+
+The immutable v30.1.2 tag and canceled run 29576545405 remain preserved. The
+run stopped after two release-tool tests exposed the stale fixture setup and
+before package assembly, attestations, asset upload, or release publication.
+No v30.1.2 production release exists. See
+`doc/v30.1.3-corrective-release.md` and
+`doc/release-notes/release-notes-30.1.3.md`.
+
+The Git signatures authenticate the source commit and tag. They do not
+code-sign release packages. Windows packages are not Authenticode-signed.
+macOS applications retain identity-free ad-hoc signatures and are not
+Developer-ID signed or notarized.
+
+30.1.2 Candidate History (Unpublished)
+======================================
+
+Blackcoin version 30.1.2 was the attempted corrective successor to the
+unpublished v30.1.1 production candidate. Runtime and consensus behavior were
+unchanged. Its corrective source uses exact Git blobs for tracked provenance
+hashes so Windows CRLF checkout conversion cannot disagree with the Linux
+publisher.
 
 The immutable v30.1.1 tag and failed run 29552432859 remain preserved. That run
 passed 35 jobs, then failed publisher assembly before attestations, draft

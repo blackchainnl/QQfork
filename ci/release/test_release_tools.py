@@ -24,7 +24,7 @@ import zipfile
 TOOLS = Path(__file__).resolve().parent
 MIXED_VERSION_TOOLS = TOOLS.parent / "mixed-version"
 SOURCE_SHA = "d161e279be86b3bc20a8c59d3e08e66cbacbeeaa"
-FINGERPRINT = "A" * 40
+FINGERPRINT = "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70"
 
 
 def load_module(name):
@@ -108,7 +108,7 @@ class ReleaseToolTests(unittest.TestCase):
             for manpage in generated:
                 self.assertNotIn("Source commit:", manpage.read_text(encoding="utf-8"))
 
-    def test_final_release_requires_explicit_unsigned_acknowledgement(self):
+    def test_final_release_requires_signed_source_and_exact_acknowledgement(self):
         workflow = (
             TOOLS.parent.parent / ".github/workflows/build.yml"
         ).read_text(encoding="utf-8")
@@ -116,8 +116,11 @@ class ReleaseToolTests(unittest.TestCase):
             "UNSIGNED_FINAL_ACK: ${{ vars.UNSIGNED_FINAL_ACK }}",
             workflow,
         )
-        self.assertIn("expected='V30.1.2'", workflow)
-        self.assertIn("expected_ack='V30.1.2'", workflow)
+        self.assertIn("expected='V30.1.3'", workflow)
+        self.assertIn("expected_ack='V30.1.3'", workflow)
+        self.assertIn("--require-signatures", workflow)
+        self.assertIn(f"--signing-fingerprint '{FINGERPRINT}'", workflow)
+        self.assertNotIn("--require-unsigned-objects", workflow)
         self.assertIn(
             'gh api "repos/$GITHUB_REPOSITORY/immutable-releases"',
             workflow,
@@ -1247,10 +1250,21 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("--build-profile native-walletless-default", gate)
         self.assertIn("--minimum-runtime-ms 250", gate)
         self.assertIn("--provenance-manifest", gate)
-        self.assertIn("pattern: quantum-resource-benchmarks-*", release)
-        self.assertIn("verify_resource_benchmark_bundle.py", release)
-        self.assertIn("test \"${#resource_evidence[@]}\" -eq 5", release)
-        self.assertIn("test \"${#resource_raw[@]}\" -eq 5", release)
+        self.assertIn(
+            '"Exact-SHA prerelease or production safety gate / measured worst-case '
+            'quantum crypto resources (Linux x86_64)"',
+            release,
+        )
+        self.assertIn(
+            '"historical_resource_and_reproducibility_results_are_not_candidate_sha_results": True',
+            release,
+        )
+        self.assertIn("inherited-core-gate-30.1.3-", release)
+        self.assertNotIn("pattern: quantum-resource-benchmarks-*", release)
+        self.assertNotIn(
+            "python3 ci/release/verify_resource_benchmark_bundle.py",
+            release,
+        )
 
     def test_quantum_crypto_provenance_is_mandatory_and_retained(self):
         root = TOOLS.parent.parent
@@ -1267,11 +1281,23 @@ class ReleaseToolTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn(
-            "name: quantum-crypto-provenance-${{ needs.resolve-target.outputs.target_sha }}",
+            '"Exact-SHA prerelease or production safety gate / pinned independent '
+            'quantum crypto provenance"',
             release_workflow,
         )
-        self.assertIn("Blackcoin-$VERSION-quantum-crypto-provenance.json", release_workflow)
-        self.assertIn("Blackcoin-$VERSION-quantum-crypto-manifest.json", release_workflow)
+        self.assertIn(
+            '"historical_results_are_not_candidate_sha_results": True',
+            release_workflow,
+        )
+        self.assertIn(
+            '"runtime_or_consensus_source_changed": False',
+            release_workflow,
+        )
+        self.assertIn("Blackcoin-$VERSION-INHERITED-CORE-EVIDENCE.json", release_workflow)
+        self.assertNotIn(
+            "Download exact-SHA quantum crypto provenance evidence",
+            release_workflow,
+        )
 
         manifest = json.loads(
             (root / "contrib" / "devtools" / "quantum-crypto-provenance.json").read_text(
@@ -2114,7 +2140,7 @@ class ReleaseToolTests(unittest.TestCase):
 
     def test_unsigned_final_metadata_is_explicit_and_source_bound(self):
         generator = load_module("generate_unsigned_release_metadata")
-        version = "30.1.2"
+        version = "30.1.3"
         with tempfile.TemporaryDirectory() as temporary:
             artifacts = Path(temporary)
             required = (
@@ -2134,12 +2160,6 @@ class ReleaseToolTests(unittest.TestCase):
             (artifacts / "SOURCE_COMMIT.txt").write_text(
                 SOURCE_SHA + "\n", encoding="utf-8"
             )
-            (artifacts / f"Blackcoin-{version}-REPRODUCIBILITY.txt").write_text(
-                f"package_label={version}\n"
-                "prerelease_channel=production\n"
-                f"source_commit={SOURCE_SHA}\n",
-                encoding="utf-8",
-            )
             notice = artifacts / f"Blackcoin-{version}-UNSIGNED-PRODUCTION.txt"
             manifest = artifacts / f"Blackcoin-{version}-UNSIGNED-PRODUCTION.json"
             document = generator.generate_metadata(
@@ -2156,9 +2176,23 @@ class ReleaseToolTests(unittest.TestCase):
 
             self.assertEqual(
                 document["classification"],
-                "PUBLISHER_UNSIGNED_PRODUCTION_RELEASE",
+                "SOURCE_SIGNED_PLATFORM_UNSIGNED_PRODUCTION_RELEASE",
             )
             self.assertEqual(document["source"]["commit"], SOURCE_SHA)
+            self.assertEqual(document["source"]["tag_type"], "annotated-ssh-signed")
+            for signature in ("commit_signature", "tag_signature"):
+                with self.subTest(signature=signature):
+                    self.assertEqual(document["source"][signature]["format"], "ssh")
+                    self.assertEqual(
+                        document["source"][signature]["signer"], "Blackcoin-Dev"
+                    )
+                    self.assertEqual(
+                        document["source"][signature]["key_fingerprint"],
+                        FINGERPRINT,
+                    )
+                    self.assertTrue(
+                        document["source"][signature]["github_verified"]
+                    )
             self.assertTrue(document["authorization"]["acknowledged"])
             self.assertTrue(
                 document["authorization"]["protected_environment_gate_required"]
@@ -2167,30 +2201,65 @@ class ReleaseToolTests(unittest.TestCase):
                 document["authorization"]["independent_environment_review_required"]
             )
             for field in (
-                "publisher_signed",
                 "source_commit_openpgp_signed",
                 "tag_openpgp_signed",
                 "checksums_openpgp_signed",
                 "provenance_openpgp_signed",
+                "packages_code_signed",
                 "authenticode_signed",
                 "developer_id_signed",
                 "notarized",
             ):
                 with self.subTest(field=field):
                     self.assertFalse(document["release"][field])
+            for field in (
+                "source_commit_signed",
+                "source_commit_github_verified",
+                "tag_signed",
+                "tag_github_verified",
+            ):
+                with self.subTest(field=field):
+                    self.assertTrue(document["release"][field])
+            self.assertEqual(document["release"]["source_commit_signature_format"], "ssh")
+            self.assertEqual(document["release"]["tag_signature_format"], "ssh")
+            self.assertEqual(document["release"]["source_commit_signer"], "Blackcoin-Dev")
+            self.assertEqual(document["release"]["tag_signer"], "Blackcoin-Dev")
+            self.assertEqual(
+                document["release"]["source_commit_signing_key_fingerprint"],
+                FINGERPRINT,
+            )
+            self.assertEqual(
+                document["release"]["tag_signing_key_fingerprint"],
+                FINGERPRINT,
+            )
             self.assertTrue(document["release"]["macos_adhoc_signed"])
+            self.assertFalse(
+                document["integrity"]["reproducibility"]["current_source_rerun"]
+            )
+            self.assertTrue(
+                document["integrity"]["reproducibility"][
+                    "historical_evidence_separately_labeled"
+                ]
+            )
             self.assertTrue(document["integrity"]["github_build_provenance_attestation"])
             self.assertTrue(document["integrity"]["github_sbom_attestation"])
             notice_text = notice.read_text(encoding="utf-8")
-            self.assertIn("PUBLISHER-UNSIGNED", notice_text)
+            self.assertIn("SOURCE-SIGNED, PLATFORM-UNSIGNED", notice_text)
             self.assertIn(
-                f"no release-signing certificates for v{version}.",
+                "exact source commit and annotated tag are SSH-signed by Blackcoin-Dev",
                 notice_text,
             )
-            self.assertNotIn(
-                "no release-signing certificates for v30.1.1.",
+            self.assertIn("and verified by GitHub", notice_text)
+            self.assertIn(
+                "These Git-object signatures do not code-sign the packages.",
                 notice_text,
             )
+            self.assertIn(
+                "does not claim a new duplicate-builder reproducibility result",
+                notice_text,
+            )
+            self.assertTrue(notice.name.endswith("-UNSIGNED-PRODUCTION.txt"))
+            self.assertTrue(manifest.name.endswith("-UNSIGNED-PRODUCTION.json"))
             self.assertTrue(manifest.is_file())
 
     def test_unsigned_final_metadata_rejects_missing_ack_or_signature_asset(self):
@@ -2214,12 +2283,6 @@ class ReleaseToolTests(unittest.TestCase):
             (artifacts / "SOURCE_COMMIT.txt").write_text(
                 SOURCE_SHA + "\n", encoding="utf-8"
             )
-            (artifacts / f"Blackcoin-{version}-REPRODUCIBILITY.txt").write_text(
-                f"package_label={version}\n"
-                "prerelease_channel=production\n"
-                f"source_commit={SOURCE_SHA}\n",
-                encoding="utf-8",
-            )
             notice = artifacts / f"Blackcoin-{version}-UNSIGNED-PRODUCTION.txt"
             manifest = artifacts / f"Blackcoin-{version}-UNSIGNED-PRODUCTION.json"
             arguments = dict(
@@ -2242,11 +2305,11 @@ class ReleaseToolTests(unittest.TestCase):
                     **arguments,
                 )
 
-    def test_prerelease_workflow_keeps_the_unsigned_production_gate_separate(self):
+    def test_prerelease_workflow_keeps_the_signed_production_gate_separate(self):
         workflow = (TOOLS.parent.parent / ".github" / "workflows" / "build.yml").read_text(
             encoding="utf-8"
         )
-        self.assertIn("default: 30.1.2-alpha1", workflow)
+        self.assertIn("default: 30.1.3-alpha1", workflow)
         self.assertIn("CALLER_WORKFLOW_SHA: ${{ github.workflow_sha }}", workflow)
         self.assertIn('test "$CALLER_WORKFLOW_SHA" = "$TARGET_SHA"', workflow)
         self.assertIn('test "$EVENT_SHA" = "$TARGET_SHA"', workflow)
@@ -2259,9 +2322,9 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn('test "$IS_RELEASE" = "false"', workflow)
         self.assertIn('test "$RC" = "0"', workflow)
         self.assertIn('test "$IS_RELEASE" = "true"', workflow)
-        self.assertIn("- 'v30.1.2'", workflow)
-        self.assertNotIn("- 'v30.1.2-alpha", workflow)
-        self.assertNotIn("- 'v30.1.2-beta", workflow)
+        self.assertIn("- 'v30.1.3'", workflow)
+        self.assertNotIn("- 'v30.1.3-alpha", workflow)
+        self.assertNotIn("- 'v30.1.3-beta", workflow)
         self.assertIn("UNSIGNED CANARY ARTIFACTS - NOT A PRODUCTION RELEASE", workflow)
         self.assertIn("Verify non-macOS binary identity", workflow)
         self.assertIn("verify_windows_payload.py identity", workflow)
@@ -2281,8 +2344,25 @@ class ReleaseToolTests(unittest.TestCase):
         self.assertIn("macos_adhoc_signed=$MACOS_SELECTED", workflow)
         self.assertIn('metadata["LSArchitecturePriority"] = [os.environ["EXPECTED_ARCH"]]', workflow)
         self.assertIn('verify_plist_architecture "$verified_plist"', workflow)
-        self.assertIn("Require explicit publisher-unsigned final acknowledgement", workflow)
-        self.assertIn("--require-unsigned-objects", workflow)
+        self.assertIn(
+            "Require explicit v30.1.3 signed-source publication acknowledgement",
+            workflow,
+        )
+        self.assertIn("--require-signatures", workflow)
+        self.assertIn(f"--signing-fingerprint '{FINGERPRINT}'", workflow)
+        self.assertNotIn("--require-unsigned-objects", workflow)
+        self.assertIn(
+            'commit.get("verification", {}).get("verified") is not True', workflow
+        )
+        self.assertIn(
+            'commit.get("verification", {}).get("reason") != "valid"', workflow
+        )
+        self.assertIn(
+            'tag.get("verification", {}).get("verified") is not True', workflow
+        )
+        self.assertIn(
+            'tag.get("verification", {}).get("reason") != "valid"', workflow
+        )
         self.assertIn("generate_unsigned_release_metadata.py", workflow)
         self.assertNotIn("Developer-ID sign and notarize macOS artifacts", workflow)
         self.assertNotIn("Authenticode-sign Windows artifacts", workflow)
@@ -2317,26 +2397,122 @@ class ReleaseToolTests(unittest.TestCase):
             (rebuilt / "artifact.bin").write_bytes(b"different")
             self.assertNotEqual(verifier.inventory(primary), verifier.inventory(rebuilt))
 
-    def test_signature_verifier_requires_configured_fingerprint(self):
+    def test_signature_verifier_pins_the_blackcoin_dev_ssh_key(self):
         identity = load_module("verify_source_identity")
-        good = subprocess.CompletedProcess(
-            args=[],
-            returncode=0,
-            stdout=f"[GNUPG:] VALIDSIG {FINGERPRINT} 0 0 0 4 0 1 8 00 {FINGERPRINT}\n",
+        self.assertEqual(identity.EXPECTED_SSH_FINGERPRINT, FINGERPRINT)
+        self.assertEqual(
+            identity.validate_allowed_signers(),
+            identity.PINNED_ALLOWED_SIGNERS.resolve(),
         )
-        with mock.patch.object(identity.subprocess, "run", return_value=good):
-            identity.verify_openpgp_signature("HEAD", "commit", FINGERPRINT)
-            with self.assertRaises(RuntimeError):
-                identity.verify_openpgp_signature("HEAD", "commit", "B" * 40)
 
-        bad = subprocess.CompletedProcess(
-            args=[],
-            returncode=1,
-            stdout="[GNUPG:] BADSIG 0000000000000000 Blackcoin-Dev\n",
-        )
-        with mock.patch.object(identity.subprocess, "run", return_value=bad):
-            with self.assertRaises(RuntimeError):
-                identity.verify_openpgp_signature("HEAD", "commit", FINGERPRINT)
+        with tempfile.TemporaryDirectory() as temporary:
+            wrong_principal = Path(temporary) / "wrong-principal.allowed_signers"
+            key_fields = identity.PINNED_ALLOWED_SIGNERS.read_text(
+                encoding="utf-8"
+            ).split()
+            wrong_principal.write_text(
+                f"attacker@example.invalid {key_fields[1]} {key_fields[2]}\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(RuntimeError, "principal is not Blackcoin-Dev"):
+                identity.validate_allowed_signers(wrong_principal, FINGERPRINT)
+
+    def test_ssh_signature_verifier_accepts_commit_and_tag_and_rejects_substitution(self):
+        identity = load_module("verify_source_identity")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repository = root / "repository"
+            repository.mkdir()
+            signing_key = root / "signing-key"
+            wrong_key = root / "wrong-key"
+
+            for key in (signing_key, wrong_key):
+                subprocess.run(
+                    ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(key)],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+
+            def public_key_fields(key):
+                return key.with_suffix(".pub").read_text(encoding="utf-8").split()[:2]
+
+            key_type, encoded_key = public_key_fields(signing_key)
+            fingerprint = identity.ssh_public_key_fingerprint(encoded_key)
+            allowed_signers = root / "allowed_signers"
+            allowed_signers.write_text(
+                f"{identity.EXPECTED_EMAIL} {key_type} {encoded_key}\n",
+                encoding="utf-8",
+            )
+            wrong_type, wrong_encoded_key = public_key_fields(wrong_key)
+            wrong_fingerprint = identity.ssh_public_key_fingerprint(wrong_encoded_key)
+            wrong_allowed_signers = root / "wrong.allowed_signers"
+            wrong_allowed_signers.write_text(
+                f"{identity.EXPECTED_EMAIL} {wrong_type} {wrong_encoded_key}\n",
+                encoding="utf-8",
+            )
+
+            def run_git(*arguments):
+                return subprocess.run(
+                    ["git", *arguments],
+                    cwd=repository,
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ).stdout.strip()
+
+            run_git("init", "--quiet")
+            run_git("config", "user.name", identity.EXPECTED_NAME)
+            run_git("config", "user.email", identity.EXPECTED_EMAIL)
+            run_git("config", "gpg.format", "ssh")
+            run_git("config", "user.signingkey", str(signing_key))
+            run_git("commit", "--allow-empty", "-S", "-m", "signed")
+            signed_commit = run_git("rev-parse", "HEAD")
+            run_git("tag", "-s", "-m", "signed", "vtest-signed", signed_commit)
+            run_git("tag", "-a", "-m", "unsigned", "vtest-unsigned", signed_commit)
+            run_git("commit", "--allow-empty", "--no-gpg-sign", "-m", "unsigned")
+            unsigned_commit = run_git("rev-parse", "HEAD")
+
+            original_directory = Path.cwd()
+            try:
+                os.chdir(repository)
+                identity.verify_ssh_signature(
+                    signed_commit,
+                    "commit",
+                    fingerprint,
+                    allowed_signers,
+                )
+                identity.verify_ssh_signature(
+                    "refs/tags/vtest-signed",
+                    "tag",
+                    fingerprint,
+                    allowed_signers,
+                )
+                with self.assertRaisesRegex(RuntimeError, "pinned Blackcoin-Dev SSH"):
+                    identity.verify_ssh_signature(
+                        unsigned_commit,
+                        "commit",
+                        fingerprint,
+                        allowed_signers,
+                    )
+                with self.assertRaisesRegex(RuntimeError, "pinned Blackcoin-Dev SSH"):
+                    identity.verify_ssh_signature(
+                        "refs/tags/vtest-unsigned",
+                        "tag",
+                        fingerprint,
+                        allowed_signers,
+                    )
+                with self.assertRaisesRegex(RuntimeError, "pinned Blackcoin-Dev SSH"):
+                    identity.verify_ssh_signature(
+                        signed_commit,
+                        "commit",
+                        wrong_fingerprint,
+                        wrong_allowed_signers,
+                    )
+            finally:
+                os.chdir(original_directory)
 
     def test_unsigned_identity_policy_rejects_embedded_signatures(self):
         identity = load_module("verify_source_identity")

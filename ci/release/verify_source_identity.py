@@ -5,6 +5,10 @@
 """Fail closed unless release history and tag metadata use the team identity."""
 
 import argparse
+import base64
+import binascii
+import hashlib
+from pathlib import Path
 import re
 import subprocess
 import sys
@@ -14,6 +18,10 @@ EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
 EXPECTED_ACTOR = "Blackcoin-Dev"
 EXPECTED_NAME = "Blackcoin-Dev"
 EXPECTED_EMAIL = "298119138+Blackcoin-Dev@users.noreply.github.com"
+EXPECTED_SSH_FINGERPRINT = "SHA256:jAkpBudDw+ntWHSUx3e1KY+czAFjnlaPxQtRFtptL70"
+PINNED_ALLOWED_SIGNERS = Path(__file__).with_name(
+    "blackcoin-dev-release-signing.allowed_signers"
+)
 TRUSTED_V30_1_0 = "f647dc75c9479c03e81414f145a8d233b60959c7"
 PINNED_IDENTITY_EXCEPTIONS = {
     # Historical main-branch commit made by the same GitHub team account before
@@ -25,7 +33,6 @@ PINNED_IDENTITY_EXCEPTIONS = {
     ),
 }
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-FINGERPRINT_RE = re.compile(r"^(?:[0-9A-F]{40}|[0-9A-F]{64})$")
 ATTRIBUTION_TRAILER_RE = re.compile(r"^(?:co-authored-by|co-developed-by):", re.IGNORECASE)
 TAG_SIGNATURE_MARKERS = (
     "-----BEGIN PGP SIGNATURE-----",
@@ -76,8 +83,80 @@ def verify_commit(commit):
             raise RuntimeError(f"{commit} contains an additional contributor-attribution trailer")
 
 
-def verify_openpgp_signature(object_name, object_kind, expected_fingerprint):
-    command = ["git", f"verify-{object_kind}", "--raw", object_name]
+def ssh_public_key_fingerprint(encoded_key):
+    try:
+        key_blob = base64.b64decode(encoded_key, validate=True)
+    except (binascii.Error, ValueError) as error:
+        raise RuntimeError("the pinned SSH public key is not valid base64") from error
+
+    def read_field(offset):
+        if offset + 4 > len(key_blob):
+            raise RuntimeError("the pinned SSH public key is truncated")
+        size = int.from_bytes(key_blob[offset:offset + 4], "big")
+        start = offset + 4
+        end = start + size
+        if end > len(key_blob):
+            raise RuntimeError("the pinned SSH public key is truncated")
+        return key_blob[start:end], end
+
+    key_type, offset = read_field(0)
+    key_material, offset = read_field(offset)
+    if key_type != b"ssh-ed25519" or len(key_material) != 32 or offset != len(key_blob):
+        raise RuntimeError("the pinned SSH public key is not an Ed25519 key")
+    digest = hashlib.sha256(key_blob).digest()
+    return "SHA256:" + base64.b64encode(digest).decode("ascii").rstrip("=")
+
+
+def validate_allowed_signers(path=None, expected_fingerprint=None):
+    path = Path(path) if path is not None else PINNED_ALLOWED_SIGNERS
+    if expected_fingerprint is None:
+        expected_fingerprint = EXPECTED_SSH_FINGERPRINT
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError("the pinned SSH allowed-signers file is missing or unsafe")
+    lines = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    if len(lines) != 1:
+        raise RuntimeError("the SSH allowed-signers file must contain exactly one signer")
+    fields = lines[0].split()
+    if len(fields) != 3:
+        raise RuntimeError("the SSH allowed-signers entry must be canonical")
+    principal, key_type, encoded_key = fields
+    if principal != EXPECTED_EMAIL:
+        raise RuntimeError("the SSH allowed-signers principal is not Blackcoin-Dev")
+    if key_type != "ssh-ed25519":
+        raise RuntimeError("the SSH allowed-signers key is not Ed25519")
+    fingerprint = ssh_public_key_fingerprint(encoded_key)
+    if fingerprint != expected_fingerprint:
+        raise RuntimeError("the SSH allowed-signers key fingerprint is not trusted")
+    return path.resolve()
+
+
+def verify_ssh_signature(
+    object_name,
+    object_kind,
+    expected_fingerprint,
+    allowed_signers_file=None,
+):
+    if object_kind not in ("commit", "tag"):
+        raise RuntimeError(f"unsupported signed object kind: {object_kind}")
+    allowed_signers = validate_allowed_signers(
+        allowed_signers_file,
+        expected_fingerprint,
+    )
+    command = [
+        "git",
+        "-c",
+        "gpg.format=ssh",
+        "-c",
+        f"gpg.ssh.allowedSignersFile={allowed_signers}",
+        f"verify-{object_kind}",
+        "--raw",
+        "--",
+        object_name,
+    ]
     result = subprocess.run(
         command,
         check=False,
@@ -85,26 +164,14 @@ def verify_openpgp_signature(object_name, object_kind, expected_fingerprint):
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
-    status_lines = [line.strip() for line in result.stdout.splitlines() if "[GNUPG:]" in line]
-    invalid_markers = (" BADSIG ", " ERRSIG ", " EXPKEYSIG ", " REVKEYSIG ")
-    if result.returncode != 0 or any(marker in f" {line} " for marker in invalid_markers for line in status_lines):
-        raise RuntimeError(f"{object_name} does not have a valid OpenPGP signature")
-
-    valid_fingerprints = set()
-    for line in status_lines:
-        marker = "[GNUPG:] VALIDSIG "
-        if marker not in line:
-            continue
-        fields = line.split(marker, 1)[1].split()
-        if fields:
-            valid_fingerprints.add(fields[0].upper())
-        # GnuPG appends the primary-key fingerprint when a signing subkey was used.
-        if len(fields) >= 10:
-            valid_fingerprints.add(fields[-1].upper())
-
-    if expected_fingerprint not in valid_fingerprints:
+    expected_status = (
+        f'Good "git" signature for {EXPECTED_EMAIL} with ED25519 key '
+        f"{expected_fingerprint}"
+    )
+    if result.returncode != 0 or expected_status not in result.stdout.splitlines():
         raise RuntimeError(
-            f"{object_name} signature is not rooted in the configured Blackcoin-Dev release key"
+            f"{object_name} does not have a valid signature from the pinned "
+            "Blackcoin-Dev SSH release key"
         )
 
 
@@ -135,7 +202,7 @@ def verify_tag(tag, head, signing_fingerprint=None):
     if (tagger_name, tagger_email) != (EXPECTED_NAME, EXPECTED_EMAIL):
         raise RuntimeError(f"{tag} was not created with the release team identity")
     if signing_fingerprint:
-        verify_openpgp_signature(tag, "tag", signing_fingerprint)
+        verify_ssh_signature(ref, "tag", signing_fingerprint)
 
 
 def main():
@@ -156,11 +223,11 @@ def main():
     if args.require_actor and args.actor != EXPECTED_ACTOR:
         raise RuntimeError("release workflow must be initiated by the release team account")
 
-    signing_fingerprint = (args.signing_fingerprint or "").replace(" ", "").upper()
+    signing_fingerprint = (args.signing_fingerprint or "").strip()
     if args.require_signatures and args.require_unsigned_objects:
         raise RuntimeError("signed and explicitly unsigned release policies are mutually exclusive")
-    if args.require_signatures and not FINGERPRINT_RE.fullmatch(signing_fingerprint):
-        raise RuntimeError("a full OpenPGP release-signing fingerprint is required")
+    if args.require_signatures and signing_fingerprint != EXPECTED_SSH_FINGERPRINT:
+        raise RuntimeError("the exact Blackcoin-Dev SSH release-signing fingerprint is required")
 
     base = resolved_commit(args.base)
     head = resolved_commit(args.head)
@@ -171,7 +238,7 @@ def main():
     for commit in commits:
         verify_commit(commit)
     if args.require_signatures:
-        verify_openpgp_signature(head, "commit", signing_fingerprint)
+        verify_ssh_signature(head, "commit", signing_fingerprint)
     if args.require_unsigned_objects:
         verify_unsigned_object(head, "commit")
     if args.tag:
