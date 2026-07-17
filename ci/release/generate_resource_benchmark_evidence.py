@@ -113,8 +113,68 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def verify_epoch_source_contract(repo_root: Path) -> dict[str, str]:
+def sha256_bytes(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def repository_head(repo_root: Path) -> str:
+    try:
+        source_sha = subprocess.run(
+            ["git", "-C", str(repo_root.resolve()), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(f"cannot resolve repository HEAD: {error}") from error
+    if not SHA1_RE.fullmatch(source_sha):
+        raise RuntimeError("repository HEAD is not a full lowercase commit identifier")
+    return source_sha
+
+
+def read_tracked_git_blob(repo_root: Path, source_sha: str, path: Path) -> bytes:
+    """Read a repo-relative tracked input from the exact commit object.
+
+    Git-for-Windows may materialize text files with CRLF even though the
+    commit stores LF. Release evidence must identify the commit blob, not a
+    platform-dependent working-tree representation. Binary benchmark output
+    is intentionally not routed through this helper.
+    """
+    if not SHA1_RE.fullmatch(source_sha):
+        raise RuntimeError("source SHA must be a full lowercase commit identifier")
+    root = repo_root.resolve()
+    candidate = path if path.is_absolute() else root / path
+    try:
+        resolved = candidate.resolve(strict=True)
+        relative = resolved.relative_to(root)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            f"tracked source input is missing or outside repository: {path}"
+        ) from error
+    if not resolved.is_file() or relative == Path("."):
+        raise RuntimeError(f"tracked source input is not a file: {path}")
+    relative_name = relative.as_posix()
+    try:
+        return subprocess.run(
+            [
+                "git", "-C", str(root), "cat-file", "blob",
+                f"{source_sha}:{relative_name}",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(
+            f"tracked source input is not a blob at {source_sha}: {relative_name}"
+        ) from error
+
+
+def verify_epoch_source_contract(
+    repo_root: Path, source_sha=None,
+) -> dict[str, str]:
     """Bind epoch arithmetic to the exact serializers and mainnet schedule."""
+    if source_sha is None:
+        source_sha = repository_head(repo_root)
     required = {
         "src/shadow.h": (
             "static constexpr int MAINNET_SHADOW_REWARD_START_HEIGHT = 5950000;",
@@ -212,16 +272,21 @@ def verify_epoch_source_contract(repo_root: Path) -> dict[str, str]:
     }
     hashes = {}
     for relative, fragments in required.items():
-        path = repo_root / relative
-        if not path.is_file():
-            raise RuntimeError(f"epoch-bound source file is missing: {relative}")
-        source = path.read_text(encoding="utf-8")
+        blob = read_tracked_git_blob(repo_root, source_sha, Path(relative))
+        try:
+            # Match Path.read_text()'s universal-newline behavior while the
+            # recorded digest remains the exact, unmodified Git blob.
+            source = blob.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+        except UnicodeDecodeError as error:
+            raise RuntimeError(
+                f"epoch-bound source file is not UTF-8: {relative}"
+            ) from error
         missing = [fragment for fragment in fragments if fragment not in source]
         if missing:
             raise RuntimeError(
                 f"epoch-bound source contract changed in {relative}: {missing[0]}"
             )
-        hashes[relative] = sha256_file(path)
+        hashes[relative] = sha256_bytes(blob)
     return hashes
 
 
@@ -882,7 +947,7 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
         repo_root, repository, source_sha,
         allowed_untracked=(nanobench_json,),
     )
-    epoch_source_contract = verify_epoch_source_contract(repo_root)
+    epoch_source_contract = verify_epoch_source_contract(repo_root, source_sha)
     if not LABEL_RE.fullmatch(platform) or not LABEL_RE.fullmatch(architecture):
         raise RuntimeError("platform and architecture must be simple stable labels")
     reported_platform, reported_architecture = verify_native_runner(
@@ -897,9 +962,15 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
     binary_format, binary_architecture = verify_native_binary(
         binary, platform, architecture
     )
-    if not provenance_manifest.is_file():
-        raise RuntimeError(f"provenance manifest does not exist: {provenance_manifest}")
-    provenance = json.loads(provenance_manifest.read_text(encoding="utf-8"))
+    provenance_blob = read_tracked_git_blob(
+        repo_root, source_sha, provenance_manifest,
+    )
+    try:
+        provenance = json.loads(provenance_blob)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise RuntimeError(
+            f"invalid quantum cryptography provenance manifest: {error}"
+        ) from error
     if not isinstance(provenance, dict) or provenance.get("schema") != 1 or not all(
         isinstance(provenance.get(component), dict)
         for component in ("liboqs", "argon2", "wycheproof")
@@ -1013,7 +1084,7 @@ def generate_evidence(*, nanobench_json: Path, binary: Path, source_sha: str,
             "benchmark_binary_sha256": sha256_file(binary),
             "nanobench_json_sha256": sha256_file(nanobench_json),
             "quantum_crypto_provenance_manifest_sha256":
-                sha256_file(provenance_manifest),
+                sha256_bytes(provenance_blob),
             "epoch_source_contract_sha256": epoch_source_contract,
         },
         "consensus_limits": {

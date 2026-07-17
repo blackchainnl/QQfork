@@ -13,9 +13,7 @@ import sys
 
 
 EXPECTED_REPOSITORY = "Blackcoin-Dev/Blackcoin"
-EXPECTED_ACKNOWLEDGEMENT = (
-    "I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES"
-)
+EXPECTED_ACKNOWLEDGEMENT = "V30.1.2"
 FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
@@ -153,7 +151,7 @@ def generate_metadata(
         "github_sbom_attestation=true\n"
         f"unsigned_final_acknowledgement_sha256={acknowledgement_sha256}\n"
         "\n"
-        "The project has no release-signing certificates for v30.1.1. Windows "
+        f"The project has no release-signing certificates for v{version}. Windows "
         "packages have no Authenticode signature. macOS applications carry only "
         "identity-free ad-hoc launch signatures and are not notarized. The source "
         "commit, annotated tag, checksums, and in-toto statement have no "

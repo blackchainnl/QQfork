@@ -1,4 +1,4 @@
-name: v30.1.1 release build
+name: v30.1.2 corrective release build
 
 on:
   workflow_dispatch:
@@ -10,7 +10,7 @@ on:
       package_label:
         description: Explicit unpublished prerelease label (must match source RC)
         required: true
-        default: 30.1.1-alpha1
+        default: 30.1.2-alpha1
         type: string
       target:
         description: Build target to run (manual runs never publish)
@@ -27,13 +27,13 @@ on:
           - macos-arm-64-bit
   push:
     tags:
-      - 'v30.1.1'
+      - 'v30.1.2'
 
 permissions:
   contents: read
 
 concurrency:
-  group: v30.1.1-release-${{ github.ref }}
+  group: v30.1.2-release-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -78,8 +78,8 @@ jobs:
           RC=$(sed -n "s/^define(_CLIENT_VERSION_RC, \([0-9]*\))$/\1/p" configure.ac)
           IS_RELEASE=$(sed -n "s/^define(_CLIENT_VERSION_IS_RELEASE, \(.*\))$/\1/p" configure.ac)
           BASE_VERSION="$MAJOR.$MINOR.$BUILD"
-          test "$BASE_VERSION" = "30.1.1" || {
-            echo "::error::This workflow is locked to the v30.1.1 source line"
+          test "$BASE_VERSION" = "30.1.2" || {
+            echo "::error::This workflow is locked to the v30.1.2 source line"
             exit 1
           }
           [[ "$RC" =~ ^[0-9]+$ ]]
@@ -180,9 +180,192 @@ jobs:
             echo "tag=$TAG"
           } >> "$GITHUB_OUTPUT"
 
+  inherited-core-evidence:
+    name: Verify inherited v30.1.1 core safety evidence
+    needs: resolve-target
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: read
+    env:
+      TARGET_SHA: ${{ needs.resolve-target.outputs.target_sha }}
+      PUBLISH: ${{ needs.resolve-target.outputs.publish }}
+      BASE_SHA: dffb457650f48848794120ef4661f0a8f0187e05
+      PRIOR_RUN_ID: '29552432859'
+      PRIOR_WORKFLOW_ID: '307671160'
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Checkout exact corrective source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.0
+        with:
+          ref: ${{ needs.resolve-target.outputs.target_sha }}
+          fetch-depth: 0
+
+      - name: Verify narrow corrective diff and inherited core gate
+        if: ${{ needs.resolve-target.outputs.publish == 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$TARGET_SHA"
+          test "$(git rev-parse "$TARGET_SHA^")" = "$BASE_SHA"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PRIOR_RUN_ID" > prior-run.json
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$PRIOR_RUN_ID/jobs?per_page=100" > prior-jobs.json
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+
+          base = os.environ["BASE_SHA"]
+          target = os.environ["TARGET_SHA"]
+          run_id = int(os.environ["PRIOR_RUN_ID"])
+          workflow_id = int(os.environ["PRIOR_WORKFLOW_ID"])
+          repository = os.environ["GITHUB_REPOSITORY"]
+          run = json.loads(Path("prior-run.json").read_text(encoding="utf-8"))
+          jobs_document = json.loads(Path("prior-jobs.json").read_text(encoding="utf-8"))
+          jobs = jobs_document.get("jobs", [])
+
+          expected_run = {
+              "id": run_id,
+              "workflow_id": workflow_id,
+              "run_attempt": 1,
+              "event": "push",
+              "head_branch": "v30.1.1",
+              "head_sha": base,
+              "status": "completed",
+              "conclusion": "failure",
+          }
+          for key, value in expected_run.items():
+              if run.get(key) != value:
+                  raise SystemExit(f"prior run {key} mismatch: {run.get(key)!r}")
+          if run.get("path") != ".github/workflows/build.yml":
+              raise SystemExit("prior workflow path mismatch")
+          for field in ("actor", "triggering_actor"):
+              actor = run.get(field) or {}
+              if actor.get("login") != "Blackcoin-Dev" or actor.get("id") != 298119138:
+                  raise SystemExit(f"prior run {field} mismatch")
+
+          required_successes = {
+              "Exact-SHA prerelease or production safety gate / source identity, workflow syntax, and lint",
+              "Exact-SHA prerelease or production safety gate / Build pinned Windows x86_64 vector binaries",
+              "Exact-SHA prerelease or production safety gate / thread-sanitizer consensus and liveness gate",
+              "Exact-SHA prerelease or production safety gate / address-undefined-sanitizer consensus and liveness gate",
+              "Exact-SHA prerelease or production safety gate / pinned independent quantum crypto provenance",
+              "Exact-SHA prerelease or production safety gate / pinned native build and unit tests",
+              "Exact-SHA prerelease or production safety gate / macOS Intel native cryptographic vectors",
+              "Exact-SHA prerelease or production safety gate / Linux ARM64 native cryptographic vectors and resources",
+              "Exact-SHA prerelease or production safety gate / macOS Apple Silicon native cryptographic vectors",
+              "Exact-SHA prerelease or production safety gate / source-pinned sanitizer regression smoke",
+              "Exact-SHA prerelease or production safety gate / Windows x86_64 native cryptographic vectors and resources",
+              "Exact-SHA prerelease or production safety gate / Linux ARM64 native UBSan block-harness gate",
+              "Exact-SHA prerelease or production safety gate / real v26.2, v28.4, v30.1, and candidate interoperability",
+              "Exact-SHA prerelease or production safety gate / measured worst-case quantum crypto resources (Linux x86_64)",
+              "Exact-SHA prerelease or production safety gate / critical Gold Rush, lifecycle, wallet, and recovery tests",
+              "Exact-SHA prerelease or production safety gate / complete extended functional suite",
+          }
+          by_name = {job.get("name"): job for job in jobs}
+          missing = sorted(required_successes - set(by_name))
+          if missing:
+              raise SystemExit(f"prior core jobs missing: {missing}")
+          bad = sorted(name for name in required_successes if by_name[name].get("conclusion") != "success")
+          if bad:
+              raise SystemExit(f"prior core jobs not successful: {bad}")
+          failures = [job for job in jobs if job.get("conclusion") != "success"]
+          if len(jobs) != 36 or len(failures) != 1:
+              raise SystemExit("prior run job inventory differs from reviewed 35-success/1-failure record")
+          failure = failures[0]
+          if failure.get("name") != "Publish authorized GitHub release" or failure.get("id") != 87820287141:
+              raise SystemExit("prior run failure identity differs")
+
+          allowed = {
+              ".github/workflows/build.yml",
+              ".github/workflows/pr-gate.yml",
+              "configure.ac",
+              "ci/release/generate_resource_benchmark_evidence.py",
+              "ci/release/generate_unsigned_release_metadata.py",
+              "ci/release/test_release_tools.py",
+              "ci/release/verify_resource_benchmark_bundle.py",
+              "doc/man/blackcoin-cli.1",
+              "doc/man/blackcoin-qt.1",
+              "doc/man/blackcoin-tx.1",
+              "doc/man/blackcoin-util.1",
+              "doc/man/blackcoin-wallet.1",
+              "doc/man/blackcoind.1",
+              "doc/release-notes.md",
+              "doc/release-notes/release-notes-30.1.2.md",
+              "doc/release-process.md",
+              "doc/v30.1.2-corrective-release.md",
+          }
+          lines = subprocess.run(
+              ["git", "diff", "--name-status", "--no-renames", f"{base}..{target}"],
+              check=True, capture_output=True, text=True,
+          ).stdout.splitlines()
+          changed = []
+          for line in lines:
+              status, path = line.split("\t", 1)
+              if status not in {"A", "M"}:
+                  raise SystemExit(f"forbidden corrective diff status: {line}")
+              if path not in allowed:
+                  raise SystemExit(f"forbidden corrective path: {path}")
+              changed.append(path)
+              mode = subprocess.run(
+                  ["git", "ls-tree", target, "--", path],
+                  check=True, capture_output=True, text=True,
+              ).stdout.split()[0]
+              if mode not in {"100644", "100755"}:
+                  raise SystemExit(f"forbidden corrective object mode {mode}: {path}")
+          if not changed:
+              raise SystemExit("corrective release diff is empty")
+
+          evidence = {
+              "schema": 1,
+              "classification": "INHERITED_UNCHANGED_CORE_TEST_EVIDENCE",
+              "repository": repository,
+              "baseline": {
+                  "source_sha": base,
+                  "workflow_run_id": run_id,
+                  "workflow_id": workflow_id,
+                  "successful_core_jobs": [
+                      {"id": by_name[name]["id"], "name": name, "conclusion": "success"}
+                      for name in sorted(required_successes)
+                  ],
+                  "publication_failure": {
+                      "id": failure["id"],
+                      "name": failure["name"],
+                      "conclusion": failure["conclusion"],
+                      "reason": "Windows resource evidence hashed CRLF working-tree bytes",
+                  },
+              },
+              "corrective_candidate": {
+                  "source_sha": target,
+                  "changed_paths": sorted(changed),
+                  "runtime_or_consensus_source_changed": False,
+              },
+              "limitations": {
+                  "historical_results_are_not_candidate_sha_results": True,
+                  "prior_windows_resource_bundle_reused": False,
+                  "fresh_platform_packages_and_resource_evidence_required": True,
+              },
+          }
+          Path("inherited-core-evidence.json").write_text(
+              json.dumps(evidence, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+          )
+          PY
+
+      - name: Upload inherited core evidence record
+        if: ${{ needs.resolve-target.outputs.publish == 'true' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: inherited-core-gate-30.1.2-${{ needs.resolve-target.outputs.target_sha }}
+          path: inherited-core-evidence.json
+          if-no-files-found: error
+          retention-days: 30
+
   safety-gate:
     name: Exact-SHA prerelease or production safety gate
-    needs: resolve-target
+    needs:
+      - resolve-target
+      - inherited-core-evidence
     permissions:
       contents: read
     uses: ./.github/workflows/pr-gate.yml
@@ -190,9 +373,12 @@ jobs:
       target_sha: ${{ needs.resolve-target.outputs.target_sha }}
       # Alpha artifacts wait for the core gate. A beta adds native-platform,
       # sanitizer, pinned-fuzz, and complete extended functional evidence.
-      # Production final runs the same complete gate.
+      # The one-time v30.1.2 production correction reuses the exact recorded
+      # dffb457 core results while regenerating candidate-bound platform,
+      # provenance, package, and reproducibility evidence.
       release_mode: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
       run_extended_functional: ${{ needs.resolve-target.outputs.publish == 'true' || needs.resolve-target.outputs.prerelease_channel == 'beta' }}
+      corrective_fast_path: ${{ needs.resolve-target.outputs.publish == 'true' }}
 
   select-targets:
     name: Select build target
@@ -742,8 +928,8 @@ jobs:
           test "$(lipo -archs "$binary")" = "$EXPECTED_ARCH"
           file "$binary" | grep -F "Mach-O 64-bit executable $EXPECTED_ARCH"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")" = blackcoin-qt
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = 30.1.1
-          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = 30.1.1
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$VERSION"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist")" = "$VERSION"
           verify_plist_architecture "$plist"
 
           xattr -cr "$app"
@@ -1075,7 +1261,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          expected='I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES'
+          expected='V30.1.2'
           test "$UNSIGNED_FINAL_ACK" = "$expected" || {
             echo '::error::Protected UNSIGNED_FINAL_ACK does not authorize this publisher-unsigned final release'
             exit 1
@@ -1131,6 +1317,12 @@ jobs:
           pattern: quantum-resource-benchmarks-*-${{ needs.resolve-target.outputs.target_sha }}
           merge-multiple: true
 
+      - name: Download inherited unchanged-core evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: gate-evidence/inherited-core
+          name: inherited-core-gate-30.1.2-${{ needs.resolve-target.outputs.target_sha }}
+
       - name: Install final release verification tools
         run: |
           sudo apt-get update
@@ -1141,7 +1333,7 @@ jobs:
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "$TARGET_SHA"
-          expected_ack='I_ACKNOWLEDGE_V30_1_1_FINAL_ARTIFACTS_HAVE_NO_PUBLISHER_SIGNATURES'
+          expected_ack='V30.1.2'
           test "$UNSIGNED_FINAL_ACK" = "$expected_ack"
           mkdir -p dist
           shopt -s nullglob
@@ -1187,6 +1379,9 @@ jobs:
             "dist/Blackcoin-$VERSION-quantum-crypto-provenance.json"
           cp contrib/devtools/quantum-crypto-provenance.json \
             "dist/Blackcoin-$VERSION-quantum-crypto-manifest.json"
+          test -s gate-evidence/inherited-core/inherited-core-evidence.json
+          cp gate-evidence/inherited-core/inherited-core-evidence.json \
+            "dist/Blackcoin-$VERSION-INHERITED-CORE-EVIDENCE.json"
           python3 ci/release/verify_resource_benchmark_bundle.py \
             --directory gate-evidence/resource-benchmarks \
             --source-sha "$TARGET_SHA" \
@@ -1233,7 +1428,7 @@ jobs:
           {
             echo '# Publisher-unsigned production release'
             echo
-            echo 'Blackcoin-Dev has no release-signing certificates for v30.1.1.'
+            echo "Blackcoin-Dev has no release-signing certificates for v$VERSION."
             echo 'Windows packages are not Authenticode-signed. macOS applications carry only identity-free ad-hoc launch signatures and are not notarized.'
             echo 'The source commit, annotated tag, checksums, and in-toto statement have no Blackcoin-Dev OpenPGP signature.'
             echo 'Verify the unsigned notice and manifest, SHA256 checksums, exact source commit, reproducibility report, SBOM, provenance, and GitHub attestations before installing.'

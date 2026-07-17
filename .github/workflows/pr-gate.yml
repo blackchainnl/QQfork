@@ -18,6 +18,11 @@ on:
         required: false
         type: boolean
         default: false
+      corrective_fast_path:
+        description: Reuse the recorded v30.1.1 core gate for a release-tool-only corrective source
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       target_sha:
@@ -31,6 +36,11 @@ on:
         default: false
       run_extended_functional:
         description: Run the complete extended functional suite
+        required: false
+        type: boolean
+        default: false
+      corrective_fast_path:
+        description: Reuse the recorded v30.1.1 core gate for a release-tool-only corrective source
         required: false
         type: boolean
         default: false
@@ -400,7 +410,7 @@ jobs:
 
   native-linux-arm64-ubsan:
     name: Linux ARM64 native UBSan block-harness gate
-    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     needs: native-linux-arm64-crypto
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 300
@@ -706,6 +716,7 @@ jobs:
 
   critical-protocol:
     name: critical Gold Rush, lifecycle, wallet, and recovery tests
+    if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
     needs: native-build-and-unit
     runs-on: ubuntu-22.04
     timeout-minutes: 240
@@ -772,6 +783,7 @@ jobs:
 
   mixed-version:
     name: real v26.2, v28.4, v30.1, and candidate interoperability
+    if: ${{ inputs.corrective_fast_path != true || github.event_name == 'pull_request' }}
     needs: native-build-and-unit
     runs-on: ubuntu-22.04
     timeout-minutes: 300
@@ -831,7 +843,7 @@ jobs:
 
   exhaustive-functional:
     name: complete extended functional suite
-    if: ${{ inputs.run_extended_functional == true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.run_extended_functional == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     needs: native-build-and-unit
     runs-on: ubuntu-22.04
     timeout-minutes: 480
@@ -859,7 +871,7 @@ jobs:
 
   sanitizer-gates:
     name: ${{ matrix.name }} consensus and liveness gate
-    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 480
     strategy:
@@ -907,7 +919,7 @@ jobs:
 
   fuzz-smoke:
     name: source-pinned sanitizer regression smoke
-    if: ${{ inputs.release_mode == true || github.event_name == 'pull_request' }}
+    if: ${{ (inputs.release_mode == true && inputs.corrective_fast_path != true) || github.event_name == 'pull_request' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
